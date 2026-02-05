@@ -392,7 +392,7 @@ pub fn render_query_editor(
         .wrap(ratatui::widgets::Wrap { trim: false })
         .block(
             Block::default()
-                .title(" Query Editor [F5/Ctrl+Enter | Tab:Complete] ")
+                .title(" Query Editor [F5/Ctrl+Enter | Ctrl+Space:Complete] ")
                 .borders(Borders::ALL)
                 .border_style(panel_style(is_active)),
         );

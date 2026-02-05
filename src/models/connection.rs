@@ -5,6 +5,7 @@ pub enum DatabaseType {
     Postgres,
     MySQL,
     SQLite,
+    SQLServer,
 }
 
 impl std::fmt::Display for DatabaseType {
@@ -13,6 +14,7 @@ impl std::fmt::Display for DatabaseType {
             DatabaseType::Postgres => write!(f, "PostgreSQL"),
             DatabaseType::MySQL => write!(f, "MySQL"),
             DatabaseType::SQLite => write!(f, "SQLite"),
+            DatabaseType::SQLServer => write!(f, "SQL Server"),
         }
     }
 }
@@ -54,6 +56,17 @@ impl ConnectionConfig {
             DatabaseType::SQLite => {
                 format!("sqlite:{}", self.database)
             }
+            DatabaseType::SQLServer => {
+                // For tiberius, we don't use a connection string directly
+                // This is just for display/logging purposes
+                format!(
+                    "sqlserver://{}@{}:{}/{}",
+                    self.username.as_deref().unwrap_or("sa"),
+                    self.host.as_deref().unwrap_or("localhost"),
+                    self.port.unwrap_or(1433),
+                    self.database
+                )
+            }
         }
     }
 }
@@ -88,4 +101,32 @@ pub struct QueryResult {
     #[allow(dead_code)]
     pub rows_affected: u64,
     pub execution_time_ms: u128,
+}
+
+/// Represents a table with its schema
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TableInfo {
+    pub schema: String,
+    pub name: String,
+}
+
+#[allow(dead_code)]
+impl TableInfo {
+    #[allow(dead_code)]
+    pub fn full_name(&self) -> String {
+        if self.schema.is_empty() || self.schema == "public" || self.schema == "dbo" || self.schema == "main" {
+            self.name.clone()
+        } else {
+            format!("{}.{}", self.schema, self.name)
+        }
+    }
+}
+
+/// Represents a schema with its tables
+#[derive(Debug, Clone)]
+pub struct SchemaInfo {
+    pub name: String,
+    pub tables: Vec<String>,
+    pub expanded: bool,
 }

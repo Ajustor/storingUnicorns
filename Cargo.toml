@@ -21,6 +21,13 @@ sqlx = { version = "0.8", features = [
   "sqlite",
 ] }
 
+# SQL Server connector
+tiberius = { version = "0.12", default-features = false, features = [
+  "tds73",
+  "rustls",
+] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"

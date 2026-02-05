@@ -6,8 +6,9 @@ use ratatui::{
 use crate::services::AppState;
 
 use super::widgets::{
-    render_connections_panel, render_help_bar, render_new_connection_dialog, render_query_editor,
-    render_results_panel, render_status_bar, render_tables_panel,
+    render_connections_panel, render_edit_row_dialog, render_help_bar,
+    render_new_connection_dialog, render_query_editor, render_results_panel, render_status_bar,
+    render_tables_panel,
 };
 
 /// Main UI layout - DataGrip-like interface
@@ -31,9 +32,9 @@ pub fn render_ui(frame: &mut Frame, state: &AppState) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(10),    // Content
-            Constraint::Length(1),  // Status bar
-            Constraint::Length(1),  // Help bar
+            Constraint::Min(10),   // Content
+            Constraint::Length(1), // Status bar
+            Constraint::Length(1), // Help bar
         ])
         .split(size);
 
@@ -65,4 +66,5 @@ pub fn render_ui(frame: &mut Frame, state: &AppState) {
 
     // Render dialog overlay if active
     render_new_connection_dialog(frame, state);
+    render_edit_row_dialog(frame, state);
 }

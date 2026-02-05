@@ -8,7 +8,9 @@ use std::io;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -76,9 +78,17 @@ async fn run_app<B: ratatui::backend::Backend>(
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                // Only handle key press events, not release events
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
                 // Handle dialog input first
                 if state.is_dialog_open() {
-                    handle_dialog_input(state, key.code, key.modifiers);
+                    let should_save_row = handle_dialog_input(state, key.code, key.modifiers);
+                    if should_save_row {
+                        handle_save_row(state).await;
+                    }
                     continue;
                 }
 
@@ -109,16 +119,44 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                     // Connect to selected database
                     KeyCode::Enter if state.active_panel == ActivePanel::Connections => {
-                        handle_connect(state).await;
+                        handle_connect(terminal, state).await;
                     }
 
-                    // Select table - generate SELECT query
+                    // Select table or toggle schema - generate SELECT query
                     KeyCode::Enter if state.active_panel == ActivePanel::Tables => {
-                        if let Some(table) = state.tables.get(state.selected_table) {
-                            state.query_input = format!("SELECT * FROM {} LIMIT 100", table);
+                        if state.selected_table == 0 {
+                            // Toggle schema expansion
+                            state.toggle_schema();
+                        } else if let Some(table_name) = state.get_selected_table_full_name() {
+                            // Generate SELECT query with proper syntax for each DB type
+                            let query = if let Some(ref config) = state.current_connection_config {
+                                match config.db_type {
+                                    crate::models::DatabaseType::SQLServer => {
+                                        format!("SELECT TOP 100 * FROM {}", table_name)
+                                    }
+                                    _ => {
+                                        format!("SELECT * FROM {} LIMIT 100", table_name)
+                                    }
+                                }
+                            } else {
+                                format!("SELECT * FROM {} LIMIT 100", table_name)
+                            };
+                            state.query_input = query;
                             state.cursor_position = state.query_input.len();
                             state.active_panel = ActivePanel::QueryEditor;
                         }
+                    }
+
+                    // Toggle schema expansion with Space
+                    KeyCode::Char(' ') if state.active_panel == ActivePanel::Tables => {
+                        if state.selected_table == 0 {
+                            state.toggle_schema();
+                        }
+                    }
+
+                    // Edit selected row in Results panel
+                    KeyCode::Enter if state.active_panel == ActivePanel::Results => {
+                        state.open_edit_row_dialog();
                     }
 
                     // Execute query
@@ -165,6 +203,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                         state.open_new_connection_dialog();
                     }
 
+                    // Edit connection dialog
+                    KeyCode::Char('e') if state.active_panel == ActivePanel::Connections => {
+                        if !state.config.connections.is_empty() {
+                            state.open_edit_connection_dialog(state.selected_connection);
+                        }
+                    }
+
                     // Delete connection
                     KeyCode::Char('d') if state.active_panel == ActivePanel::Connections => {
                         if !state.config.connections.is_empty() {
@@ -206,21 +251,24 @@ async fn run_app<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-fn handle_dialog_input(state: &mut AppState, key: KeyCode, modifiers: KeyModifiers) {
+fn handle_dialog_input(state: &mut AppState, key: KeyCode, modifiers: KeyModifiers) -> bool {
     match state.dialog_mode {
-        DialogMode::NewConnection => {
-            handle_new_connection_dialog(state, key, modifiers);
+        DialogMode::NewConnection | DialogMode::EditConnection => {
+            handle_connection_dialog(state, key, modifiers);
+            false
         }
+        DialogMode::EditRow => handle_edit_row_dialog(state, key),
         DialogMode::DeleteConfirm => {
             // TODO: implement delete confirmation
+            false
         }
-        DialogMode::None => {}
+        DialogMode::None => false,
     }
 }
 
-fn handle_new_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyModifiers) {
+fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyModifiers) {
     let nc = &mut state.new_connection;
-    
+
     match key {
         KeyCode::Esc => {
             state.close_dialog();
@@ -247,9 +295,18 @@ fn handle_new_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: 
             // Save the connection
             let config = nc.to_config();
             let name = config.name.clone();
-            state.config.add_connection(config);
-            state.close_dialog();
-            state.set_status(format!("Added connection: {}", name));
+
+            if let Some(index) = state.editing_connection_index {
+                // Editing existing connection
+                state.config.connections[index] = config;
+                state.close_dialog();
+                state.set_status(format!("Updated connection: {}", name));
+            } else {
+                // Adding new connection
+                state.config.add_connection(config);
+                state.close_dialog();
+                state.set_status(format!("Added connection: {}", name));
+            }
             return;
         }
         KeyCode::Char(c) => {
@@ -300,7 +357,102 @@ fn handle_new_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: 
     }
 }
 
-async fn handle_connect(state: &mut AppState) {
+fn handle_edit_row_dialog(state: &mut AppState, key: KeyCode) -> bool {
+    let row = match state.editing_row.as_mut() {
+        Some(row) => row,
+        None => return false,
+    };
+    let row_count = row.len();
+    if row_count == 0 {
+        return false;
+    }
+
+    match key {
+        KeyCode::Esc => {
+            state.close_dialog();
+            false
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            // Move to next field
+            state.editing_column = (state.editing_column + 1) % row_count;
+            if let Some(ref row) = state.editing_row {
+                state.editing_cursor = row[state.editing_column].len();
+            }
+            false
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            // Move to previous field
+            if state.editing_column == 0 {
+                state.editing_column = row_count - 1;
+            } else {
+                state.editing_column -= 1;
+            }
+            if let Some(ref row) = state.editing_row {
+                state.editing_cursor = row[state.editing_column].len();
+            }
+            false
+        }
+        KeyCode::Enter => {
+            // Signal that we want to save - actual update will be done async
+            true
+        }
+        KeyCode::Char(c) => {
+            let pos = state.editing_cursor;
+            if let Some(ref mut row) = state.editing_row {
+                row[state.editing_column].insert(pos, c);
+            }
+            state.editing_cursor += 1;
+            false
+        }
+        KeyCode::Backspace => {
+            if state.editing_cursor > 0 {
+                state.editing_cursor -= 1;
+                if let Some(ref mut row) = state.editing_row {
+                    row[state.editing_column].remove(state.editing_cursor);
+                }
+            }
+            false
+        }
+        KeyCode::Delete => {
+            if let Some(ref mut row) = state.editing_row {
+                let len = row[state.editing_column].len();
+                if state.editing_cursor < len {
+                    row[state.editing_column].remove(state.editing_cursor);
+                }
+            }
+            false
+        }
+        KeyCode::Home => {
+            state.editing_cursor = 0;
+            false
+        }
+        KeyCode::End => {
+            if let Some(ref row) = state.editing_row {
+                state.editing_cursor = row[state.editing_column].len();
+            }
+            false
+        }
+        KeyCode::Left => {
+            state.editing_cursor = state.editing_cursor.saturating_sub(1);
+            false
+        }
+        KeyCode::Right => {
+            if let Some(ref row) = state.editing_row {
+                let len = row[state.editing_column].len();
+                if state.editing_cursor < len {
+                    state.editing_cursor += 1;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+async fn handle_connect<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut AppState,
+) {
     if state.config.connections.is_empty() {
         state.set_status("No connections configured. Press 'n' to add one.");
         return;
@@ -309,6 +461,11 @@ async fn handle_connect(state: &mut AppState) {
     let conn_config = state.config.connections[state.selected_connection].clone();
     state.set_status(format!("Connecting to {}...", conn_config.name));
     state.is_loading = true;
+    state.is_connecting = true;
+    state.connection_error = None;
+
+    // Redraw to show connecting state
+    let _ = terminal.draw(|f| render_ui(f, state));
 
     match DatabaseConnection::connect(&conn_config).await {
         Ok(conn) => {
@@ -325,20 +482,30 @@ async fn handle_connect(state: &mut AppState) {
             handle_refresh_tables(state).await;
         }
         Err(e) => {
-            state.set_status(format!("Connection failed: {}", e));
+            let error_msg = format!("Connection failed: {}", e);
+            state.set_status(&error_msg);
+            state.connection_error = Some(error_msg);
         }
     }
 
     state.is_loading = false;
+    state.is_connecting = false;
 }
 
 async fn handle_refresh_tables(state: &mut AppState) {
     if let Some(ref conn) = state.connection {
-        match conn.get_tables().await {
-            Ok(tables) => {
-                state.tables = tables;
+        match conn.get_tables_by_schema().await {
+            Ok(schemas) => {
+                let total_tables: usize = schemas.iter().map(|s| s.tables.len()).sum();
+                state.schemas = schemas;
+                state.tables = Vec::new(); // Clear legacy flat list
+                state.selected_schema = 0;
                 state.selected_table = 0;
-                state.set_status(format!("Loaded {} tables", state.tables.len()));
+                state.set_status(format!(
+                    "Loaded {} schemas, {} tables",
+                    state.schemas.len(),
+                    total_tables
+                ));
             }
             Err(e) => {
                 state.set_status(format!("Failed to fetch tables: {}", e));
@@ -385,4 +552,88 @@ async fn handle_execute_query(state: &mut AppState) {
     }
 
     state.is_loading = false;
+}
+
+async fn handle_save_row(state: &mut AppState) {
+    // Get required data for update
+    let table_name = match &state.editing_table_name {
+        Some(name) => name.clone(),
+        None => {
+            state.set_status("Cannot save: table name not found");
+            state.close_dialog();
+            return;
+        }
+    };
+
+    let columns = match &state.query_result {
+        Some(result) => result.columns.clone(),
+        None => {
+            state.set_status("Cannot save: no query result");
+            state.close_dialog();
+            return;
+        }
+    };
+
+    let original_values = match &state.original_editing_row {
+        Some(row) => row.clone(),
+        None => {
+            state.set_status("Cannot save: original row not found");
+            state.close_dialog();
+            return;
+        }
+    };
+
+    let new_values = match &state.editing_row {
+        Some(row) => row.clone(),
+        None => {
+            state.set_status("Cannot save: edited row not found");
+            state.close_dialog();
+            return;
+        }
+    };
+
+    // Check if there are any changes
+    if original_values == new_values {
+        state.set_status("No changes to save");
+        state.close_dialog();
+        return;
+    }
+
+    // Check if connected
+    if state.connection.is_none() {
+        state.set_status("Cannot save: not connected");
+        state.close_dialog();
+        return;
+    }
+
+    state.set_status("Saving row...");
+
+    // Perform the update
+    let result = state
+        .connection
+        .as_ref()
+        .unwrap()
+        .update_row(&table_name, &columns, &original_values, &new_values)
+        .await;
+
+    match result {
+        Ok(rows_affected) => {
+            if rows_affected > 0 {
+                // Update the row in the current result set
+                if let Some(ref mut result) = state.query_result {
+                    if let Some(row) = result.rows.get_mut(state.selected_row) {
+                        *row = new_values;
+                    }
+                }
+                state.set_status(format!("Row updated ({} row(s) affected)", rows_affected));
+            } else {
+                state.set_status("No rows were updated (row may have been modified)");
+            }
+        }
+        Err(e) => {
+            state.set_status(format!("Update failed: {}", e));
+        }
+    }
+
+    state.close_dialog();
 }

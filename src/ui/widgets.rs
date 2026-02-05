@@ -1,14 +1,14 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
-    },
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row, Table, TableState},
     Frame,
 };
 
-use crate::services::{ActivePanel, AppState, ConnectionField, DialogMode};
+use super::clickable::{ClickableRegistry, ClickableType};
+use super::layout::PanelType;
+use crate::services::{ActivePanel, AppState};
 
 fn panel_style(active: bool) -> Style {
     if active {
@@ -24,14 +24,55 @@ fn highlight_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-pub fn render_connections_panel(frame: &mut Frame, area: Rect, state: &AppState) {
+pub fn render_connections_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    registry: &ClickableRegistry,
+) {
     let is_active = state.active_panel == ActivePanel::Connections && !state.is_dialog_open();
 
+    // Register panel area
+    registry.register(area, ClickableType::Panel(PanelType::Connections));
+
+    // Calculate inner area (excluding borders)
+    let inner_area = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+
+    let visible_height = inner_area.height as usize;
+    let scroll_offset = state.connections_scroll;
+
+    // Register each visible connection item
+    for (display_idx, (i, _conn)) in state
+        .config
+        .connections
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .enumerate()
+    {
+        let item_rect = Rect {
+            x: inner_area.x,
+            y: inner_area.y + display_idx as u16,
+            width: inner_area.width,
+            height: 1,
+        };
+        registry.register(item_rect, ClickableType::Connection(i));
+    }
+
+    // Build items with scroll offset
     let items: Vec<ListItem> = state
         .config
         .connections
         .iter()
         .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
         .map(|(i, conn)| {
             let style = if i == state.selected_connection && is_active {
                 highlight_style()
@@ -54,10 +95,18 @@ pub fn render_connections_panel(frame: &mut Frame, area: Rect, state: &AppState)
         })
         .collect();
 
-    let title = if state.config.connections.is_empty() {
-        " Connections (none) "
+    let total = state.config.connections.len();
+    let title = if total == 0 {
+        " Connections (none) ".to_string()
+    } else if total > visible_height {
+        format!(
+            " Connections [{}-{}/{}] ",
+            scroll_offset + 1,
+            (scroll_offset + visible_height).min(total),
+            total
+        )
     } else {
-        " Connections "
+        " Connections ".to_string()
     };
 
     let list = List::new(items)
@@ -69,16 +118,38 @@ pub fn render_connections_panel(frame: &mut Frame, area: Rect, state: &AppState)
         )
         .highlight_style(highlight_style());
 
+    // Adjust selection for scroll offset
+    let visible_selection = state.selected_connection.saturating_sub(scroll_offset);
     let mut list_state = ListState::default();
-    list_state.select(Some(state.selected_connection));
+    list_state.select(Some(visible_selection));
 
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-pub fn render_tables_panel(frame: &mut Frame, area: Rect, state: &AppState) {
+pub fn render_tables_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    registry: &ClickableRegistry,
+) {
     let is_active = state.active_panel == ActivePanel::Tables && !state.is_dialog_open();
 
-    let mut items: Vec<ListItem> = Vec::new();
+    // Register panel area
+    registry.register(area, ClickableType::Panel(PanelType::Tables));
+
+    // Calculate inner area (excluding borders)
+    let inner_area = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+
+    let visible_height = inner_area.height as usize;
+    let scroll_offset = state.tables_scroll;
+
+    // First, build all items to get total count
+    let mut all_items: Vec<(ListItem, Option<(usize, Option<usize>)>)> = Vec::new();
 
     for (schema_idx, schema) in state.schemas.iter().enumerate() {
         // Schema header
@@ -90,7 +161,7 @@ pub fn render_tables_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         } else {
             Style::default().fg(Color::Yellow)
         };
-        items.push(
+        all_items.push((
             ListItem::new(format!(
                 "{} {} ({})",
                 expand_icon,
@@ -98,7 +169,8 @@ pub fn render_tables_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                 schema.tables.len()
             ))
             .style(schema_style),
-        );
+            Some((schema_idx, None)), // Schema click info
+        ));
 
         // Tables under this schema (if expanded)
         if schema.expanded {
@@ -111,17 +183,61 @@ pub fn render_tables_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                 } else {
                     Style::default()
                 };
-                items.push(ListItem::new(format!("    {}", table)).style(table_style));
+                all_items.push((
+                    ListItem::new(format!("    {}", table)).style(table_style),
+                    Some((schema_idx, Some(table_idx))), // Table click info
+                ));
             }
         }
     }
 
+    let total_items = all_items.len();
+
+    // Apply scroll and take visible items
+    let visible_items: Vec<_> = all_items
+        .into_iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .collect();
+
+    // Register clickable areas for visible items
+    for (display_idx, (_, (_, click_info))) in visible_items.iter().enumerate() {
+        if let Some((schema_idx, table_idx_opt)) = click_info {
+            let item_rect = Rect {
+                x: inner_area.x,
+                y: inner_area.y + display_idx as u16,
+                width: inner_area.width,
+                height: 1,
+            };
+            if let Some(table_idx) = table_idx_opt {
+                registry.register(
+                    item_rect,
+                    ClickableType::Table {
+                        schema_idx: *schema_idx,
+                        table_idx: *table_idx,
+                    },
+                );
+            } else {
+                registry.register(item_rect, ClickableType::Schema(*schema_idx));
+            }
+        }
+    }
+
+    // Extract just the ListItems
+    let items: Vec<ListItem> = visible_items
+        .into_iter()
+        .map(|(_, (item, _))| item)
+        .collect();
+
     // Fallback to flat table list if no schemas
-    if state.schemas.is_empty() && !state.tables.is_empty() {
-        items = state
+    let items = if state.schemas.is_empty() && !state.tables.is_empty() {
+        state
             .tables
             .iter()
             .enumerate()
+            .skip(scroll_offset)
+            .take(visible_height)
             .map(|(i, table)| {
                 let style = if i == state.selected_table && is_active {
                     highlight_style()
@@ -130,13 +246,22 @@ pub fn render_tables_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                 };
                 ListItem::new(format!("  {}", table)).style(style)
             })
-            .collect();
-    }
-
-    let title = if state.is_connected() {
-        " Tables "
+            .collect()
     } else {
-        " Tables (not connected) "
+        items
+    };
+
+    let title = if !state.is_connected() {
+        " Tables (not connected) ".to_string()
+    } else if total_items > visible_height {
+        format!(
+            " Tables [{}-{}/{}] ",
+            scroll_offset + 1,
+            (scroll_offset + visible_height).min(total_items),
+            total_items
+        )
+    } else {
+        " Tables ".to_string()
     };
 
     let list = List::new(items)
@@ -148,7 +273,7 @@ pub fn render_tables_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         )
         .highlight_style(highlight_style());
 
-    // Calculate selected index in flat list
+    // Calculate selected index in flat list and adjust for scroll
     let mut selected_idx = 0;
     for (schema_idx, schema) in state.schemas.iter().enumerate() {
         if schema_idx == state.selected_schema {
@@ -160,15 +285,33 @@ pub fn render_tables_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             selected_idx += schema.tables.len();
         }
     }
+    let visible_selection = selected_idx.saturating_sub(scroll_offset);
 
     let mut list_state = ListState::default();
-    list_state.select(Some(selected_idx));
+    list_state.select(Some(visible_selection));
 
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-pub fn render_query_editor(frame: &mut Frame, area: Rect, state: &AppState) {
+pub fn render_query_editor(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    registry: &ClickableRegistry,
+) {
     let is_active = state.active_panel == ActivePanel::QueryEditor && !state.is_dialog_open();
+
+    // Register panel area
+    registry.register(area, ClickableType::Panel(PanelType::QueryEditor));
+
+    // Register inner editor area for cursor positioning
+    let inner_area = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    registry.register(inner_area, ClickableType::QueryEditor);
 
     let input_text = if state.query_input.is_empty() && !is_active {
         "-- Enter SQL query here..."
@@ -181,21 +324,41 @@ pub fn render_query_editor(frame: &mut Frame, area: Rect, state: &AppState) {
         .wrap(ratatui::widgets::Wrap { trim: false })
         .block(
             Block::default()
-                .title(" Query Editor [F5 to execute] ")
+                .title(" Query Editor [F5/Ctrl+Enter] ")
                 .borders(Borders::ALL)
                 .border_style(panel_style(is_active)),
         );
 
     frame.render_widget(paragraph, area);
 
-    // Show cursor when editing (calculate position with wrapping)
+    // Show cursor when editing (calculate position with real line breaks)
     if is_active {
         let inner_width = area.width.saturating_sub(2) as usize; // Account for borders
         if inner_width > 0 {
-            let cursor_line = state.cursor_position / inner_width;
-            let cursor_col = state.cursor_position % inner_width;
-            let cursor_x = area.x + 1 + cursor_col as u16;
-            let cursor_y = area.y + 1 + cursor_line as u16;
+            // Calculate cursor position considering actual newlines
+            let text_before_cursor =
+                &state.query_input[..state.cursor_position.min(state.query_input.len())];
+
+            let mut visual_line = 0;
+            let mut visual_col = 0;
+
+            for c in text_before_cursor.chars() {
+                if c == '\n' {
+                    visual_line += 1;
+                    visual_col = 0;
+                } else {
+                    visual_col += 1;
+                    // Handle wrapping
+                    if visual_col >= inner_width {
+                        visual_line += 1;
+                        visual_col = 0;
+                    }
+                }
+            }
+
+            let cursor_x = area.x + 1 + visual_col as u16;
+            let cursor_y = area.y + 1 + visual_line as u16;
+
             // Only show cursor if it's within the visible area
             if cursor_y < area.y + area.height - 1 {
                 frame.set_cursor_position((cursor_x, cursor_y));
@@ -204,8 +367,16 @@ pub fn render_query_editor(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
-pub fn render_results_panel(frame: &mut Frame, area: Rect, state: &AppState) {
+pub fn render_results_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    registry: &ClickableRegistry,
+) {
     let is_active = state.active_panel == ActivePanel::Results && !state.is_dialog_open();
+
+    // Register panel area
+    registry.register(area, ClickableType::Panel(PanelType::Results));
 
     // Show connection error if any
     if let Some(ref error) = state.connection_error {
@@ -275,11 +446,26 @@ pub fn render_results_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             )
             .height(1);
 
-        // Build rows with column offset
+        // Calculate visible area for rows
+        // Inner area: border (1) + header row (1) = start at y+2
+        let inner_area = Rect {
+            x: area.x + 1,
+            y: area.y + 2, // +1 for border, +1 for header
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(3), // -2 for borders, -1 for header
+        };
+
+        let visible_height = inner_area.height as usize;
+        let scroll_offset = state.results_scroll;
+        let total_rows = result.rows.len();
+
+        // Build rows with column offset and vertical scroll
         let rows: Vec<Row> = result
             .rows
             .iter()
             .enumerate()
+            .skip(scroll_offset)
+            .take(visible_height)
             .map(|(i, row)| {
                 let style = if i == state.selected_row && is_active {
                     highlight_style()
@@ -290,6 +476,24 @@ pub fn render_results_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                 Row::new(cells).style(style)
             })
             .collect();
+
+        // Register clickable areas for visible result rows
+        for (display_idx, (i, _)) in result
+            .rows
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(visible_height)
+            .enumerate()
+        {
+            let row_rect = Rect {
+                x: inner_area.x,
+                y: inner_area.y + display_idx as u16,
+                width: inner_area.width,
+                height: 1,
+            };
+            registry.register(row_rect, ClickableType::ResultRow(i));
+        }
 
         // Use calculated widths with offset
         let widths: Vec<Constraint> = col_widths
@@ -308,10 +512,22 @@ pub fn render_results_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             String::new()
         };
 
+        let row_scroll_info = if total_rows > visible_height {
+            format!(
+                " [{}-{}/{}]",
+                scroll_offset + 1,
+                (scroll_offset + visible_height).min(total_rows),
+                total_rows
+            )
+        } else {
+            String::new()
+        };
+
         let title = format!(
-            " Results ({} rows, {}ms){} [Enter to edit] ",
+            " Results ({} rows, {}ms){}{} [Enter to edit] ",
             result.rows.len(),
             result.execution_time_ms,
+            row_scroll_info,
             scroll_info
         );
 
@@ -326,8 +542,10 @@ pub fn render_results_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             .row_highlight_style(highlight_style())
             .column_spacing(1);
 
+        // Adjust selection for scroll offset
+        let visible_selection = state.selected_row.saturating_sub(scroll_offset);
         let mut table_state = TableState::default();
-        table_state.select(Some(state.selected_row));
+        table_state.select(Some(visible_selection));
 
         frame.render_stateful_widget(table, area, &mut table_state);
     } else {
@@ -389,7 +607,11 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
                 ("q", "Quit"),
             ],
             ActivePanel::QueryEditor => {
-                vec![("F5", "Execute"), ("Tab", "Next panel"), ("Ctrl+Q", "Quit")]
+                vec![
+                    ("F5", "Execute all"),
+                    ("Ctrl+↵", "Execute current"),
+                    ("Tab", "Next panel"),
+                ]
             }
             ActivePanel::Results => vec![
                 ("↑/↓", "Navigate"),
@@ -418,290 +640,4 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     let paragraph = Paragraph::new(help_line);
 
     frame.render_widget(paragraph, area);
-}
-
-pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
-    if state.dialog_mode != DialogMode::NewConnection
-        && state.dialog_mode != DialogMode::EditConnection
-    {
-        return;
-    }
-
-    let area = centered_rect(60, 70, frame.area());
-
-    // Clear the area behind the dialog
-    frame.render_widget(Clear, area);
-
-    let title = if state.dialog_mode == DialogMode::EditConnection {
-        " Edit Connection "
-    } else {
-        " New Connection "
-    };
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-
-    frame.render_widget(block, area);
-
-    let inner = Rect {
-        x: area.x + 2,
-        y: area.y + 1,
-        width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(2),
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Name
-            Constraint::Length(3), // DB Type
-            Constraint::Length(3), // Host
-            Constraint::Length(3), // Port
-            Constraint::Length(3), // Username
-            Constraint::Length(3), // Password
-            Constraint::Length(3), // Database
-            Constraint::Min(1),    // Spacer
-        ])
-        .split(inner);
-
-    let nc = &state.new_connection;
-
-    // Helper to render a field
-    let render_field = |frame: &mut Frame,
-                        area: Rect,
-                        label: &str,
-                        value: &str,
-                        field: ConnectionField,
-                        is_password: bool| {
-        let is_active = nc.active_field == field;
-        let display_value = if is_password && !value.is_empty() {
-            "*".repeat(value.len())
-        } else {
-            value.to_string()
-        };
-
-        let style = if is_active {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-
-        let content = format!("{}: {}", label, display_value);
-        let paragraph = Paragraph::new(content).style(style).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(style),
-        );
-
-        frame.render_widget(paragraph, area);
-
-        // Show cursor for active text field
-        if is_active && field != ConnectionField::DbType {
-            let cursor_x = area.x + label.len() as u16 + 2 + nc.cursor_position as u16;
-            let cursor_y = area.y;
-            frame.set_cursor_position((cursor_x.min(area.x + area.width - 1), cursor_y));
-        }
-    };
-
-    render_field(
-        frame,
-        chunks[0],
-        "Name",
-        &nc.name,
-        ConnectionField::Name,
-        false,
-    );
-
-    // DB Type - special handling with cycle indicator
-    let db_type_active = nc.active_field == ConnectionField::DbType;
-    let db_style = if db_type_active {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    let db_hint = if db_type_active {
-        " (←/→ to change)"
-    } else {
-        ""
-    };
-    let db_content = format!("Type: {}{}", nc.db_type, db_hint);
-    let db_paragraph = Paragraph::new(db_content).style(db_style).block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(db_style),
-    );
-    frame.render_widget(db_paragraph, chunks[1]);
-
-    render_field(
-        frame,
-        chunks[2],
-        "Host",
-        &nc.host,
-        ConnectionField::Host,
-        false,
-    );
-    render_field(
-        frame,
-        chunks[3],
-        "Port",
-        &nc.port,
-        ConnectionField::Port,
-        false,
-    );
-    render_field(
-        frame,
-        chunks[4],
-        "Username",
-        &nc.username,
-        ConnectionField::Username,
-        false,
-    );
-    render_field(
-        frame,
-        chunks[5],
-        "Password",
-        &nc.password,
-        ConnectionField::Password,
-        true,
-    );
-    render_field(
-        frame,
-        chunks[6],
-        "Database",
-        &nc.database,
-        ConnectionField::Database,
-        false,
-    );
-}
-
-/// Helper to create a centered popup area
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-pub fn render_edit_row_dialog(frame: &mut Frame, state: &AppState) {
-    if state.dialog_mode != DialogMode::EditRow && state.dialog_mode != DialogMode::AddRow {
-        return;
-    }
-
-    let Some(ref editing_row) = state.editing_row else {
-        return;
-    };
-
-    let Some(ref result) = state.query_result else {
-        return;
-    };
-
-    let area = centered_rect(70, 80, frame.area());
-
-    // Clear the area behind the dialog
-    frame.render_widget(Clear, area);
-
-    let title = if state.dialog_mode == DialogMode::AddRow {
-        " Add Row (Tab to switch fields, Enter to save, Esc to cancel) "
-    } else {
-        " Edit Row (Tab to switch fields, Enter to save, Esc to cancel) "
-    };
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-
-    frame.render_widget(block, area);
-
-    let inner = Rect {
-        x: area.x + 2,
-        y: area.y + 1,
-        width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(2),
-    };
-
-    // Calculate how many fields we can show
-    let visible_fields = (inner.height as usize).saturating_sub(1);
-    let total_fields = result.columns.len();
-
-    // Calculate scroll offset to keep current field visible
-    let scroll_offset = if state.editing_column >= visible_fields {
-        state.editing_column - visible_fields + 1
-    } else {
-        0
-    };
-
-    let constraints: Vec<Constraint> = (0..visible_fields.min(total_fields))
-        .map(|_| Constraint::Length(2))
-        .chain(std::iter::once(Constraint::Min(0)))
-        .collect();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(inner);
-
-    for (display_idx, chunk) in chunks.iter().enumerate() {
-        let field_idx = display_idx + scroll_offset;
-        if field_idx >= total_fields {
-            break;
-        }
-
-        let col_name = &result.columns[field_idx].name;
-        let value = editing_row.get(field_idx).map(|s| s.as_str()).unwrap_or("");
-        let is_active = field_idx == state.editing_column;
-        let is_system = state.is_system_column(field_idx);
-
-        // Style based on active state and system column
-        let style = if is_system {
-            Style::default().fg(Color::DarkGray)
-        } else if is_active {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-
-        // Add indicators for required and system columns
-        let col = &result.columns[field_idx];
-        let required_indicator = if !col.nullable && !is_system { "*" } else { "" };
-        let system_indicator = if is_system { " [auto]" } else { "" };
-
-        // Build styled content
-        let spans = vec![
-            Span::styled(col_name.clone(), style),
-            Span::styled(required_indicator, Style::default().fg(Color::Red)),
-            Span::styled(system_indicator, Style::default().fg(Color::DarkGray)),
-            Span::styled(": ", style),
-            Span::styled(value, style),
-        ];
-        let paragraph = Paragraph::new(Line::from(spans));
-
-        frame.render_widget(paragraph, *chunk);
-
-        // Show cursor for active field (only if not a system column in add mode)
-        if is_active && !(is_system && state.dialog_mode == DialogMode::AddRow) {
-            let cursor_x = chunk.x
-                + col_name.len() as u16
-                + system_indicator.len() as u16
-                + 2
-                + state.editing_cursor as u16;
-            let cursor_y = chunk.y;
-            frame.set_cursor_position((cursor_x.min(chunk.x + chunk.width - 1), cursor_y));
-        }
-    }
 }

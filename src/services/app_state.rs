@@ -166,7 +166,6 @@ pub struct AppState {
 
     // Connection list state
     pub selected_connection: usize,
-    #[allow(dead_code)]
     pub connections_scroll: usize,
 
     // Tables list state
@@ -174,7 +173,6 @@ pub struct AppState {
     pub schemas: Vec<SchemaInfo>,
     pub selected_schema: usize,
     pub selected_table: usize,
-    #[allow(dead_code)]
     pub tables_scroll: usize,
 
     // Query editor state
@@ -183,7 +181,6 @@ pub struct AppState {
 
     // Results state
     pub query_result: Option<QueryResult>,
-    #[allow(dead_code)]
     pub results_scroll: usize,
     pub results_scroll_x: usize, // Horizontal scroll offset
     pub selected_row: usize,

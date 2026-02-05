@@ -4,12 +4,13 @@ mod models;
 mod services;
 mod ui;
 
-use std::{fs::File, io, sync::Arc};
+use std::{fs::File, io, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -19,7 +20,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use config::AppConfig;
 use db::DatabaseConnection;
 use services::{ActivePanel, AppState, ConnectionField, DialogMode};
-use ui::render_ui;
+use ui::{render_ui, ClickableRegistry};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -86,207 +87,264 @@ async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state: &mut AppState,
 ) -> Result<()> {
+    // Track last click for double-click detection
+    let mut last_click: Option<(Instant, u16, u16)> = None;
+    const DOUBLE_CLICK_THRESHOLD_MS: u128 = 500;
+
+    // Clickable registry for mouse handling
+    let clickable_registry = ClickableRegistry::new();
+
     loop {
-        terminal.draw(|f| render_ui(f, state))?;
+        let registry_clone = clickable_registry.clone();
+        terminal.draw(|f| render_ui(f, state, &registry_clone))?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                // Only handle key press events, not release events
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                // Handle dialog input first
-                if state.is_dialog_open() {
-                    let should_save = handle_dialog_input(state, key.code, key.modifiers);
-                    if should_save {
-                        match state.dialog_mode {
-                            DialogMode::EditRow => handle_save_row(state).await,
-                            DialogMode::AddRow => handle_insert_row(state).await,
-                            _ => {}
-                        }
-                    }
-                    continue;
-                }
-
-                match key.code {
-                    // Quit
-                    KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        state.should_quit = true;
-                    }
-                    KeyCode::Char('q') if state.active_panel != ActivePanel::QueryEditor => {
-                        state.should_quit = true;
+            match event::read()? {
+                Event::Key(key) => {
+                    // Only handle key press events, not release events
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
 
-                    // Panel navigation
-                    KeyCode::Tab => state.next_panel(),
-                    KeyCode::BackTab => state.prev_panel(),
-
-                    // List navigation
-                    KeyCode::Up | KeyCode::Char('k')
-                        if state.active_panel != ActivePanel::QueryEditor =>
-                    {
-                        state.select_prev();
-                    }
-                    KeyCode::Down | KeyCode::Char('j')
-                        if state.active_panel != ActivePanel::QueryEditor =>
-                    {
-                        state.select_next();
-                    }
-
-                    // Connect to selected database
-                    KeyCode::Enter if state.active_panel == ActivePanel::Connections => {
-                        handle_connect(terminal, state).await;
-                    }
-
-                    // Select table or toggle schema - generate SELECT query
-                    KeyCode::Enter if state.active_panel == ActivePanel::Tables => {
-                        if state.selected_table == 0 {
-                            // Toggle schema expansion
-                            state.toggle_schema();
-                        } else if let Some(table_name) = state.get_selected_table_full_name() {
-                            // Generate SELECT query with proper syntax for each DB type
-                            let query = if let Some(ref config) = state.current_connection_config {
-                                match config.db_type {
-                                    crate::models::DatabaseType::SQLServer => {
-                                        format!("SELECT TOP 100 * FROM {}", table_name)
-                                    }
-                                    _ => {
-                                        format!("SELECT * FROM {} LIMIT 100", table_name)
-                                    }
-                                }
-                            } else {
-                                format!("SELECT * FROM {} LIMIT 100", table_name)
-                            };
-                            state.query_input = query;
-                            state.cursor_position = state.query_input.len();
-                            state.active_panel = ActivePanel::QueryEditor;
-                        }
-                    }
-
-                    // Toggle schema expansion with Space
-                    KeyCode::Char(' ') if state.active_panel == ActivePanel::Tables => {
-                        if state.selected_table == 0 {
-                            state.toggle_schema();
-                        }
-                    }
-
-                    // Edit selected row in Results panel
-                    KeyCode::Enter if state.active_panel == ActivePanel::Results => {
-                        state.open_edit_row_dialog();
-                    }
-
-                    // Add new row in Results panel
-                    KeyCode::Char('a') if state.active_panel == ActivePanel::Results => {
-                        if state.query_result.is_some() {
-                            state.open_add_row_dialog();
-                        } else {
-                            state.set_status("Execute a query first to add rows");
-                        }
-                    }
-
-                    // Horizontal scroll in Results panel (scroll by columns)
-                    KeyCode::Left if state.active_panel == ActivePanel::Results => {
-                        state.results_scroll_x = state.results_scroll_x.saturating_sub(1);
-                    }
-                    KeyCode::Right if state.active_panel == ActivePanel::Results => {
-                        // Limit scroll to number of columns
-                        if let Some(ref result) = state.query_result {
-                            if state.results_scroll_x < result.columns.len().saturating_sub(1) {
-                                state.results_scroll_x += 1;
+                    // Handle dialog input first
+                    if state.is_dialog_open() {
+                        let should_save = handle_dialog_input(state, key.code, key.modifiers);
+                        if should_save {
+                            match state.dialog_mode {
+                                DialogMode::EditRow => handle_save_row(state).await,
+                                DialogMode::AddRow => handle_insert_row(state).await,
+                                _ => {}
                             }
                         }
-                    }
-                    KeyCode::Home if state.active_panel == ActivePanel::Results => {
-                        state.results_scroll_x = 0;
-                    }
-                    KeyCode::End if state.active_panel == ActivePanel::Results => {
-                        if let Some(ref result) = state.query_result {
-                            state.results_scroll_x = result.columns.len().saturating_sub(1);
-                        }
+                        continue;
                     }
 
-                    // Execute query
-                    KeyCode::F(5) => {
-                        handle_execute_query(state).await;
-                    }
+                    match key.code {
+                        // Quit
+                        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.should_quit = true;
+                        }
+                        KeyCode::Char('q') if state.active_panel != ActivePanel::QueryEditor => {
+                            state.should_quit = true;
+                        }
 
-                    // Query editor input
-                    KeyCode::Char(c) if state.active_panel == ActivePanel::QueryEditor => {
-                        state.query_input.insert(state.cursor_position, c);
-                        state.cursor_position += 1;
-                    }
-                    KeyCode::Backspace if state.active_panel == ActivePanel::QueryEditor => {
-                        if state.cursor_position > 0 {
-                            state.cursor_position -= 1;
-                            state.query_input.remove(state.cursor_position);
+                        // Panel navigation
+                        KeyCode::Tab => state.next_panel(),
+                        KeyCode::BackTab => state.prev_panel(),
+
+                        // List navigation
+                        KeyCode::Up | KeyCode::Char('k')
+                            if state.active_panel != ActivePanel::QueryEditor =>
+                        {
+                            state.select_prev();
                         }
-                    }
-                    KeyCode::Delete if state.active_panel == ActivePanel::QueryEditor => {
-                        if state.cursor_position < state.query_input.len() {
-                            state.query_input.remove(state.cursor_position);
+                        KeyCode::Down | KeyCode::Char('j')
+                            if state.active_panel != ActivePanel::QueryEditor =>
+                        {
+                            state.select_next();
                         }
-                    }
-                    KeyCode::Left if state.active_panel == ActivePanel::QueryEditor => {
-                        state.cursor_position = state.cursor_position.saturating_sub(1);
-                    }
-                    KeyCode::Right if state.active_panel == ActivePanel::QueryEditor => {
-                        if state.cursor_position < state.query_input.len() {
+
+                        // Connect to selected database
+                        KeyCode::Enter if state.active_panel == ActivePanel::Connections => {
+                            handle_connect(terminal, state).await;
+                        }
+
+                        // Select table or toggle schema - generate SELECT query
+                        KeyCode::Enter if state.active_panel == ActivePanel::Tables => {
+                            if state.selected_table == 0 {
+                                // Toggle schema expansion
+                                state.toggle_schema();
+                            } else if let Some(table_name) = state.get_selected_table_full_name() {
+                                // Generate SELECT query with proper syntax for each DB type
+                                let query =
+                                    if let Some(ref config) = state.current_connection_config {
+                                        match config.db_type {
+                                            crate::models::DatabaseType::SQLServer => {
+                                                format!("SELECT TOP 100 * FROM {};", table_name)
+                                            }
+                                            _ => {
+                                                format!("SELECT * FROM {} LIMIT 100;", table_name)
+                                            }
+                                        }
+                                    } else {
+                                        format!("SELECT * FROM {} LIMIT 100;", table_name)
+                                    };
+                                state.query_input = query;
+                                state.cursor_position = state.query_input.len();
+                                state.active_panel = ActivePanel::QueryEditor;
+                            }
+                        }
+
+                        // Toggle schema expansion with Space
+                        KeyCode::Char(' ') if state.active_panel == ActivePanel::Tables => {
+                            if state.selected_table == 0 {
+                                state.toggle_schema();
+                            }
+                        }
+
+                        // Edit selected row in Results panel
+                        KeyCode::Enter if state.active_panel == ActivePanel::Results => {
+                            state.open_edit_row_dialog();
+                        }
+
+                        // Add new row in Results panel
+                        KeyCode::Char('a') if state.active_panel == ActivePanel::Results => {
+                            if state.query_result.is_some() {
+                                state.open_add_row_dialog();
+                            } else {
+                                state.set_status("Execute a query first to add rows");
+                            }
+                        }
+
+                        // Horizontal scroll in Results panel (scroll by columns)
+                        KeyCode::Left if state.active_panel == ActivePanel::Results => {
+                            state.results_scroll_x = state.results_scroll_x.saturating_sub(1);
+                        }
+                        KeyCode::Right if state.active_panel == ActivePanel::Results => {
+                            // Limit scroll to number of columns
+                            if let Some(ref result) = state.query_result {
+                                if state.results_scroll_x < result.columns.len().saturating_sub(1) {
+                                    state.results_scroll_x += 1;
+                                }
+                            }
+                        }
+                        KeyCode::Home if state.active_panel == ActivePanel::Results => {
+                            state.results_scroll_x = 0;
+                        }
+                        KeyCode::End if state.active_panel == ActivePanel::Results => {
+                            if let Some(ref result) = state.query_result {
+                                state.results_scroll_x = result.columns.len().saturating_sub(1);
+                            }
+                        }
+
+                        // Execute query
+                        KeyCode::F(5) => {
+                            handle_execute_query(state).await;
+                        }
+
+                        // Execute current query at cursor with Ctrl+Enter
+                        KeyCode::Enter
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            handle_execute_current_query(state).await;
+                        }
+
+                        // Newline in query editor
+                        KeyCode::Enter if state.active_panel == ActivePanel::QueryEditor => {
+                            state.query_input.insert(state.cursor_position, '\n');
                             state.cursor_position += 1;
                         }
-                    }
-                    KeyCode::Home if state.active_panel == ActivePanel::QueryEditor => {
-                        state.cursor_position = 0;
-                    }
-                    KeyCode::End if state.active_panel == ActivePanel::QueryEditor => {
-                        state.cursor_position = state.query_input.len();
-                    }
 
-                    // New connection dialog
-                    KeyCode::Char('n') if state.active_panel == ActivePanel::Connections => {
-                        state.open_new_connection_dialog();
-                    }
-                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        state.open_new_connection_dialog();
-                    }
-
-                    // Edit connection dialog
-                    KeyCode::Char('e') if state.active_panel == ActivePanel::Connections => {
-                        if !state.config.connections.is_empty() {
-                            state.open_edit_connection_dialog(state.selected_connection);
+                        // Query editor input
+                        KeyCode::Char(c) if state.active_panel == ActivePanel::QueryEditor => {
+                            state.query_input.insert(state.cursor_position, c);
+                            state.cursor_position += 1;
                         }
-                    }
-
-                    // Delete connection
-                    KeyCode::Char('d') if state.active_panel == ActivePanel::Connections => {
-                        if !state.config.connections.is_empty() {
-                            let name = state.config.connections[state.selected_connection]
-                                .name
-                                .clone();
-                            state.config.connections.remove(state.selected_connection);
-                            if state.selected_connection >= state.config.connections.len()
-                                && state.selected_connection > 0
-                            {
-                                state.selected_connection -= 1;
+                        KeyCode::Backspace if state.active_panel == ActivePanel::QueryEditor => {
+                            if state.cursor_position > 0 {
+                                state.cursor_position -= 1;
+                                state.query_input.remove(state.cursor_position);
                             }
-                            state.set_status(format!("Deleted connection: {}", name));
                         }
-                    }
+                        KeyCode::Delete if state.active_panel == ActivePanel::QueryEditor => {
+                            if state.cursor_position < state.query_input.len() {
+                                state.query_input.remove(state.cursor_position);
+                            }
+                        }
+                        KeyCode::Left if state.active_panel == ActivePanel::QueryEditor => {
+                            state.cursor_position = state.cursor_position.saturating_sub(1);
+                        }
+                        KeyCode::Right if state.active_panel == ActivePanel::QueryEditor => {
+                            if state.cursor_position < state.query_input.len() {
+                                state.cursor_position += 1;
+                            }
+                        }
+                        KeyCode::Up if state.active_panel == ActivePanel::QueryEditor => {
+                            move_cursor_up(state);
+                        }
+                        KeyCode::Down if state.active_panel == ActivePanel::QueryEditor => {
+                            move_cursor_down(state);
+                        }
+                        KeyCode::Home if state.active_panel == ActivePanel::QueryEditor => {
+                            // Move to start of current line
+                            let before_cursor = &state.query_input[..state.cursor_position];
+                            if let Some(line_start) = before_cursor.rfind('\n') {
+                                state.cursor_position = line_start + 1;
+                            } else {
+                                state.cursor_position = 0;
+                            }
+                        }
+                        KeyCode::End if state.active_panel == ActivePanel::QueryEditor => {
+                            // Move to end of current line
+                            let after_cursor = &state.query_input[state.cursor_position..];
+                            if let Some(line_end) = after_cursor.find('\n') {
+                                state.cursor_position += line_end;
+                            } else {
+                                state.cursor_position = state.query_input.len();
+                            }
+                        }
 
-                    // Refresh tables
-                    KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        handle_refresh_tables(state).await;
-                    }
+                        // New connection dialog
+                        KeyCode::Char('n') if state.active_panel == ActivePanel::Connections => {
+                            state.open_new_connection_dialog();
+                        }
+                        KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.open_new_connection_dialog();
+                        }
 
-                    // Help (placeholder - could show a help dialog)
-                    KeyCode::Char('?') => {
-                        state.set_status(
+                        // Edit connection dialog
+                        KeyCode::Char('e') if state.active_panel == ActivePanel::Connections => {
+                            if !state.config.connections.is_empty() {
+                                state.open_edit_connection_dialog(state.selected_connection);
+                            }
+                        }
+
+                        // Delete connection
+                        KeyCode::Char('d') if state.active_panel == ActivePanel::Connections => {
+                            if !state.config.connections.is_empty() {
+                                let name = state.config.connections[state.selected_connection]
+                                    .name
+                                    .clone();
+                                state.config.connections.remove(state.selected_connection);
+                                if state.selected_connection >= state.config.connections.len()
+                                    && state.selected_connection > 0
+                                {
+                                    state.selected_connection -= 1;
+                                }
+                                state.set_status(format!("Deleted connection: {}", name));
+                            }
+                        }
+
+                        // Refresh tables
+                        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            handle_refresh_tables(state).await;
+                        }
+
+                        // Help (placeholder - could show a help dialog)
+                        KeyCode::Char('?') => {
+                            state.set_status(
                             "Help: Tab=switch panels, Enter=connect/select, F5=execute, n=new, d=delete, q=quit",
                         );
-                    }
+                        }
 
-                    _ => {}
+                        _ => {}
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    if !state.is_dialog_open() {
+                        handle_mouse_event(
+                            state,
+                            mouse,
+                            terminal,
+                            &mut last_click,
+                            DOUBLE_CLICK_THRESHOLD_MS,
+                            &clickable_registry,
+                        )
+                        .await;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -296,6 +354,299 @@ async fn run_app<B: ratatui::backend::Backend>(
     }
 
     Ok(())
+}
+
+/// Handle mouse click events
+async fn handle_mouse_event<B: ratatui::backend::Backend>(
+    state: &mut AppState,
+    mouse: crossterm::event::MouseEvent,
+    terminal: &mut Terminal<B>,
+    last_click: &mut Option<(Instant, u16, u16)>,
+    double_click_threshold_ms: u128,
+    registry: &ClickableRegistry,
+) {
+    use ui::ClickableType;
+
+    let x = mouse.column;
+    let y = mouse.row;
+
+    // Handle scroll events
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            handle_scroll(state, x, y, registry, -1);
+            return;
+        }
+        MouseEventKind::ScrollDown => {
+            handle_scroll(state, x, y, registry, 1);
+            return;
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Continue with click handling below
+        }
+        _ => return,
+    }
+
+    // Find what was clicked using the registry
+    let clicked_item = registry.find_at(x, y);
+
+    // Check for double-click
+    let is_double_click = if let Some((last_time, last_x, last_y)) = *last_click {
+        let elapsed = last_time.elapsed().as_millis();
+        elapsed < double_click_threshold_ms && x == last_x && y == last_y
+    } else {
+        false
+    };
+
+    if is_double_click {
+        // Reset last click and handle double-click
+        *last_click = None;
+
+        match clicked_item {
+            Some(ClickableType::Connection(idx)) => {
+                state.active_panel = ActivePanel::Connections;
+                state.selected_connection = idx;
+                handle_connect(terminal, state).await;
+            }
+            Some(ClickableType::Schema(schema_idx)) => {
+                state.active_panel = ActivePanel::Tables;
+                state.selected_schema = schema_idx;
+                state.selected_table = 0;
+                state.toggle_schema();
+            }
+            Some(ClickableType::Table {
+                schema_idx,
+                table_idx,
+            }) => {
+                state.active_panel = ActivePanel::Tables;
+                state.selected_schema = schema_idx;
+                state.selected_table = table_idx + 1;
+
+                // Generate SELECT query
+                if let Some(table_name) = state.get_selected_table_full_name() {
+                    let query = if let Some(ref config) = state.current_connection_config {
+                        match config.db_type {
+                            crate::models::DatabaseType::SQLServer => {
+                                format!("SELECT TOP 100 * FROM {};", table_name)
+                            }
+                            _ => {
+                                format!("SELECT * FROM {} LIMIT 100;", table_name)
+                            }
+                        }
+                    } else {
+                        format!("SELECT * FROM {} LIMIT 100;", table_name)
+                    };
+                    state.query_input = query;
+                    state.cursor_position = state.query_input.len();
+                    state.active_panel = ActivePanel::QueryEditor;
+                }
+            }
+            Some(ClickableType::ResultRow(row_idx)) => {
+                state.active_panel = ActivePanel::Results;
+                if let Some(ref result) = state.query_result {
+                    if row_idx < result.rows.len() {
+                        state.selected_row = row_idx;
+                        state.open_edit_row_dialog();
+                    }
+                }
+            }
+            _ => {}
+        }
+    } else {
+        // Record this click and handle single-click
+        *last_click = Some((Instant::now(), x, y));
+
+        match clicked_item {
+            Some(ClickableType::Connection(idx)) => {
+                state.active_panel = ActivePanel::Connections;
+                if idx < state.config.connections.len() {
+                    state.selected_connection = idx;
+                }
+            }
+            Some(ClickableType::Schema(schema_idx)) => {
+                state.active_panel = ActivePanel::Tables;
+                state.selected_schema = schema_idx;
+                state.selected_table = 0;
+            }
+            Some(ClickableType::Table {
+                schema_idx,
+                table_idx,
+            }) => {
+                state.active_panel = ActivePanel::Tables;
+                state.selected_schema = schema_idx;
+                state.selected_table = table_idx + 1;
+            }
+            Some(ClickableType::QueryEditor) => {
+                state.active_panel = ActivePanel::QueryEditor;
+                // Calculate cursor position from click
+                if let Some(editor_rect) = registry.get_query_editor_rect() {
+                    let click_line = y.saturating_sub(editor_rect.y) as usize;
+                    let click_col = x.saturating_sub(editor_rect.x) as usize;
+                    let inner_width = editor_rect.width as usize;
+                    let new_cursor_pos = calculate_cursor_from_click(
+                        &state.query_input,
+                        click_line,
+                        click_col,
+                        inner_width,
+                    );
+                    state.cursor_position = new_cursor_pos;
+                }
+            }
+            Some(ClickableType::ResultRow(row_idx)) => {
+                state.active_panel = ActivePanel::Results;
+                if let Some(ref result) = state.query_result {
+                    if row_idx < result.rows.len() {
+                        state.selected_row = row_idx;
+                    }
+                }
+            }
+            Some(ClickableType::Panel(panel_type)) => {
+                use ui::PanelType;
+                match panel_type {
+                    PanelType::Connections => state.active_panel = ActivePanel::Connections,
+                    PanelType::Tables => state.active_panel = ActivePanel::Tables,
+                    PanelType::QueryEditor => state.active_panel = ActivePanel::QueryEditor,
+                    PanelType::Results => state.active_panel = ActivePanel::Results,
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+/// Handle mouse scroll events
+fn handle_scroll(
+    state: &mut AppState,
+    x: u16,
+    y: u16,
+    registry: &ClickableRegistry,
+    direction: i32,
+) {
+    use ui::ClickableType;
+    use ui::PanelType;
+
+    // Find what panel we're scrolling in
+    let item = registry.find_at(x, y);
+
+    match item {
+        Some(ClickableType::Connection(_)) | Some(ClickableType::Panel(PanelType::Connections)) => {
+            // Scroll connections list
+            let max_scroll = state.config.connections.len().saturating_sub(1);
+            if direction > 0 {
+                // Scroll down
+                if state.connections_scroll < max_scroll {
+                    state.connections_scroll += 1;
+                }
+            } else {
+                // Scroll up
+                state.connections_scroll = state.connections_scroll.saturating_sub(1);
+            }
+            // Keep selection visible
+            if state.selected_connection < state.connections_scroll {
+                state.selected_connection = state.connections_scroll;
+            }
+        }
+        Some(ClickableType::Schema(_))
+        | Some(ClickableType::Table { .. })
+        | Some(ClickableType::Panel(PanelType::Tables)) => {
+            // Scroll tables list
+            let total_items = count_visible_table_items(state);
+            let max_scroll = total_items.saturating_sub(1);
+            if direction > 0 {
+                // Scroll down
+                if state.tables_scroll < max_scroll {
+                    state.tables_scroll += 1;
+                }
+            } else {
+                // Scroll up
+                state.tables_scroll = state.tables_scroll.saturating_sub(1);
+            }
+        }
+        Some(ClickableType::QueryEditor) | Some(ClickableType::Panel(PanelType::QueryEditor)) => {
+            // Scroll query editor (move cursor up/down by lines)
+            if direction > 0 {
+                move_cursor_down(state);
+            } else {
+                move_cursor_up(state);
+            }
+        }
+        Some(ClickableType::ResultRow(_)) | Some(ClickableType::Panel(PanelType::Results)) => {
+            // Scroll results
+            if let Some(ref result) = state.query_result {
+                let max_scroll = result.rows.len().saturating_sub(1);
+                if direction > 0 {
+                    // Scroll down
+                    if state.results_scroll < max_scroll {
+                        state.results_scroll += 1;
+                    }
+                } else {
+                    // Scroll up
+                    state.results_scroll = state.results_scroll.saturating_sub(1);
+                }
+                // Keep selection visible
+                if state.selected_row < state.results_scroll {
+                    state.selected_row = state.results_scroll;
+                }
+            }
+        }
+        None => {}
+    }
+}
+
+/// Count total visible items in tables panel (schemas + expanded tables)
+fn count_visible_table_items(state: &AppState) -> usize {
+    let mut count = 0;
+    for schema in &state.schemas {
+        count += 1; // Schema header
+        if schema.expanded {
+            count += schema.tables.len();
+        }
+    }
+    count
+}
+
+/// Calculate cursor position from mouse click in query editor
+fn calculate_cursor_from_click(
+    text: &str,
+    click_line: usize,
+    click_col: usize,
+    inner_width: usize,
+) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
+    let mut visual_line = 0;
+    let mut visual_col = 0;
+    let mut char_index = 0;
+
+    for (i, c) in text.char_indices() {
+        if visual_line == click_line && visual_col == click_col {
+            return i;
+        }
+
+        if c == '\n' {
+            if visual_line == click_line {
+                // Click was beyond end of this line
+                return i;
+            }
+            visual_line += 1;
+            visual_col = 0;
+        } else {
+            visual_col += 1;
+            if inner_width > 0 && visual_col >= inner_width {
+                visual_line += 1;
+                visual_col = 0;
+            }
+        }
+        char_index = i + c.len_utf8();
+    }
+
+    // If click is beyond text, return end of text
+    if visual_line == click_line && click_col >= visual_col {
+        return char_index;
+    }
+
+    char_index
 }
 
 fn handle_dialog_input(state: &mut AppState, key: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -638,7 +989,8 @@ async fn handle_connect<B: ratatui::backend::Backend>(
     state.connection_error = None;
 
     // Redraw to show connecting state
-    let _ = terminal.draw(|f| render_ui(f, state));
+    let temp_registry = ClickableRegistry::new();
+    let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
 
     match DatabaseConnection::connect(&conn_config).await {
         Ok(conn) => {
@@ -758,6 +1110,175 @@ async fn handle_execute_query(state: &mut AppState) {
     }
 
     state.is_loading = false;
+}
+
+/// Execute only the SQL statement at the current cursor position
+async fn handle_execute_current_query(state: &mut AppState) {
+    if state.query_input.trim().is_empty() {
+        state.set_status("Query is empty");
+        return;
+    }
+
+    if state.connection.is_none() {
+        state.set_status("Not connected. Select a connection and press Enter.");
+        return;
+    }
+
+    // Find the query at the cursor position
+    let query = get_query_at_cursor(&state.query_input, state.cursor_position);
+    if query.trim().is_empty() {
+        state.set_status("No query at cursor position");
+        return;
+    }
+
+    state.set_status("Executing query...");
+    state.is_loading = true;
+
+    let result = state
+        .connection
+        .as_ref()
+        .unwrap()
+        .execute_query(&query)
+        .await;
+
+    match result {
+        Ok(mut result) => {
+            let row_count = result.rows.len();
+            let time = result.execution_time_ms;
+
+            // Try to get column metadata for the table
+            if let Some(table_name) = extract_table_from_query(&query) {
+                // Get nullability info
+                if let Ok(nullability) = state
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .get_column_nullability(&table_name)
+                    .await
+                {
+                    for col in &mut result.columns {
+                        if let Some(&nullable) = nullability.get(&col.name) {
+                            col.nullable = nullable;
+                        }
+                    }
+                }
+
+                // Get primary key info
+                if let Ok(primary_keys) = state
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .get_primary_keys(&table_name)
+                    .await
+                {
+                    for col in &mut result.columns {
+                        col.is_primary_key = primary_keys.contains(&col.name);
+                    }
+                }
+            }
+
+            state.query_result = Some(result);
+            state.selected_row = 0;
+            state.results_scroll_x = 0;
+            state.set_status(format!("Query executed: {} rows in {}ms", row_count, time));
+            state.active_panel = ActivePanel::Results;
+        }
+        Err(e) => {
+            state.set_status(format!("Query error: {}", e));
+        }
+    }
+
+    state.is_loading = false;
+}
+
+/// Get the SQL statement at the given cursor position
+/// Statements are separated by semicolons
+fn get_query_at_cursor(input: &str, cursor_pos: usize) -> String {
+    // Find statement boundaries (separated by ;)
+    let mut start = 0;
+    let mut end = input.len();
+
+    // Find the start of the current statement
+    for (i, c) in input[..cursor_pos].char_indices() {
+        if c == ';' {
+            start = i + 1;
+        }
+    }
+
+    // Find the end of the current statement
+    if let Some(semicolon_pos) = input[cursor_pos..].find(';') {
+        end = cursor_pos + semicolon_pos;
+    }
+
+    input[start..end].trim().to_string()
+}
+
+/// Move cursor up one line in the query editor
+fn move_cursor_up(state: &mut AppState) {
+    let text = &state.query_input;
+    let cursor = state.cursor_position;
+
+    // Find the start of the current line
+    let line_start = text[..cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
+
+    // Find the column position on the current line
+    let col = cursor - line_start;
+
+    // If we're on the first line, move to start
+    if line_start == 0 {
+        state.cursor_position = 0;
+        return;
+    }
+
+    // Find the start of the previous line
+    let prev_line_end = line_start - 1; // Position of the \n
+    let prev_line_start = text[..prev_line_end]
+        .rfind('\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+
+    // Calculate the length of the previous line
+    let prev_line_len = prev_line_end - prev_line_start;
+
+    // Move to the same column on the previous line, or end of line if shorter
+    state.cursor_position = prev_line_start + col.min(prev_line_len);
+}
+
+/// Move cursor down one line in the query editor
+fn move_cursor_down(state: &mut AppState) {
+    let text = &state.query_input;
+    let cursor = state.cursor_position;
+
+    // Find the start of the current line
+    let line_start = text[..cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
+
+    // Find the column position on the current line
+    let col = cursor - line_start;
+
+    // Find the end of the current line
+    let line_end = text[cursor..]
+        .find('\n')
+        .map(|p| cursor + p)
+        .unwrap_or(text.len());
+
+    // If we're on the last line, move to end
+    if line_end == text.len() {
+        state.cursor_position = text.len();
+        return;
+    }
+
+    // Find the end of the next line
+    let next_line_start = line_end + 1;
+    let next_line_end = text[next_line_start..]
+        .find('\n')
+        .map(|p| next_line_start + p)
+        .unwrap_or(text.len());
+
+    // Calculate the length of the next line
+    let next_line_len = next_line_end - next_line_start;
+
+    // Move to the same column on the next line, or end of line if shorter
+    state.cursor_position = next_line_start + col.min(next_line_len);
 }
 
 /// Extract table name from a query (simple heuristic for SELECT ... FROM table)

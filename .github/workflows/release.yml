@@ -1,0 +1,19 @@
+# .github/workflows/release.yml
+# Drop this into any Cargo project repo
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: Ajustor/workflows/.github/workflows/cargo-release.yml@master
+    with:
+      targets: '["windows", "linux", "macos"]'
+      # package_name: "my-binary"  # Optional: defaults to Cargo.toml name

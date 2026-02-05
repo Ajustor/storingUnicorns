@@ -89,8 +89,11 @@ impl Default for ConnectionConfig {
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: String,
-    #[allow(dead_code)]
     pub type_name: String,
+    /// Whether the column allows NULL values
+    pub nullable: bool,
+    /// Whether the column is a primary key
+    pub is_primary_key: bool,
 }
 
 /// Represents query results
@@ -115,7 +118,11 @@ pub struct TableInfo {
 impl TableInfo {
     #[allow(dead_code)]
     pub fn full_name(&self) -> String {
-        if self.schema.is_empty() || self.schema == "public" || self.schema == "dbo" || self.schema == "main" {
+        if self.schema.is_empty()
+            || self.schema == "public"
+            || self.schema == "dbo"
+            || self.schema == "main"
+        {
             self.name.clone()
         } else {
             format!("{}.{}", self.schema, self.name)

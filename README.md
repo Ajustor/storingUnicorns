@@ -4,7 +4,7 @@ A terminal-based database client inspired by JetBrains DataGrip, built with Rust
 
 ## Features
 
-- Multi-database support (PostgreSQL, MySQL, SQLite)
+- Multi-database support (PostgreSQL, MySQL, SQLite, SQL Server)
 - Connection management with dialog-based creation
 - Schema browser (tables list)
 - SQL query editor
@@ -123,4 +123,4 @@ cargo run
 - [ ] Async query execution with cancellation
 - [ ] SSH tunnel support
 - [ ] Tab completion for table/column names
-- [ ] Edit existing connections
+- [x] Edit existing connections

@@ -178,6 +178,7 @@ pub fn render_query_editor(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let paragraph = Paragraph::new(input_text)
         .style(Style::default().fg(Color::White))
+        .wrap(ratatui::widgets::Wrap { trim: false })
         .block(
             Block::default()
                 .title(" Query Editor [F5 to execute] ")
@@ -187,11 +188,19 @@ pub fn render_query_editor(frame: &mut Frame, area: Rect, state: &AppState) {
 
     frame.render_widget(paragraph, area);
 
-    // Show cursor when editing
+    // Show cursor when editing (calculate position with wrapping)
     if is_active {
-        let cursor_x = area.x + 1 + state.cursor_position as u16;
-        let cursor_y = area.y + 1;
-        frame.set_cursor_position((cursor_x.min(area.x + area.width - 2), cursor_y));
+        let inner_width = area.width.saturating_sub(2) as usize; // Account for borders
+        if inner_width > 0 {
+            let cursor_line = state.cursor_position / inner_width;
+            let cursor_col = state.cursor_position % inner_width;
+            let cursor_x = area.x + 1 + cursor_col as u16;
+            let cursor_y = area.y + 1 + cursor_line as u16;
+            // Only show cursor if it's within the visible area
+            if cursor_y < area.y + area.height - 1 {
+                frame.set_cursor_position((cursor_x, cursor_y));
+            }
+        }
     }
 }
 
@@ -228,8 +237,36 @@ pub fn render_results_panel(frame: &mut Frame, area: Rect, state: &AppState) {
     }
 
     if let Some(ref result) = state.query_result {
-        // Build header
-        let header_cells: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+        // Calculate column widths: min(30, max_content_length)
+        let col_widths: Vec<u16> = result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(col_idx, col)| {
+                // Start with column name length
+                let mut max_len = col.name.len();
+                // Check all rows for max content length
+                for row in &result.rows {
+                    if let Some(cell) = row.get(col_idx) {
+                        max_len = max_len.max(cell.len());
+                    }
+                }
+                // Min between 30 and max_len, with minimum of 5
+                (max_len.min(30).max(5)) as u16
+            })
+            .collect();
+
+        // Apply horizontal scroll by skipping columns
+        let col_offset = state.results_scroll_x;
+        let visible_col_start = col_offset.min(result.columns.len().saturating_sub(1));
+
+        // Build header with column offset
+        let header_cells: Vec<&str> = result
+            .columns
+            .iter()
+            .skip(visible_col_start)
+            .map(|c| c.name.as_str())
+            .collect();
         let header = Row::new(header_cells)
             .style(
                 Style::default()
@@ -238,7 +275,7 @@ pub fn render_results_panel(frame: &mut Frame, area: Rect, state: &AppState) {
             )
             .height(1);
 
-        // Build rows
+        // Build rows with column offset
         let rows: Vec<Row> = result
             .rows
             .iter()
@@ -249,20 +286,33 @@ pub fn render_results_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                 } else {
                     Style::default()
                 };
-                Row::new(row.clone()).style(style)
+                let cells: Vec<String> = row.iter().skip(visible_col_start).cloned().collect();
+                Row::new(cells).style(style)
             })
             .collect();
 
-        // Calculate column widths (equal distribution for now)
-        let col_count = result.columns.len().max(1);
-        let widths: Vec<Constraint> = (0..col_count)
-            .map(|_| Constraint::Percentage((100 / col_count) as u16))
+        // Use calculated widths with offset
+        let widths: Vec<Constraint> = col_widths
+            .iter()
+            .skip(visible_col_start)
+            .map(|&w| Constraint::Length(w))
             .collect();
 
+        let scroll_info = if result.columns.len() > 1 {
+            format!(
+                " [←/→ col {}/{}]",
+                visible_col_start + 1,
+                result.columns.len()
+            )
+        } else {
+            String::new()
+        };
+
         let title = format!(
-            " Results ({} rows, {}ms) [Enter to edit] ",
+            " Results ({} rows, {}ms){} [Enter to edit] ",
             result.rows.len(),
-            result.execution_time_ms
+            result.execution_time_ms,
+            scroll_info
         );
 
         let table = Table::new(rows, widths)
@@ -273,7 +323,8 @@ pub fn render_results_panel(frame: &mut Frame, area: Rect, state: &AppState) {
                     .borders(Borders::ALL)
                     .border_style(panel_style(is_active)),
             )
-            .row_highlight_style(highlight_style());
+            .row_highlight_style(highlight_style())
+            .column_spacing(1);
 
         let mut table_state = TableState::default();
         table_state.select(Some(state.selected_row));
@@ -547,7 +598,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 pub fn render_edit_row_dialog(frame: &mut Frame, state: &AppState) {
-    if state.dialog_mode != DialogMode::EditRow {
+    if state.dialog_mode != DialogMode::EditRow && state.dialog_mode != DialogMode::AddRow {
         return;
     }
 
@@ -564,8 +615,14 @@ pub fn render_edit_row_dialog(frame: &mut Frame, state: &AppState) {
     // Clear the area behind the dialog
     frame.render_widget(Clear, area);
 
+    let title = if state.dialog_mode == DialogMode::AddRow {
+        " Add Row (Tab to switch fields, Enter to save, Esc to cancel) "
+    } else {
+        " Edit Row (Tab to switch fields, Enter to save, Esc to cancel) "
+    };
+
     let block = Block::default()
-        .title(" Edit Row (Tab to switch fields, Enter to save, Esc to cancel) ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
@@ -608,21 +665,41 @@ pub fn render_edit_row_dialog(frame: &mut Frame, state: &AppState) {
         let col_name = &result.columns[field_idx].name;
         let value = editing_row.get(field_idx).map(|s| s.as_str()).unwrap_or("");
         let is_active = field_idx == state.editing_column;
+        let is_system = state.is_system_column(field_idx);
 
-        let style = if is_active {
+        // Style based on active state and system column
+        let style = if is_system {
+            Style::default().fg(Color::DarkGray)
+        } else if is_active {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::Gray)
         };
 
-        let content = format!("{}: {}", col_name, value);
-        let paragraph = Paragraph::new(content).style(style);
+        // Add indicators for required and system columns
+        let col = &result.columns[field_idx];
+        let required_indicator = if !col.nullable && !is_system { "*" } else { "" };
+        let system_indicator = if is_system { " [auto]" } else { "" };
+
+        // Build styled content
+        let spans = vec![
+            Span::styled(col_name.clone(), style),
+            Span::styled(required_indicator, Style::default().fg(Color::Red)),
+            Span::styled(system_indicator, Style::default().fg(Color::DarkGray)),
+            Span::styled(": ", style),
+            Span::styled(value, style),
+        ];
+        let paragraph = Paragraph::new(Line::from(spans));
 
         frame.render_widget(paragraph, *chunk);
 
-        // Show cursor for active field
-        if is_active {
-            let cursor_x = chunk.x + col_name.len() as u16 + 2 + state.editing_cursor as u16;
+        // Show cursor for active field (only if not a system column in add mode)
+        if is_active && !(is_system && state.dialog_mode == DialogMode::AddRow) {
+            let cursor_x = chunk.x
+                + col_name.len() as u16
+                + system_indicator.len() as u16
+                + 2
+                + state.editing_cursor as u16;
             let cursor_y = chunk.y;
             frame.set_cursor_position((cursor_x.min(chunk.x + chunk.width - 1), cursor_y));
         }

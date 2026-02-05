@@ -18,6 +18,7 @@ pub enum DialogMode {
     NewConnection,
     EditConnection,
     EditRow,
+    AddRow,
     #[allow(dead_code)]
     DeleteConfirm,
 }
@@ -184,6 +185,7 @@ pub struct AppState {
     pub query_result: Option<QueryResult>,
     #[allow(dead_code)]
     pub results_scroll: usize,
+    pub results_scroll_x: usize, // Horizontal scroll offset
     pub selected_row: usize,
 
     // Row editing state
@@ -192,6 +194,7 @@ pub struct AppState {
     pub editing_table_name: Option<String>,
     pub editing_column: usize,
     pub editing_cursor: usize,
+    pub system_columns: Vec<usize>, // Indices of auto-generated columns (id, timestamps, etc.)
 
     // Dialog state
     pub dialog_mode: DialogMode,
@@ -204,12 +207,15 @@ pub struct AppState {
     pub is_connecting: bool,
     pub connection_error: Option<String>,
 
+    // Debug mode
+    pub debug_mode: bool,
+
     // App control
     pub should_quit: bool,
 }
 
 impl AppState {
-    pub fn new(config: AppConfig) -> Self {
+    pub fn new(config: AppConfig, debug_mode: bool) -> Self {
         Self {
             config,
             active_panel: ActivePanel::Connections,
@@ -226,12 +232,14 @@ impl AppState {
             cursor_position: 0,
             query_result: None,
             results_scroll: 0,
+            results_scroll_x: 0,
             selected_row: 0,
             editing_row: None,
             original_editing_row: None,
             editing_table_name: None,
             editing_column: 0,
             editing_cursor: 0,
+            system_columns: Vec::new(),
             dialog_mode: DialogMode::None,
             new_connection: NewConnectionState::default(),
             editing_connection_index: None,
@@ -239,6 +247,7 @@ impl AppState {
             is_loading: false,
             is_connecting: false,
             connection_error: None,
+            debug_mode,
             should_quit: false,
         }
     }
@@ -408,7 +417,8 @@ impl AppState {
         }
     }
 
-    /// Get currently selected table full name (schema.table or just table)
+    /// Get currently selected table full name (schema.table)
+    /// Always includes schema for proper query generation
     pub fn get_selected_table_full_name(&self) -> Option<String> {
         if self.selected_table == 0 {
             return None; // Schema header is selected, not a table
@@ -416,18 +426,30 @@ impl AppState {
         if let Some(schema) = self.schemas.get(self.selected_schema) {
             if schema.expanded {
                 if let Some(table) = schema.tables.get(self.selected_table - 1) {
-                    return Some(
-                        if schema.name == "public" || schema.name == "dbo" || schema.name == "main"
-                        {
-                            table.clone()
-                        } else {
-                            format!("{}.{}", schema.name, table)
-                        },
-                    );
+                    // Get quote characters based on database type
+                    let (quote_start, quote_end) = self.get_quote_chars();
+                    // Always include schema for clarity and correctness
+                    return Some(format!(
+                        "{1}{0}{2}.{1}{3}{2}",
+                        schema.name, quote_start, quote_end, table
+                    ));
                 }
             }
         }
         None
+    }
+
+    /// Get quote characters for the current database type
+    pub fn get_quote_chars(&self) -> (char, char) {
+        match &self.current_connection_config {
+            Some(config) => match config.db_type {
+                crate::models::DatabaseType::Postgres => ('"', '"'),
+                crate::models::DatabaseType::MySQL => ('`', '`'),
+                crate::models::DatabaseType::SQLite => ('"', '"'),
+                crate::models::DatabaseType::SQLServer => ('[', ']'),
+            },
+            None => ('"', '"'), // Default to double quotes
+        }
     }
 
     /// Get total visible items count in tables panel
@@ -449,21 +471,95 @@ impl AppState {
                 self.editing_table_name = self.extract_table_from_query();
                 self.editing_column = 0;
                 self.editing_cursor = row.first().map(|s| s.len()).unwrap_or(0);
+                self.system_columns = Vec::new(); // No system columns for edit mode
                 self.dialog_mode = DialogMode::EditRow;
             }
         }
     }
 
+    /// Open add row dialog
+    pub fn open_add_row_dialog(&mut self) {
+        if let Some(ref result) = self.query_result {
+            // Create empty row with same number of columns
+            let empty_row: Vec<String> = result.columns.iter().map(|_| String::new()).collect();
+
+            // Detect system columns (auto-generated: id, created_at, updated_at, etc.)
+            self.system_columns = result
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, col)| {
+                    let name_lower = col.name.to_lowercase();
+                    let type_lower = col.type_name.to_lowercase();
+
+                    // Detect common auto-generated column patterns
+                    let is_auto_id = name_lower == "id"
+                        || name_lower.ends_with("_id")
+                            && name_lower.starts_with(
+                                &result
+                                    .columns
+                                    .first()
+                                    .map(|c| c.name.to_lowercase())
+                                    .unwrap_or_default(),
+                            )
+                        || type_lower.contains("serial")
+                        || type_lower.contains("identity")
+                        || type_lower.contains("auto_increment");
+
+                    let is_timestamp = name_lower.contains("created_at")
+                        || name_lower.contains("updated_at")
+                        || name_lower.contains("createdat")
+                        || name_lower.contains("updatedat")
+                        || name_lower.contains("created_on")
+                        || name_lower.contains("updated_on")
+                        || name_lower.contains("inserted_at")
+                        || name_lower.contains("modified_at");
+
+                    if is_auto_id || is_timestamp {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            self.editing_row = Some(empty_row);
+            self.original_editing_row = None; // No original for new rows
+            self.editing_table_name = self.extract_table_from_query();
+
+            // Find first non-system column to start editing
+            let first_editable = (0..result.columns.len())
+                .find(|idx| !self.system_columns.contains(idx))
+                .unwrap_or(0);
+
+            self.editing_column = first_editable;
+            self.editing_cursor = 0;
+            self.dialog_mode = DialogMode::AddRow;
+        }
+    }
+
+    /// Check if a column is a system column (auto-generated)
+    pub fn is_system_column(&self, idx: usize) -> bool {
+        self.system_columns.contains(&idx)
+    }
+
     /// Extract table name from current query (simple heuristic for SELECT ... FROM table)
+    /// Supports schema.table format and quoted identifiers
     fn extract_table_from_query(&self) -> Option<String> {
         let query = self.query_input.to_uppercase();
         if let Some(from_pos) = query.find("FROM") {
             let after_from = &self.query_input[from_pos + 4..].trim_start();
-            // Take the first word after FROM
+            // Take the first word after FROM (including schema.table and quoted identifiers)
             let table_name: String = after_from
                 .chars()
                 .take_while(|c| {
-                    c.is_alphanumeric() || *c == '_' || *c == '.' || *c == '[' || *c == ']'
+                    c.is_alphanumeric()
+                        || *c == '_'
+                        || *c == '.'
+                        || *c == '['
+                        || *c == ']'
+                        || *c == '"'
+                        || *c == '`'
                 })
                 .collect();
             if !table_name.is_empty() {

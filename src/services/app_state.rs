@@ -179,6 +179,12 @@ pub struct AppState {
     // Query tabs state
     pub query_tabs: QueryTabsState,
 
+    // Autocompletion state
+    pub completion_suggestions: Vec<String>,
+    pub completion_selected: usize,
+    pub show_completion: bool,
+    pub known_columns: Vec<String>, // Columns from last query result
+
     // Results state
     pub query_result: Option<QueryResult>,
     pub results_scroll: usize,
@@ -226,6 +232,10 @@ impl AppState {
             selected_table: 0,
             tables_scroll: 0,
             query_tabs: QueryTabsState::load().unwrap_or_default(),
+            completion_suggestions: Vec::new(),
+            completion_selected: 0,
+            show_completion: false,
+            known_columns: Vec::new(),
             query_result: None,
             results_scroll: 0,
             results_scroll_x: 0,
@@ -307,6 +317,87 @@ impl AppState {
 
     pub fn save_query_tabs(&self) {
         let _ = self.query_tabs.save();
+    }
+
+    /// Update known columns from query result (for autocompletion)
+    pub fn update_known_columns(&mut self) {
+        if let Some(ref result) = self.query_result {
+            self.known_columns = result.columns.iter().map(|c| c.name.clone()).collect();
+        }
+    }
+
+    /// Get all known table names for autocompletion
+    pub fn get_known_tables(&self) -> Vec<String> {
+        let mut tables = Vec::new();
+        for schema in &self.schemas {
+            for table in &schema.tables {
+                tables.push(format!("{}.{}", schema.name, table));
+                tables.push(table.clone());
+            }
+        }
+        tables
+    }
+    /// Update completion suggestions based on current input
+    pub fn update_completions(&mut self) {
+        use crate::ui::sql_highlight::get_completions;
+
+        let query = self.query_input().to_string();
+        let cursor = self.cursor_position();
+        let tables = self.get_known_tables();
+
+        self.completion_suggestions = get_completions(&query, cursor, &self.known_columns, &tables);
+        self.completion_selected = 0;
+        self.show_completion = !self.completion_suggestions.is_empty();
+    }
+
+    /// Apply the selected completion
+    pub fn apply_completion(&mut self) {
+        if !self.show_completion || self.completion_suggestions.is_empty() {
+            return;
+        }
+
+        let suggestion = self.completion_suggestions[self.completion_selected].clone();
+        let query = self.query_input().to_string();
+        let cursor = self.cursor_position();
+
+        // Find the word being completed
+        let before_cursor = &query[..cursor.min(query.len())];
+        let word_start = before_cursor
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        // Replace the current word with the suggestion
+        let new_query = format!("{}{}{}", &query[..word_start], suggestion, &query[cursor..]);
+        let new_cursor = word_start + suggestion.len();
+
+        self.set_query(new_query);
+        self.set_cursor_position(new_cursor);
+        self.hide_completion();
+    }
+
+    /// Hide completion popup
+    pub fn hide_completion(&mut self) {
+        self.show_completion = false;
+        self.completion_suggestions.clear();
+        self.completion_selected = 0;
+    }
+
+    /// Navigate completion suggestions
+    pub fn completion_next(&mut self) {
+        if !self.completion_suggestions.is_empty() {
+            self.completion_selected =
+                (self.completion_selected + 1) % self.completion_suggestions.len();
+        }
+    }
+
+    pub fn completion_prev(&mut self) {
+        if !self.completion_suggestions.is_empty() {
+            self.completion_selected = self
+                .completion_selected
+                .checked_sub(1)
+                .unwrap_or(self.completion_suggestions.len() - 1);
+        }
     }
 
     pub fn next_panel(&mut self) {

@@ -247,12 +247,54 @@ async fn run_app<B: ratatui::backend::Backend>(
                             handle_execute_current_query(state).await;
                         }
 
-                        // Newline in query editor
-                        KeyCode::Enter if state.active_panel == ActivePanel::QueryEditor => {
+                        // Autocompletion: Apply with Enter if completion popup is visible
+                        KeyCode::Enter
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && state.show_completion =>
+                        {
+                            state.apply_completion();
+                        }
+
+                        // Autocompletion: Navigate with Up/Down if popup is visible
+                        KeyCode::Up
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && state.show_completion =>
+                        {
+                            state.completion_prev();
+                        }
+                        KeyCode::Down
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && state.show_completion =>
+                        {
+                            state.completion_next();
+                        }
+
+                        // Autocompletion: Hide with Escape
+                        KeyCode::Esc
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && state.show_completion =>
+                        {
+                            state.hide_completion();
+                        }
+
+                        // Autocompletion: Trigger with Ctrl+Space
+                        KeyCode::Char(' ')
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            state.update_completions();
+                        }
+
+                        // Newline in query editor (only if completion not shown)
+                        KeyCode::Enter
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !state.show_completion =>
+                        {
                             let pos = state.cursor_position();
                             state.query_input_mut().insert(pos, '\n');
                             state.set_cursor_position(pos + 1);
                             state.query_tabs.current_tab_mut().is_modified = true;
+                            state.hide_completion();
                         }
 
                         // Query editor input (exclude Ctrl combinations)
@@ -264,6 +306,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                             state.query_input_mut().insert(pos, c);
                             state.set_cursor_position(pos + 1);
                             state.query_tabs.current_tab_mut().is_modified = true;
+                            // Auto-update completions while typing (if enabled)
+                            if state.show_completion {
+                                state.update_completions();
+                            }
                         }
                         KeyCode::Backspace if state.active_panel == ActivePanel::QueryEditor => {
                             let pos = state.cursor_position();
@@ -271,6 +317,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 state.set_cursor_position(pos - 1);
                                 state.query_input_mut().remove(pos - 1);
                                 state.query_tabs.current_tab_mut().is_modified = true;
+                                state.hide_completion();
                             }
                         }
                         KeyCode::Delete if state.active_panel == ActivePanel::QueryEditor => {
@@ -278,22 +325,35 @@ async fn run_app<B: ratatui::backend::Backend>(
                             if pos < state.query_input().len() {
                                 state.query_input_mut().remove(pos);
                                 state.query_tabs.current_tab_mut().is_modified = true;
+                                state.hide_completion();
                             }
                         }
-                        KeyCode::Left if state.active_panel == ActivePanel::QueryEditor => {
+                        KeyCode::Left
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !state.show_completion =>
+                        {
                             let pos = state.cursor_position();
                             state.set_cursor_position(pos.saturating_sub(1));
                         }
-                        KeyCode::Right if state.active_panel == ActivePanel::QueryEditor => {
+                        KeyCode::Right
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !state.show_completion =>
+                        {
                             let pos = state.cursor_position();
                             if pos < state.query_input().len() {
                                 state.set_cursor_position(pos + 1);
                             }
                         }
-                        KeyCode::Up if state.active_panel == ActivePanel::QueryEditor => {
+                        KeyCode::Up
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !state.show_completion =>
+                        {
                             move_cursor_up(state);
                         }
-                        KeyCode::Down if state.active_panel == ActivePanel::QueryEditor => {
+                        KeyCode::Down
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !state.show_completion =>
+                        {
                             move_cursor_down(state);
                         }
                         KeyCode::Home if state.active_panel == ActivePanel::QueryEditor => {
@@ -1169,6 +1229,7 @@ async fn handle_execute_query(state: &mut AppState) {
             }
 
             state.query_result = Some(result);
+            state.update_known_columns(); // Update columns for autocompletion
             state.selected_row = 0;
             state.results_scroll_x = 0; // Reset horizontal scroll
             state.set_status(format!("Query executed: {} rows in {}ms", row_count, time));

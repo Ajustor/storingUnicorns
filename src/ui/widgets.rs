@@ -376,23 +376,33 @@ pub fn render_query_editor(
     let query_input = state.query_input();
     let cursor_position = state.cursor_position();
 
-    let input_text = if query_input.is_empty() && !is_active {
-        "-- Enter SQL query here..."
+    // Use syntax highlighting
+    let highlighted_content = if query_input.is_empty() && !is_active {
+        vec![Line::from(Span::styled(
+            "-- Enter SQL query here...",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))]
     } else {
-        query_input
+        super::sql_highlight::highlight_sql(query_input, &state.known_columns)
     };
 
-    let paragraph = Paragraph::new(input_text)
-        .style(Style::default().fg(Color::White))
+    let paragraph = Paragraph::new(highlighted_content)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .block(
             Block::default()
-                .title(" Query Editor [F5/Ctrl+Enter] ")
+                .title(" Query Editor [F5/Ctrl+Enter | Tab:Complete] ")
                 .borders(Borders::ALL)
                 .border_style(panel_style(is_active)),
         );
 
     frame.render_widget(paragraph, editor_area);
+
+    // Render completion popup if active
+    if is_active && state.show_completion && !state.completion_suggestions.is_empty() {
+        render_completion_popup(frame, editor_area, state, cursor_position, query_input);
+    }
 
     // Show cursor when editing (calculate position with real line breaks)
     if is_active {
@@ -427,6 +437,100 @@ pub fn render_query_editor(
             }
         }
     }
+}
+
+/// Render the autocompletion popup
+fn render_completion_popup(
+    frame: &mut Frame,
+    editor_area: Rect,
+    state: &AppState,
+    cursor_position: usize,
+    query_input: &str,
+) {
+    use ratatui::widgets::Clear;
+
+    // Calculate popup position based on cursor
+    let inner_width = editor_area.width.saturating_sub(2) as usize;
+    let text_before_cursor = &query_input[..cursor_position.min(query_input.len())];
+
+    let mut visual_line = 0;
+    let mut visual_col = 0;
+
+    for c in text_before_cursor.chars() {
+        if c == '\n' {
+            visual_line += 1;
+            visual_col = 0;
+        } else {
+            visual_col += 1;
+            if visual_col >= inner_width {
+                visual_line += 1;
+                visual_col = 0;
+            }
+        }
+    }
+
+    // Position popup below cursor
+    let popup_x = editor_area.x + 1 + visual_col as u16;
+    let popup_y = editor_area.y + 2 + visual_line as u16;
+
+    // Calculate popup dimensions
+    let max_width = state
+        .completion_suggestions
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(10) as u16
+        + 4;
+    let popup_width = max_width.min(30);
+    let popup_height = (state.completion_suggestions.len() as u16 + 2).min(8);
+
+    // Ensure popup fits on screen
+    let popup_x = popup_x.min(editor_area.x + editor_area.width - popup_width - 1);
+    let popup_y = if popup_y + popup_height > editor_area.y + editor_area.height {
+        // Show above cursor if not enough space below
+        (editor_area.y + 1 + visual_line as u16).saturating_sub(popup_height)
+    } else {
+        popup_y
+    };
+
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    // Clear the area behind the popup
+    frame.render_widget(Clear, popup_area);
+
+    // Build completion list items
+    let items: Vec<Line> = state
+        .completion_suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, suggestion)| {
+            let style = if i == state.completion_selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(format!(" {} ", suggestion), style))
+        })
+        .collect();
+
+    let popup = Paragraph::new(items)
+        .block(
+            Block::default()
+                .title(" Completions ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .style(Style::default().bg(Color::Black));
+
+    frame.render_widget(popup, popup_area);
 }
 
 pub fn render_results_panel(

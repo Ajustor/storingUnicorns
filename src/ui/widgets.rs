@@ -767,10 +767,9 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
             ],
             ActivePanel::Tables => vec![
                 ("Enter", "Select"),
+                ("s", "Schema"),
                 ("Ctrl+R", "Refresh"),
                 ("Tab", "Next panel"),
-                ("?", "Help"),
-                ("q", "Quit"),
             ],
             ActivePanel::QueryEditor => {
                 vec![

@@ -1,7 +1,9 @@
 use super::query_tabs::QueryTabsState;
+use super::table_cache::{FetchQueue, TableCache};
 use crate::config::AppConfig;
 use crate::db::DatabaseConnection;
 use crate::models::{ConnectionConfig, DatabaseType, QueryResult, SchemaInfo};
+use crate::ui::modals::SchemaAction;
 
 /// Active panel in the UI
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,7 @@ pub enum DialogMode {
     AddRow,
     #[allow(dead_code)]
     DeleteConfirm,
+    SchemaModify,
 }
 
 /// Fields in the new connection dialog
@@ -185,6 +188,11 @@ pub struct AppState {
     pub show_completion: bool,
     pub known_columns: Vec<String>, // Columns from last query result
 
+    // Table column cache for autocompletion
+    pub table_cache: TableCache,
+    pub fetch_queue: FetchQueue,
+    pub current_table_context: Option<String>, // Table detected from current query
+
     // Results state
     pub query_result: Option<QueryResult>,
     pub results_scroll: usize,
@@ -203,6 +211,14 @@ pub struct AppState {
     pub dialog_mode: DialogMode,
     pub new_connection: NewConnectionState,
     pub editing_connection_index: Option<usize>,
+
+    // Schema modification state
+    pub schema_action: Option<SchemaAction>,
+    pub schema_table_name: Option<String>,
+    pub schema_field_index: usize,
+    pub schema_cursor_pos: usize,
+    /// Pending operation for column selection: "view", "modify", "drop", "rename"
+    pub schema_pending_operation: Option<String>,
 
     // Status
     pub status_message: String,
@@ -236,6 +252,9 @@ impl AppState {
             completion_selected: 0,
             show_completion: false,
             known_columns: Vec::new(),
+            table_cache: TableCache::default(),
+            fetch_queue: FetchQueue::default(),
+            current_table_context: None,
             query_result: None,
             results_scroll: 0,
             results_scroll_x: 0,
@@ -249,6 +268,11 @@ impl AppState {
             dialog_mode: DialogMode::None,
             new_connection: NewConnectionState::default(),
             editing_connection_index: None,
+            schema_action: None,
+            schema_table_name: None,
+            schema_field_index: 0,
+            schema_cursor_pos: 0,
+            schema_pending_operation: None,
             status_message: String::from("Press ? for help"),
             is_loading: false,
             is_connecting: false,
@@ -285,10 +309,34 @@ impl AppState {
     pub fn close_dialog(&mut self) {
         self.dialog_mode = DialogMode::None;
         self.editing_connection_index = None;
+        self.schema_action = None;
+        self.schema_table_name = None;
+        self.schema_field_index = 0;
+        self.schema_cursor_pos = 0;
+        self.schema_pending_operation = None;
     }
 
     pub fn is_dialog_open(&self) -> bool {
         self.dialog_mode != DialogMode::None
+    }
+
+    /// Open the schema modification dialog for the selected table
+    pub fn open_schema_dialog(&mut self) {
+        if let Some(table_name) = self.get_selected_table_full_name() {
+            self.schema_table_name = Some(table_name);
+            self.schema_action = None;
+            self.schema_field_index = 0;
+            self.schema_cursor_pos = 0;
+            self.schema_pending_operation = None;
+            self.dialog_mode = DialogMode::SchemaModify;
+        }
+    }
+
+    /// Open schema dialog with a specific action
+    pub fn open_schema_action(&mut self, action: SchemaAction) {
+        self.schema_action = Some(action);
+        self.schema_field_index = 0;
+        self.schema_cursor_pos = 0;
     }
 
     // Query tab helper methods

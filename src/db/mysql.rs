@@ -181,6 +181,90 @@ pub async fn get_primary_keys(pool: &MySqlPool, table_name: &str) -> Result<Vec<
     Ok(rows.into_iter().map(|(name,)| name).collect())
 }
 
+/// Get column names for a table (for autocompletion)
+pub async fn get_table_columns(pool: &MySqlPool, table_name: &str) -> Result<Vec<String>> {
+    // Parse schema.table or just table
+    let (schema, table) = if table_name.contains('.') {
+        let parts: Vec<&str> = table_name.split('.').collect();
+        (parts[0].trim_matches('`'), parts[1].trim_matches('`'))
+    } else {
+        ("", table_name.trim_matches('`'))
+    };
+
+    let rows: Vec<(String,)> = if schema.is_empty() {
+        sqlx::query_as(
+            "SELECT column_name 
+             FROM information_schema.columns 
+             WHERE table_name = ?
+             ORDER BY ordinal_position",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT column_name 
+             FROM information_schema.columns 
+             WHERE table_schema = ? AND table_name = ?
+             ORDER BY ordinal_position",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_all(pool)
+        .await?
+    };
+
+    Ok(rows.into_iter().map(|(name,)| name).collect())
+}
+
+/// Get full column details for a table (for schema modification)
+pub async fn get_table_column_details(
+    pool: &MySqlPool,
+    table_name: &str,
+) -> Result<Vec<crate::models::Column>> {
+    // Parse schema.table or just table
+    let (schema, table) = if table_name.contains('.') {
+        let parts: Vec<&str> = table_name.split('.').collect();
+        (parts[0].trim_matches('`'), parts[1].trim_matches('`'))
+    } else {
+        ("", table_name.trim_matches('`'))
+    };
+
+    // Get column info with primary key
+    let rows: Vec<(String, String, String, String)> = if schema.is_empty() {
+        sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable, column_key
+             FROM information_schema.columns 
+             WHERE table_name = ?
+             ORDER BY ordinal_position",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable, column_key
+             FROM information_schema.columns 
+             WHERE table_schema = ? AND table_name = ?
+             ORDER BY ordinal_position",
+        )
+        .bind(schema)
+        .bind(table)
+        .fetch_all(pool)
+        .await?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(|(name, type_name, nullable, column_key)| crate::models::Column {
+            name,
+            type_name,
+            nullable: nullable == "YES",
+            is_primary_key: column_key == "PRI",
+        })
+        .collect())
+}
+
 /// Test the connection
 pub async fn test(pool: &MySqlPool) -> Result<()> {
     sqlx::query("SELECT 1").execute(pool).await?;

@@ -294,6 +294,17 @@ pub fn get_completions(
         || context_before.ends_with("UPDATE ")
         || context_before.ends_with("TABLE ");
 
+    // Check if we're in SELECT clause (before FROM)
+    let in_select_clause = context_before.contains("SELECT") && !context_before.contains("FROM");
+    
+    // Check if we're after WHERE, AND, OR, SET
+    let in_condition_clause = context_before.ends_with("WHERE ")
+        || context_before.ends_with("AND ")
+        || context_before.ends_with("OR ")
+        || context_before.ends_with("SET ")
+        || context_before.ends_with("ON ")
+        || context_before.ends_with("BY ");
+
     if table_context {
         // Suggest tables
         for table in known_tables {
@@ -301,8 +312,31 @@ pub fn get_completions(
                 suggestions.push(table.clone());
             }
         }
+    } else if in_select_clause || in_condition_clause {
+        // Prioritize columns in SELECT and WHERE clauses
+        for col in known_columns {
+            if col.to_uppercase().starts_with(&word_upper) {
+                suggestions.push(col.clone());
+            }
+        }
+
+        // Then add functions (especially aggregate functions in SELECT)
+        if in_select_clause {
+            for func in SQL_FUNCTIONS {
+                if func.starts_with(&word_upper) {
+                    suggestions.push(format!("{}()", func));
+                }
+            }
+        }
+
+        // Then keywords
+        for kw in SQL_KEYWORDS {
+            if kw.starts_with(&word_upper) {
+                suggestions.push(kw.to_string());
+            }
+        }
     } else {
-        // Suggest columns first
+        // Default behavior: suggest columns first
         for col in known_columns {
             if col.to_uppercase().starts_with(&word_upper) {
                 suggestions.push(col.clone());
@@ -326,6 +360,74 @@ pub fn get_completions(
 
     // Limit and sort suggestions
     suggestions.sort();
+    suggestions.dedup();
     suggestions.truncate(10);
     suggestions
+}
+
+/// Extract table name from a SQL query for context-aware completion
+pub fn extract_table_from_query(query: &str) -> Option<String> {
+    let query_upper = query.to_uppercase();
+    
+    // Try to find table name after FROM
+    if let Some(from_pos) = query_upper.find("FROM") {
+        let after_from = query[from_pos + 4..].trim_start();
+        let table_name: String = after_from
+            .chars()
+            .take_while(|c| {
+                c.is_alphanumeric()
+                    || *c == '_'
+                    || *c == '.'
+                    || *c == '['
+                    || *c == ']'
+                    || *c == '"'
+                    || *c == '`'
+            })
+            .collect();
+        if !table_name.is_empty() {
+            return Some(table_name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string());
+        }
+    }
+    
+    // Try UPDATE table_name
+    if let Some(update_pos) = query_upper.find("UPDATE") {
+        let after_update = query[update_pos + 6..].trim_start();
+        let table_name: String = after_update
+            .chars()
+            .take_while(|c| {
+                c.is_alphanumeric()
+                    || *c == '_'
+                    || *c == '.'
+                    || *c == '['
+                    || *c == ']'
+                    || *c == '"'
+                    || *c == '`'
+            })
+            .collect();
+        if !table_name.is_empty() {
+            return Some(table_name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string());
+        }
+    }
+    
+    // Try INSERT INTO table_name
+    if let Some(into_pos) = query_upper.find("INTO") {
+        let after_into = query[into_pos + 4..].trim_start();
+        let table_name: String = after_into
+            .chars()
+            .take_while(|c| {
+                c.is_alphanumeric()
+                    || *c == '_'
+                    || *c == '.'
+                    || *c == '['
+                    || *c == ']'
+                    || *c == '"'
+                    || *c == '`'
+            })
+            .collect();
+        if !table_name.is_empty() {
+            return Some(table_name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string());
+        }
+    }
+    
+    None
 }

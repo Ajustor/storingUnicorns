@@ -1,13 +1,13 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     Frame,
 };
 
 use crate::services::AppState;
 
 use super::widgets::{
-    render_connections_panel, render_query_editor, render_results_panel, render_status_bar,
-    render_tables_panel,
+    render_connections_panel, render_help_bar, render_new_connection_dialog, render_query_editor,
+    render_results_panel, render_status_bar, render_tables_panel,
 };
 
 /// Main UI layout - DataGrip-like interface
@@ -22,13 +22,19 @@ use super::widgets::{
 /// └─────────────┴─────────────────────────────────┘
 /// │ Status Bar                                    │
 /// └───────────────────────────────────────────────┘
+/// │ Help Bar                                      │
+/// └───────────────────────────────────────────────┘
 pub fn render_ui(frame: &mut Frame, state: &AppState) {
     let size = frame.area();
 
-    // Main vertical split: content + status bar
+    // Main vertical split: content + status bar + help bar
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(10), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(10),    // Content
+            Constraint::Length(1),  // Status bar
+            Constraint::Length(1),  // Help bar
+        ])
         .split(size);
 
     // Content area: left sidebar + right main area
@@ -55,26 +61,8 @@ pub fn render_ui(frame: &mut Frame, state: &AppState) {
     render_query_editor(frame, right_chunks[0], state);
     render_results_panel(frame, right_chunks[1], state);
     render_status_bar(frame, main_chunks[1], state);
-}
+    render_help_bar(frame, main_chunks[2], state);
 
-/// Helper to create a centered popup area
-#[allow(dead_code)]
-pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+    // Render dialog overlay if active
+    render_new_connection_dialog(frame, state);
 }

@@ -1,15 +1,16 @@
-# DataGrip TUI
+# storingUnicorns 🦄
 
 A terminal-based database client inspired by JetBrains DataGrip, built with Rust and ratatui.
 
 ## Features
 
 - Multi-database support (PostgreSQL, MySQL, SQLite)
-- Connection management with saved configurations
+- Connection management with dialog-based creation
 - Schema browser (tables list)
 - SQL query editor
 - Results table with navigation
 - Persistent configuration
+- Contextual help bar
 
 ## Project Structure
 
@@ -26,32 +27,46 @@ src/
 │   └── connection.rs # ConnectionConfig, QueryResult, Column
 ├── services/        # Application logic
 │   ├── mod.rs
-│   └── app_state.rs # AppState: runtime state management
+│   └── app_state.rs # AppState: runtime state, dialogs
 └── ui/              # Terminal UI
     ├── mod.rs
     ├── layout.rs    # Main layout, panel arrangement
-    └── widgets.rs   # Panel renderers (connections, tables, editor, results)
+    └── widgets.rs   # Panel renderers, dialogs, help bar
 ```
 
 ## Keybindings
 
+### Main Interface
+
+| Key         | Context        | Action                         |
+|-------------|----------------|--------------------------------|
+| `Tab`       | Any            | Next panel                     |
+| `Shift+Tab` | Any            | Previous panel                 |
+| `↑/k`       | Lists          | Select previous item           |
+| `↓/j`       | Lists          | Select next item               |
+| `Enter`     | Connections    | Connect to database            |
+| `Enter`     | Tables         | Generate SELECT query          |
+| `n`         | Connections    | New connection dialog          |
+| `d`         | Connections    | Delete selected connection     |
+| `F5`        | Any            | Execute query                  |
+| `Ctrl+R`    | Any            | Refresh tables                 |
+| `?`         | Any            | Show help in status bar        |
+| `q`         | Outside editor | Quit                           |
+| `Ctrl+Q`    | Any            | Force quit                     |
+
+### New Connection Dialog
+
 | Key         | Action                              |
 |-------------|-------------------------------------|
-| `Tab`       | Next panel                          |
-| `Shift+Tab` | Previous panel                      |
-| `↑/k`       | Select previous item                |
-| `↓/j`       | Select next item                    |
-| `Enter`     | Connect (in Connections panel)      |
-| `Enter`     | Generate SELECT query (in Tables)   |
-| `F5`        | Execute query                       |
-| `Ctrl+N`    | Add new connection                  |
-| `Ctrl+R`    | Refresh tables                      |
-| `q`         | Quit (outside query editor)         |
-| `Ctrl+Q`    | Force quit                          |
+| `Tab/↓`     | Next field                          |
+| `Shift+Tab/↑` | Previous field                    |
+| `←/→`       | Cycle database type (on Type field) |
+| `Enter`     | Save connection                     |
+| `Esc`       | Cancel                              |
 
 ## Configuration
 
-Connections are stored in `~/.config/datagrip-tui/config.toml`:
+Connections are stored in `~/.config/storingUnicorns/config.toml`:
 
 ```toml
 [[connections]]
@@ -80,13 +95,27 @@ cargo build --release
 ```bash
 cargo run
 # or after building:
-./target/release/datagrip_tui
+./target/release/storingUnicorns
+```
+
+## Layout
+
+```
+┌─────────────┬─────────────────────────────────┐
+│ Connections │  Query Editor                   │
+├─────────────┤                                 │
+│ Tables      ├─────────────────────────────────┤
+│             │  Results                        │
+└─────────────┴─────────────────────────────────┘
+│ Status: Connected to mydb                     │
+├───────────────────────────────────────────────┤
+│ Enter Connect │ n New │ d Delete │ Tab Next  │
+└───────────────────────────────────────────────┘
 ```
 
 ## TODO
 
 - [ ] Multi-line query editor with proper cursor movement
-- [ ] Connection dialog popup (instead of Ctrl+N placeholder)
 - [ ] Table structure view (columns, types, indexes)
 - [ ] Query history
 - [ ] Result set export (CSV, JSON)
@@ -94,3 +123,4 @@ cargo run
 - [ ] Async query execution with cancellation
 - [ ] SSH tunnel support
 - [ ] Tab completion for table/column names
+- [ ] Edit existing connections

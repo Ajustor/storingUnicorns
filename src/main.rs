@@ -16,7 +16,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use config::AppConfig;
 use db::DatabaseConnection;
-use services::{ActivePanel, AppState};
+use services::{ActivePanel, AppState, ConnectionField, DialogMode};
 use ui::render_ui;
 
 #[tokio::main]
@@ -76,6 +76,12 @@ async fn run_app<B: ratatui::backend::Backend>(
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                // Handle dialog input first
+                if state.is_dialog_open() {
+                    handle_dialog_input(state, key.code, key.modifiers);
+                    continue;
+                }
+
                 match key.code {
                     // Quit
                     KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -90,10 +96,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                     KeyCode::BackTab => state.prev_panel(),
 
                     // List navigation
-                    KeyCode::Up | KeyCode::Char('k') if state.active_panel != ActivePanel::QueryEditor => {
+                    KeyCode::Up | KeyCode::Char('k')
+                        if state.active_panel != ActivePanel::QueryEditor =>
+                    {
                         state.select_prev();
                     }
-                    KeyCode::Down | KeyCode::Char('j') if state.active_panel != ActivePanel::QueryEditor => {
+                    KeyCode::Down | KeyCode::Char('j')
+                        if state.active_panel != ActivePanel::QueryEditor =>
+                    {
                         state.select_next();
                     }
 
@@ -147,26 +157,40 @@ async fn run_app<B: ratatui::backend::Backend>(
                         state.cursor_position = state.query_input.len();
                     }
 
-                    // Add new connection (placeholder - would open a dialog)
+                    // New connection dialog
+                    KeyCode::Char('n') if state.active_panel == ActivePanel::Connections => {
+                        state.open_new_connection_dialog();
+                    }
                     KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // For now, add a sample connection
-                        use models::{ConnectionConfig, DatabaseType};
-                        let new_conn = ConnectionConfig {
-                            name: format!("Connection {}", state.config.connections.len() + 1),
-                            db_type: DatabaseType::Postgres,
-                            host: Some("localhost".into()),
-                            port: Some(5432),
-                            username: Some("postgres".into()),
-                            password: None,
-                            database: "postgres".into(),
-                        };
-                        state.config.add_connection(new_conn);
-                        state.set_status("Added new connection. Edit config.toml to customize.");
+                        state.open_new_connection_dialog();
+                    }
+
+                    // Delete connection
+                    KeyCode::Char('d') if state.active_panel == ActivePanel::Connections => {
+                        if !state.config.connections.is_empty() {
+                            let name = state.config.connections[state.selected_connection]
+                                .name
+                                .clone();
+                            state.config.connections.remove(state.selected_connection);
+                            if state.selected_connection >= state.config.connections.len()
+                                && state.selected_connection > 0
+                            {
+                                state.selected_connection -= 1;
+                            }
+                            state.set_status(format!("Deleted connection: {}", name));
+                        }
                     }
 
                     // Refresh tables
                     KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         handle_refresh_tables(state).await;
+                    }
+
+                    // Help (placeholder - could show a help dialog)
+                    KeyCode::Char('?') => {
+                        state.set_status(
+                            "Help: Tab=switch panels, Enter=connect/select, F5=execute, n=new, d=delete, q=quit",
+                        );
                     }
 
                     _ => {}
@@ -182,9 +206,103 @@ async fn run_app<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+fn handle_dialog_input(state: &mut AppState, key: KeyCode, modifiers: KeyModifiers) {
+    match state.dialog_mode {
+        DialogMode::NewConnection => {
+            handle_new_connection_dialog(state, key, modifiers);
+        }
+        DialogMode::DeleteConfirm => {
+            // TODO: implement delete confirmation
+        }
+        DialogMode::None => {}
+    }
+}
+
+fn handle_new_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyModifiers) {
+    let nc = &mut state.new_connection;
+    
+    match key {
+        KeyCode::Esc => {
+            state.close_dialog();
+            state.set_status("Cancelled");
+            return;
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            // Move to next field
+            nc.active_field = nc.active_field.next();
+            nc.cursor_position = nc.get_active_field_value().len();
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            // Move to previous field
+            nc.active_field = nc.active_field.prev();
+            nc.cursor_position = nc.get_active_field_value().len();
+        }
+        KeyCode::Left if nc.active_field == ConnectionField::DbType => {
+            nc.cycle_db_type();
+        }
+        KeyCode::Right if nc.active_field == ConnectionField::DbType => {
+            nc.cycle_db_type();
+        }
+        KeyCode::Enter => {
+            // Save the connection
+            let config = nc.to_config();
+            let name = config.name.clone();
+            state.config.add_connection(config);
+            state.close_dialog();
+            state.set_status(format!("Added connection: {}", name));
+            return;
+        }
+        KeyCode::Char(c) => {
+            // For port field, only allow digits
+            if nc.active_field == ConnectionField::Port && !c.is_ascii_digit() {
+                return;
+            }
+            let pos = nc.cursor_position;
+            if let Some(field) = nc.get_active_field_mut() {
+                field.insert(pos, c);
+            }
+            nc.cursor_position += 1;
+        }
+        KeyCode::Backspace => {
+            if nc.cursor_position > 0 {
+                let pos = nc.cursor_position - 1;
+                if let Some(field) = nc.get_active_field_mut() {
+                    field.remove(pos);
+                }
+                nc.cursor_position = pos;
+            }
+        }
+        KeyCode::Delete => {
+            let pos = nc.cursor_position;
+            let len = nc.get_active_field_value().len();
+            if pos < len {
+                if let Some(field) = nc.get_active_field_mut() {
+                    field.remove(pos);
+                }
+            }
+        }
+        KeyCode::Home => {
+            nc.cursor_position = 0;
+        }
+        KeyCode::End => {
+            nc.cursor_position = nc.get_active_field_value().len();
+        }
+        KeyCode::Left => {
+            nc.cursor_position = nc.cursor_position.saturating_sub(1);
+        }
+        KeyCode::Right => {
+            let len = nc.get_active_field_value().len();
+            if nc.cursor_position < len {
+                nc.cursor_position += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn handle_connect(state: &mut AppState) {
     if state.config.connections.is_empty() {
-        state.set_status("No connections configured. Press Ctrl+N to add one.");
+        state.set_status("No connections configured. Press 'n' to add one.");
         return;
     }
 

@@ -299,24 +299,87 @@ pub fn render_query_editor(
     state: &AppState,
     registry: &ClickableRegistry,
 ) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::text::{Line, Span};
+
     let is_active = state.active_panel == ActivePanel::QueryEditor && !state.is_dialog_open();
 
     // Register panel area
     registry.register(area, ClickableType::Panel(PanelType::QueryEditor));
 
+    // Split area: tab bar (1 line) + editor content
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+
+    let tab_area = chunks[0];
+    let editor_area = chunks[1];
+
+    // Render tab bar and register clickable areas for each tab
+    let tabs = &state.query_tabs.tabs;
+    let active_tab = state.query_tabs.active_tab;
+
+    let mut tab_spans: Vec<Span> = vec![];
+    let mut current_x = tab_area.x;
+
+    for (i, tab) in tabs.iter().enumerate() {
+        let modified_marker = if tab.is_modified { "*" } else { "" };
+        let tab_name = format!(" {}{} ", tab.name, modified_marker);
+        let tab_width = tab_name.len() as u16;
+
+        // Register clickable area for this tab
+        let tab_rect = Rect {
+            x: current_x,
+            y: tab_area.y,
+            width: tab_width,
+            height: 1,
+        };
+        registry.register(tab_rect, ClickableType::QueryTab(i));
+        current_x += tab_width;
+
+        if i == active_tab {
+            tab_spans.push(Span::styled(
+                tab_name,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            tab_spans.push(Span::styled(tab_name, Style::default().fg(Color::DarkGray)));
+        }
+        if i < tabs.len() - 1 {
+            tab_spans.push(Span::raw("│"));
+            current_x += 1; // separator width
+        }
+    }
+    // Add hint for tab shortcuts
+    tab_spans.push(Span::styled(
+        " [Ctrl+1-9:Switch Ctrl+T:New Ctrl+W:Close]",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let tab_line = Line::from(tab_spans);
+    let tab_bar = Paragraph::new(tab_line).style(Style::default().bg(Color::Black));
+    frame.render_widget(tab_bar, tab_area);
+
     // Register inner editor area for cursor positioning
     let inner_area = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
+        x: editor_area.x + 1,
+        y: editor_area.y + 1,
+        width: editor_area.width.saturating_sub(2),
+        height: editor_area.height.saturating_sub(2),
     };
     registry.register(inner_area, ClickableType::QueryEditor);
 
-    let input_text = if state.query_input.is_empty() && !is_active {
+    let query_input = state.query_input();
+    let cursor_position = state.cursor_position();
+
+    let input_text = if query_input.is_empty() && !is_active {
         "-- Enter SQL query here..."
     } else {
-        &state.query_input
+        query_input
     };
 
     let paragraph = Paragraph::new(input_text)
@@ -329,15 +392,14 @@ pub fn render_query_editor(
                 .border_style(panel_style(is_active)),
         );
 
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, editor_area);
 
     // Show cursor when editing (calculate position with real line breaks)
     if is_active {
-        let inner_width = area.width.saturating_sub(2) as usize; // Account for borders
+        let inner_width = editor_area.width.saturating_sub(2) as usize; // Account for borders
         if inner_width > 0 {
             // Calculate cursor position considering actual newlines
-            let text_before_cursor =
-                &state.query_input[..state.cursor_position.min(state.query_input.len())];
+            let text_before_cursor = &query_input[..cursor_position.min(query_input.len())];
 
             let mut visual_line = 0;
             let mut visual_col = 0;
@@ -356,11 +418,11 @@ pub fn render_query_editor(
                 }
             }
 
-            let cursor_x = area.x + 1 + visual_col as u16;
-            let cursor_y = area.y + 1 + visual_line as u16;
+            let cursor_x = editor_area.x + 1 + visual_col as u16;
+            let cursor_y = editor_area.y + 1 + visual_line as u16;
 
             // Only show cursor if it's within the visible area
-            if cursor_y < area.y + area.height - 1 {
+            if cursor_y < editor_area.y + editor_area.height - 1 {
                 frame.set_cursor_position((cursor_x, cursor_y));
             }
         }

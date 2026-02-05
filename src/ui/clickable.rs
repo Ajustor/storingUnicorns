@@ -8,6 +8,7 @@ pub enum ClickableType {
     Schema(usize),
     Table { schema_idx: usize, table_idx: usize },
     QueryEditor,
+    QueryTab(usize),
     ResultRow(usize),
     Panel(super::layout::PanelType),
 }

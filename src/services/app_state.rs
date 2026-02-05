@@ -1,3 +1,4 @@
+use super::query_tabs::QueryTabsState;
 use crate::config::AppConfig;
 use crate::db::DatabaseConnection;
 use crate::models::{ConnectionConfig, DatabaseType, QueryResult, SchemaInfo};
@@ -175,9 +176,8 @@ pub struct AppState {
     pub selected_table: usize,
     pub tables_scroll: usize,
 
-    // Query editor state
-    pub query_input: String,
-    pub cursor_position: usize,
+    // Query tabs state
+    pub query_tabs: QueryTabsState,
 
     // Results state
     pub query_result: Option<QueryResult>,
@@ -225,8 +225,7 @@ impl AppState {
             selected_schema: 0,
             selected_table: 0,
             tables_scroll: 0,
-            query_input: String::new(),
-            cursor_position: 0,
+            query_tabs: QueryTabsState::load().unwrap_or_default(),
             query_result: None,
             results_scroll: 0,
             results_scroll_x: 0,
@@ -280,6 +279,34 @@ impl AppState {
 
     pub fn is_dialog_open(&self) -> bool {
         self.dialog_mode != DialogMode::None
+    }
+
+    // Query tab helper methods
+    pub fn query_input(&self) -> &str {
+        &self.query_tabs.current_tab().query
+    }
+
+    pub fn query_input_mut(&mut self) -> &mut String {
+        &mut self.query_tabs.current_tab_mut().query
+    }
+
+    pub fn cursor_position(&self) -> usize {
+        self.query_tabs.current_tab().cursor_position
+    }
+
+    pub fn set_cursor_position(&mut self, pos: usize) {
+        self.query_tabs.current_tab_mut().cursor_position = pos;
+    }
+
+    pub fn set_query(&mut self, query: String) {
+        let tab = self.query_tabs.current_tab_mut();
+        tab.query = query;
+        tab.cursor_position = tab.query.len();
+        tab.is_modified = true;
+    }
+
+    pub fn save_query_tabs(&self) {
+        let _ = self.query_tabs.save();
     }
 
     pub fn next_panel(&mut self) {
@@ -364,6 +391,24 @@ impl AppState {
         }
     }
 
+    /// Calculate the visual index of the currently selected item in the tables panel
+    fn get_selected_visual_index(&self) -> usize {
+        let mut visual_idx = 0;
+        for (schema_idx, schema) in self.schemas.iter().enumerate() {
+            if schema_idx == self.selected_schema {
+                // Found the schema, add the table offset
+                return visual_idx + self.selected_table;
+            }
+            // Count this schema header
+            visual_idx += 1;
+            // Count expanded tables
+            if schema.expanded {
+                visual_idx += schema.tables.len();
+            }
+        }
+        visual_idx
+    }
+
     /// Navigate through tables panel (schemas and tables)
     fn navigate_tables(&mut self, forward: bool) {
         if self.schemas.is_empty() {
@@ -411,6 +456,17 @@ impl AppState {
                     };
                 }
             }
+        }
+
+        // Update scroll to keep selection visible
+        let visual_idx = self.get_selected_visual_index();
+        // Scroll down if selection is below visible area (assume ~10 visible items)
+        if visual_idx >= self.tables_scroll + 10 {
+            self.tables_scroll = visual_idx.saturating_sub(9);
+        }
+        // Scroll up if selection is above visible area
+        if visual_idx < self.tables_scroll {
+            self.tables_scroll = visual_idx;
         }
     }
 
@@ -543,9 +599,10 @@ impl AppState {
     /// Extract table name from current query (simple heuristic for SELECT ... FROM table)
     /// Supports schema.table format and quoted identifiers
     fn extract_table_from_query(&self) -> Option<String> {
-        let query = self.query_input.to_uppercase();
+        let query_input = self.query_input();
+        let query = query_input.to_uppercase();
         if let Some(from_pos) = query.find("FROM") {
-            let after_from = &self.query_input[from_pos + 4..].trim_start();
+            let after_from = &query_input[from_pos + 4..].trim_start();
             // Take the first word after FROM (including schema.table and quoted identifiers)
             let table_name: String = after_from
                 .chars()

@@ -73,8 +73,9 @@ async fn main() -> Result<()> {
         conn.close().await;
     }
 
-    // Save config on exit
+    // Save config and queries on exit
     state.config.save()?;
+    state.save_query_tabs();
 
     if let Err(err) = res {
         eprintln!("Error: {err:?}");
@@ -128,8 +129,25 @@ async fn run_app<B: ratatui::backend::Backend>(
                             state.should_quit = true;
                         }
 
-                        // Panel navigation
-                        KeyCode::Tab => state.next_panel(),
+                        // Tab navigation: Ctrl+Tab for next tab, Ctrl+Shift+Tab for previous
+                        KeyCode::Tab
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                        {
+                            state.query_tabs.prev_tab();
+                        }
+                        KeyCode::Tab
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            state.query_tabs.next_tab();
+                        }
+
+                        // Panel navigation (Tab without modifiers)
+                        KeyCode::Tab if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.next_panel()
+                        }
                         KeyCode::BackTab => state.prev_panel(),
 
                         // List navigation
@@ -169,8 +187,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     } else {
                                         format!("SELECT * FROM {} LIMIT 100;", table_name)
                                     };
-                                state.query_input = query;
-                                state.cursor_position = state.query_input.len();
+                                state.set_query(query);
                                 state.active_panel = ActivePanel::QueryEditor;
                             }
                         }
@@ -232,32 +249,45 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                         // Newline in query editor
                         KeyCode::Enter if state.active_panel == ActivePanel::QueryEditor => {
-                            state.query_input.insert(state.cursor_position, '\n');
-                            state.cursor_position += 1;
+                            let pos = state.cursor_position();
+                            state.query_input_mut().insert(pos, '\n');
+                            state.set_cursor_position(pos + 1);
+                            state.query_tabs.current_tab_mut().is_modified = true;
                         }
 
-                        // Query editor input
-                        KeyCode::Char(c) if state.active_panel == ActivePanel::QueryEditor => {
-                            state.query_input.insert(state.cursor_position, c);
-                            state.cursor_position += 1;
+                        // Query editor input (exclude Ctrl combinations)
+                        KeyCode::Char(c)
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let pos = state.cursor_position();
+                            state.query_input_mut().insert(pos, c);
+                            state.set_cursor_position(pos + 1);
+                            state.query_tabs.current_tab_mut().is_modified = true;
                         }
                         KeyCode::Backspace if state.active_panel == ActivePanel::QueryEditor => {
-                            if state.cursor_position > 0 {
-                                state.cursor_position -= 1;
-                                state.query_input.remove(state.cursor_position);
+                            let pos = state.cursor_position();
+                            if pos > 0 {
+                                state.set_cursor_position(pos - 1);
+                                state.query_input_mut().remove(pos - 1);
+                                state.query_tabs.current_tab_mut().is_modified = true;
                             }
                         }
                         KeyCode::Delete if state.active_panel == ActivePanel::QueryEditor => {
-                            if state.cursor_position < state.query_input.len() {
-                                state.query_input.remove(state.cursor_position);
+                            let pos = state.cursor_position();
+                            if pos < state.query_input().len() {
+                                state.query_input_mut().remove(pos);
+                                state.query_tabs.current_tab_mut().is_modified = true;
                             }
                         }
                         KeyCode::Left if state.active_panel == ActivePanel::QueryEditor => {
-                            state.cursor_position = state.cursor_position.saturating_sub(1);
+                            let pos = state.cursor_position();
+                            state.set_cursor_position(pos.saturating_sub(1));
                         }
                         KeyCode::Right if state.active_panel == ActivePanel::QueryEditor => {
-                            if state.cursor_position < state.query_input.len() {
-                                state.cursor_position += 1;
+                            let pos = state.cursor_position();
+                            if pos < state.query_input().len() {
+                                state.set_cursor_position(pos + 1);
                             }
                         }
                         KeyCode::Up if state.active_panel == ActivePanel::QueryEditor => {
@@ -268,21 +298,59 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                         KeyCode::Home if state.active_panel == ActivePanel::QueryEditor => {
                             // Move to start of current line
-                            let before_cursor = &state.query_input[..state.cursor_position];
+                            let pos = state.cursor_position();
+                            let query = state.query_input().to_string();
+                            let before_cursor = &query[..pos];
                             if let Some(line_start) = before_cursor.rfind('\n') {
-                                state.cursor_position = line_start + 1;
+                                state.set_cursor_position(line_start + 1);
                             } else {
-                                state.cursor_position = 0;
+                                state.set_cursor_position(0);
                             }
                         }
                         KeyCode::End if state.active_panel == ActivePanel::QueryEditor => {
                             // Move to end of current line
-                            let after_cursor = &state.query_input[state.cursor_position..];
+                            let pos = state.cursor_position();
+                            let query = state.query_input().to_string();
+                            let after_cursor = &query[pos..];
                             if let Some(line_end) = after_cursor.find('\n') {
-                                state.cursor_position += line_end;
+                                state.set_cursor_position(pos + line_end);
                             } else {
-                                state.cursor_position = state.query_input.len();
+                                state.set_cursor_position(query.len());
                             }
+                        }
+
+                        // New tab: Ctrl+T
+                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.query_tabs.add_tab();
+                            state.active_panel = ActivePanel::QueryEditor;
+                        }
+
+                        // Close tab: Ctrl+W
+                        KeyCode::Char('w')
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && state.active_panel == ActivePanel::QueryEditor =>
+                        {
+                            if !state.query_tabs.close_current_tab() {
+                                state.set_status("Cannot close the last tab");
+                            }
+                        }
+
+                        // Switch to tab by number: Ctrl+1 to Ctrl+9
+                        KeyCode::Char(c @ '1'..='9')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let tab_idx = (c as usize) - ('1' as usize);
+                            if tab_idx < state.query_tabs.tabs.len() {
+                                state.query_tabs.switch_to_tab(tab_idx);
+                                state.active_panel = ActivePanel::QueryEditor;
+                            }
+                        }
+
+                        // Save tabs: Ctrl+S
+                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.save_query_tabs();
+                            state.query_tabs.current_tab_mut().is_modified = false;
+                            state.set_status("Queries saved");
                         }
 
                         // New connection dialog
@@ -435,8 +503,7 @@ async fn handle_mouse_event<B: ratatui::backend::Backend>(
                     } else {
                         format!("SELECT * FROM {} LIMIT 100;", table_name)
                     };
-                    state.query_input = query;
-                    state.cursor_position = state.query_input.len();
+                    state.set_query(query);
                     state.active_panel = ActivePanel::QueryEditor;
                 }
             }
@@ -482,13 +549,10 @@ async fn handle_mouse_event<B: ratatui::backend::Backend>(
                     let click_line = y.saturating_sub(editor_rect.y) as usize;
                     let click_col = x.saturating_sub(editor_rect.x) as usize;
                     let inner_width = editor_rect.width as usize;
-                    let new_cursor_pos = calculate_cursor_from_click(
-                        &state.query_input,
-                        click_line,
-                        click_col,
-                        inner_width,
-                    );
-                    state.cursor_position = new_cursor_pos;
+                    let query = state.query_input().to_string();
+                    let new_cursor_pos =
+                        calculate_cursor_from_click(&query, click_line, click_col, inner_width);
+                    state.set_cursor_position(new_cursor_pos);
                 }
             }
             Some(ClickableType::ResultRow(row_idx)) => {
@@ -498,6 +562,10 @@ async fn handle_mouse_event<B: ratatui::backend::Backend>(
                         state.selected_row = row_idx;
                     }
                 }
+            }
+            Some(ClickableType::QueryTab(tab_idx)) => {
+                state.active_panel = ActivePanel::QueryEditor;
+                state.query_tabs.switch_to_tab(tab_idx);
             }
             Some(ClickableType::Panel(panel_type)) => {
                 use ui::PanelType;
@@ -561,7 +629,9 @@ fn handle_scroll(
                 state.tables_scroll = state.tables_scroll.saturating_sub(1);
             }
         }
-        Some(ClickableType::QueryEditor) | Some(ClickableType::Panel(PanelType::QueryEditor)) => {
+        Some(ClickableType::QueryEditor)
+        | Some(ClickableType::QueryTab(_))
+        | Some(ClickableType::Panel(PanelType::QueryEditor)) => {
             // Scroll query editor (move cursor up/down by lines)
             if direction > 0 {
                 move_cursor_down(state);
@@ -1040,7 +1110,7 @@ async fn handle_refresh_tables(state: &mut AppState) {
 }
 
 async fn handle_execute_query(state: &mut AppState) {
-    if state.query_input.trim().is_empty() {
+    if state.query_input().trim().is_empty() {
         state.set_status("Query is empty");
         return;
     }
@@ -1051,7 +1121,7 @@ async fn handle_execute_query(state: &mut AppState) {
     }
 
     // Clone the query to avoid borrow issues
-    let query = state.query_input.clone();
+    let query = state.query_input().to_string();
     state.set_status("Executing query...");
     state.is_loading = true;
 
@@ -1114,7 +1184,7 @@ async fn handle_execute_query(state: &mut AppState) {
 
 /// Execute only the SQL statement at the current cursor position
 async fn handle_execute_current_query(state: &mut AppState) {
-    if state.query_input.trim().is_empty() {
+    if state.query_input().trim().is_empty() {
         state.set_status("Query is empty");
         return;
     }
@@ -1125,7 +1195,9 @@ async fn handle_execute_current_query(state: &mut AppState) {
     }
 
     // Find the query at the cursor position
-    let query = get_query_at_cursor(&state.query_input, state.cursor_position);
+    let query_text = state.query_input().to_string();
+    let cursor_pos = state.cursor_position();
+    let query = get_query_at_cursor(&query_text, cursor_pos);
     if query.trim().is_empty() {
         state.set_status("No query at cursor position");
         return;
@@ -1215,8 +1287,8 @@ fn get_query_at_cursor(input: &str, cursor_pos: usize) -> String {
 
 /// Move cursor up one line in the query editor
 fn move_cursor_up(state: &mut AppState) {
-    let text = &state.query_input;
-    let cursor = state.cursor_position;
+    let text = state.query_input().to_string();
+    let cursor = state.cursor_position();
 
     // Find the start of the current line
     let line_start = text[..cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
@@ -1226,7 +1298,7 @@ fn move_cursor_up(state: &mut AppState) {
 
     // If we're on the first line, move to start
     if line_start == 0 {
-        state.cursor_position = 0;
+        state.set_cursor_position(0);
         return;
     }
 
@@ -1241,13 +1313,13 @@ fn move_cursor_up(state: &mut AppState) {
     let prev_line_len = prev_line_end - prev_line_start;
 
     // Move to the same column on the previous line, or end of line if shorter
-    state.cursor_position = prev_line_start + col.min(prev_line_len);
+    state.set_cursor_position(prev_line_start + col.min(prev_line_len));
 }
 
 /// Move cursor down one line in the query editor
 fn move_cursor_down(state: &mut AppState) {
-    let text = &state.query_input;
-    let cursor = state.cursor_position;
+    let text = state.query_input().to_string();
+    let cursor = state.cursor_position();
 
     // Find the start of the current line
     let line_start = text[..cursor].rfind('\n').map(|p| p + 1).unwrap_or(0);
@@ -1263,7 +1335,7 @@ fn move_cursor_down(state: &mut AppState) {
 
     // If we're on the last line, move to end
     if line_end == text.len() {
-        state.cursor_position = text.len();
+        state.set_cursor_position(text.len());
         return;
     }
 
@@ -1278,7 +1350,7 @@ fn move_cursor_down(state: &mut AppState) {
     let next_line_len = next_line_end - next_line_start;
 
     // Move to the same column on the next line, or end of line if shorter
-    state.cursor_position = next_line_start + col.min(next_line_len);
+    state.set_cursor_position(next_line_start + col.min(next_line_len));
 }
 
 /// Extract table name from a query (simple heuristic for SELECT ... FROM table)
@@ -1383,8 +1455,9 @@ async fn handle_save_row(state: &mut AppState) {
             quote_chars.0,
             quote_chars.1,
         ) {
-            state.query_input = query;
-            state.cursor_position = state.query_input.len();
+            let query_len = query.len();
+            state.set_query(query);
+            state.set_cursor_position(query_len);
             state.set_status("Debug: UPDATE query copied to editor (not executed)");
         } else {
             state.set_status("Debug: No changes to generate query");
@@ -1474,8 +1547,9 @@ async fn handle_insert_row(state: &mut AppState) {
             quote_chars.0,
             quote_chars.1,
         ) {
-            state.query_input = query;
-            state.cursor_position = state.query_input.len();
+            let query_len = query.len();
+            state.set_query(query);
+            state.set_cursor_position(query_len);
             state.set_status("Debug: INSERT query copied to editor (not executed)");
         } else {
             state.set_status("Debug: No columns to insert");

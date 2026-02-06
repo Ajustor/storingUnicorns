@@ -301,7 +301,9 @@ impl SchemaService {
             crate::models::DatabaseType::Postgres => ('"', '"'),
             crate::models::DatabaseType::MySQL => ('`', '`'),
             crate::models::DatabaseType::SQLite => ('"', '"'),
-            crate::models::DatabaseType::SQLServer | crate::models::DatabaseType::Azure => ('[', ']'),
+            crate::models::DatabaseType::SQLServer | crate::models::DatabaseType::Azure => {
+                ('[', ']')
+            }
         }
     }
 }

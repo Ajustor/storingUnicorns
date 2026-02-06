@@ -61,7 +61,7 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     constraints.push(Constraint::Length(3)); // Username
     constraints.push(Constraint::Length(3)); // Password
     constraints.push(Constraint::Length(3)); // Database
-    constraints.push(Constraint::Min(1));    // Spacer
+    constraints.push(Constraint::Min(1)); // Spacer
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -98,10 +98,7 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
         frame.render_widget(paragraph, area);
 
         // Show cursor for active text field (not for cycle fields)
-        if is_active
-            && field != ConnectionField::DbType
-            && field != ConnectionField::AzureAuth
-        {
+        if is_active && field != ConnectionField::DbType && field != ConnectionField::AzureAuth {
             let cursor_x = area.x + label.len() as u16 + 2 + nc.cursor_position as u16;
             let cursor_y = area.y;
             frame.set_cursor_position((cursor_x.min(area.x + area.width - 1), cursor_y));

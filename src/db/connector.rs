@@ -56,9 +56,7 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) => {
                 sqlserver::execute_query(client, query).await?
             }
-            DatabaseConnection::Azure(client) => {
-                azure::execute_query(client, query).await?
-            }
+            DatabaseConnection::Azure(client) => azure::execute_query(client, query).await?,
         };
 
         Ok(QueryResult {

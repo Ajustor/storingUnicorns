@@ -995,7 +995,7 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
                 ("Enter", "Select"),
                 ("s", "Schema"),
                 ("Ctrl+R", "Refresh"),
-                ("Ctrl+±", "Resize"),
+                ("Alt+±", "Resize"),
             ],
             ActivePanel::QueryEditor => {
                 if state.has_selection() {
@@ -1010,7 +1010,7 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
                         ("F5", "Execute"),
                         ("Ctrl+↵", "Run current"),
                         ("Shift+←→", "Select"),
-                        ("Ctrl+±", "Resize"),
+                        ("Alt+±", "Resize"),
                     ]
                 }
             }
@@ -1018,7 +1018,7 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
                 ("/", "Filter"),
                 ("↑/↓", "Navigate"),
                 ("Enter", "Edit"),
-                ("Ctrl+±", "Resize"),
+                ("Alt+±", "Resize"),
             ],
         }
     };

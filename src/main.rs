@@ -1337,7 +1337,6 @@ fn handle_column_editor_input(
     key: KeyCode,
     current_column: services::ColumnDefinition,
 ) -> bool {
-    use crate::services::ColumnDefinition;
     use crate::ui::modals::SchemaAction;
 
     match key {

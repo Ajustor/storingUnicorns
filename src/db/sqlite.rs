@@ -152,6 +152,7 @@ pub async fn get_primary_keys(pool: &SqlitePool, table_name: &str) -> Result<Vec
 }
 
 /// Get column names for a table (for autocompletion)
+#[allow(dead_code)]
 pub async fn get_table_columns(pool: &SqlitePool, table_name: &str) -> Result<Vec<String>> {
     let table = table_name.trim_matches('"').replace("main.", "");
     let query = format!("PRAGMA table_info('{}')", table);

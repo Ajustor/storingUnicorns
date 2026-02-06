@@ -137,6 +137,7 @@ impl TableCache {
 
 /// Represents a pending fetch request for table columns
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PendingFetch {
     pub table_name: String,
     pub requested_at: Instant,
@@ -144,6 +145,7 @@ pub struct PendingFetch {
 
 /// Manages async fetching of table metadata
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FetchQueue {
     /// Tables currently being fetched
     in_progress: Arc<RwLock<HashMap<String, Instant>>>,
@@ -158,6 +160,7 @@ impl Default for FetchQueue {
 }
 
 impl FetchQueue {
+    #[allow(dead_code)]
     pub fn new(timeout: Duration) -> Self {
         Self {
             in_progress: Arc::new(RwLock::new(HashMap::new())),
@@ -166,6 +169,7 @@ impl FetchQueue {
     }
 
     /// Check if a table fetch is already in progress
+    #[allow(dead_code)]
     pub async fn is_fetching(&self, table_name: &str) -> bool {
         let in_progress = self.in_progress.read().await;
         if let Some(started) = in_progress.get(table_name) {
@@ -177,6 +181,7 @@ impl FetchQueue {
     }
 
     /// Mark a table as being fetched
+    #[allow(dead_code)]
     pub async fn start_fetch(&self, table_name: String) -> bool {
         let mut in_progress = self.in_progress.write().await;
 
@@ -192,12 +197,14 @@ impl FetchQueue {
     }
 
     /// Mark a fetch as complete
+    #[allow(dead_code)]
     pub async fn complete_fetch(&self, table_name: &str) {
         let mut in_progress = self.in_progress.write().await;
         in_progress.remove(table_name);
     }
 
     /// Clean up timed-out fetches
+    #[allow(dead_code)]
     pub async fn cleanup(&self) {
         let mut in_progress = self.in_progress.write().await;
         in_progress.retain(|_, started| started.elapsed() < self.timeout);

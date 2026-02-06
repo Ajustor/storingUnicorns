@@ -186,6 +186,7 @@ impl DatabaseConnection {
     }
 
     /// Get column names for a specific table (for autocompletion)
+    #[allow(dead_code)]
     pub async fn get_table_columns(&self, table_name: &str) -> Result<Vec<String>> {
         match self {
             DatabaseConnection::Postgres(pool) => {

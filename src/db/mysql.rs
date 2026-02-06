@@ -182,6 +182,7 @@ pub async fn get_primary_keys(pool: &MySqlPool, table_name: &str) -> Result<Vec<
 }
 
 /// Get column names for a table (for autocompletion)
+#[allow(dead_code)]
 pub async fn get_table_columns(pool: &MySqlPool, table_name: &str) -> Result<Vec<String>> {
     // Parse schema.table or just table
     let (schema, table) = if table_name.contains('.') {
@@ -256,12 +257,14 @@ pub async fn get_table_column_details(
 
     Ok(rows
         .into_iter()
-        .map(|(name, type_name, nullable, column_key)| crate::models::Column {
-            name,
-            type_name,
-            nullable: nullable == "YES",
-            is_primary_key: column_key == "PRI",
-        })
+        .map(
+            |(name, type_name, nullable, column_key)| crate::models::Column {
+                name,
+                type_name,
+                nullable: nullable == "YES",
+                is_primary_key: column_key == "PRI",
+            },
+        )
         .collect())
 }
 

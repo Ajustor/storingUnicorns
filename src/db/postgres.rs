@@ -160,6 +160,7 @@ pub async fn get_primary_keys(pool: &PgPool, table_name: &str) -> Result<Vec<Str
 }
 
 /// Get column names for a table (for autocompletion)
+#[allow(dead_code)]
 pub async fn get_table_columns(pool: &PgPool, table_name: &str) -> Result<Vec<String>> {
     // Parse schema.table or just table
     let (schema, table) = if table_name.contains('.') {

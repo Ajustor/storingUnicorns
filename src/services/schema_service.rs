@@ -27,6 +27,7 @@ impl Default for ColumnDefinition {
 
 /// Types of schema modifications
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum SchemaModification {
     AddColumn {
         table_name: String,

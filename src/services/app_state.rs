@@ -190,6 +190,7 @@ pub struct AppState {
 
     // Table column cache for autocompletion
     pub table_cache: TableCache,
+    #[allow(dead_code)]
     pub fetch_queue: FetchQueue,
     pub current_table_context: Option<String>, // Table detected from current query
 

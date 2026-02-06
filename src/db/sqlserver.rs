@@ -177,10 +177,7 @@ pub async fn get_column_nullability(
 }
 
 /// Get primary key columns for a table
-pub async fn get_primary_keys(
-    client: &SqlServerClient,
-    table_name: &str,
-) -> Result<Vec<String>> {
+pub async fn get_primary_keys(client: &SqlServerClient, table_name: &str) -> Result<Vec<String>> {
     // Parse schema.table or just table
     let (schema, table) = if table_name.contains('.') {
         let parts: Vec<&str> = table_name.split('.').collect();
@@ -215,6 +212,7 @@ pub async fn get_primary_keys(
 }
 
 /// Get column names for a table (for autocompletion)
+#[allow(dead_code)]
 pub async fn get_table_columns(client: &SqlServerClient, table_name: &str) -> Result<Vec<String>> {
     // Parse schema.table or just table
     let (schema, table) = if table_name.contains('.') {

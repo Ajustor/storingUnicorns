@@ -1,11 +1,35 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AzureAuthMethod {
+    Credentials,     // SQL Server authentication (username/password)
+    Interactive,     // Azure AD Interactive login
+    ManagedIdentity, // Azure managed identity
+}
+
+impl Default for AzureAuthMethod {
+    fn default() -> Self {
+        Self::Credentials
+    }
+}
+
+impl std::fmt::Display for AzureAuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AzureAuthMethod::Credentials => write!(f, "SQL Auth"),
+            AzureAuthMethod::Interactive => write!(f, "Azure AD"),
+            AzureAuthMethod::ManagedIdentity => write!(f, "Managed Identity"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DatabaseType {
     Postgres,
     MySQL,
     SQLite,
     SQLServer,
+    Azure,
 }
 
 impl std::fmt::Display for DatabaseType {
@@ -15,6 +39,7 @@ impl std::fmt::Display for DatabaseType {
             DatabaseType::MySQL => write!(f, "MySQL"),
             DatabaseType::SQLite => write!(f, "SQLite"),
             DatabaseType::SQLServer => write!(f, "SQL Server"),
+            DatabaseType::Azure => write!(f, "Azure SQL"),
         }
     }
 }
@@ -28,6 +53,10 @@ pub struct ConnectionConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub database: String,
+    #[serde(default)]
+    pub azure_auth_method: Option<AzureAuthMethod>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 impl ConnectionConfig {
@@ -67,6 +96,16 @@ impl ConnectionConfig {
                     self.database
                 )
             }
+            DatabaseType::Azure => {
+                // Azure SQL Database - displayed connection info
+                format!(
+                    "azure://{}@{}:{}/{}",
+                    self.username.as_deref().unwrap_or("<username>"),
+                    self.host.as_deref().unwrap_or("*.database.windows.net"),
+                    self.port.unwrap_or(1433),
+                    self.database
+                )
+            }
         }
     }
 }
@@ -81,6 +120,8 @@ impl Default for ConnectionConfig {
             username: Some(String::from("postgres")),
             password: None,
             database: String::from("postgres"),
+            azure_auth_method: None,
+            tenant_id: None,
         }
     }
 }

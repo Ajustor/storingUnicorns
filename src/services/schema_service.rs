@@ -149,7 +149,7 @@ impl SchemaService {
                         quote_end
                     )
                 }
-                crate::models::DatabaseType::SQLServer => {
+                crate::models::DatabaseType::SQLServer | crate::models::DatabaseType::Azure => {
                     format!(
                         "EXEC sp_rename '{}.{}', '{}', 'COLUMN'",
                         table_name, old_name, new_name
@@ -187,7 +187,7 @@ impl SchemaService {
                             column.name, column.data_type
                         )
                     }
-                    crate::models::DatabaseType::SQLServer => {
+                    crate::models::DatabaseType::SQLServer | crate::models::DatabaseType::Azure => {
                         format!(
                             "ALTER TABLE {} ALTER COLUMN {}{}{} {}{}",
                             table_name,
@@ -237,7 +237,7 @@ impl SchemaService {
                 crate::models::DatabaseType::SQLite => {
                     format!("ALTER TABLE {} RENAME TO {}", old_name, new_name)
                 }
-                crate::models::DatabaseType::SQLServer => {
+                crate::models::DatabaseType::SQLServer | crate::models::DatabaseType::Azure => {
                     format!("EXEC sp_rename '{}', '{}'", old_name, new_name)
                 }
             },
@@ -275,7 +275,7 @@ impl SchemaService {
                         quote_start, index_name, quote_end, table_name
                     )
                 }
-                crate::models::DatabaseType::SQLServer => {
+                crate::models::DatabaseType::SQLServer | crate::models::DatabaseType::Azure => {
                     format!(
                         "DROP INDEX {}{}{} ON {}",
                         quote_start, index_name, quote_end, table_name
@@ -301,7 +301,7 @@ impl SchemaService {
             crate::models::DatabaseType::Postgres => ('"', '"'),
             crate::models::DatabaseType::MySQL => ('`', '`'),
             crate::models::DatabaseType::SQLite => ('"', '"'),
-            crate::models::DatabaseType::SQLServer => ('[', ']'),
+            crate::models::DatabaseType::SQLServer | crate::models::DatabaseType::Azure => ('[', ']'),
         }
     }
 }
@@ -354,7 +354,7 @@ pub fn get_common_data_types(db_type: &crate::models::DatabaseType) -> Vec<&'sta
             "JSON",
         ],
         crate::models::DatabaseType::SQLite => vec!["INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC"],
-        crate::models::DatabaseType::SQLServer => vec![
+        crate::models::DatabaseType::SQLServer | crate::models::DatabaseType::Azure => vec![
             "INT",
             "BIGINT",
             "SMALLINT",

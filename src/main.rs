@@ -4,7 +4,12 @@ mod models;
 mod services;
 mod ui;
 
-use std::{fs::File, io, sync::Arc, time::Instant};
+use std::{
+    fs::File,
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use crossterm::{
@@ -17,8 +22,11 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+use update_notifier::check_version;
+
 use config::AppConfig;
 use db::DatabaseConnection;
+use models::{AzureAuthMethod, DatabaseType};
 use services::{ActivePanel, AppState, ColumnDefinition, ConnectionField, DialogMode};
 use ui::{render_ui, ClickableRegistry};
 
@@ -712,6 +720,13 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
     }
 
+    check_version(
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        Duration::from_secs(60 * 60 * 24),
+    )
+    .ok();
+
     Ok(())
 }
 
@@ -864,7 +879,12 @@ async fn handle_mouse_event<B: ratatui::backend::Backend>(
                     PanelType::Connections => state.active_panel = ActivePanel::Connections,
                     PanelType::Tables => state.active_panel = ActivePanel::Tables,
                     PanelType::QueryEditor => state.active_panel = ActivePanel::QueryEditor,
-                    PanelType::Results => state.active_panel = ActivePanel::Results,
+                    PanelType::Results => {
+                        // Only allow selecting Results panel if it's visible
+                        if state.should_show_results() {
+                            state.active_panel = ActivePanel::Results;
+                        }
+                    }
                 }
             }
             None => {}
@@ -931,21 +951,25 @@ fn handle_scroll(
             }
         }
         Some(ClickableType::ResultRow(_)) | Some(ClickableType::Panel(PanelType::Results)) => {
-            // Scroll results
-            if let Some(ref result) = state.query_result {
-                let max_scroll = result.rows.len().saturating_sub(1);
-                if direction > 0 {
-                    // Scroll down
-                    if state.results_scroll < max_scroll {
-                        state.results_scroll += 1;
+            // Scroll results - only if results are visible
+            if state.should_show_results() {
+                if let Some(ref _result) = state.query_result {
+                    // Get filtered rows to account for filter
+                    let filtered_rows = state.get_filtered_results().unwrap_or_default();
+                    let max_scroll = filtered_rows.len().saturating_sub(1);
+                    if direction > 0 {
+                        // Scroll down
+                        if state.results_scroll < max_scroll {
+                            state.results_scroll += 1;
+                        }
+                    } else {
+                        // Scroll up
+                        state.results_scroll = state.results_scroll.saturating_sub(1);
                     }
-                } else {
-                    // Scroll up
-                    state.results_scroll = state.results_scroll.saturating_sub(1);
-                }
-                // Keep selection visible
-                if state.selected_row < state.results_scroll {
-                    state.selected_row = state.results_scroll;
+                    // Keep selection visible
+                    if state.selected_row < state.results_scroll {
+                        state.selected_row = state.results_scroll;
+                    }
                 }
             }
         }
@@ -1037,13 +1061,13 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
             return;
         }
         KeyCode::Tab | KeyCode::Down => {
-            // Move to next field
-            nc.active_field = nc.active_field.next();
+            // Move to next field (skip Azure-specific fields if not Azure)
+            nc.active_field = nc.active_field.next_for(&nc.db_type, &nc.azure_auth_method);
             nc.cursor_position = nc.get_active_field_value().len();
         }
         KeyCode::BackTab | KeyCode::Up => {
-            // Move to previous field
-            nc.active_field = nc.active_field.prev();
+            // Move to previous field (skip Azure-specific fields if not Azure)
+            nc.active_field = nc.active_field.prev_for(&nc.db_type, &nc.azure_auth_method);
             nc.cursor_position = nc.get_active_field_value().len();
         }
         KeyCode::Left if nc.active_field == ConnectionField::DbType => {
@@ -1051,6 +1075,12 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
         }
         KeyCode::Right if nc.active_field == ConnectionField::DbType => {
             nc.cycle_db_type();
+        }
+        KeyCode::Left if nc.active_field == ConnectionField::AzureAuth => {
+            nc.cycle_azure_auth_method();
+        }
+        KeyCode::Right if nc.active_field == ConnectionField::AzureAuth => {
+            nc.cycle_azure_auth_method();
         }
         KeyCode::Enter => {
             // Save the connection
@@ -1552,8 +1582,6 @@ fn handle_column_editor_input(
     key: KeyCode,
     current_column: services::ColumnDefinition,
 ) -> bool {
-    use crate::ui::modals::SchemaAction;
-
     match key {
         KeyCode::Esc => {
             state.schema_action = None;
@@ -1749,7 +1777,46 @@ async fn handle_connect<B: ratatui::backend::Backend>(
     let temp_registry = ClickableRegistry::new();
     let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
 
-    match DatabaseConnection::connect(&conn_config).await {
+    // Azure Interactive auth needs special handling to display device code
+    let is_azure_interactive = conn_config.db_type == DatabaseType::Azure
+        && conn_config
+            .azure_auth_method
+            .as_ref()
+            .map_or(false, |m| *m == AzureAuthMethod::Interactive);
+
+    let result = if is_azure_interactive {
+        let tenant_id = conn_config.tenant_id.as_deref().unwrap_or("common");
+
+        match db::azure::request_device_code(tenant_id).await {
+            Ok(device_code) => {
+                // Show device code in status bar so the user can see it
+                state.set_status(format!(
+                    "Code: {} — Visit: {} (browser opening...)",
+                    device_code.user_code, device_code.verification_uri
+                ));
+                let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
+
+                // Try to open the browser
+                let _ = open::that(&device_code.verification_uri);
+
+                // Poll for token, then connect
+                match db::azure::poll_for_token(tenant_id, &device_code).await {
+                    Ok(token) => {
+                        state.set_status("Authenticated! Connecting to Azure SQL...");
+                        let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
+                        db::azure::connect_with_aad_token(&conn_config, &token).await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+        .map(DatabaseConnection::Azure)
+    } else {
+        DatabaseConnection::connect(&conn_config).await
+    };
+
+    match result {
         Ok(conn) => {
             // Close existing connection if any
             if let Some(old_conn) = state.connection.take() {
@@ -2075,6 +2142,7 @@ fn get_quote_chars(state: &AppState) -> (char, char) {
             models::DatabaseType::MySQL => ('`', '`'),
             models::DatabaseType::SQLite => ('"', '"'),
             models::DatabaseType::SQLServer => ('[', ']'),
+            models::DatabaseType::Azure => ('[', ']'),
         },
         None => ('"', '"'), // Default to double quotes
     }

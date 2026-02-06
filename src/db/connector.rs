@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::models::{Column, ConnectionConfig, DatabaseType, QueryResult, SchemaInfo};
 
 pub use super::sqlserver::SqlServerClient;
-use super::{mysql, postgres, sqlite, sqlserver};
+use super::{azure, mysql, postgres, sqlite, sqlserver};
 
 /// Unified database connection handle
 pub enum DatabaseConnection {
@@ -13,6 +13,7 @@ pub enum DatabaseConnection {
     MySQL(MySqlPool),
     SQLite(SqlitePool),
     SQLServer(SqlServerClient),
+    Azure(SqlServerClient),
 }
 
 impl DatabaseConnection {
@@ -37,6 +38,10 @@ impl DatabaseConnection {
                 let client = sqlserver::connect(config).await?;
                 Ok(DatabaseConnection::SQLServer(client))
             }
+            DatabaseType::Azure => {
+                let client = azure::connect(config).await?;
+                Ok(DatabaseConnection::Azure(client))
+            }
         }
     }
 
@@ -50,6 +55,9 @@ impl DatabaseConnection {
             DatabaseConnection::SQLite(pool) => sqlite::execute_query(pool, query).await?,
             DatabaseConnection::SQLServer(client) => {
                 sqlserver::execute_query(client, query).await?
+            }
+            DatabaseConnection::Azure(client) => {
+                azure::execute_query(client, query).await?
             }
         };
 
@@ -67,6 +75,7 @@ impl DatabaseConnection {
             DatabaseConnection::MySQL(pool) => mysql::test(pool).await,
             DatabaseConnection::SQLite(pool) => sqlite::test(pool).await,
             DatabaseConnection::SQLServer(client) => sqlserver::test(client).await,
+            DatabaseConnection::Azure(client) => azure::test(client).await,
         }
     }
 
@@ -95,6 +104,7 @@ impl DatabaseConnection {
             DatabaseConnection::MySQL(pool) => mysql::get_tables_by_schema(pool).await,
             DatabaseConnection::SQLite(pool) => sqlite::get_tables_by_schema(pool).await,
             DatabaseConnection::SQLServer(client) => sqlserver::get_tables_by_schema(client).await,
+            DatabaseConnection::Azure(client) => azure::get_tables_by_schema(client).await,
         }
     }
 
@@ -118,6 +128,10 @@ impl DatabaseConnection {
                 sqlite::update_row(pool, table_name, columns, original_values, new_values).await
             }
             DatabaseConnection::SQLServer(client) => {
+                sqlserver::update_row(client, table_name, columns, original_values, new_values)
+                    .await
+            }
+            DatabaseConnection::Azure(client) => {
                 sqlserver::update_row(client, table_name, columns, original_values, new_values)
                     .await
             }
@@ -146,6 +160,9 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) => {
                 sqlserver::insert_row(client, table_name, columns, values, system_columns).await
             }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::insert_row(client, table_name, columns, values, system_columns).await
+            }
         }
     }
 
@@ -168,6 +185,9 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) => {
                 sqlserver::get_column_nullability(client, table_name).await
             }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::get_column_nullability(client, table_name).await
+            }
         }
     }
 
@@ -180,6 +200,9 @@ impl DatabaseConnection {
             DatabaseConnection::MySQL(pool) => mysql::get_primary_keys(pool, table_name).await,
             DatabaseConnection::SQLite(pool) => sqlite::get_primary_keys(pool, table_name).await,
             DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_primary_keys(client, table_name).await
+            }
+            DatabaseConnection::Azure(client) => {
                 sqlserver::get_primary_keys(client, table_name).await
             }
         }
@@ -195,6 +218,9 @@ impl DatabaseConnection {
             DatabaseConnection::MySQL(pool) => mysql::get_table_columns(pool, table_name).await,
             DatabaseConnection::SQLite(pool) => sqlite::get_table_columns(pool, table_name).await,
             DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_table_columns(client, table_name).await
+            }
+            DatabaseConnection::Azure(client) => {
                 sqlserver::get_table_columns(client, table_name).await
             }
         }
@@ -218,6 +244,9 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) => {
                 sqlserver::get_table_column_details(client, table_name).await
             }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::get_table_column_details(client, table_name).await
+            }
         }
     }
 
@@ -229,6 +258,9 @@ impl DatabaseConnection {
             DatabaseConnection::SQLite(pool) => sqlite::close(pool).await,
             DatabaseConnection::SQLServer(_) => {
                 // Tiberius client is dropped automatically
+            }
+            DatabaseConnection::Azure(_) => {
+                // Azure client is dropped automatically
             }
         }
     }

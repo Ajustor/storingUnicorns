@@ -1,3 +1,4 @@
+pub mod azure;
 mod mysql;
 mod postgres;
 mod sqlite;

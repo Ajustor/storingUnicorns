@@ -2,7 +2,7 @@ use super::query_tabs::QueryTabsState;
 use super::table_cache::{FetchQueue, TableCache};
 use crate::config::AppConfig;
 use crate::db::DatabaseConnection;
-use crate::models::{ConnectionConfig, DatabaseType, QueryResult, SchemaInfo};
+use crate::models::{AzureAuthMethod, ConnectionConfig, DatabaseType, QueryResult, SchemaInfo};
 use crate::ui::modals::SchemaAction;
 
 /// Active panel in the UI
@@ -32,6 +32,8 @@ pub enum DialogMode {
 pub enum ConnectionField {
     Name,
     DbType,
+    AzureAuth,
+    TenantId,
     Host,
     Port,
     Username,
@@ -40,10 +42,13 @@ pub enum ConnectionField {
 }
 
 impl ConnectionField {
+    /// Get the next field in the full chain (Azure-aware cycling handled separately)
     pub fn next(self) -> Self {
         match self {
             Self::Name => Self::DbType,
-            Self::DbType => Self::Host,
+            Self::DbType => Self::AzureAuth,
+            Self::AzureAuth => Self::TenantId,
+            Self::TenantId => Self::Host,
             Self::Host => Self::Port,
             Self::Port => Self::Username,
             Self::Username => Self::Password,
@@ -56,11 +61,43 @@ impl ConnectionField {
         match self {
             Self::Name => Self::Database,
             Self::DbType => Self::Name,
-            Self::Host => Self::DbType,
+            Self::AzureAuth => Self::DbType,
+            Self::TenantId => Self::AzureAuth,
+            Self::Host => Self::TenantId,
             Self::Port => Self::Host,
             Self::Username => Self::Port,
             Self::Password => Self::Username,
             Self::Database => Self::Password,
+        }
+    }
+
+    /// Get next field, skipping Azure-only fields when not relevant
+    pub fn next_for(self, db_type: &DatabaseType, auth_method: &AzureAuthMethod) -> Self {
+        let mut field = self.next();
+        // Skip Azure-only fields when not Azure type
+        while Self::should_skip(&field, db_type, auth_method) {
+            field = field.next();
+        }
+        field
+    }
+
+    /// Get previous field, skipping Azure-only fields when not relevant
+    pub fn prev_for(self, db_type: &DatabaseType, auth_method: &AzureAuthMethod) -> Self {
+        let mut field = self.prev();
+        while Self::should_skip(&field, db_type, auth_method) {
+            field = field.prev();
+        }
+        field
+    }
+
+    /// Whether this field should be skipped based on context
+    fn should_skip(field: &Self, db_type: &DatabaseType, auth_method: &AzureAuthMethod) -> bool {
+        match field {
+            Self::AzureAuth => *db_type != DatabaseType::Azure,
+            Self::TenantId => {
+                *db_type != DatabaseType::Azure || *auth_method != AzureAuthMethod::Interactive
+            }
+            _ => false,
         }
     }
 }
@@ -77,6 +114,8 @@ pub struct NewConnectionState {
     pub database: String,
     pub active_field: ConnectionField,
     pub cursor_position: usize,
+    pub azure_auth_method: AzureAuthMethod,
+    pub tenant_id: String,
 }
 
 impl Default for NewConnectionState {
@@ -91,6 +130,8 @@ impl Default for NewConnectionState {
             database: String::from("postgres"),
             active_field: ConnectionField::Name,
             cursor_position: 14, // length of "New Connection"
+            azure_auth_method: AzureAuthMethod::default(),
+            tenant_id: String::from("common"),
         }
     }
 }
@@ -117,13 +158,28 @@ impl NewConnectionState {
                 Some(self.password.clone())
             },
             database: self.database.clone(),
+            azure_auth_method: if self.db_type == DatabaseType::Azure {
+                Some(self.azure_auth_method.clone())
+            } else {
+                None
+            },
+            tenant_id: if self.db_type == DatabaseType::Azure
+                && self.azure_auth_method == AzureAuthMethod::Interactive
+                && !self.tenant_id.is_empty()
+            {
+                Some(self.tenant_id.clone())
+            } else {
+                None
+            },
         }
     }
 
     pub fn get_active_field_value(&self) -> &str {
         match self.active_field {
             ConnectionField::Name => &self.name,
-            ConnectionField::DbType => "", // handled separately
+            ConnectionField::DbType => "",    // handled separately
+            ConnectionField::AzureAuth => "", // handled separately (cycle)
+            ConnectionField::TenantId => &self.tenant_id,
             ConnectionField::Host => &self.host,
             ConnectionField::Port => &self.port,
             ConnectionField::Username => &self.username,
@@ -135,7 +191,9 @@ impl NewConnectionState {
     pub fn get_active_field_mut(&mut self) -> Option<&mut String> {
         match self.active_field {
             ConnectionField::Name => Some(&mut self.name),
-            ConnectionField::DbType => None, // handled separately
+            ConnectionField::DbType => None,    // handled separately
+            ConnectionField::AzureAuth => None, // handled separately (cycle)
+            ConnectionField::TenantId => Some(&mut self.tenant_id),
             ConnectionField::Host => Some(&mut self.host),
             ConnectionField::Port => Some(&mut self.port),
             ConnectionField::Username => Some(&mut self.username),
@@ -144,19 +202,45 @@ impl NewConnectionState {
         }
     }
 
+    pub fn cycle_azure_auth_method(&mut self) {
+        self.azure_auth_method = match self.azure_auth_method {
+            AzureAuthMethod::Credentials => AzureAuthMethod::Interactive,
+            AzureAuthMethod::Interactive => AzureAuthMethod::ManagedIdentity,
+            AzureAuthMethod::ManagedIdentity => AzureAuthMethod::Credentials,
+        };
+    }
+
     pub fn cycle_db_type(&mut self) {
         self.db_type = match self.db_type {
             DatabaseType::Postgres => DatabaseType::MySQL,
             DatabaseType::MySQL => DatabaseType::SQLite,
             DatabaseType::SQLite => DatabaseType::SQLServer,
-            DatabaseType::SQLServer => DatabaseType::Postgres,
+            DatabaseType::SQLServer => DatabaseType::Azure,
+            DatabaseType::Azure => DatabaseType::Postgres,
         };
-        // Update default port
-        self.port = match self.db_type {
-            DatabaseType::Postgres => String::from("5432"),
-            DatabaseType::MySQL => String::from("3306"),
-            DatabaseType::SQLite => String::new(),
-            DatabaseType::SQLServer => String::from("1433"),
+        // Update default port and host
+        match self.db_type {
+            DatabaseType::Postgres => {
+                self.port = String::from("5432");
+                self.host = String::from("localhost");
+            }
+            DatabaseType::MySQL => {
+                self.port = String::from("3306");
+                self.host = String::from("localhost");
+            }
+            DatabaseType::SQLite => {
+                self.port = String::new();
+                self.host = String::new();
+            }
+            DatabaseType::SQLServer => {
+                self.port = String::from("1433");
+                self.username = String::from("sa");
+                self.host = String::from("localhost");
+            }
+            DatabaseType::Azure => {
+                self.port = String::from("1433");
+                self.host = String::from("servername.database.windows.net");
+            }
         };
     }
 }
@@ -319,6 +403,14 @@ impl AppState {
                 username: conn.username.clone().unwrap_or_default(),
                 password: conn.password.clone().unwrap_or_default(),
                 database: conn.database.clone(),
+                azure_auth_method: conn
+                    .azure_auth_method
+                    .clone()
+                    .unwrap_or(AzureAuthMethod::Credentials),
+                tenant_id: conn
+                    .tenant_id
+                    .clone()
+                    .unwrap_or_else(|| "common".to_string()),
                 active_field: ConnectionField::Name,
                 cursor_position: conn.name.len(),
             };
@@ -660,6 +752,7 @@ impl AppState {
                 crate::models::DatabaseType::MySQL => ('`', '`'),
                 crate::models::DatabaseType::SQLite => ('"', '"'),
                 crate::models::DatabaseType::SQLServer => ('[', ']'),
+                crate::models::DatabaseType::Azure => ('[', ']'),
             },
             None => ('"', '"'), // Default to double quotes
         }

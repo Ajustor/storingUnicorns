@@ -7,8 +7,6 @@ license = "MIT"
 
 [[bin]]
 name = "storingUnicorns"
-path = "src/main.rs"
-required-features = ["default"]
 
 [dependencies]
 # TUI

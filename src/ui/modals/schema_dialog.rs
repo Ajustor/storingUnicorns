@@ -62,15 +62,19 @@ pub fn render_schema_dialog(frame: &mut Frame, state: &AppState) {
                     width: inner.width,
                     height: 1,
                 };
-                let hint_text = Paragraph::new(hint)
-                    .style(Style::default().fg(Color::Yellow));
+                let hint_text = Paragraph::new(hint).style(Style::default().fg(Color::Yellow));
                 frame.render_widget(hint_text, hint_area);
             }
         }
-        Some(SchemaAction::DropColumn { table_name, column_name }) => {
+        Some(SchemaAction::DropColumn {
+            table_name,
+            column_name,
+        }) => {
             render_drop_confirmation(frame, inner, table_name, column_name);
         }
-        Some(SchemaAction::RenameColumn { old_name, new_name, .. }) => {
+        Some(SchemaAction::RenameColumn {
+            old_name, new_name, ..
+        }) => {
             render_rename_column(frame, inner, old_name, new_name, state);
         }
         None => {
@@ -134,8 +138,11 @@ fn render_action_menu(frame: &mut Frame, area: Rect, state: &AppState) {
     let table_name = state.schema_table_name.as_deref().unwrap_or("Unknown");
 
     let items: Vec<ListItem> = vec![
-        ListItem::new(format!("  Table: {}", table_name))
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ListItem::new(format!("  Table: {}", table_name)).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         ListItem::new(""),
         ListItem::new("  [v] View Columns"),
         ListItem::new("  [a] Add Column"),
@@ -198,7 +205,13 @@ fn render_column_editor(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // Nullable
     let nullable_text = if column.nullable { "Yes" } else { "No" };
-    render_toggle_field(frame, chunks[2], "Nullable", nullable_text, active_field == 2);
+    render_toggle_field(
+        frame,
+        chunks[2],
+        "Nullable",
+        nullable_text,
+        active_field == 2,
+    );
 
     // Primary Key
     let pk_text = if column.is_primary_key { "Yes" } else { "No" };
@@ -249,7 +262,9 @@ fn render_columns_list(
                 .unwrap_or_default();
 
             let style = if i == state.schema_field_index {
-                Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -330,7 +345,10 @@ fn render_drop_confirmation(frame: &mut Frame, area: Rect, table_name: &str, col
     frame.render_widget(warning, chunks[0]);
 
     let help = Line::from(vec![
-        Span::styled(" Enter/y ", Style::default().bg(Color::Red).fg(Color::White)),
+        Span::styled(
+            " Enter/y ",
+            Style::default().bg(Color::Red).fg(Color::White),
+        ),
         Span::raw(" Confirm Drop "),
         Span::styled(" Esc/n ", Style::default().bg(Color::DarkGray)),
         Span::raw(" Cancel "),

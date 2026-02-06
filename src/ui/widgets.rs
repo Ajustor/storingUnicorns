@@ -25,9 +25,7 @@ fn highlight_style() -> Style {
 }
 
 fn selection_style() -> Style {
-    Style::default()
-        .bg(Color::Blue)
-        .fg(Color::White)
+    Style::default().bg(Color::Blue).fg(Color::White)
 }
 
 /// Highlight SQL with text selection overlay
@@ -38,27 +36,27 @@ fn highlight_sql_with_selection(
     sel_end: usize,
 ) -> Vec<Line<'static>> {
     use super::sql_highlight;
-    
+
     // Get the base highlighted content
     let base_lines = sql_highlight::highlight_sql(text, known_columns);
-    
+
     // If no selection or invalid range, return base
     if sel_start >= sel_end || sel_start >= text.len() {
         return base_lines;
     }
-    
+
     // Apply selection highlighting character by character
     let mut result_lines: Vec<Line<'static>> = Vec::new();
     let mut char_idx = 0;
-    
+
     for line in base_lines {
         let mut new_spans: Vec<Span<'static>> = Vec::new();
-        
+
         for span in line.spans {
             let span_text = span.content.to_string();
             let span_start = char_idx;
             let span_end = char_idx + span_text.len();
-            
+
             // Check if this span overlaps with selection
             if span_end <= sel_start || span_start >= sel_end {
                 // No overlap, keep original span
@@ -67,7 +65,7 @@ fn highlight_sql_with_selection(
                 // Has overlap, split the span
                 let overlap_start = sel_start.max(span_start);
                 let overlap_end = sel_end.min(span_end);
-                
+
                 // Before selection
                 if overlap_start > span_start {
                     let before = &span_text[..(overlap_start - span_start)];
@@ -75,7 +73,7 @@ fn highlight_sql_with_selection(
                         new_spans.push(Span::styled(before.to_string(), span.style));
                     }
                 }
-                
+
                 // Selected part
                 let selected_start = overlap_start - span_start;
                 let selected_end = overlap_end - span_start;
@@ -83,7 +81,7 @@ fn highlight_sql_with_selection(
                 if !selected.is_empty() {
                     new_spans.push(Span::styled(selected.to_string(), selection_style()));
                 }
-                
+
                 // After selection
                 if overlap_end < span_end {
                     let after = &span_text[(overlap_end - span_start)..];
@@ -92,16 +90,16 @@ fn highlight_sql_with_selection(
                     }
                 }
             }
-            
+
             char_idx = span_end;
         }
-        
+
         // Account for newline
         char_idx += 1;
-        
+
         result_lines.push(Line::from(new_spans));
     }
-    
+
     result_lines
 }
 
@@ -239,17 +237,19 @@ pub fn render_tables_panel(
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        
+
         let filter_text = if state.tables_filter.is_empty() && !state.tables_filter_active {
             "🔍 Press / to filter...".to_string()
         } else {
             format!("🔍 {}", state.tables_filter)
         };
 
-        let filter_block = Paragraph::new(filter_text)
-            .style(filter_style)
-            .block(Block::default().borders(Borders::ALL).border_style(filter_style));
-        
+        let filter_block = Paragraph::new(filter_text).style(filter_style).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(filter_style),
+        );
+
         frame.render_widget(filter_block, filter_rect);
 
         // Show cursor in filter input
@@ -279,29 +279,26 @@ pub fn render_tables_panel(
 
     for (schema_idx, schema, filtered_tables) in &filtered_schemas {
         // Schema header
-        let is_schema_selected =
-            *schema_idx == state.selected_schema && state.selected_table == 0 && is_active && !state.tables_filter_active;
+        let is_schema_selected = *schema_idx == state.selected_schema
+            && state.selected_table == 0
+            && is_active
+            && !state.tables_filter_active;
         let expand_icon = if schema.expanded { "▼" } else { "▶" };
         let schema_style = if is_schema_selected {
             highlight_style()
         } else {
             Style::default().fg(Color::Yellow)
         };
-        
+
         let table_count = if state.tables_filter.is_empty() {
             schema.tables.len()
         } else {
             filtered_tables.len()
         };
-        
+
         all_items.push((
-            ListItem::new(format!(
-                "{} {} ({})",
-                expand_icon,
-                schema.name,
-                table_count
-            ))
-            .style(schema_style),
+            ListItem::new(format!("{} {} ({})", expand_icon, schema.name, table_count))
+                .style(schema_style),
             Some((*schema_idx, None)),
         ));
 
@@ -749,17 +746,19 @@ pub fn render_results_panel(
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            
+
             let filter_text = if state.results_filter.is_empty() && !state.results_filter_active {
                 "🔍 Press / to filter...".to_string()
             } else {
                 format!("🔍 {}", state.results_filter)
             };
 
-            let filter_block = Paragraph::new(filter_text)
-                .style(filter_style)
-                .block(Block::default().borders(Borders::ALL).border_style(filter_style));
-            
+            let filter_block = Paragraph::new(filter_text).style(filter_style).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(filter_style),
+            );
+
             frame.render_widget(filter_block, filter_rect);
 
             // Show cursor in filter input
@@ -830,11 +829,13 @@ pub fn render_results_panel(
             .skip(scroll_offset)
             .take(visible_height)
             .map(|(orig_idx, row)| {
-                let style = if *orig_idx == state.selected_row && is_active && !state.results_filter_active {
-                    highlight_style()
-                } else {
-                    Style::default()
-                };
+                let style =
+                    if *orig_idx == state.selected_row && is_active && !state.results_filter_active
+                    {
+                        highlight_style()
+                    } else {
+                        Style::default()
+                    };
                 let cells: Vec<String> = row.iter().skip(visible_col_start).cloned().collect();
                 Row::new(cells).style(style)
             })
@@ -864,7 +865,11 @@ pub fn render_results_panel(
             .collect();
 
         let filter_indicator = if !state.results_filter.is_empty() {
-            format!(" [filtered: {} of {}]", total_filtered_rows, result.rows.len())
+            format!(
+                " [filtered: {} of {}]",
+                total_filtered_rows,
+                result.rows.len()
+            )
         } else {
             String::new()
         };

@@ -3,28 +3,135 @@ use ratatui::text::{Line, Span};
 
 /// SQL Keywords for syntax highlighting
 const SQL_KEYWORDS: &[&str] = &[
-    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "LIKE", "BETWEEN",
-    "IS", "NULL", "TRUE", "FALSE", "AS", "ON", "JOIN", "LEFT", "RIGHT",
-    "INNER", "OUTER", "FULL", "CROSS", "NATURAL", "USING", "ORDER", "BY",
-    "ASC", "DESC", "LIMIT", "OFFSET", "GROUP", "HAVING", "DISTINCT",
-    "ALL", "UNION", "INTERSECT", "EXCEPT", "INSERT", "INTO", "VALUES",
-    "UPDATE", "SET", "DELETE", "CREATE", "TABLE", "INDEX", "VIEW",
-    "DROP", "ALTER", "ADD", "COLUMN", "PRIMARY", "KEY", "FOREIGN",
-    "REFERENCES", "CONSTRAINT", "DEFAULT", "CHECK", "UNIQUE", "CASCADE",
-    "TRUNCATE", "BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION", "GRANT",
-    "REVOKE", "TOP", "WITH", "CASE", "WHEN", "THEN", "ELSE", "END",
-    "EXISTS", "ANY", "SOME", "COALESCE", "NULLIF", "CAST", "CONVERT",
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "AND",
+    "OR",
+    "NOT",
+    "IN",
+    "LIKE",
+    "BETWEEN",
+    "IS",
+    "NULL",
+    "TRUE",
+    "FALSE",
+    "AS",
+    "ON",
+    "JOIN",
+    "LEFT",
+    "RIGHT",
+    "INNER",
+    "OUTER",
+    "FULL",
+    "CROSS",
+    "NATURAL",
+    "USING",
+    "ORDER",
+    "BY",
+    "ASC",
+    "DESC",
+    "LIMIT",
+    "OFFSET",
+    "GROUP",
+    "HAVING",
+    "DISTINCT",
+    "ALL",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "INSERT",
+    "INTO",
+    "VALUES",
+    "UPDATE",
+    "SET",
+    "DELETE",
+    "CREATE",
+    "TABLE",
+    "INDEX",
+    "VIEW",
+    "DROP",
+    "ALTER",
+    "ADD",
+    "COLUMN",
+    "PRIMARY",
+    "KEY",
+    "FOREIGN",
+    "REFERENCES",
+    "CONSTRAINT",
+    "DEFAULT",
+    "CHECK",
+    "UNIQUE",
+    "CASCADE",
+    "TRUNCATE",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "TRANSACTION",
+    "GRANT",
+    "REVOKE",
+    "TOP",
+    "WITH",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "EXISTS",
+    "ANY",
+    "SOME",
+    "COALESCE",
+    "NULLIF",
+    "CAST",
+    "CONVERT",
 ];
 
 /// SQL Functions for highlighting
 const SQL_FUNCTIONS: &[&str] = &[
-    "COUNT", "SUM", "AVG", "MIN", "MAX", "ROUND", "FLOOR", "CEIL",
-    "ABS", "UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM", "LENGTH", "LEN",
-    "SUBSTRING", "SUBSTR", "REPLACE", "CONCAT", "COALESCE", "NULLIF",
-    "NOW", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP",
-    "DATE", "TIME", "DATETIME", "YEAR", "MONTH", "DAY", "HOUR",
-    "MINUTE", "SECOND", "DATEADD", "DATEDIFF", "GETDATE", "GETUTCDATE",
-    "ISNULL", "IFNULL", "NVL", "DECODE", "IIF",
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "ROUND",
+    "FLOOR",
+    "CEIL",
+    "ABS",
+    "UPPER",
+    "LOWER",
+    "TRIM",
+    "LTRIM",
+    "RTRIM",
+    "LENGTH",
+    "LEN",
+    "SUBSTRING",
+    "SUBSTR",
+    "REPLACE",
+    "CONCAT",
+    "COALESCE",
+    "NULLIF",
+    "NOW",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "DATE",
+    "TIME",
+    "DATETIME",
+    "YEAR",
+    "MONTH",
+    "DAY",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
+    "DATEADD",
+    "DATEDIFF",
+    "GETDATE",
+    "GETUTCDATE",
+    "ISNULL",
+    "IFNULL",
+    "NVL",
+    "DECODE",
+    "IIF",
 ];
 
 /// SQL Operators
@@ -40,7 +147,7 @@ pub enum SqlToken {
     Operator(String),
     Comment(String),
     Identifier(String),
-    Column(String),      // Highlighted column from table
+    Column(String), // Highlighted column from table
     Punctuation(String),
     Whitespace(String),
 }
@@ -110,7 +217,8 @@ pub fn tokenize_sql(query: &str, known_columns: &[String]) -> Vec<SqlToken> {
         }
 
         // Numbers
-        if c.is_ascii_digit() || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit()) {
+        if c.is_ascii_digit() || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit())
+        {
             let start = i;
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
                 i += 1;
@@ -149,7 +257,10 @@ pub fn tokenize_sql(query: &str, known_columns: &[String]) -> Vec<SqlToken> {
                 tokens.push(SqlToken::Keyword(word));
             } else if SQL_FUNCTIONS.contains(&upper.as_str()) {
                 tokens.push(SqlToken::Function(word));
-            } else if known_columns.iter().any(|col| col.eq_ignore_ascii_case(&word)) {
+            } else if known_columns
+                .iter()
+                .any(|col| col.eq_ignore_ascii_case(&word))
+            {
                 tokens.push(SqlToken::Column(word));
             } else {
                 tokens.push(SqlToken::Identifier(word));
@@ -176,22 +287,10 @@ pub fn tokens_to_spans(tokens: &[SqlToken]) -> Vec<Span<'static>> {
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
-            SqlToken::Function(s) => Span::styled(
-                s.clone(),
-                Style::default().fg(Color::Yellow),
-            ),
-            SqlToken::String(s) => Span::styled(
-                s.clone(),
-                Style::default().fg(Color::Green),
-            ),
-            SqlToken::Number(s) => Span::styled(
-                s.clone(),
-                Style::default().fg(Color::Cyan),
-            ),
-            SqlToken::Operator(s) => Span::styled(
-                s.clone(),
-                Style::default().fg(Color::Red),
-            ),
+            SqlToken::Function(s) => Span::styled(s.clone(), Style::default().fg(Color::Yellow)),
+            SqlToken::String(s) => Span::styled(s.clone(), Style::default().fg(Color::Green)),
+            SqlToken::Number(s) => Span::styled(s.clone(), Style::default().fg(Color::Cyan)),
+            SqlToken::Operator(s) => Span::styled(s.clone(), Style::default().fg(Color::Red)),
             SqlToken::Comment(s) => Span::styled(
                 s.clone(),
                 Style::default()
@@ -204,14 +303,8 @@ pub fn tokens_to_spans(tokens: &[SqlToken]) -> Vec<Span<'static>> {
                     .fg(Color::LightBlue)
                     .add_modifier(Modifier::BOLD),
             ),
-            SqlToken::Identifier(s) => Span::styled(
-                s.clone(),
-                Style::default().fg(Color::White),
-            ),
-            SqlToken::Punctuation(s) => Span::styled(
-                s.clone(),
-                Style::default().fg(Color::Gray),
-            ),
+            SqlToken::Identifier(s) => Span::styled(s.clone(), Style::default().fg(Color::White)),
+            SqlToken::Punctuation(s) => Span::styled(s.clone(), Style::default().fg(Color::Gray)),
             SqlToken::Whitespace(s) => Span::raw(s.clone()),
         })
         .collect()
@@ -225,7 +318,7 @@ pub fn highlight_sql(query: &str, known_columns: &[String]) -> Vec<Line<'static>
 
     let tokens = tokenize_sql(query, known_columns);
     let spans = tokens_to_spans(&tokens);
-    
+
     // Split spans by newlines to create multiple lines
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_line_spans: Vec<Span<'static>> = Vec::new();
@@ -270,15 +363,15 @@ pub fn get_completions(
 ) -> Vec<String> {
     // Find the current word being typed
     let before_cursor = &query[..cursor_pos.min(query.len())];
-    
+
     // Find the start of the current word
     let word_start = before_cursor
         .rfind(|c: char| !c.is_alphanumeric() && c != '_')
         .map(|i| i + 1)
         .unwrap_or(0);
-    
+
     let current_word = &before_cursor[word_start..];
-    
+
     if current_word.is_empty() {
         return Vec::new();
     }
@@ -296,7 +389,7 @@ pub fn get_completions(
 
     // Check if we're in SELECT clause (before FROM)
     let in_select_clause = context_before.contains("SELECT") && !context_before.contains("FROM");
-    
+
     // Check if we're after WHERE, AND, OR, SET
     let in_condition_clause = context_before.ends_with("WHERE ")
         || context_before.ends_with("AND ")
@@ -368,7 +461,7 @@ pub fn get_completions(
 /// Extract table name from a SQL query for context-aware completion
 pub fn extract_table_from_query(query: &str) -> Option<String> {
     let query_upper = query.to_uppercase();
-    
+
     // Try to find table name after FROM
     if let Some(from_pos) = query_upper.find("FROM") {
         let after_from = query[from_pos + 4..].trim_start();
@@ -385,10 +478,14 @@ pub fn extract_table_from_query(query: &str) -> Option<String> {
             })
             .collect();
         if !table_name.is_empty() {
-            return Some(table_name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string());
+            return Some(
+                table_name
+                    .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
+                    .to_string(),
+            );
         }
     }
-    
+
     // Try UPDATE table_name
     if let Some(update_pos) = query_upper.find("UPDATE") {
         let after_update = query[update_pos + 6..].trim_start();
@@ -405,10 +502,14 @@ pub fn extract_table_from_query(query: &str) -> Option<String> {
             })
             .collect();
         if !table_name.is_empty() {
-            return Some(table_name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string());
+            return Some(
+                table_name
+                    .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
+                    .to_string(),
+            );
         }
     }
-    
+
     // Try INSERT INTO table_name
     if let Some(into_pos) = query_upper.find("INTO") {
         let after_into = query[into_pos + 4..].trim_start();
@@ -425,9 +526,13 @@ pub fn extract_table_from_query(query: &str) -> Option<String> {
             })
             .collect();
         if !table_name.is_empty() {
-            return Some(table_name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']').to_string());
+            return Some(
+                table_name
+                    .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
+                    .to_string(),
+            );
         }
     }
-    
+
     None
 }

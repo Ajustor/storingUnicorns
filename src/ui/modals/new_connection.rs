@@ -5,8 +5,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::services::{AppState, ConnectionField, DialogMode};
 use super::centered_rect;
+use crate::services::{AppState, ConnectionField, DialogMode};
 
 pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     if state.dialog_mode != DialogMode::NewConnection

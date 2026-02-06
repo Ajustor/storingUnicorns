@@ -16,4 +16,5 @@ jobs:
     uses: Ajustor/workflows/.github/workflows/cargo-release.yml@master
     with:
       targets: '["windows", "linux", "macos"]'
+      publish_to_crate: true
       # package_name: "my-binary"  # Optional: defaults to Cargo.toml name

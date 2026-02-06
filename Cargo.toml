@@ -3,7 +3,12 @@ name = "storingUnicorns"
 version = "0.3.0"
 edition = "2021"
 description = "A terminal-based database client inspired by DataGrip"
+license = "MIT"
 
+[[bin]]
+name = "storingUnicorns"
+path = "src/main.rs"
+required-features = ["default"]
 
 [dependencies]
 # TUI

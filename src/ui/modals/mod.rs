@@ -1,8 +1,10 @@
 mod edit_row;
 mod new_connection;
+mod schema_dialog;
 
 pub use edit_row::render_edit_row_dialog;
 pub use new_connection::render_new_connection_dialog;
+pub use schema_dialog::{render_schema_dialog, SchemaAction};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 

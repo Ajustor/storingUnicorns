@@ -1,7 +1,9 @@
 use super::query_tabs::QueryTabsState;
+use super::table_cache::{FetchQueue, TableCache};
 use crate::config::AppConfig;
 use crate::db::DatabaseConnection;
 use crate::models::{ConnectionConfig, DatabaseType, QueryResult, SchemaInfo};
+use crate::ui::modals::SchemaAction;
 
 /// Active panel in the UI
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,7 @@ pub enum DialogMode {
     AddRow,
     #[allow(dead_code)]
     DeleteConfirm,
+    SchemaModify,
 }
 
 /// Fields in the new connection dialog
@@ -175,15 +178,39 @@ pub struct AppState {
     pub selected_schema: usize,
     pub selected_table: usize,
     pub tables_scroll: usize,
+    pub tables_filter: String,      // Filter text for tables
+    pub tables_filter_active: bool, // Whether filter input is active
 
     // Query tabs state
     pub query_tabs: QueryTabsState,
+
+    // Text selection state
+    pub selection_start: Option<usize>, // Selection anchor position
+    pub selection_end: Option<usize>,   // Selection end position (cursor)
+
+    // Panel sizes (percentages)
+    pub sidebar_width: u16,       // Width of sidebar (default: 25)
+    pub query_editor_height: u16, // Height of query editor (default: 40)
+
+    // Autocompletion state
+    pub completion_suggestions: Vec<String>,
+    pub completion_selected: usize,
+    pub show_completion: bool,
+    pub known_columns: Vec<String>, // Columns from last query result
+
+    // Table column cache for autocompletion
+    pub table_cache: TableCache,
+    #[allow(dead_code)]
+    pub fetch_queue: FetchQueue,
+    pub current_table_context: Option<String>, // Table detected from current query
 
     // Results state
     pub query_result: Option<QueryResult>,
     pub results_scroll: usize,
     pub results_scroll_x: usize, // Horizontal scroll offset
     pub selected_row: usize,
+    pub results_filter: String,      // Filter text for results
+    pub results_filter_active: bool, // Whether filter input is active
 
     // Row editing state
     pub editing_row: Option<Vec<String>>,
@@ -197,6 +224,14 @@ pub struct AppState {
     pub dialog_mode: DialogMode,
     pub new_connection: NewConnectionState,
     pub editing_connection_index: Option<usize>,
+
+    // Schema modification state
+    pub schema_action: Option<SchemaAction>,
+    pub schema_table_name: Option<String>,
+    pub schema_field_index: usize,
+    pub schema_cursor_pos: usize,
+    /// Pending operation for column selection: "view", "modify", "drop", "rename"
+    pub schema_pending_operation: Option<String>,
 
     // Status
     pub status_message: String,
@@ -225,11 +260,26 @@ impl AppState {
             selected_schema: 0,
             selected_table: 0,
             tables_scroll: 0,
+            tables_filter: String::new(),
+            tables_filter_active: false,
             query_tabs: QueryTabsState::load().unwrap_or_default(),
+            selection_start: None,
+            selection_end: None,
+            sidebar_width: 25,
+            query_editor_height: 40,
+            completion_suggestions: Vec::new(),
+            completion_selected: 0,
+            show_completion: false,
+            known_columns: Vec::new(),
+            table_cache: TableCache::default(),
+            fetch_queue: FetchQueue::default(),
+            current_table_context: None,
             query_result: None,
             results_scroll: 0,
             results_scroll_x: 0,
             selected_row: 0,
+            results_filter: String::new(),
+            results_filter_active: false,
             editing_row: None,
             original_editing_row: None,
             editing_table_name: None,
@@ -239,6 +289,11 @@ impl AppState {
             dialog_mode: DialogMode::None,
             new_connection: NewConnectionState::default(),
             editing_connection_index: None,
+            schema_action: None,
+            schema_table_name: None,
+            schema_field_index: 0,
+            schema_cursor_pos: 0,
+            schema_pending_operation: None,
             status_message: String::from("Press ? for help"),
             is_loading: false,
             is_connecting: false,
@@ -275,10 +330,34 @@ impl AppState {
     pub fn close_dialog(&mut self) {
         self.dialog_mode = DialogMode::None;
         self.editing_connection_index = None;
+        self.schema_action = None;
+        self.schema_table_name = None;
+        self.schema_field_index = 0;
+        self.schema_cursor_pos = 0;
+        self.schema_pending_operation = None;
     }
 
     pub fn is_dialog_open(&self) -> bool {
         self.dialog_mode != DialogMode::None
+    }
+
+    /// Open the schema modification dialog for the selected table
+    pub fn open_schema_dialog(&mut self) {
+        if let Some(table_name) = self.get_selected_table_full_name() {
+            self.schema_table_name = Some(table_name);
+            self.schema_action = None;
+            self.schema_field_index = 0;
+            self.schema_cursor_pos = 0;
+            self.schema_pending_operation = None;
+            self.dialog_mode = DialogMode::SchemaModify;
+        }
+    }
+
+    /// Open schema dialog with a specific action
+    pub fn open_schema_action(&mut self, action: SchemaAction) {
+        self.schema_action = Some(action);
+        self.schema_field_index = 0;
+        self.schema_cursor_pos = 0;
     }
 
     // Query tab helper methods
@@ -307,6 +386,87 @@ impl AppState {
 
     pub fn save_query_tabs(&self) {
         let _ = self.query_tabs.save();
+    }
+
+    /// Update known columns from query result (for autocompletion)
+    pub fn update_known_columns(&mut self) {
+        if let Some(ref result) = self.query_result {
+            self.known_columns = result.columns.iter().map(|c| c.name.clone()).collect();
+        }
+    }
+
+    /// Get all known table names for autocompletion
+    pub fn get_known_tables(&self) -> Vec<String> {
+        let mut tables = Vec::new();
+        for schema in &self.schemas {
+            for table in &schema.tables {
+                tables.push(format!("{}.{}", schema.name, table));
+                tables.push(table.clone());
+            }
+        }
+        tables
+    }
+    /// Update completion suggestions based on current input
+    pub fn update_completions(&mut self) {
+        use crate::ui::sql_highlight::get_completions;
+
+        let query = self.query_input().to_string();
+        let cursor = self.cursor_position();
+        let tables = self.get_known_tables();
+
+        self.completion_suggestions = get_completions(&query, cursor, &self.known_columns, &tables);
+        self.completion_selected = 0;
+        self.show_completion = !self.completion_suggestions.is_empty();
+    }
+
+    /// Apply the selected completion
+    pub fn apply_completion(&mut self) {
+        if !self.show_completion || self.completion_suggestions.is_empty() {
+            return;
+        }
+
+        let suggestion = self.completion_suggestions[self.completion_selected].clone();
+        let query = self.query_input().to_string();
+        let cursor = self.cursor_position();
+
+        // Find the word being completed
+        let before_cursor = &query[..cursor.min(query.len())];
+        let word_start = before_cursor
+            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        // Replace the current word with the suggestion
+        let new_query = format!("{}{}{}", &query[..word_start], suggestion, &query[cursor..]);
+        let new_cursor = word_start + suggestion.len();
+
+        self.set_query(new_query);
+        self.set_cursor_position(new_cursor);
+        self.hide_completion();
+    }
+
+    /// Hide completion popup
+    pub fn hide_completion(&mut self) {
+        self.show_completion = false;
+        self.completion_suggestions.clear();
+        self.completion_selected = 0;
+    }
+
+    /// Navigate completion suggestions
+    pub fn completion_next(&mut self) {
+        if !self.completion_suggestions.is_empty() {
+            self.completion_selected =
+                (self.completion_selected + 1) % self.completion_suggestions.len();
+        }
+    }
+
+    pub fn completion_prev(&mut self) {
+        if !self.completion_suggestions.is_empty() {
+            self.completion_selected = self
+                .completion_selected
+                .checked_sub(1)
+                .unwrap_or(self.completion_suggestions.len() - 1);
+        }
     }
 
     pub fn next_panel(&mut self) {
@@ -645,6 +805,182 @@ impl AppState {
             self.results_scroll = self.selected_row;
         } else if self.selected_row >= self.results_scroll + visible_height {
             self.results_scroll = self.selected_row - visible_height + 1;
+        }
+    }
+
+    // ========== Text Selection Methods ==========
+
+    /// Check if there's an active selection
+    pub fn has_selection(&self) -> bool {
+        self.selection_start.is_some() && self.selection_end.is_some()
+    }
+
+    /// Get the selection range (start, end) normalized so start <= end
+    pub fn get_selection_range(&self) -> Option<(usize, usize)> {
+        match (self.selection_start, self.selection_end) {
+            (Some(start), Some(end)) => {
+                if start <= end {
+                    Some((start, end))
+                } else {
+                    Some((end, start))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the selected text
+    pub fn get_selected_text(&self) -> Option<String> {
+        if let Some((start, end)) = self.get_selection_range() {
+            let query = self.query_input();
+            if end <= query.len() {
+                return Some(query[start..end].to_string());
+            }
+        }
+        None
+    }
+
+    /// Start a new selection at the current cursor position
+    pub fn start_selection(&mut self) {
+        let cursor = self.cursor_position();
+        self.selection_start = Some(cursor);
+        self.selection_end = Some(cursor);
+    }
+
+    /// Extend the selection to the current cursor position
+    pub fn extend_selection(&mut self, new_pos: usize) {
+        if self.selection_start.is_some() {
+            self.selection_end = Some(new_pos);
+        }
+    }
+
+    /// Clear the selection
+    pub fn clear_selection(&mut self) {
+        self.selection_start = None;
+        self.selection_end = None;
+    }
+
+    /// Delete the selected text and return it
+    pub fn delete_selection(&mut self) -> Option<String> {
+        if let Some((start, end)) = self.get_selection_range() {
+            let selected = self.get_selected_text();
+            let query = self.query_input().to_string();
+            if end <= query.len() {
+                let new_query = format!("{}{}", &query[..start], &query[end..]);
+                self.set_query(new_query);
+                self.set_cursor_position(start);
+            }
+            self.clear_selection();
+            return selected;
+        }
+        None
+    }
+
+    /// Select all text in the query editor
+    pub fn select_all(&mut self) {
+        self.selection_start = Some(0);
+        self.selection_end = Some(self.query_input().len());
+    }
+
+    // ========== Filter Methods ==========
+
+    /// Get filtered tables based on current filter
+    pub fn get_filtered_schemas(&self) -> Vec<(usize, &SchemaInfo, Vec<(usize, &String)>)> {
+        let filter = self.tables_filter.to_lowercase();
+
+        if filter.is_empty() {
+            // No filter, return all schemas with all tables
+            return self
+                .schemas
+                .iter()
+                .enumerate()
+                .map(|(idx, schema)| {
+                    let tables: Vec<(usize, &String)> = schema.tables.iter().enumerate().collect();
+                    (idx, schema, tables)
+                })
+                .collect();
+        }
+
+        // Filter schemas and tables
+        self.schemas
+            .iter()
+            .enumerate()
+            .filter_map(|(schema_idx, schema)| {
+                // Check if schema name matches
+                let schema_matches = schema.name.to_lowercase().contains(&filter);
+
+                // Filter tables
+                let filtered_tables: Vec<(usize, &String)> = schema
+                    .tables
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, table)| table.to_lowercase().contains(&filter))
+                    .collect();
+
+                if schema_matches || !filtered_tables.is_empty() {
+                    Some((schema_idx, schema, filtered_tables))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get filtered results based on current filter
+    pub fn get_filtered_results(&self) -> Option<Vec<(usize, &Vec<String>)>> {
+        let result = self.query_result.as_ref()?;
+        let filter = self.results_filter.to_lowercase();
+
+        if filter.is_empty() {
+            // No filter, return all rows
+            return Some(result.rows.iter().enumerate().collect());
+        }
+
+        // Filter rows that contain the search term in any column
+        Some(
+            result
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.iter().any(|cell| cell.to_lowercase().contains(&filter)))
+                .collect(),
+        )
+    }
+
+    /// Check if results panel should be visible
+    pub fn should_show_results(&self) -> bool {
+        self.query_result.is_some() || self.connection_error.is_some() || self.is_connecting
+    }
+
+    // ========== Panel Resize Methods ==========
+
+    /// Adjust sidebar width
+    pub fn adjust_sidebar_width(&mut self, delta: i16) {
+        let new_width = (self.sidebar_width as i16 + delta).clamp(15, 50) as u16;
+        self.sidebar_width = new_width;
+    }
+
+    /// Adjust query editor height
+    pub fn adjust_query_editor_height(&mut self, delta: i16) {
+        let new_height = (self.query_editor_height as i16 + delta).clamp(20, 80) as u16;
+        self.query_editor_height = new_height;
+    }
+
+    /// Toggle tables filter mode
+    pub fn toggle_tables_filter(&mut self) {
+        self.tables_filter_active = !self.tables_filter_active;
+        if !self.tables_filter_active {
+            // Optionally clear filter when deactivating
+            // self.tables_filter.clear();
+        }
+    }
+
+    /// Toggle results filter mode
+    pub fn toggle_results_filter(&mut self) {
+        self.results_filter_active = !self.results_filter_active;
+        if !self.results_filter_active {
+            // Optionally clear filter when deactivating
+            // self.results_filter.clear();
         }
     }
 }

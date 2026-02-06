@@ -6,7 +6,7 @@ use ratatui::{
 use crate::services::AppState;
 
 use super::clickable::ClickableRegistry;
-use super::modals::{render_edit_row_dialog, render_new_connection_dialog};
+use super::modals::{render_edit_row_dialog, render_new_connection_dialog, render_schema_dialog};
 use super::widgets::{
     render_connections_panel, render_help_bar, render_query_editor, render_results_panel,
     render_status_bar, render_tables_panel,
@@ -51,10 +51,13 @@ pub fn render_ui(frame: &mut Frame, state: &AppState, clickable_registry: &Click
         ])
         .split(size);
 
-    // Content area: left sidebar + right main area
+    // Content area: left sidebar + right main area (resizable)
+    let sidebar_constraint = Constraint::Percentage(state.sidebar_width);
+    let main_constraint = Constraint::Percentage(100 - state.sidebar_width);
+
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(30), Constraint::Min(50)])
+        .constraints([sidebar_constraint, main_constraint])
         .split(main_chunks[0]);
 
     // Left sidebar: connections + tables
@@ -63,21 +66,38 @@ pub fn render_ui(frame: &mut Frame, state: &AppState, clickable_registry: &Click
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(content_chunks[0]);
 
-    // Right side: query editor + results
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(content_chunks[1]);
+    // Right side: query editor + results (resizable, results hidden if empty)
+    let right_chunks = if state.should_show_results() {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(state.query_editor_height),
+                Constraint::Percentage(100 - state.query_editor_height),
+            ])
+            .split(content_chunks[1])
+    } else {
+        // No results - query editor takes full height
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(100)])
+            .split(content_chunks[1])
+    };
 
     // Render all panels
     render_connections_panel(frame, sidebar_chunks[0], state, clickable_registry);
     render_tables_panel(frame, sidebar_chunks[1], state, clickable_registry);
     render_query_editor(frame, right_chunks[0], state, clickable_registry);
-    render_results_panel(frame, right_chunks[1], state, clickable_registry);
+
+    // Only render results if there's something to show
+    if state.should_show_results() && right_chunks.len() > 1 {
+        render_results_panel(frame, right_chunks[1], state, clickable_registry);
+    }
+
     render_status_bar(frame, main_chunks[1], state);
     render_help_bar(frame, main_chunks[2], state);
 
     // Render dialog overlay if active
     render_new_connection_dialog(frame, state);
     render_edit_row_dialog(frame, state);
+    render_schema_dialog(frame, state);
 }

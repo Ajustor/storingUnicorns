@@ -177,10 +177,7 @@ pub async fn get_column_nullability(
 }
 
 /// Get primary key columns for a table
-pub async fn get_primary_keys(
-    client: &SqlServerClient,
-    table_name: &str,
-) -> Result<Vec<String>> {
+pub async fn get_primary_keys(client: &SqlServerClient, table_name: &str) -> Result<Vec<String>> {
     // Parse schema.table or just table
     let (schema, table) = if table_name.contains('.') {
         let parts: Vec<&str> = table_name.split('.').collect();
@@ -212,6 +209,94 @@ pub async fn get_primary_keys(
     }
 
     Ok(primary_keys)
+}
+
+/// Get column names for a table (for autocompletion)
+#[allow(dead_code)]
+pub async fn get_table_columns(client: &SqlServerClient, table_name: &str) -> Result<Vec<String>> {
+    // Parse schema.table or just table
+    let (schema, table) = if table_name.contains('.') {
+        let parts: Vec<&str> = table_name.split('.').collect();
+        (
+            parts[0].trim_matches(|c| c == '[' || c == ']'),
+            parts[1].trim_matches(|c| c == '[' || c == ']'),
+        )
+    } else {
+        ("dbo", table_name.trim_matches(|c| c == '[' || c == ']'))
+    };
+
+    let query = format!(
+        "SELECT COLUMN_NAME 
+         FROM INFORMATION_SCHEMA.COLUMNS 
+         WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}'
+         ORDER BY ORDINAL_POSITION",
+        schema, table
+    );
+
+    let mut client = client.lock().await;
+    let stream = client.simple_query(&query).await?;
+    let rows = stream.into_first_result().await?;
+
+    let mut columns = Vec::new();
+    for row in rows {
+        let name: &str = row.try_get(0)?.unwrap_or("");
+        columns.push(name.to_string());
+    }
+
+    Ok(columns)
+}
+
+/// Get full column details for a table (for schema modification)
+pub async fn get_table_column_details(
+    client: &SqlServerClient,
+    table_name: &str,
+) -> Result<Vec<crate::models::Column>> {
+    // Parse schema.table or just table
+    let (schema, table) = if table_name.contains('.') {
+        let parts: Vec<&str> = table_name.split('.').collect();
+        (
+            parts[0].trim_matches(|c| c == '[' || c == ']'),
+            parts[1].trim_matches(|c| c == '[' || c == ']'),
+        )
+    } else {
+        ("dbo", table_name.trim_matches(|c| c == '[' || c == ']'))
+    };
+
+    // Get column info
+    let query = format!(
+        "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE,
+                CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS is_pk
+         FROM INFORMATION_SCHEMA.COLUMNS c
+         LEFT JOIN (
+             SELECT ku.TABLE_SCHEMA, ku.TABLE_NAME, ku.COLUMN_NAME
+             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku
+             WHERE OBJECTPROPERTY(OBJECT_ID(ku.CONSTRAINT_SCHEMA + '.' + QUOTENAME(ku.CONSTRAINT_NAME)), 'IsPrimaryKey') = 1
+         ) pk ON c.TABLE_SCHEMA = pk.TABLE_SCHEMA AND c.TABLE_NAME = pk.TABLE_NAME AND c.COLUMN_NAME = pk.COLUMN_NAME
+         WHERE c.TABLE_SCHEMA = '{}' AND c.TABLE_NAME = '{}'
+         ORDER BY c.ORDINAL_POSITION",
+        schema, table
+    );
+
+    let mut client = client.lock().await;
+    let stream = client.simple_query(&query).await?;
+    let rows = stream.into_first_result().await?;
+
+    let mut columns = Vec::new();
+    for row in rows {
+        let name: &str = row.try_get(0)?.unwrap_or("");
+        let type_name: &str = row.try_get(1)?.unwrap_or("");
+        let nullable: &str = row.try_get(2)?.unwrap_or("YES");
+        let is_pk: i32 = row.try_get(3)?.unwrap_or(0);
+
+        columns.push(crate::models::Column {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            nullable: nullable == "YES",
+            is_primary_key: is_pk == 1,
+        });
+    }
+
+    Ok(columns)
 }
 
 /// Test the connection

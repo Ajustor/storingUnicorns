@@ -6,8 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::services::{AppState, DialogMode};
 use super::centered_rect;
+use crate::services::{AppState, DialogMode};
 
 pub fn render_edit_row_dialog(frame: &mut Frame, state: &AppState) {
     if state.dialog_mode != DialogMode::EditRow && state.dialog_mode != DialogMode::AddRow {

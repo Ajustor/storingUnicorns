@@ -159,6 +159,83 @@ pub async fn get_primary_keys(pool: &PgPool, table_name: &str) -> Result<Vec<Str
     Ok(rows.into_iter().map(|(name,)| name).collect())
 }
 
+/// Get column names for a table (for autocompletion)
+#[allow(dead_code)]
+pub async fn get_table_columns(pool: &PgPool, table_name: &str) -> Result<Vec<String>> {
+    // Parse schema.table or just table
+    let (schema, table) = if table_name.contains('.') {
+        let parts: Vec<&str> = table_name.split('.').collect();
+        (parts[0].trim_matches('"'), parts[1].trim_matches('"'))
+    } else {
+        ("public", table_name.trim_matches('"'))
+    };
+
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT column_name 
+         FROM information_schema.columns 
+         WHERE table_schema = $1 AND table_name = $2
+         ORDER BY ordinal_position",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|(name,)| name).collect())
+}
+
+/// Get full column details for a table (for schema modification)
+pub async fn get_table_column_details(
+    pool: &PgPool,
+    table_name: &str,
+) -> Result<Vec<crate::models::Column>> {
+    // Parse schema.table or just table
+    let (schema, table) = if table_name.contains('.') {
+        let parts: Vec<&str> = table_name.split('.').collect();
+        (parts[0].trim_matches('"'), parts[1].trim_matches('"'))
+    } else {
+        ("public", table_name.trim_matches('"'))
+    };
+
+    // Get column info
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable 
+         FROM information_schema.columns 
+         WHERE table_schema = $1 AND table_name = $2
+         ORDER BY ordinal_position",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    // Get primary keys
+    let pk_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT a.attname
+         FROM pg_index i
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+         WHERE i.indrelid = ($1 || '.' || $2)::regclass
+         AND i.indisprimary",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let primary_keys: Vec<String> = pk_rows.into_iter().map(|(name,)| name).collect();
+
+    Ok(rows
+        .into_iter()
+        .map(|(name, type_name, nullable)| crate::models::Column {
+            name: name.clone(),
+            type_name,
+            nullable: nullable == "YES",
+            is_primary_key: primary_keys.contains(&name),
+        })
+        .collect())
+}
+
 /// Test the connection
 pub async fn test(pool: &PgPool) -> Result<()> {
     sqlx::query("SELECT 1").execute(pool).await?;

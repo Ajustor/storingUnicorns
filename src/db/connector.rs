@@ -185,6 +185,42 @@ impl DatabaseConnection {
         }
     }
 
+    /// Get column names for a specific table (for autocompletion)
+    #[allow(dead_code)]
+    pub async fn get_table_columns(&self, table_name: &str) -> Result<Vec<String>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::get_table_columns(pool, table_name).await
+            }
+            DatabaseConnection::MySQL(pool) => mysql::get_table_columns(pool, table_name).await,
+            DatabaseConnection::SQLite(pool) => sqlite::get_table_columns(pool, table_name).await,
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_table_columns(client, table_name).await
+            }
+        }
+    }
+
+    /// Get full column metadata for a table (for schema modification)
+    pub async fn get_table_column_details(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<crate::models::Column>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::get_table_column_details(pool, table_name).await
+            }
+            DatabaseConnection::MySQL(pool) => {
+                mysql::get_table_column_details(pool, table_name).await
+            }
+            DatabaseConnection::SQLite(pool) => {
+                sqlite::get_table_column_details(pool, table_name).await
+            }
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_table_column_details(client, table_name).await
+            }
+        }
+    }
+
     /// Close the connection
     pub async fn close(self) {
         match self {

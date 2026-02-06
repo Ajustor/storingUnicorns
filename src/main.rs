@@ -19,7 +19,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 use config::AppConfig;
 use db::DatabaseConnection;
-use services::{ActivePanel, AppState, ConnectionField, DialogMode};
+use services::{ActivePanel, AppState, ColumnDefinition, ConnectionField, DialogMode};
 use ui::{render_ui, ClickableRegistry};
 
 #[tokio::main]
@@ -114,8 +114,53 @@ async fn run_app<B: ratatui::backend::Backend>(
                             match state.dialog_mode {
                                 DialogMode::EditRow => handle_save_row(state).await,
                                 DialogMode::AddRow => handle_insert_row(state).await,
+                                DialogMode::SchemaModify => handle_schema_action(state).await,
                                 _ => {}
                             }
+                        }
+                        continue;
+                    }
+
+                    // Handle filter input modes
+                    if state.tables_filter_active {
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.tables_filter_active = false;
+                            }
+                            KeyCode::Enter => {
+                                state.tables_filter_active = false;
+                            }
+                            KeyCode::Char(c) => {
+                                state.tables_filter.push(c);
+                                state.tables_scroll = 0;
+                                state.selected_table = 0;
+                            }
+                            KeyCode::Backspace => {
+                                state.tables_filter.pop();
+                                state.tables_scroll = 0;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    if state.results_filter_active {
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.results_filter_active = false;
+                            }
+                            KeyCode::Enter => {
+                                state.results_filter_active = false;
+                            }
+                            KeyCode::Char(c) => {
+                                state.results_filter.push(c);
+                                state.results_scroll = 0;
+                            }
+                            KeyCode::Backspace => {
+                                state.results_filter.pop();
+                                state.results_scroll = 0;
+                            }
+                            _ => {}
                         }
                         continue;
                     }
@@ -173,6 +218,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 // Toggle schema expansion
                                 state.toggle_schema();
                             } else if let Some(table_name) = state.get_selected_table_full_name() {
+                                // Pre-fetch columns for autocompletion (async, cached)
+                                let _ = fetch_table_columns(state, &table_name).await;
+                                state.current_table_context = Some(table_name.clone());
+
                                 // Generate SELECT query with proper syntax for each DB type
                                 let query =
                                     if let Some(ref config) = state.current_connection_config {
@@ -196,6 +245,71 @@ async fn run_app<B: ratatui::backend::Backend>(
                         KeyCode::Char(' ') if state.active_panel == ActivePanel::Tables => {
                             if state.selected_table == 0 {
                                 state.toggle_schema();
+                            }
+                        }
+
+                        // Open schema modification dialog
+                        KeyCode::Char('s') if state.active_panel == ActivePanel::Tables => {
+                            if state.selected_table > 0 && state.is_connected() {
+                                state.open_schema_dialog();
+                            } else {
+                                state.set_status("Select a table first (not a schema)");
+                            }
+                        }
+
+                        // Activate filter mode with '/'
+                        KeyCode::Char('/') if state.active_panel == ActivePanel::Tables => {
+                            state.tables_filter_active = true;
+                        }
+                        KeyCode::Char('/') if state.active_panel == ActivePanel::Results => {
+                            if state.query_result.is_some() {
+                                state.results_filter_active = true;
+                            }
+                        }
+
+                        // Clear filter with Escape (when filter exists but not active)
+                        KeyCode::Esc
+                            if state.active_panel == ActivePanel::Tables
+                                && !state.tables_filter.is_empty() =>
+                        {
+                            state.tables_filter.clear();
+                            state.tables_scroll = 0;
+                        }
+                        KeyCode::Esc
+                            if state.active_panel == ActivePanel::Results
+                                && !state.results_filter.is_empty() =>
+                        {
+                            state.results_filter.clear();
+                            state.results_scroll = 0;
+                        }
+
+                        // Panel resizing with Ctrl+Plus/Minus
+                        KeyCode::Char('+') | KeyCode::Char('=')
+                            if key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            match state.active_panel {
+                                ActivePanel::Tables | ActivePanel::Connections => {
+                                    state.adjust_sidebar_width(5);
+                                }
+                                ActivePanel::QueryEditor => {
+                                    state.adjust_query_editor_height(5);
+                                }
+                                ActivePanel::Results => {
+                                    state.adjust_query_editor_height(-5);
+                                }
+                            }
+                        }
+                        KeyCode::Char('-') if key.modifiers.contains(KeyModifiers::ALT) => {
+                            match state.active_panel {
+                                ActivePanel::Tables | ActivePanel::Connections => {
+                                    state.adjust_sidebar_width(-5);
+                                }
+                                ActivePanel::QueryEditor => {
+                                    state.adjust_query_editor_height(-5);
+                                }
+                                ActivePanel::Results => {
+                                    state.adjust_query_editor_height(5);
+                                }
                             }
                         }
 
@@ -247,12 +361,56 @@ async fn run_app<B: ratatui::backend::Backend>(
                             handle_execute_current_query(state).await;
                         }
 
-                        // Newline in query editor
-                        KeyCode::Enter if state.active_panel == ActivePanel::QueryEditor => {
+                        // Autocompletion: Apply with Enter if completion popup is visible
+                        KeyCode::Enter
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && state.show_completion =>
+                        {
+                            state.apply_completion();
+                        }
+
+                        // Autocompletion: Navigate with Up/Down if popup is visible
+                        KeyCode::Up
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && state.show_completion =>
+                        {
+                            state.completion_prev();
+                        }
+                        KeyCode::Down
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && state.show_completion =>
+                        {
+                            state.completion_next();
+                        }
+
+                        // Autocompletion: Hide with Escape
+                        KeyCode::Esc
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && state.show_completion =>
+                        {
+                            state.hide_completion();
+                        }
+
+                        // Autocompletion: Trigger with Ctrl+Space
+                        KeyCode::Char(' ')
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            // Try to fetch table columns from context before showing completions
+                            update_completions_from_context(state).await;
+                            state.update_completions();
+                        }
+
+                        // Newline in query editor (only if completion not shown)
+                        KeyCode::Enter
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !state.show_completion =>
+                        {
                             let pos = state.cursor_position();
                             state.query_input_mut().insert(pos, '\n');
                             state.set_cursor_position(pos + 1);
                             state.query_tabs.current_tab_mut().is_modified = true;
+                            state.hide_completion();
                         }
 
                         // Query editor input (exclude Ctrl combinations)
@@ -260,40 +418,173 @@ async fn run_app<B: ratatui::backend::Backend>(
                             if state.active_panel == ActivePanel::QueryEditor
                                 && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
+                            // If there's a selection, delete it first
+                            if state.has_selection() {
+                                state.delete_selection();
+                            }
                             let pos = state.cursor_position();
                             state.query_input_mut().insert(pos, c);
                             state.set_cursor_position(pos + 1);
                             state.query_tabs.current_tab_mut().is_modified = true;
+                            // Auto-update completions while typing (if enabled)
+                            if state.show_completion {
+                                state.update_completions();
+                            }
                         }
                         KeyCode::Backspace if state.active_panel == ActivePanel::QueryEditor => {
-                            let pos = state.cursor_position();
-                            if pos > 0 {
-                                state.set_cursor_position(pos - 1);
-                                state.query_input_mut().remove(pos - 1);
+                            // If there's a selection, delete it
+                            if state.has_selection() {
+                                state.delete_selection();
                                 state.query_tabs.current_tab_mut().is_modified = true;
+                            } else {
+                                let pos = state.cursor_position();
+                                if pos > 0 {
+                                    state.set_cursor_position(pos - 1);
+                                    state.query_input_mut().remove(pos - 1);
+                                    state.query_tabs.current_tab_mut().is_modified = true;
+                                }
                             }
+                            state.hide_completion();
                         }
                         KeyCode::Delete if state.active_panel == ActivePanel::QueryEditor => {
-                            let pos = state.cursor_position();
-                            if pos < state.query_input().len() {
-                                state.query_input_mut().remove(pos);
+                            // If there's a selection, delete it
+                            if state.has_selection() {
+                                state.delete_selection();
                                 state.query_tabs.current_tab_mut().is_modified = true;
+                            } else {
+                                let pos = state.cursor_position();
+                                if pos < state.query_input().len() {
+                                    state.query_input_mut().remove(pos);
+                                    state.query_tabs.current_tab_mut().is_modified = true;
+                                }
+                            }
+                            state.hide_completion();
+                        }
+
+                        // Text selection with Shift+Arrow keys
+                        KeyCode::Left
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::SHIFT)
+                                && !state.show_completion =>
+                        {
+                            let pos = state.cursor_position();
+                            if !state.has_selection() {
+                                state.start_selection();
+                            }
+                            let new_pos = pos.saturating_sub(1);
+                            state.set_cursor_position(new_pos);
+                            state.extend_selection(new_pos);
+                        }
+                        KeyCode::Right
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::SHIFT)
+                                && !state.show_completion =>
+                        {
+                            let pos = state.cursor_position();
+                            let max_pos = state.query_input().len();
+                            if !state.has_selection() {
+                                state.start_selection();
+                            }
+                            let new_pos = (pos + 1).min(max_pos);
+                            state.set_cursor_position(new_pos);
+                            state.extend_selection(new_pos);
+                        }
+                        KeyCode::Up
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::SHIFT)
+                                && !state.show_completion =>
+                        {
+                            if !state.has_selection() {
+                                state.start_selection();
+                            }
+                            move_cursor_up(state);
+                            state.extend_selection(state.cursor_position());
+                        }
+                        KeyCode::Down
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::SHIFT)
+                                && !state.show_completion =>
+                        {
+                            if !state.has_selection() {
+                                state.start_selection();
+                            }
+                            move_cursor_down(state);
+                            state.extend_selection(state.cursor_position());
+                        }
+
+                        // Select all with Ctrl+A
+                        KeyCode::Char('a')
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            state.select_all();
+                        }
+
+                        // Copy with Ctrl+C
+                        KeyCode::Char('c')
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            if let Some(selected_text) = state.get_selected_text() {
+                                // TODO: Copy to system clipboard (requires external crate)
+                                state.set_status(format!(
+                                    "Copied {} characters",
+                                    selected_text.len()
+                                ));
                             }
                         }
-                        KeyCode::Left if state.active_panel == ActivePanel::QueryEditor => {
+
+                        // Cut with Ctrl+X
+                        KeyCode::Char('x')
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            if let Some(selected_text) = state.delete_selection() {
+                                // TODO: Copy to system clipboard (requires external crate)
+                                state.query_tabs.current_tab_mut().is_modified = true;
+                                state.set_status(format!("Cut {} characters", selected_text.len()));
+                            }
+                        }
+
+                        // Clear selection with Escape
+                        KeyCode::Esc
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && state.has_selection() =>
+                        {
+                            state.clear_selection();
+                        }
+
+                        // Normal arrow keys (clear selection on move)
+                        KeyCode::Left
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !state.show_completion =>
+                        {
+                            state.clear_selection();
                             let pos = state.cursor_position();
                             state.set_cursor_position(pos.saturating_sub(1));
                         }
-                        KeyCode::Right if state.active_panel == ActivePanel::QueryEditor => {
+                        KeyCode::Right
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !state.show_completion =>
+                        {
+                            state.clear_selection();
                             let pos = state.cursor_position();
                             if pos < state.query_input().len() {
                                 state.set_cursor_position(pos + 1);
                             }
                         }
-                        KeyCode::Up if state.active_panel == ActivePanel::QueryEditor => {
+                        KeyCode::Up
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !state.show_completion =>
+                        {
+                            state.clear_selection();
                             move_cursor_up(state);
                         }
-                        KeyCode::Down if state.active_panel == ActivePanel::QueryEditor => {
+                        KeyCode::Down
+                            if state.active_panel == ActivePanel::QueryEditor
+                                && !state.show_completion =>
+                        {
+                            state.clear_selection();
                             move_cursor_down(state);
                         }
                         KeyCode::Home if state.active_panel == ActivePanel::QueryEditor => {
@@ -727,6 +1018,7 @@ fn handle_dialog_input(state: &mut AppState, key: KeyCode, modifiers: KeyModifie
         }
         DialogMode::EditRow => handle_edit_row_dialog(state, key),
         DialogMode::AddRow => handle_add_row_dialog(state, key),
+        DialogMode::SchemaModify => handle_schema_dialog(state, key),
         DialogMode::DeleteConfirm => {
             // TODO: implement delete confirmation
             false
@@ -1043,6 +1335,401 @@ fn handle_add_row_dialog(state: &mut AppState, key: KeyCode) -> bool {
     }
 }
 
+fn handle_schema_dialog(state: &mut AppState, key: KeyCode) -> bool {
+    use crate::services::ColumnDefinition;
+    use crate::ui::modals::SchemaAction;
+
+    // If no action is selected, handle the menu
+    if state.schema_action.is_none() {
+        match key {
+            KeyCode::Esc => {
+                state.close_dialog();
+                false
+            }
+            KeyCode::Char('v') => {
+                // View columns - will trigger async fetch
+                state.schema_pending_operation = Some("view".to_string());
+                true // Signal to fetch columns
+            }
+            KeyCode::Char('a') => {
+                // Add column
+                if let Some(table_name) = state.schema_table_name.clone() {
+                    state.open_schema_action(SchemaAction::AddColumn {
+                        table_name,
+                        column: ColumnDefinition::default(),
+                    });
+                }
+                false
+            }
+            KeyCode::Char('m') => {
+                // Modify column - will trigger async fetch to select column
+                state.schema_pending_operation = Some("modify".to_string());
+                true
+            }
+            KeyCode::Char('r') => {
+                // Rename column - will trigger async fetch to select column
+                state.schema_pending_operation = Some("rename".to_string());
+                true
+            }
+            KeyCode::Char('d') => {
+                // Drop column - will trigger async fetch to select column
+                state.schema_pending_operation = Some("drop".to_string());
+                true
+            }
+            _ => false,
+        }
+    } else {
+        // Handle specific action dialogs
+        match &state.schema_action.clone() {
+            Some(SchemaAction::ViewColumns { columns }) => match key {
+                KeyCode::Esc => {
+                    state.schema_action = None;
+                    false
+                }
+                KeyCode::Up => {
+                    if state.schema_field_index > 0 {
+                        state.schema_field_index -= 1;
+                    }
+                    false
+                }
+                KeyCode::Down => {
+                    if state.schema_field_index < columns.len().saturating_sub(1) {
+                        state.schema_field_index += 1;
+                    }
+                    false
+                }
+                KeyCode::Enter => {
+                    // Open modify dialog for selected column
+                    if let Some(col) = columns.get(state.schema_field_index) {
+                        if let Some(table_name) = state.schema_table_name.clone() {
+                            state.schema_action = Some(SchemaAction::ModifyColumn {
+                                table_name,
+                                column: col.clone(),
+                                original_name: col.name.clone(),
+                            });
+                            state.schema_field_index = 0;
+                            state.schema_cursor_pos = col.name.len();
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            },
+            Some(SchemaAction::SelectColumn { columns, operation }) => match key {
+                KeyCode::Esc => {
+                    state.schema_action = None;
+                    false
+                }
+                KeyCode::Up => {
+                    if state.schema_field_index > 0 {
+                        state.schema_field_index -= 1;
+                    }
+                    false
+                }
+                KeyCode::Down => {
+                    if state.schema_field_index < columns.len().saturating_sub(1) {
+                        state.schema_field_index += 1;
+                    }
+                    false
+                }
+                KeyCode::Enter => {
+                    // Execute the selected operation on the selected column
+                    if let Some(col) = columns.get(state.schema_field_index) {
+                        if let Some(table_name) = state.schema_table_name.clone() {
+                            match operation.as_str() {
+                                "modify" => {
+                                    state.schema_action = Some(SchemaAction::ModifyColumn {
+                                        table_name,
+                                        column: col.clone(),
+                                        original_name: col.name.clone(),
+                                    });
+                                    state.schema_field_index = 0;
+                                    state.schema_cursor_pos = col.name.len();
+                                }
+                                "drop" => {
+                                    state.schema_action = Some(SchemaAction::DropColumn {
+                                        table_name,
+                                        column_name: col.name.clone(),
+                                    });
+                                }
+                                "rename" => {
+                                    state.schema_action = Some(SchemaAction::RenameColumn {
+                                        table_name,
+                                        old_name: col.name.clone(),
+                                        new_name: col.name.clone(),
+                                    });
+                                    state.schema_cursor_pos = col.name.len();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            },
+            Some(SchemaAction::AddColumn { column, .. })
+            | Some(SchemaAction::ModifyColumn { column, .. }) => {
+                handle_column_editor_input(state, key, column.clone())
+            }
+            Some(SchemaAction::DropColumn { .. }) => match key {
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    state.schema_action = None;
+                    false
+                }
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    // Execute drop
+                    true
+                }
+                _ => false,
+            },
+            Some(SchemaAction::RenameColumn { new_name, .. }) => match key {
+                KeyCode::Esc => {
+                    state.schema_action = None;
+                    false
+                }
+                KeyCode::Enter => {
+                    // Execute rename
+                    true
+                }
+                KeyCode::Char(c) => {
+                    if let Some(SchemaAction::RenameColumn {
+                        table_name,
+                        old_name,
+                        new_name,
+                    }) = state.schema_action.take()
+                    {
+                        let mut new_name = new_name;
+                        new_name.insert(state.schema_cursor_pos, c);
+                        state.schema_cursor_pos += 1;
+                        state.schema_action = Some(SchemaAction::RenameColumn {
+                            table_name,
+                            old_name,
+                            new_name,
+                        });
+                    }
+                    false
+                }
+                KeyCode::Backspace => {
+                    if state.schema_cursor_pos > 0 {
+                        if let Some(SchemaAction::RenameColumn {
+                            table_name,
+                            old_name,
+                            new_name,
+                        }) = state.schema_action.take()
+                        {
+                            let mut new_name = new_name;
+                            state.schema_cursor_pos -= 1;
+                            new_name.remove(state.schema_cursor_pos);
+                            state.schema_action = Some(SchemaAction::RenameColumn {
+                                table_name,
+                                old_name,
+                                new_name,
+                            });
+                        }
+                    }
+                    false
+                }
+                KeyCode::Left => {
+                    state.schema_cursor_pos = state.schema_cursor_pos.saturating_sub(1);
+                    false
+                }
+                KeyCode::Right => {
+                    if state.schema_cursor_pos < new_name.len() {
+                        state.schema_cursor_pos += 1;
+                    }
+                    false
+                }
+                _ => false,
+            },
+            None => false,
+        }
+    }
+}
+
+fn handle_column_editor_input(
+    state: &mut AppState,
+    key: KeyCode,
+    current_column: services::ColumnDefinition,
+) -> bool {
+    use crate::ui::modals::SchemaAction;
+
+    match key {
+        KeyCode::Esc => {
+            state.schema_action = None;
+            false
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            state.schema_field_index = (state.schema_field_index + 1) % 5;
+            // Update cursor position for text fields
+            match state.schema_field_index {
+                0 => state.schema_cursor_pos = current_column.name.len(),
+                1 => state.schema_cursor_pos = current_column.data_type.len(),
+                4 => {
+                    state.schema_cursor_pos = current_column
+                        .default_value
+                        .as_ref()
+                        .map(|s| s.len())
+                        .unwrap_or(0)
+                }
+                _ => state.schema_cursor_pos = 0,
+            }
+            false
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            state.schema_field_index = if state.schema_field_index == 0 {
+                4
+            } else {
+                state.schema_field_index - 1
+            };
+            match state.schema_field_index {
+                0 => state.schema_cursor_pos = current_column.name.len(),
+                1 => state.schema_cursor_pos = current_column.data_type.len(),
+                4 => {
+                    state.schema_cursor_pos = current_column
+                        .default_value
+                        .as_ref()
+                        .map(|s| s.len())
+                        .unwrap_or(0)
+                }
+                _ => state.schema_cursor_pos = 0,
+            }
+            false
+        }
+        KeyCode::Left | KeyCode::Right
+            if state.schema_field_index == 2 || state.schema_field_index == 3 =>
+        {
+            // Toggle boolean fields
+            let mut new_column = current_column.clone();
+            if state.schema_field_index == 2 {
+                new_column.nullable = !new_column.nullable;
+            } else {
+                new_column.is_primary_key = !new_column.is_primary_key;
+            }
+            update_schema_column(state, new_column);
+            false
+        }
+        KeyCode::Enter => {
+            // Execute add/modify
+            true
+        }
+        KeyCode::Char(c)
+            if state.schema_field_index == 0
+                || state.schema_field_index == 1
+                || state.schema_field_index == 4 =>
+        {
+            let mut new_column = current_column.clone();
+            let pos = state.schema_cursor_pos;
+            match state.schema_field_index {
+                0 => {
+                    new_column.name.insert(pos, c);
+                }
+                1 => {
+                    new_column.data_type.insert(pos, c);
+                }
+                4 => {
+                    if let Some(ref mut default) = new_column.default_value {
+                        default.insert(pos, c);
+                    } else {
+                        new_column.default_value = Some(c.to_string());
+                    }
+                }
+                _ => {}
+            }
+            state.schema_cursor_pos += 1;
+            update_schema_column(state, new_column);
+            false
+        }
+        KeyCode::Backspace
+            if state.schema_field_index == 0
+                || state.schema_field_index == 1
+                || state.schema_field_index == 4 =>
+        {
+            if state.schema_cursor_pos > 0 {
+                let mut new_column = current_column.clone();
+                state.schema_cursor_pos -= 1;
+                match state.schema_field_index {
+                    0 => {
+                        new_column.name.remove(state.schema_cursor_pos);
+                    }
+                    1 => {
+                        new_column.data_type.remove(state.schema_cursor_pos);
+                    }
+                    4 => {
+                        if let Some(ref mut default) = new_column.default_value {
+                            if !default.is_empty() {
+                                default.remove(state.schema_cursor_pos);
+                            }
+                            if default.is_empty() {
+                                new_column.default_value = None;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                update_schema_column(state, new_column);
+            }
+            false
+        }
+        KeyCode::Left
+            if state.schema_field_index == 0
+                || state.schema_field_index == 1
+                || state.schema_field_index == 4 =>
+        {
+            state.schema_cursor_pos = state.schema_cursor_pos.saturating_sub(1);
+            false
+        }
+        KeyCode::Right
+            if state.schema_field_index == 0
+                || state.schema_field_index == 1
+                || state.schema_field_index == 4 =>
+        {
+            let max_len = match state.schema_field_index {
+                0 => current_column.name.len(),
+                1 => current_column.data_type.len(),
+                4 => current_column
+                    .default_value
+                    .as_ref()
+                    .map(|s| s.len())
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            if state.schema_cursor_pos < max_len {
+                state.schema_cursor_pos += 1;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn update_schema_column(state: &mut AppState, new_column: services::ColumnDefinition) {
+    use crate::ui::modals::SchemaAction;
+
+    match state.schema_action.take() {
+        Some(SchemaAction::AddColumn { table_name, .. }) => {
+            state.schema_action = Some(SchemaAction::AddColumn {
+                table_name,
+                column: new_column,
+            });
+        }
+        Some(SchemaAction::ModifyColumn {
+            table_name,
+            original_name,
+            ..
+        }) => {
+            state.schema_action = Some(SchemaAction::ModifyColumn {
+                table_name,
+                column: new_column,
+                original_name,
+            });
+        }
+        other => {
+            state.schema_action = other;
+        }
+    }
+}
+
 async fn handle_connect<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state: &mut AppState,
@@ -1169,6 +1856,7 @@ async fn handle_execute_query(state: &mut AppState) {
             }
 
             state.query_result = Some(result);
+            state.update_known_columns(); // Update columns for autocompletion
             state.selected_row = 0;
             state.results_scroll_x = 0; // Reset horizontal scroll
             state.set_status(format!("Query executed: {} rows in {}ms", row_count, time));
@@ -1584,4 +2272,276 @@ async fn handle_insert_row(state: &mut AppState) {
     }
 
     state.close_dialog();
+}
+
+/// Handle schema modification actions
+async fn handle_schema_action(state: &mut AppState) {
+    use crate::services::SchemaService;
+    use crate::ui::modals::SchemaAction;
+
+    let table_name = match &state.schema_table_name {
+        Some(name) => name.clone(),
+        None => {
+            state.set_status("No table selected");
+            state.close_dialog();
+            return;
+        }
+    };
+
+    let db_type = match &state.current_connection_config {
+        Some(config) => config.db_type.clone(),
+        None => {
+            state.set_status("Not connected");
+            state.close_dialog();
+            return;
+        }
+    };
+
+    // Handle action based on current state
+    match &state.schema_action.clone() {
+        None => {
+            // Menu action - fetch columns for view/modify/rename/drop
+            if let Some(columns) = fetch_table_columns(state, &table_name).await {
+                let operation = state.schema_pending_operation.take();
+                match operation.as_deref() {
+                    Some("view") => {
+                        state.open_schema_action(SchemaAction::ViewColumns { columns });
+                    }
+                    Some("modify") | Some("drop") | Some("rename") => {
+                        state.open_schema_action(SchemaAction::SelectColumn {
+                            columns,
+                            operation: operation.unwrap_or_default(),
+                        });
+                    }
+                    _ => {
+                        // Default to view
+                        state.open_schema_action(SchemaAction::ViewColumns { columns });
+                    }
+                }
+            } else {
+                state.set_status("Failed to fetch table columns");
+                state.schema_pending_operation = None;
+            }
+        }
+        Some(SchemaAction::ViewColumns { .. }) | Some(SchemaAction::SelectColumn { .. }) => {
+            // Already viewing/selecting columns, nothing to do
+        }
+        Some(SchemaAction::AddColumn { column, .. }) => {
+            if column.name.is_empty() {
+                state.set_status("Column name is required");
+                return;
+            }
+
+            let modification = services::SchemaModification::AddColumn {
+                table_name: table_name.clone(),
+                column: column.clone(),
+            };
+
+            let sql = SchemaService::generate_sql(&modification, &db_type);
+
+            // Debug mode: show SQL in editor
+            if state.debug_mode {
+                let sql_len = sql.len();
+                state.set_query(sql);
+                state.set_cursor_position(sql_len);
+                state.set_status("Debug: ALTER TABLE query copied to editor (not executed)");
+                state.close_dialog();
+                return;
+            }
+
+            // Execute the SQL
+            if let Some(ref conn) = state.connection {
+                match conn.execute_query(&sql).await {
+                    Ok(_) => {
+                        state.set_status(format!("Column '{}' added successfully", column.name));
+                        // Invalidate cache
+                        state.table_cache.invalidate(&table_name).await;
+                    }
+                    Err(e) => {
+                        state.set_status(format!("Failed to add column: {}", e));
+                    }
+                }
+            }
+            state.close_dialog();
+        }
+        Some(SchemaAction::ModifyColumn {
+            column,
+            original_name,
+            ..
+        }) => {
+            let modification = services::SchemaModification::ModifyColumn {
+                table_name: table_name.clone(),
+                column: column.clone(),
+            };
+
+            let sql = SchemaService::generate_sql(&modification, &db_type);
+
+            if state.debug_mode {
+                let sql_len = sql.len();
+                state.set_query(sql);
+                state.set_cursor_position(sql_len);
+                state.set_status("Debug: ALTER TABLE query copied to editor (not executed)");
+                state.close_dialog();
+                return;
+            }
+
+            if let Some(ref conn) = state.connection {
+                match conn.execute_query(&sql).await {
+                    Ok(_) => {
+                        state.set_status(format!(
+                            "Column '{}' modified successfully",
+                            original_name
+                        ));
+                        state.table_cache.invalidate(&table_name).await;
+                    }
+                    Err(e) => {
+                        state.set_status(format!("Failed to modify column: {}", e));
+                    }
+                }
+            }
+            state.close_dialog();
+        }
+        Some(SchemaAction::DropColumn { column_name, .. }) => {
+            let modification = services::SchemaModification::DropColumn {
+                table_name: table_name.clone(),
+                column_name: column_name.clone(),
+            };
+
+            let sql = SchemaService::generate_sql(&modification, &db_type);
+
+            if state.debug_mode {
+                let sql_len = sql.len();
+                state.set_query(sql);
+                state.set_cursor_position(sql_len);
+                state.set_status("Debug: DROP COLUMN query copied to editor (not executed)");
+                state.close_dialog();
+                return;
+            }
+
+            if let Some(ref conn) = state.connection {
+                match conn.execute_query(&sql).await {
+                    Ok(_) => {
+                        state.set_status(format!("Column '{}' dropped successfully", column_name));
+                        state.table_cache.invalidate(&table_name).await;
+                    }
+                    Err(e) => {
+                        state.set_status(format!("Failed to drop column: {}", e));
+                    }
+                }
+            }
+            state.close_dialog();
+        }
+        Some(SchemaAction::RenameColumn {
+            old_name, new_name, ..
+        }) => {
+            if new_name.is_empty() {
+                state.set_status("New column name is required");
+                return;
+            }
+
+            let modification = services::SchemaModification::RenameColumn {
+                table_name: table_name.clone(),
+                old_name: old_name.clone(),
+                new_name: new_name.clone(),
+            };
+
+            let sql = SchemaService::generate_sql(&modification, &db_type);
+
+            if state.debug_mode {
+                let sql_len = sql.len();
+                state.set_query(sql);
+                state.set_cursor_position(sql_len);
+                state.set_status("Debug: RENAME COLUMN query copied to editor (not executed)");
+                state.close_dialog();
+                return;
+            }
+
+            if let Some(ref conn) = state.connection {
+                match conn.execute_query(&sql).await {
+                    Ok(_) => {
+                        state
+                            .set_status(format!("Column '{}' renamed to '{}'", old_name, new_name));
+                        state.table_cache.invalidate(&table_name).await;
+                    }
+                    Err(e) => {
+                        state.set_status(format!("Failed to rename column: {}", e));
+                    }
+                }
+            }
+            state.close_dialog();
+        }
+    }
+}
+
+/// Fetch table columns asynchronously for autocompletion or schema modification
+async fn fetch_table_columns(
+    state: &mut AppState,
+    table_name: &str,
+) -> Option<Vec<ColumnDefinition>> {
+    // Check cache first
+    if let Some(columns) = state.table_cache.get_column_details(table_name).await {
+        return Some(
+            columns
+                .into_iter()
+                .map(|c| ColumnDefinition {
+                    name: c.name,
+                    data_type: c.type_name,
+                    nullable: c.nullable,
+                    is_primary_key: c.is_primary_key,
+                    default_value: None,
+                })
+                .collect(),
+        );
+    }
+
+    // Fetch from database
+    if let Some(ref conn) = state.connection {
+        match conn.get_table_column_details(table_name).await {
+            Ok(columns) => {
+                // Store in cache
+                let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+                state
+                    .table_cache
+                    .set(table_name.to_string(), column_names, columns.clone())
+                    .await;
+
+                return Some(
+                    columns
+                        .into_iter()
+                        .map(|c| ColumnDefinition {
+                            name: c.name,
+                            data_type: c.type_name,
+                            nullable: c.nullable,
+                            is_primary_key: c.is_primary_key,
+                            default_value: None,
+                        })
+                        .collect(),
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to fetch columns for {}: {}", table_name, e);
+                state.set_status(format!("Failed to fetch columns: {}", e));
+                return None;
+            }
+        }
+    }
+
+    None
+}
+
+/// Update completions with cached table columns
+async fn update_completions_from_context(state: &mut AppState) {
+    // Extract table name from current query
+    let query = state.query_input().to_string();
+    if let Some(table_name) = crate::ui::sql_highlight::extract_table_from_query(&query) {
+        // Check if we need to fetch columns
+        if state.current_table_context.as_ref() != Some(&table_name) {
+            state.current_table_context = Some(table_name.clone());
+
+            // Fetch columns asynchronously
+            if let Some(columns) = fetch_table_columns(state, &table_name).await {
+                state.known_columns = columns.iter().map(|c| c.name.clone()).collect();
+            }
+        }
+    }
 }

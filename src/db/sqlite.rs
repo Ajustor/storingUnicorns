@@ -151,6 +151,51 @@ pub async fn get_primary_keys(pool: &SqlitePool, table_name: &str) -> Result<Vec
     Ok(primary_keys)
 }
 
+/// Get column names for a table (for autocompletion)
+#[allow(dead_code)]
+pub async fn get_table_columns(pool: &SqlitePool, table_name: &str) -> Result<Vec<String>> {
+    let table = table_name.trim_matches('"').replace("main.", "");
+    let query = format!("PRAGMA table_info('{}')", table);
+
+    let rows: Vec<SqliteRow> = sqlx::query(&query).fetch_all(pool).await?;
+
+    let mut columns = Vec::new();
+    for row in rows {
+        let name: String = row.try_get(1).unwrap_or_default();
+        columns.push(name);
+    }
+
+    Ok(columns)
+}
+
+/// Get full column details for a table (for schema modification)
+pub async fn get_table_column_details(
+    pool: &SqlitePool,
+    table_name: &str,
+) -> Result<Vec<crate::models::Column>> {
+    let table = table_name.trim_matches('"').replace("main.", "");
+    let query = format!("PRAGMA table_info('{}')", table);
+
+    let rows: Vec<SqliteRow> = sqlx::query(&query).fetch_all(pool).await?;
+
+    let mut columns = Vec::new();
+    for row in rows {
+        let name: String = row.try_get(1).unwrap_or_default();
+        let type_name: String = row.try_get(2).unwrap_or_default();
+        let notnull: i32 = row.try_get(3).unwrap_or(0);
+        let pk: i32 = row.try_get(5).unwrap_or(0);
+
+        columns.push(crate::models::Column {
+            name,
+            type_name,
+            nullable: notnull == 0,
+            is_primary_key: pk > 0,
+        });
+    }
+
+    Ok(columns)
+}
+
 /// Test the connection
 pub async fn test(pool: &SqlitePool) -> Result<()> {
     sqlx::query("SELECT 1").execute(pool).await?;

@@ -178,9 +178,19 @@ pub struct AppState {
     pub selected_schema: usize,
     pub selected_table: usize,
     pub tables_scroll: usize,
+    pub tables_filter: String,      // Filter text for tables
+    pub tables_filter_active: bool, // Whether filter input is active
 
     // Query tabs state
     pub query_tabs: QueryTabsState,
+
+    // Text selection state
+    pub selection_start: Option<usize>, // Selection anchor position
+    pub selection_end: Option<usize>,   // Selection end position (cursor)
+
+    // Panel sizes (percentages)
+    pub sidebar_width: u16,       // Width of sidebar (default: 25)
+    pub query_editor_height: u16, // Height of query editor (default: 40)
 
     // Autocompletion state
     pub completion_suggestions: Vec<String>,
@@ -199,6 +209,8 @@ pub struct AppState {
     pub results_scroll: usize,
     pub results_scroll_x: usize, // Horizontal scroll offset
     pub selected_row: usize,
+    pub results_filter: String,      // Filter text for results
+    pub results_filter_active: bool, // Whether filter input is active
 
     // Row editing state
     pub editing_row: Option<Vec<String>>,
@@ -248,7 +260,13 @@ impl AppState {
             selected_schema: 0,
             selected_table: 0,
             tables_scroll: 0,
+            tables_filter: String::new(),
+            tables_filter_active: false,
             query_tabs: QueryTabsState::load().unwrap_or_default(),
+            selection_start: None,
+            selection_end: None,
+            sidebar_width: 25,
+            query_editor_height: 40,
             completion_suggestions: Vec::new(),
             completion_selected: 0,
             show_completion: false,
@@ -260,6 +278,8 @@ impl AppState {
             results_scroll: 0,
             results_scroll_x: 0,
             selected_row: 0,
+            results_filter: String::new(),
+            results_filter_active: false,
             editing_row: None,
             original_editing_row: None,
             editing_table_name: None,
@@ -785,6 +805,182 @@ impl AppState {
             self.results_scroll = self.selected_row;
         } else if self.selected_row >= self.results_scroll + visible_height {
             self.results_scroll = self.selected_row - visible_height + 1;
+        }
+    }
+
+    // ========== Text Selection Methods ==========
+
+    /// Check if there's an active selection
+    pub fn has_selection(&self) -> bool {
+        self.selection_start.is_some() && self.selection_end.is_some()
+    }
+
+    /// Get the selection range (start, end) normalized so start <= end
+    pub fn get_selection_range(&self) -> Option<(usize, usize)> {
+        match (self.selection_start, self.selection_end) {
+            (Some(start), Some(end)) => {
+                if start <= end {
+                    Some((start, end))
+                } else {
+                    Some((end, start))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the selected text
+    pub fn get_selected_text(&self) -> Option<String> {
+        if let Some((start, end)) = self.get_selection_range() {
+            let query = self.query_input();
+            if end <= query.len() {
+                return Some(query[start..end].to_string());
+            }
+        }
+        None
+    }
+
+    /// Start a new selection at the current cursor position
+    pub fn start_selection(&mut self) {
+        let cursor = self.cursor_position();
+        self.selection_start = Some(cursor);
+        self.selection_end = Some(cursor);
+    }
+
+    /// Extend the selection to the current cursor position
+    pub fn extend_selection(&mut self, new_pos: usize) {
+        if self.selection_start.is_some() {
+            self.selection_end = Some(new_pos);
+        }
+    }
+
+    /// Clear the selection
+    pub fn clear_selection(&mut self) {
+        self.selection_start = None;
+        self.selection_end = None;
+    }
+
+    /// Delete the selected text and return it
+    pub fn delete_selection(&mut self) -> Option<String> {
+        if let Some((start, end)) = self.get_selection_range() {
+            let selected = self.get_selected_text();
+            let query = self.query_input().to_string();
+            if end <= query.len() {
+                let new_query = format!("{}{}", &query[..start], &query[end..]);
+                self.set_query(new_query);
+                self.set_cursor_position(start);
+            }
+            self.clear_selection();
+            return selected;
+        }
+        None
+    }
+
+    /// Select all text in the query editor
+    pub fn select_all(&mut self) {
+        self.selection_start = Some(0);
+        self.selection_end = Some(self.query_input().len());
+    }
+
+    // ========== Filter Methods ==========
+
+    /// Get filtered tables based on current filter
+    pub fn get_filtered_schemas(&self) -> Vec<(usize, &SchemaInfo, Vec<(usize, &String)>)> {
+        let filter = self.tables_filter.to_lowercase();
+
+        if filter.is_empty() {
+            // No filter, return all schemas with all tables
+            return self
+                .schemas
+                .iter()
+                .enumerate()
+                .map(|(idx, schema)| {
+                    let tables: Vec<(usize, &String)> = schema.tables.iter().enumerate().collect();
+                    (idx, schema, tables)
+                })
+                .collect();
+        }
+
+        // Filter schemas and tables
+        self.schemas
+            .iter()
+            .enumerate()
+            .filter_map(|(schema_idx, schema)| {
+                // Check if schema name matches
+                let schema_matches = schema.name.to_lowercase().contains(&filter);
+
+                // Filter tables
+                let filtered_tables: Vec<(usize, &String)> = schema
+                    .tables
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, table)| table.to_lowercase().contains(&filter))
+                    .collect();
+
+                if schema_matches || !filtered_tables.is_empty() {
+                    Some((schema_idx, schema, filtered_tables))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get filtered results based on current filter
+    pub fn get_filtered_results(&self) -> Option<Vec<(usize, &Vec<String>)>> {
+        let result = self.query_result.as_ref()?;
+        let filter = self.results_filter.to_lowercase();
+
+        if filter.is_empty() {
+            // No filter, return all rows
+            return Some(result.rows.iter().enumerate().collect());
+        }
+
+        // Filter rows that contain the search term in any column
+        Some(
+            result
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.iter().any(|cell| cell.to_lowercase().contains(&filter)))
+                .collect(),
+        )
+    }
+
+    /// Check if results panel should be visible
+    pub fn should_show_results(&self) -> bool {
+        self.query_result.is_some() || self.connection_error.is_some() || self.is_connecting
+    }
+
+    // ========== Panel Resize Methods ==========
+
+    /// Adjust sidebar width
+    pub fn adjust_sidebar_width(&mut self, delta: i16) {
+        let new_width = (self.sidebar_width as i16 + delta).clamp(15, 50) as u16;
+        self.sidebar_width = new_width;
+    }
+
+    /// Adjust query editor height
+    pub fn adjust_query_editor_height(&mut self, delta: i16) {
+        let new_height = (self.query_editor_height as i16 + delta).clamp(20, 80) as u16;
+        self.query_editor_height = new_height;
+    }
+
+    /// Toggle tables filter mode
+    pub fn toggle_tables_filter(&mut self) {
+        self.tables_filter_active = !self.tables_filter_active;
+        if !self.tables_filter_active {
+            // Optionally clear filter when deactivating
+            // self.tables_filter.clear();
+        }
+    }
+
+    /// Toggle results filter mode
+    pub fn toggle_results_filter(&mut self) {
+        self.results_filter_active = !self.results_filter_active;
+        if !self.results_filter_active {
+            // Optionally clear filter when deactivating
+            // self.results_filter.clear();
         }
     }
 }

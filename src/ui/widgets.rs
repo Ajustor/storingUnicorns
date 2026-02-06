@@ -24,6 +24,87 @@ fn highlight_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+fn selection_style() -> Style {
+    Style::default()
+        .bg(Color::Blue)
+        .fg(Color::White)
+}
+
+/// Highlight SQL with text selection overlay
+fn highlight_sql_with_selection(
+    text: &str,
+    known_columns: &[String],
+    sel_start: usize,
+    sel_end: usize,
+) -> Vec<Line<'static>> {
+    use super::sql_highlight;
+    
+    // Get the base highlighted content
+    let base_lines = sql_highlight::highlight_sql(text, known_columns);
+    
+    // If no selection or invalid range, return base
+    if sel_start >= sel_end || sel_start >= text.len() {
+        return base_lines;
+    }
+    
+    // Apply selection highlighting character by character
+    let mut result_lines: Vec<Line<'static>> = Vec::new();
+    let mut char_idx = 0;
+    
+    for line in base_lines {
+        let mut new_spans: Vec<Span<'static>> = Vec::new();
+        
+        for span in line.spans {
+            let span_text = span.content.to_string();
+            let span_start = char_idx;
+            let span_end = char_idx + span_text.len();
+            
+            // Check if this span overlaps with selection
+            if span_end <= sel_start || span_start >= sel_end {
+                // No overlap, keep original span
+                new_spans.push(Span::styled(span_text, span.style));
+            } else {
+                // Has overlap, split the span
+                let overlap_start = sel_start.max(span_start);
+                let overlap_end = sel_end.min(span_end);
+                
+                // Before selection
+                if overlap_start > span_start {
+                    let before = &span_text[..(overlap_start - span_start)];
+                    if !before.is_empty() {
+                        new_spans.push(Span::styled(before.to_string(), span.style));
+                    }
+                }
+                
+                // Selected part
+                let selected_start = overlap_start - span_start;
+                let selected_end = overlap_end - span_start;
+                let selected = &span_text[selected_start..selected_end];
+                if !selected.is_empty() {
+                    new_spans.push(Span::styled(selected.to_string(), selection_style()));
+                }
+                
+                // After selection
+                if overlap_end < span_end {
+                    let after = &span_text[(overlap_end - span_start)..];
+                    if !after.is_empty() {
+                        new_spans.push(Span::styled(after.to_string(), span.style));
+                    }
+                }
+            }
+            
+            char_idx = span_end;
+        }
+        
+        // Account for newline
+        char_idx += 1;
+        
+        result_lines.push(Line::from(new_spans));
+    }
+    
+    result_lines
+}
+
 pub fn render_connections_panel(
     frame: &mut Frame,
     area: Rect,
@@ -132,52 +213,105 @@ pub fn render_tables_panel(
     state: &AppState,
     registry: &ClickableRegistry,
 ) {
+    use ratatui::layout::{Constraint as LayoutConstraint, Direction, Layout};
+
     let is_active = state.active_panel == ActivePanel::Tables && !state.is_dialog_open();
 
     // Register panel area
     registry.register(area, ClickableType::Panel(PanelType::Tables));
 
+    // Split area: filter bar (if active or has content) + list
+    let has_filter = state.tables_filter_active || !state.tables_filter.is_empty();
+    let (filter_area, list_area) = if has_filter {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([LayoutConstraint::Length(3), LayoutConstraint::Min(3)])
+            .split(area);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, area)
+    };
+
+    // Render filter bar if active
+    if let Some(filter_rect) = filter_area {
+        let filter_style = if state.tables_filter_active && is_active {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        
+        let filter_text = if state.tables_filter.is_empty() && !state.tables_filter_active {
+            "🔍 Press / to filter...".to_string()
+        } else {
+            format!("🔍 {}", state.tables_filter)
+        };
+
+        let filter_block = Paragraph::new(filter_text)
+            .style(filter_style)
+            .block(Block::default().borders(Borders::ALL).border_style(filter_style));
+        
+        frame.render_widget(filter_block, filter_rect);
+
+        // Show cursor in filter input
+        if state.tables_filter_active && is_active {
+            let cursor_x = filter_rect.x + 3 + state.tables_filter.len() as u16;
+            let cursor_y = filter_rect.y + 1;
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
+
     // Calculate inner area (excluding borders)
     let inner_area = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
+        x: list_area.x + 1,
+        y: list_area.y + 1,
+        width: list_area.width.saturating_sub(2),
+        height: list_area.height.saturating_sub(2),
     };
 
     let visible_height = inner_area.height as usize;
     let scroll_offset = state.tables_scroll;
 
-    // First, build all items to get total count
+    // Get filtered schemas and tables
+    let filtered_schemas = state.get_filtered_schemas();
+
+    // Build all items from filtered schemas
     let mut all_items: Vec<(ListItem, Option<(usize, Option<usize>)>)> = Vec::new();
 
-    for (schema_idx, schema) in state.schemas.iter().enumerate() {
+    for (schema_idx, schema, filtered_tables) in &filtered_schemas {
         // Schema header
         let is_schema_selected =
-            schema_idx == state.selected_schema && state.selected_table == 0 && is_active;
+            *schema_idx == state.selected_schema && state.selected_table == 0 && is_active && !state.tables_filter_active;
         let expand_icon = if schema.expanded { "▼" } else { "▶" };
         let schema_style = if is_schema_selected {
             highlight_style()
         } else {
             Style::default().fg(Color::Yellow)
         };
+        
+        let table_count = if state.tables_filter.is_empty() {
+            schema.tables.len()
+        } else {
+            filtered_tables.len()
+        };
+        
         all_items.push((
             ListItem::new(format!(
                 "{} {} ({})",
                 expand_icon,
                 schema.name,
-                schema.tables.len()
+                table_count
             ))
             .style(schema_style),
-            Some((schema_idx, None)), // Schema click info
+            Some((*schema_idx, None)),
         ));
 
         // Tables under this schema (if expanded)
         if schema.expanded {
-            for (table_idx, table) in schema.tables.iter().enumerate() {
-                let is_table_selected = schema_idx == state.selected_schema
-                    && table_idx + 1 == state.selected_table
-                    && is_active;
+            for (table_idx, table) in filtered_tables {
+                let is_table_selected = *schema_idx == state.selected_schema
+                    && *table_idx + 1 == state.selected_table
+                    && is_active
+                    && !state.tables_filter_active;
                 let table_style = if is_table_selected {
                     highlight_style()
                 } else {
@@ -185,7 +319,7 @@ pub fn render_tables_panel(
                 };
                 all_items.push((
                     ListItem::new(format!("    {}", table)).style(table_style),
-                    Some((schema_idx, Some(table_idx))), // Table click info
+                    Some((*schema_idx, Some(*table_idx))),
                 ));
             }
         }
@@ -251,17 +385,26 @@ pub fn render_tables_panel(
         items
     };
 
+    let filter_indicator = if !state.tables_filter.is_empty() {
+        format!(" [filtered: {}]", state.tables_filter)
+    } else {
+        String::new()
+    };
+
     let title = if !state.is_connected() {
         " Tables (not connected) ".to_string()
     } else if total_items > visible_height {
         format!(
-            " Tables [{}-{}/{}] ",
+            " Tables [{}-{}/{}]{} ",
             scroll_offset + 1,
             (scroll_offset + visible_height).min(total_items),
-            total_items
+            total_items,
+            filter_indicator
         )
+    } else if !filter_indicator.is_empty() {
+        format!(" Tables{} ", filter_indicator)
     } else {
-        " Tables ".to_string()
+        " Tables [/ to filter] ".to_string()
     };
 
     let list = List::new(items)
@@ -290,7 +433,7 @@ pub fn render_tables_panel(
     let mut list_state = ListState::default();
     list_state.select(Some(visible_selection));
 
-    frame.render_stateful_widget(list, area, &mut list_state);
+    frame.render_stateful_widget(list, list_area, &mut list_state);
 }
 
 pub fn render_query_editor(
@@ -376,7 +519,7 @@ pub fn render_query_editor(
     let query_input = state.query_input();
     let cursor_position = state.cursor_position();
 
-    // Use syntax highlighting
+    // Use syntax highlighting with selection support
     let highlighted_content = if query_input.is_empty() && !is_active {
         vec![Line::from(Span::styled(
             "-- Enter SQL query here...",
@@ -385,14 +528,25 @@ pub fn render_query_editor(
                 .add_modifier(Modifier::ITALIC),
         ))]
     } else {
-        super::sql_highlight::highlight_sql(query_input, &state.known_columns)
+        // Apply selection highlighting if there's a selection
+        if let Some((sel_start, sel_end)) = state.get_selection_range() {
+            highlight_sql_with_selection(query_input, &state.known_columns, sel_start, sel_end)
+        } else {
+            super::sql_highlight::highlight_sql(query_input, &state.known_columns)
+        }
+    };
+
+    let title = if state.has_selection() {
+        " Query Editor [Ctrl+C:Copy | Ctrl+X:Cut | Ctrl+A:Select All] "
+    } else {
+        " Query Editor [F5/Ctrl+Enter | Ctrl+Space:Complete | Shift+Arrow:Select] "
     };
 
     let paragraph = Paragraph::new(highlighted_content)
         .wrap(ratatui::widgets::Wrap { trim: false })
         .block(
             Block::default()
-                .title(" Query Editor [F5/Ctrl+Enter | Ctrl+Space:Complete] ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(panel_style(is_active)),
         );
@@ -405,7 +559,7 @@ pub fn render_query_editor(
     }
 
     // Show cursor when editing (calculate position with real line breaks)
-    if is_active {
+    if is_active && !state.results_filter_active && !state.tables_filter_active {
         let inner_width = editor_area.width.saturating_sub(2) as usize; // Account for borders
         if inner_width > 0 {
             // Calculate cursor position considering actual newlines
@@ -539,6 +693,8 @@ pub fn render_results_panel(
     state: &AppState,
     registry: &ClickableRegistry,
 ) {
+    use ratatui::layout::{Constraint as LayoutConstraint, Direction, Layout};
+
     let is_active = state.active_panel == ActivePanel::Results && !state.is_dialog_open();
 
     // Register panel area
@@ -574,6 +730,50 @@ pub fn render_results_panel(
     }
 
     if let Some(ref result) = state.query_result {
+        // Split area: filter bar (if active or has content) + table
+        let has_filter = state.results_filter_active || !state.results_filter.is_empty();
+        let (filter_area, table_area) = if has_filter {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([LayoutConstraint::Length(3), LayoutConstraint::Min(3)])
+                .split(area);
+            (Some(chunks[0]), chunks[1])
+        } else {
+            (None, area)
+        };
+
+        // Render filter bar if active
+        if let Some(filter_rect) = filter_area {
+            let filter_style = if state.results_filter_active && is_active {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            
+            let filter_text = if state.results_filter.is_empty() && !state.results_filter_active {
+                "🔍 Press / to filter...".to_string()
+            } else {
+                format!("🔍 {}", state.results_filter)
+            };
+
+            let filter_block = Paragraph::new(filter_text)
+                .style(filter_style)
+                .block(Block::default().borders(Borders::ALL).border_style(filter_style));
+            
+            frame.render_widget(filter_block, filter_rect);
+
+            // Show cursor in filter input
+            if state.results_filter_active && is_active {
+                let cursor_x = filter_rect.x + 3 + state.results_filter.len() as u16;
+                let cursor_y = filter_rect.y + 1;
+                frame.set_cursor_position((cursor_x, cursor_y));
+            }
+        }
+
+        // Get filtered rows
+        let filtered_rows = state.get_filtered_results().unwrap_or_default();
+        let total_filtered_rows = filtered_rows.len();
+
         // Calculate column widths: min(30, max_content_length)
         let col_widths: Vec<u16> = result
             .columns
@@ -615,25 +815,22 @@ pub fn render_results_panel(
         // Calculate visible area for rows
         // Inner area: border (1) + header row (1) = start at y+2
         let inner_area = Rect {
-            x: area.x + 1,
-            y: area.y + 2, // +1 for border, +1 for header
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(3), // -2 for borders, -1 for header
+            x: table_area.x + 1,
+            y: table_area.y + 2, // +1 for border, +1 for header
+            width: table_area.width.saturating_sub(2),
+            height: table_area.height.saturating_sub(3), // -2 for borders, -1 for header
         };
 
         let visible_height = inner_area.height as usize;
         let scroll_offset = state.results_scroll;
-        let total_rows = result.rows.len();
 
-        // Build rows with column offset and vertical scroll
-        let rows: Vec<Row> = result
-            .rows
+        // Build rows from filtered results with column offset and vertical scroll
+        let rows: Vec<Row> = filtered_rows
             .iter()
-            .enumerate()
             .skip(scroll_offset)
             .take(visible_height)
-            .map(|(i, row)| {
-                let style = if i == state.selected_row && is_active {
+            .map(|(orig_idx, row)| {
+                let style = if *orig_idx == state.selected_row && is_active && !state.results_filter_active {
                     highlight_style()
                 } else {
                     Style::default()
@@ -644,10 +841,8 @@ pub fn render_results_panel(
             .collect();
 
         // Register clickable areas for visible result rows
-        for (display_idx, (i, _)) in result
-            .rows
+        for (display_idx, (orig_idx, _)) in filtered_rows
             .iter()
-            .enumerate()
             .skip(scroll_offset)
             .take(visible_height)
             .enumerate()
@@ -658,7 +853,7 @@ pub fn render_results_panel(
                 width: inner_area.width,
                 height: 1,
             };
-            registry.register(row_rect, ClickableType::ResultRow(i));
+            registry.register(row_rect, ClickableType::ResultRow(*orig_idx));
         }
 
         // Use calculated widths with offset
@@ -667,6 +862,12 @@ pub fn render_results_panel(
             .skip(visible_col_start)
             .map(|&w| Constraint::Length(w))
             .collect();
+
+        let filter_indicator = if !state.results_filter.is_empty() {
+            format!(" [filtered: {} of {}]", total_filtered_rows, result.rows.len())
+        } else {
+            String::new()
+        };
 
         let scroll_info = if result.columns.len() > 1 {
             format!(
@@ -678,21 +879,22 @@ pub fn render_results_panel(
             String::new()
         };
 
-        let row_scroll_info = if total_rows > visible_height {
+        let row_scroll_info = if total_filtered_rows > visible_height {
             format!(
                 " [{}-{}/{}]",
                 scroll_offset + 1,
-                (scroll_offset + visible_height).min(total_rows),
-                total_rows
+                (scroll_offset + visible_height).min(total_filtered_rows),
+                total_filtered_rows
             )
         } else {
             String::new()
         };
 
         let title = format!(
-            " Results ({} rows, {}ms){}{} [Enter to edit] ",
+            " Results ({} rows, {}ms){}{}{} [/ to filter] ",
             result.rows.len(),
             result.execution_time_ms,
+            filter_indicator,
             row_scroll_info,
             scroll_info
         );
@@ -708,12 +910,16 @@ pub fn render_results_panel(
             .row_highlight_style(highlight_style())
             .column_spacing(1);
 
-        // Adjust selection for scroll offset
-        let visible_selection = state.selected_row.saturating_sub(scroll_offset);
+        // Adjust selection for scroll offset (find position in filtered list)
+        let visible_selection = filtered_rows
+            .iter()
+            .position(|(idx, _)| *idx == state.selected_row)
+            .unwrap_or(0)
+            .saturating_sub(scroll_offset);
         let mut table_state = TableState::default();
         table_state.select(Some(visible_selection));
 
-        frame.render_stateful_widget(table, area, &mut table_state);
+        frame.render_stateful_widget(table, table_area, &mut table_state);
     } else {
         let paragraph = Paragraph::new("No results yet. Execute a query with F5.")
             .style(Style::default().fg(Color::DarkGray))
@@ -755,6 +961,20 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
             ("Esc", "Cancel"),
             ("←/→", "Cycle type"),
         ]
+    } else if state.tables_filter_active {
+        vec![
+            ("Type", "Filter"),
+            ("Enter", "Apply"),
+            ("Esc", "Cancel"),
+            ("Backspace", "Delete"),
+        ]
+    } else if state.results_filter_active {
+        vec![
+            ("Type", "Filter"),
+            ("Enter", "Apply"),
+            ("Esc", "Cancel"),
+            ("Backspace", "Delete"),
+        ]
     } else {
         match state.active_panel {
             ActivePanel::Connections => vec![
@@ -766,23 +986,34 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
                 ("q", "Quit"),
             ],
             ActivePanel::Tables => vec![
+                ("/", "Filter"),
                 ("Enter", "Select"),
                 ("s", "Schema"),
                 ("Ctrl+R", "Refresh"),
-                ("Tab", "Next panel"),
+                ("Ctrl+±", "Resize"),
             ],
             ActivePanel::QueryEditor => {
-                vec![
-                    ("F5", "Execute all"),
-                    ("Ctrl+↵", "Execute current"),
-                    ("Tab", "Next panel"),
-                ]
+                if state.has_selection() {
+                    vec![
+                        ("Ctrl+C", "Copy"),
+                        ("Ctrl+X", "Cut"),
+                        ("Ctrl+A", "Select all"),
+                        ("Esc", "Deselect"),
+                    ]
+                } else {
+                    vec![
+                        ("F5", "Execute"),
+                        ("Ctrl+↵", "Run current"),
+                        ("Shift+←→", "Select"),
+                        ("Ctrl+±", "Resize"),
+                    ]
+                }
             }
             ActivePanel::Results => vec![
+                ("/", "Filter"),
                 ("↑/↓", "Navigate"),
-                ("Tab", "Next panel"),
-                ("?", "Help"),
-                ("q", "Quit"),
+                ("Enter", "Edit"),
+                ("Ctrl+±", "Resize"),
             ],
         }
     };

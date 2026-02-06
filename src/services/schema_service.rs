@@ -1,10 +1,9 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 
 use crate::db::DatabaseConnection;
 
 /// Represents a column definition for schema operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ColumnDefinition {
     pub name: String,
     pub data_type: String,
@@ -116,20 +115,38 @@ impl SchemaService {
                 crate::models::DatabaseType::Postgres => {
                     format!(
                         "ALTER TABLE {} RENAME COLUMN {}{}{} TO {}{}{}",
-                        table_name, quote_start, old_name, quote_end, quote_start, new_name, quote_end
+                        table_name,
+                        quote_start,
+                        old_name,
+                        quote_end,
+                        quote_start,
+                        new_name,
+                        quote_end
                     )
                 }
                 crate::models::DatabaseType::MySQL => {
                     // MySQL requires CHANGE with full column definition, but for rename we use RENAME COLUMN (MySQL 8.0+)
                     format!(
                         "ALTER TABLE {} RENAME COLUMN {}{}{} TO {}{}{}",
-                        table_name, quote_start, old_name, quote_end, quote_start, new_name, quote_end
+                        table_name,
+                        quote_start,
+                        old_name,
+                        quote_end,
+                        quote_start,
+                        new_name,
+                        quote_end
                     )
                 }
                 crate::models::DatabaseType::SQLite => {
                     format!(
                         "ALTER TABLE {} RENAME COLUMN {}{}{} TO {}{}{}",
-                        table_name, quote_start, old_name, quote_end, quote_start, new_name, quote_end
+                        table_name,
+                        quote_start,
+                        old_name,
+                        quote_end,
+                        quote_start,
+                        new_name,
+                        quote_end
                     )
                 }
                 crate::models::DatabaseType::SQLServer => {
@@ -140,7 +157,11 @@ impl SchemaService {
                 }
             },
             SchemaModification::ModifyColumn { table_name, column } => {
-                let not_null = if column.nullable { " NULL" } else { " NOT NULL" };
+                let not_null = if column.nullable {
+                    " NULL"
+                } else {
+                    " NOT NULL"
+                };
                 match db_type {
                     crate::models::DatabaseType::Postgres => {
                         format!(
@@ -186,10 +207,8 @@ impl SchemaService {
                 let column_defs: Vec<String> = columns
                     .iter()
                     .map(|col| {
-                        let mut def = format!(
-                            "{}{}{} {}",
-                            quote_start, col.name, quote_end, col.data_type
-                        );
+                        let mut def =
+                            format!("{}{}{} {}", quote_start, col.name, quote_end, col.data_type);
                         if !col.nullable {
                             def.push_str(" NOT NULL");
                         }
@@ -248,10 +267,7 @@ impl SchemaService {
                 index_name,
             } => match db_type {
                 crate::models::DatabaseType::Postgres | crate::models::DatabaseType::SQLite => {
-                    format!(
-                        "DROP INDEX {}{}{}",
-                        quote_start, index_name, quote_end
-                    )
+                    format!("DROP INDEX {}{}{}", quote_start, index_name, quote_end)
                 }
                 crate::models::DatabaseType::MySQL => {
                     format!(
@@ -337,13 +353,7 @@ pub fn get_common_data_types(db_type: &crate::models::DatabaseType) -> Vec<&'sta
             "BLOB",
             "JSON",
         ],
-        crate::models::DatabaseType::SQLite => vec![
-            "INTEGER",
-            "REAL",
-            "TEXT",
-            "BLOB",
-            "NUMERIC",
-        ],
+        crate::models::DatabaseType::SQLite => vec!["INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC"],
         crate::models::DatabaseType::SQLServer => vec![
             "INT",
             "BIGINT",

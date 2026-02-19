@@ -47,8 +47,8 @@ pub fn render_edit_row_dialog(frame: &mut Frame, state: &AppState) {
         height: area.height.saturating_sub(2),
     };
 
-    // Calculate how many fields we can show
-    let visible_fields = (inner.height as usize).saturating_sub(1);
+    // Calculate how many fields we can show (each field takes 2 lines)
+    let visible_fields = (inner.height as usize).saturating_sub(1) / 2;
     let total_fields = result.columns.len();
 
     // Calculate scroll offset to keep current field visible
@@ -109,6 +109,7 @@ pub fn render_edit_row_dialog(frame: &mut Frame, state: &AppState) {
         if is_active && !(is_system && state.dialog_mode == DialogMode::AddRow) {
             let cursor_x = chunk.x
                 + col_name.len() as u16
+                + required_indicator.len() as u16
                 + system_indicator.len() as u16
                 + 2
                 + state.editing_cursor as u16;

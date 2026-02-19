@@ -262,8 +262,9 @@ pub struct AppState {
     pub selected_schema: usize,
     pub selected_table: usize,
     pub tables_scroll: usize,
-    pub tables_filter: String,      // Filter text for tables
-    pub tables_filter_active: bool, // Whether filter input is active
+    pub tables_filter: String,       // Filter text for tables
+    pub tables_filter_active: bool,  // Whether filter input is active
+    pub tables_filter_cursor: usize, // Cursor position in tables filter
 
     // Query tabs state
     pub query_tabs: QueryTabsState,
@@ -293,8 +294,9 @@ pub struct AppState {
     pub results_scroll: usize,
     pub results_scroll_x: usize, // Horizontal scroll offset
     pub selected_row: usize,
-    pub results_filter: String,      // Filter text for results
-    pub results_filter_active: bool, // Whether filter input is active
+    pub results_filter: String,       // Filter text for results
+    pub results_filter_active: bool,  // Whether filter input is active
+    pub results_filter_cursor: usize, // Cursor position in results filter
 
     // Row editing state
     pub editing_row: Option<Vec<String>>,
@@ -323,6 +325,12 @@ pub struct AppState {
     pub is_connecting: bool,
     pub connection_error: Option<String>,
 
+    // Azure Interactive auth background task
+    pub pending_azure_task: Option<(
+        tokio::task::JoinHandle<anyhow::Result<DatabaseConnection>>,
+        ConnectionConfig,
+    )>,
+
     // Debug mode
     pub debug_mode: bool,
 
@@ -346,6 +354,7 @@ impl AppState {
             tables_scroll: 0,
             tables_filter: String::new(),
             tables_filter_active: false,
+            tables_filter_cursor: 0,
             query_tabs: QueryTabsState::load().unwrap_or_default(),
             selection_start: None,
             selection_end: None,
@@ -364,6 +373,7 @@ impl AppState {
             selected_row: 0,
             results_filter: String::new(),
             results_filter_active: false,
+            results_filter_cursor: 0,
             editing_row: None,
             original_editing_row: None,
             editing_table_name: None,
@@ -382,6 +392,7 @@ impl AppState {
             is_loading: false,
             is_connecting: false,
             connection_error: None,
+            pending_azure_task: None,
             debug_mode,
             should_quit: false,
         }
@@ -643,75 +654,75 @@ impl AppState {
         }
     }
 
-    /// Calculate the visual index of the currently selected item in the tables panel
+    /// Calculate the visual index of the currently selected item in the filtered tables panel
+    #[allow(dead_code)]
     fn get_selected_visual_index(&self) -> usize {
+        let filtered = self.get_filtered_schemas();
         let mut visual_idx = 0;
-        for (schema_idx, schema) in self.schemas.iter().enumerate() {
-            if schema_idx == self.selected_schema {
-                // Found the schema, add the table offset
-                return visual_idx + self.selected_table;
+        for (schema_idx, schema, filtered_tables) in &filtered {
+            if *schema_idx == self.selected_schema && self.selected_table == 0 {
+                return visual_idx;
             }
-            // Count this schema header
-            visual_idx += 1;
-            // Count expanded tables
+            visual_idx += 1; // schema header
             if schema.expanded {
-                visual_idx += schema.tables.len();
+                for (table_idx, _) in filtered_tables {
+                    if *schema_idx == self.selected_schema && *table_idx + 1 == self.selected_table
+                    {
+                        return visual_idx;
+                    }
+                    visual_idx += 1;
+                }
             }
         }
         visual_idx
     }
 
-    /// Navigate through tables panel (schemas and tables)
+    /// Build a flat list of navigable items from filtered schemas.
+    /// Each item is (schema_idx, table_original_idx) where table_original_idx is 0 for schema headers
+    /// and original_table_index + 1 for tables.
+    fn build_filtered_nav_items(&self) -> Vec<(usize, usize)> {
+        let filtered = self.get_filtered_schemas();
+        let mut items = Vec::new();
+        for (schema_idx, schema, filtered_tables) in &filtered {
+            items.push((*schema_idx, 0)); // schema header
+            if schema.expanded {
+                for (table_idx, _) in filtered_tables {
+                    items.push((*schema_idx, *table_idx + 1));
+                }
+            }
+        }
+        items
+    }
+
+    /// Navigate through tables panel (schemas and tables), respecting the current filter
     fn navigate_tables(&mut self, forward: bool) {
-        if self.schemas.is_empty() {
+        let nav_items = self.build_filtered_nav_items();
+        if nav_items.is_empty() {
             return;
         }
 
-        if forward {
-            // Move forward
-            if let Some(schema) = self.schemas.get(self.selected_schema) {
-                if schema.expanded && self.selected_table < schema.tables.len() {
-                    // Move to next table within schema
-                    self.selected_table += 1;
-                    if self.selected_table > schema.tables.len() {
-                        // Move to next schema
-                        self.selected_table = 0;
-                        self.selected_schema = (self.selected_schema + 1) % self.schemas.len();
-                    }
-                } else {
-                    // Move to next schema
-                    self.selected_table = 0;
-                    self.selected_schema = (self.selected_schema + 1) % self.schemas.len();
-                }
+        // Find current position in the nav items
+        let current_pos = nav_items
+            .iter()
+            .position(|(s, t)| *s == self.selected_schema && *t == self.selected_table);
+
+        let new_pos = if let Some(pos) = current_pos {
+            if forward {
+                (pos + 1) % nav_items.len()
+            } else {
+                pos.checked_sub(1).unwrap_or(nav_items.len() - 1)
             }
         } else {
-            // Move backward
-            if self.selected_table > 0 {
-                self.selected_table -= 1;
-            } else if self.selected_schema > 0 {
-                self.selected_schema -= 1;
-                if let Some(schema) = self.schemas.get(self.selected_schema) {
-                    self.selected_table = if schema.expanded {
-                        schema.tables.len()
-                    } else {
-                        0
-                    };
-                }
-            } else {
-                // Wrap to last schema
-                self.selected_schema = self.schemas.len() - 1;
-                if let Some(schema) = self.schemas.get(self.selected_schema) {
-                    self.selected_table = if schema.expanded {
-                        schema.tables.len()
-                    } else {
-                        0
-                    };
-                }
-            }
-        }
+            // Current selection not in filtered list, jump to first item
+            0
+        };
+
+        let (new_schema, new_table) = nav_items[new_pos];
+        self.selected_schema = new_schema;
+        self.selected_table = new_table;
 
         // Update scroll to keep selection visible
-        let visual_idx = self.get_selected_visual_index();
+        let visual_idx = new_pos;
         // Scroll down if selection is below visible area (assume ~10 visible items)
         if visual_idx >= self.tables_scroll + 10 {
             self.tables_scroll = visual_idx.saturating_sub(9);

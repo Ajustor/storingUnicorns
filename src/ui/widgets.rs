@@ -254,7 +254,9 @@ pub fn render_tables_panel(
 
         // Show cursor in filter input
         if state.tables_filter_active && is_active {
-            let cursor_x = filter_rect.x + 3 + state.tables_filter.len() as u16;
+            // +1 border, +2 for 🔍 emoji (2 cells wide), +1 space = +4
+            let cursor_x =
+                filter_rect.x + 4 + state.tables_filter[..state.tables_filter_cursor].len() as u16;
             let cursor_y = filter_rect.y + 1;
             frame.set_cursor_position((cursor_x, cursor_y));
         }
@@ -404,33 +406,14 @@ pub fn render_tables_panel(
         " Tables [/ to filter] ".to_string()
     };
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(panel_style(is_active)),
-        )
-        .highlight_style(highlight_style());
+    let list = List::new(items).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(panel_style(is_active)),
+    );
 
-    // Calculate selected index in flat list and adjust for scroll
-    let mut selected_idx = 0;
-    for (schema_idx, schema) in state.schemas.iter().enumerate() {
-        if schema_idx == state.selected_schema {
-            selected_idx += state.selected_table;
-            break;
-        }
-        selected_idx += 1; // schema header
-        if schema.expanded {
-            selected_idx += schema.tables.len();
-        }
-    }
-    let visible_selection = selected_idx.saturating_sub(scroll_offset);
-
-    let mut list_state = ListState::default();
-    list_state.select(Some(visible_selection));
-
-    frame.render_stateful_widget(list, list_area, &mut list_state);
+    frame.render_widget(list, list_area);
 }
 
 pub fn render_query_editor(
@@ -763,7 +746,10 @@ pub fn render_results_panel(
 
             // Show cursor in filter input
             if state.results_filter_active && is_active {
-                let cursor_x = filter_rect.x + 3 + state.results_filter.len() as u16;
+                // +1 border, +2 for 🔍 emoji (2 cells wide), +1 space = +4
+                let cursor_x = filter_rect.x
+                    + 4
+                    + state.results_filter[..state.results_filter_cursor].len() as u16;
                 let cursor_y = filter_rect.y + 1;
                 frame.set_cursor_position((cursor_x, cursor_y));
             }
@@ -995,7 +981,7 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
                 ("Enter", "Select"),
                 ("s", "Schema"),
                 ("Ctrl+R", "Refresh"),
-                ("Ctrl+±", "Resize"),
+                ("Alt+±", "Resize"),
             ],
             ActivePanel::QueryEditor => {
                 if state.has_selection() {
@@ -1010,7 +996,7 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
                         ("F5", "Execute"),
                         ("Ctrl+↵", "Run current"),
                         ("Shift+←→", "Select"),
-                        ("Ctrl+±", "Resize"),
+                        ("Alt+±", "Resize"),
                     ]
                 }
             }
@@ -1018,7 +1004,7 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
                 ("/", "Filter"),
                 ("↑/↓", "Navigate"),
                 ("Enter", "Edit"),
-                ("Ctrl+±", "Resize"),
+                ("Alt+±", "Resize"),
             ],
         }
     };

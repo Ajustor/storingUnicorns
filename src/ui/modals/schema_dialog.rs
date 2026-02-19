@@ -249,9 +249,46 @@ fn render_columns_list(
     state: &AppState,
     selectable: bool,
 ) {
+    // Reserve space for hint
+    let list_height = if selectable {
+        Constraint::Min(2)
+    } else {
+        Constraint::Min(3)
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([list_height, Constraint::Length(2)])
+        .split(area);
+
+    let list_area = chunks[0];
+    let total = columns.len();
+
+    // Calculate visible height accounting for bottom border (always 1 line)
+    // and title line (only when scrolling is needed, since Block::title()
+    // reserves a line in the inner area even without a top border in ratatui 0.29)
+    let visible_height_raw = list_area.height.saturating_sub(1) as usize;
+    let needs_scroll = total > visible_height_raw;
+    let visible_height = if needs_scroll {
+        list_area.height.saturating_sub(2) as usize // bottom border + title line
+    } else {
+        visible_height_raw
+    };
+
+    // Calculate scroll offset to keep selected item visible
+    let scroll_offset = if visible_height == 0 {
+        0
+    } else if state.schema_field_index >= visible_height {
+        state.schema_field_index - visible_height + 1
+    } else {
+        0
+    };
+
     let items: Vec<ListItem> = columns
         .iter()
         .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
         .map(|(i, col)| {
             let pk_marker = if col.is_primary_key { " PK" } else { "" };
             let nullable_marker = if col.nullable { " NULL" } else { " NOT NULL" };
@@ -283,20 +320,20 @@ fn render_columns_list(
         })
         .collect();
 
-    // Reserve space for hint if selectable
-    let list_height = if selectable {
-        Constraint::Min(2)
-    } else {
-        Constraint::Min(3)
-    };
+    // Build block - only add title (scroll indicator) when scrolling,
+    // to avoid reserving an extra line for an empty title
+    let mut block = Block::default().borders(Borders::BOTTOM);
+    if needs_scroll {
+        block = block.title(format!(
+            " [{}-{}/{}] ",
+            scroll_offset + 1,
+            (scroll_offset + visible_height).min(total),
+            total
+        ));
+    }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([list_height, Constraint::Length(2)])
-        .split(area);
-
-    let list = List::new(items).block(Block::default().borders(Borders::BOTTOM));
-    frame.render_widget(list, chunks[0]);
+    let list = List::new(items).block(block);
+    frame.render_widget(list, list_area);
 
     // Help
     let help = if selectable {

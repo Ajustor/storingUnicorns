@@ -30,6 +30,32 @@ use models::{AzureAuthMethod, DatabaseType};
 use services::{ActivePanel, AppState, ColumnDefinition, ConnectionField, DialogMode};
 use ui::{render_ui, ClickableRegistry};
 
+/// Find the previous char boundary from a byte position in a string.
+/// Returns the byte index of the start of the previous character.
+fn prev_char_boundary(s: &str, pos: usize) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    let mut idx = pos - 1;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Find the next char boundary from a byte position in a string.
+/// Returns the byte index of the start of the next character.
+fn next_char_boundary(s: &str, pos: usize) -> usize {
+    if pos >= s.len() {
+        return s.len();
+    }
+    let mut idx = pos + 1;
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments
@@ -138,13 +164,49 @@ async fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Enter => {
                                 state.tables_filter_active = false;
                             }
+                            KeyCode::Left => {
+                                if state.tables_filter_cursor > 0 {
+                                    state.tables_filter_cursor = prev_char_boundary(
+                                        &state.tables_filter,
+                                        state.tables_filter_cursor,
+                                    );
+                                }
+                            }
+                            KeyCode::Right => {
+                                if state.tables_filter_cursor < state.tables_filter.len() {
+                                    state.tables_filter_cursor = next_char_boundary(
+                                        &state.tables_filter,
+                                        state.tables_filter_cursor,
+                                    );
+                                }
+                            }
+                            KeyCode::Home => {
+                                state.tables_filter_cursor = 0;
+                            }
+                            KeyCode::End => {
+                                state.tables_filter_cursor = state.tables_filter.len();
+                            }
                             KeyCode::Char(c) => {
-                                state.tables_filter.push(c);
+                                state.tables_filter.insert(state.tables_filter_cursor, c);
+                                state.tables_filter_cursor += c.len_utf8();
                                 state.tables_scroll = 0;
                                 state.selected_table = 0;
                             }
                             KeyCode::Backspace => {
-                                state.tables_filter.pop();
+                                if state.tables_filter_cursor > 0 {
+                                    let new_cursor = prev_char_boundary(
+                                        &state.tables_filter,
+                                        state.tables_filter_cursor,
+                                    );
+                                    state.tables_filter.remove(new_cursor);
+                                    state.tables_filter_cursor = new_cursor;
+                                }
+                                state.tables_scroll = 0;
+                            }
+                            KeyCode::Delete => {
+                                if state.tables_filter_cursor < state.tables_filter.len() {
+                                    state.tables_filter.remove(state.tables_filter_cursor);
+                                }
                                 state.tables_scroll = 0;
                             }
                             _ => {}
@@ -160,12 +222,48 @@ async fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Enter => {
                                 state.results_filter_active = false;
                             }
+                            KeyCode::Left => {
+                                if state.results_filter_cursor > 0 {
+                                    state.results_filter_cursor = prev_char_boundary(
+                                        &state.results_filter,
+                                        state.results_filter_cursor,
+                                    );
+                                }
+                            }
+                            KeyCode::Right => {
+                                if state.results_filter_cursor < state.results_filter.len() {
+                                    state.results_filter_cursor = next_char_boundary(
+                                        &state.results_filter,
+                                        state.results_filter_cursor,
+                                    );
+                                }
+                            }
+                            KeyCode::Home => {
+                                state.results_filter_cursor = 0;
+                            }
+                            KeyCode::End => {
+                                state.results_filter_cursor = state.results_filter.len();
+                            }
                             KeyCode::Char(c) => {
-                                state.results_filter.push(c);
+                                state.results_filter.insert(state.results_filter_cursor, c);
+                                state.results_filter_cursor += c.len_utf8();
                                 state.results_scroll = 0;
                             }
                             KeyCode::Backspace => {
-                                state.results_filter.pop();
+                                if state.results_filter_cursor > 0 {
+                                    let new_cursor = prev_char_boundary(
+                                        &state.results_filter,
+                                        state.results_filter_cursor,
+                                    );
+                                    state.results_filter.remove(new_cursor);
+                                    state.results_filter_cursor = new_cursor;
+                                }
+                                state.results_scroll = 0;
+                            }
+                            KeyCode::Delete => {
+                                if state.results_filter_cursor < state.results_filter.len() {
+                                    state.results_filter.remove(state.results_filter_cursor);
+                                }
                                 state.results_scroll = 0;
                             }
                             _ => {}
@@ -268,10 +366,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                         // Activate filter mode with '/'
                         KeyCode::Char('/') if state.active_panel == ActivePanel::Tables => {
                             state.tables_filter_active = true;
+                            state.tables_filter_cursor = state.tables_filter.len();
                         }
                         KeyCode::Char('/') if state.active_panel == ActivePanel::Results => {
                             if state.query_result.is_some() {
                                 state.results_filter_active = true;
+                                state.results_filter_cursor = state.results_filter.len();
                             }
                         }
 
@@ -281,6 +381,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 && !state.tables_filter.is_empty() =>
                         {
                             state.tables_filter.clear();
+                            state.tables_filter_cursor = 0;
                             state.tables_scroll = 0;
                         }
                         KeyCode::Esc
@@ -288,6 +389,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 && !state.results_filter.is_empty() =>
                         {
                             state.results_filter.clear();
+                            state.results_filter_cursor = 0;
                             state.results_scroll = 0;
                         }
 
@@ -416,7 +518,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         {
                             let pos = state.cursor_position();
                             state.query_input_mut().insert(pos, '\n');
-                            state.set_cursor_position(pos + 1);
+                            state.set_cursor_position(pos + '\n'.len_utf8());
                             state.query_tabs.current_tab_mut().is_modified = true;
                             state.hide_completion();
                         }
@@ -432,7 +534,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                             let pos = state.cursor_position();
                             state.query_input_mut().insert(pos, c);
-                            state.set_cursor_position(pos + 1);
+                            state.set_cursor_position(pos + c.len_utf8());
                             state.query_tabs.current_tab_mut().is_modified = true;
                             // Auto-update completions while typing (if enabled)
                             if state.show_completion {
@@ -447,8 +549,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                             } else {
                                 let pos = state.cursor_position();
                                 if pos > 0 {
-                                    state.set_cursor_position(pos - 1);
-                                    state.query_input_mut().remove(pos - 1);
+                                    let query = state.query_input().to_string();
+                                    let prev = prev_char_boundary(&query, pos);
+                                    state.set_cursor_position(prev);
+                                    state.query_input_mut().remove(prev);
                                     state.query_tabs.current_tab_mut().is_modified = true;
                                 }
                             }
@@ -476,10 +580,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 && !state.show_completion =>
                         {
                             let pos = state.cursor_position();
+                            let query = state.query_input().to_string();
                             if !state.has_selection() {
                                 state.start_selection();
                             }
-                            let new_pos = pos.saturating_sub(1);
+                            let new_pos = prev_char_boundary(&query, pos);
                             state.set_cursor_position(new_pos);
                             state.extend_selection(new_pos);
                         }
@@ -489,11 +594,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 && !state.show_completion =>
                         {
                             let pos = state.cursor_position();
-                            let max_pos = state.query_input().len();
+                            let query = state.query_input().to_string();
                             if !state.has_selection() {
                                 state.start_selection();
                             }
-                            let new_pos = (pos + 1).min(max_pos);
+                            let new_pos = next_char_boundary(&query, pos);
                             state.set_cursor_position(new_pos);
                             state.extend_selection(new_pos);
                         }
@@ -569,7 +674,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                         {
                             state.clear_selection();
                             let pos = state.cursor_position();
-                            state.set_cursor_position(pos.saturating_sub(1));
+                            let query = state.query_input().to_string();
+                            state.set_cursor_position(prev_char_boundary(&query, pos));
                         }
                         KeyCode::Right
                             if state.active_panel == ActivePanel::QueryEditor
@@ -577,9 +683,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                         {
                             state.clear_selection();
                             let pos = state.cursor_position();
-                            if pos < state.query_input().len() {
-                                state.set_cursor_position(pos + 1);
-                            }
+                            let query = state.query_input().to_string();
+                            state.set_cursor_position(next_char_boundary(&query, pos));
                         }
                         KeyCode::Up
                             if state.active_panel == ActivePanel::QueryEditor
@@ -927,8 +1032,8 @@ fn handle_scroll(
         Some(ClickableType::Schema(_))
         | Some(ClickableType::Table { .. })
         | Some(ClickableType::Panel(PanelType::Tables)) => {
-            // Scroll tables list
-            let total_items = count_visible_table_items(state);
+            // Scroll tables list (use filtered count)
+            let total_items = count_filtered_table_items(state);
             let max_scroll = total_items.saturating_sub(1);
             if direction > 0 {
                 // Scroll down
@@ -977,13 +1082,14 @@ fn handle_scroll(
     }
 }
 
-/// Count total visible items in tables panel (schemas + expanded tables)
-fn count_visible_table_items(state: &AppState) -> usize {
+/// Count total items in the filtered tables view
+fn count_filtered_table_items(state: &AppState) -> usize {
+    let filtered = state.get_filtered_schemas();
     let mut count = 0;
-    for schema in &state.schemas {
+    for (_schema_idx, schema, filtered_tables) in &filtered {
         count += 1; // Schema header
         if schema.expanded {
-            count += schema.tables.len();
+            count += filtered_tables.len();
         }
     }
     count
@@ -1109,15 +1215,16 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
             if let Some(field) = nc.get_active_field_mut() {
                 field.insert(pos, c);
             }
-            nc.cursor_position += 1;
+            nc.cursor_position += c.len_utf8();
         }
         KeyCode::Backspace => {
             if nc.cursor_position > 0 {
-                let pos = nc.cursor_position - 1;
+                let field_val = nc.get_active_field_value().to_string();
+                let prev = prev_char_boundary(&field_val, nc.cursor_position);
                 if let Some(field) = nc.get_active_field_mut() {
-                    field.remove(pos);
+                    field.remove(prev);
                 }
-                nc.cursor_position = pos;
+                nc.cursor_position = prev;
             }
         }
         KeyCode::Delete => {
@@ -1136,13 +1243,12 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
             nc.cursor_position = nc.get_active_field_value().len();
         }
         KeyCode::Left => {
-            nc.cursor_position = nc.cursor_position.saturating_sub(1);
+            let field_val = nc.get_active_field_value().to_string();
+            nc.cursor_position = prev_char_boundary(&field_val, nc.cursor_position);
         }
         KeyCode::Right => {
-            let len = nc.get_active_field_value().len();
-            if nc.cursor_position < len {
-                nc.cursor_position += 1;
-            }
+            let field_val = nc.get_active_field_value().to_string();
+            nc.cursor_position = next_char_boundary(&field_val, nc.cursor_position);
         }
         _ => {}
     }
@@ -1192,12 +1298,17 @@ fn handle_edit_row_dialog(state: &mut AppState, key: KeyCode) -> bool {
             if let Some(ref mut row) = state.editing_row {
                 row[state.editing_column].insert(pos, c);
             }
-            state.editing_cursor += 1;
+            state.editing_cursor += c.len_utf8();
             false
         }
         KeyCode::Backspace => {
             if state.editing_cursor > 0 {
-                state.editing_cursor -= 1;
+                let prev = if let Some(ref row) = state.editing_row {
+                    prev_char_boundary(&row[state.editing_column], state.editing_cursor)
+                } else {
+                    state.editing_cursor.saturating_sub(1)
+                };
+                state.editing_cursor = prev;
                 if let Some(ref mut row) = state.editing_row {
                     row[state.editing_column].remove(state.editing_cursor);
                 }
@@ -1224,15 +1335,16 @@ fn handle_edit_row_dialog(state: &mut AppState, key: KeyCode) -> bool {
             false
         }
         KeyCode::Left => {
-            state.editing_cursor = state.editing_cursor.saturating_sub(1);
+            if let Some(ref row) = state.editing_row {
+                state.editing_cursor =
+                    prev_char_boundary(&row[state.editing_column], state.editing_cursor);
+            }
             false
         }
         KeyCode::Right => {
             if let Some(ref row) = state.editing_row {
-                let len = row[state.editing_column].len();
-                if state.editing_cursor < len {
-                    state.editing_cursor += 1;
-                }
+                state.editing_cursor =
+                    next_char_boundary(&row[state.editing_column], state.editing_cursor);
             }
             false
         }
@@ -1307,7 +1419,7 @@ fn handle_add_row_dialog(state: &mut AppState, key: KeyCode) -> bool {
             if let Some(ref mut row) = state.editing_row {
                 row[state.editing_column].insert(pos, c);
             }
-            state.editing_cursor += 1;
+            state.editing_cursor += c.len_utf8();
             false
         }
         KeyCode::Backspace => {
@@ -1315,7 +1427,12 @@ fn handle_add_row_dialog(state: &mut AppState, key: KeyCode) -> bool {
                 return false;
             }
             if state.editing_cursor > 0 {
-                state.editing_cursor -= 1;
+                let prev = if let Some(ref row) = state.editing_row {
+                    prev_char_boundary(&row[state.editing_column], state.editing_cursor)
+                } else {
+                    state.editing_cursor.saturating_sub(1)
+                };
+                state.editing_cursor = prev;
                 if let Some(ref mut row) = state.editing_row {
                     row[state.editing_column].remove(state.editing_cursor);
                 }
@@ -1346,17 +1463,18 @@ fn handle_add_row_dialog(state: &mut AppState, key: KeyCode) -> bool {
         }
         KeyCode::Left => {
             if !state.system_columns.contains(&state.editing_column) {
-                state.editing_cursor = state.editing_cursor.saturating_sub(1);
+                if let Some(ref row) = state.editing_row {
+                    state.editing_cursor =
+                        prev_char_boundary(&row[state.editing_column], state.editing_cursor);
+                }
             }
             false
         }
         KeyCode::Right => {
             if !state.system_columns.contains(&state.editing_column) {
                 if let Some(ref row) = state.editing_row {
-                    let len = row[state.editing_column].len();
-                    if state.editing_cursor < len {
-                        state.editing_cursor += 1;
-                    }
+                    state.editing_cursor =
+                        next_char_boundary(&row[state.editing_column], state.editing_cursor);
                 }
             }
             false
@@ -1531,7 +1649,7 @@ fn handle_schema_dialog(state: &mut AppState, key: KeyCode) -> bool {
                     {
                         let mut new_name = new_name;
                         new_name.insert(state.schema_cursor_pos, c);
-                        state.schema_cursor_pos += 1;
+                        state.schema_cursor_pos += c.len_utf8();
                         state.schema_action = Some(SchemaAction::RenameColumn {
                             table_name,
                             old_name,
@@ -1549,7 +1667,8 @@ fn handle_schema_dialog(state: &mut AppState, key: KeyCode) -> bool {
                         }) = state.schema_action.take()
                         {
                             let mut new_name = new_name;
-                            state.schema_cursor_pos -= 1;
+                            state.schema_cursor_pos =
+                                prev_char_boundary(&new_name, state.schema_cursor_pos);
                             new_name.remove(state.schema_cursor_pos);
                             state.schema_action = Some(SchemaAction::RenameColumn {
                                 table_name,
@@ -1561,13 +1680,11 @@ fn handle_schema_dialog(state: &mut AppState, key: KeyCode) -> bool {
                     false
                 }
                 KeyCode::Left => {
-                    state.schema_cursor_pos = state.schema_cursor_pos.saturating_sub(1);
+                    state.schema_cursor_pos = prev_char_boundary(new_name, state.schema_cursor_pos);
                     false
                 }
                 KeyCode::Right => {
-                    if state.schema_cursor_pos < new_name.len() {
-                        state.schema_cursor_pos += 1;
-                    }
+                    state.schema_cursor_pos = next_char_boundary(new_name, state.schema_cursor_pos);
                     false
                 }
                 _ => false,
@@ -1664,7 +1781,7 @@ fn handle_column_editor_input(
                 }
                 _ => {}
             }
-            state.schema_cursor_pos += 1;
+            state.schema_cursor_pos += c.len_utf8();
             update_schema_column(state, new_column);
             false
         }
@@ -1675,7 +1792,12 @@ fn handle_column_editor_input(
         {
             if state.schema_cursor_pos > 0 {
                 let mut new_column = current_column.clone();
-                state.schema_cursor_pos -= 1;
+                let field_str: &str = match state.schema_field_index {
+                    0 => &current_column.name,
+                    1 => &current_column.data_type,
+                    _ => current_column.default_value.as_deref().unwrap_or(""),
+                };
+                state.schema_cursor_pos = prev_char_boundary(field_str, state.schema_cursor_pos);
                 match state.schema_field_index {
                     0 => {
                         new_column.name.remove(state.schema_cursor_pos);
@@ -1704,7 +1826,12 @@ fn handle_column_editor_input(
                 || state.schema_field_index == 1
                 || state.schema_field_index == 4 =>
         {
-            state.schema_cursor_pos = state.schema_cursor_pos.saturating_sub(1);
+            let field_str: &str = match state.schema_field_index {
+                0 => &current_column.name,
+                1 => &current_column.data_type,
+                _ => current_column.default_value.as_deref().unwrap_or(""),
+            };
+            state.schema_cursor_pos = prev_char_boundary(field_str, state.schema_cursor_pos);
             false
         }
         KeyCode::Right
@@ -1712,19 +1839,12 @@ fn handle_column_editor_input(
                 || state.schema_field_index == 1
                 || state.schema_field_index == 4 =>
         {
-            let max_len = match state.schema_field_index {
-                0 => current_column.name.len(),
-                1 => current_column.data_type.len(),
-                4 => current_column
-                    .default_value
-                    .as_ref()
-                    .map(|s| s.len())
-                    .unwrap_or(0),
-                _ => 0,
+            let field_str: &str = match state.schema_field_index {
+                0 => &current_column.name,
+                1 => &current_column.data_type,
+                _ => current_column.default_value.as_deref().unwrap_or(""),
             };
-            if state.schema_cursor_pos < max_len {
-                state.schema_cursor_pos += 1;
-            }
+            state.schema_cursor_pos = next_char_boundary(field_str, state.schema_cursor_pos);
             false
         }
         _ => false,

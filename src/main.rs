@@ -107,6 +107,11 @@ async fn main() -> Result<()> {
         conn.close().await;
     }
 
+    // Abort any pending Azure auth task
+    if let Some((task, _)) = state.pending_azure_task.take() {
+        task.abort();
+    }
+
     // Save config and queries on exit
     state.config.save()?;
     state.save_query_tabs();
@@ -133,11 +138,58 @@ async fn run_app<B: ratatui::backend::Backend>(
         let registry_clone = clickable_registry.clone();
         terminal.draw(|f| render_ui(f, state, &registry_clone))?;
 
+        // Check if a pending Azure Interactive auth task has completed
+        if let Some((ref task, _)) = state.pending_azure_task {
+            if task.is_finished() {
+                let (task, conn_config) = state.pending_azure_task.take().unwrap();
+                match task.await {
+                    Ok(Ok(conn)) => {
+                        // Close existing connection if any
+                        if let Some(old_conn) = state.connection.take() {
+                            old_conn.close().await;
+                        }
+                        state.connection = Some(conn);
+                        state.current_connection_config = Some(conn_config.clone());
+                        state.set_status(format!("Connected to {}", conn_config.name));
+                        handle_refresh_tables(state).await;
+                    }
+                    Ok(Err(e)) => {
+                        let error_msg = format!("Connection failed: {}", e);
+                        state.set_status(&error_msg);
+                        state.connection_error = Some(error_msg);
+                    }
+                    Err(e) => {
+                        // JoinError (task panicked or was cancelled)
+                        if !e.is_cancelled() {
+                            let error_msg = format!("Connection task failed: {}", e);
+                            state.set_status(&error_msg);
+                            state.connection_error = Some(error_msg);
+                        }
+                    }
+                }
+                state.is_loading = false;
+                state.is_connecting = false;
+            }
+        }
+
         if event::poll(std::time::Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => {
                     // Only handle key press events, not release events
                     if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    // Allow Escape to cancel a pending Azure Interactive auth
+                    if state.pending_azure_task.is_some() {
+                        if key.code == KeyCode::Esc {
+                            if let Some((task, _)) = state.pending_azure_task.take() {
+                                task.abort();
+                            }
+                            state.is_loading = false;
+                            state.is_connecting = false;
+                            state.set_status("Azure authentication cancelled.");
+                        }
                         continue;
                     }
 
@@ -821,6 +873,10 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
 
         if state.should_quit {
+            // Abort pending Azure auth task if any
+            if let Some((task, _)) = state.pending_azure_task.take() {
+                task.abort();
+            }
             break;
         }
     }
@@ -1911,7 +1967,7 @@ async fn handle_connect<B: ratatui::backend::Backend>(
             Ok(device_code) => {
                 // Show device code in status bar so the user can see it
                 state.set_status(format!(
-                    "Code: {} — Visit: {} (browser opening...)",
+                    "🔐 Code: {} — Visit: {} | Press Esc to cancel",
                     device_code.user_code, device_code.verification_uri
                 ));
                 let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
@@ -1919,19 +1975,20 @@ async fn handle_connect<B: ratatui::backend::Backend>(
                 // Try to open the browser
                 let _ = open::that(&device_code.verification_uri);
 
-                // Poll for token, then connect
-                match db::azure::poll_for_token(tenant_id, &device_code).await {
-                    Ok(token) => {
-                        state.set_status("Authenticated! Connecting to Azure SQL...");
-                        let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
-                        db::azure::connect_with_aad_token(&conn_config, &token).await
-                    }
-                    Err(e) => Err(e),
-                }
+                // Spawn token polling as background task so the TUI stays responsive
+                let tenant_owned = tenant_id.to_string();
+                let config_clone = conn_config.clone();
+                let task = tokio::spawn(async move {
+                    let token = db::azure::poll_for_token(&tenant_owned, &device_code).await?;
+                    let client = db::azure::connect_with_aad_token(&config_clone, &token).await?;
+                    Ok(DatabaseConnection::Azure(client))
+                });
+                state.pending_azure_task = Some((task, conn_config));
+                // Return early — the event loop will pick up the result
+                return;
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e).map(DatabaseConnection::Azure),
         }
-        .map(DatabaseConnection::Azure)
     } else {
         DatabaseConnection::connect(&conn_config).await
     };

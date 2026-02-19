@@ -255,7 +255,8 @@ pub fn render_tables_panel(
         // Show cursor in filter input
         if state.tables_filter_active && is_active {
             // +1 border, +2 for 🔍 emoji (2 cells wide), +1 space = +4
-            let cursor_x = filter_rect.x + 4 + state.tables_filter[..state.tables_filter_cursor].len() as u16;
+            let cursor_x =
+                filter_rect.x + 4 + state.tables_filter[..state.tables_filter_cursor].len() as u16;
             let cursor_y = filter_rect.y + 1;
             frame.set_cursor_position((cursor_x, cursor_y));
         }
@@ -746,7 +747,9 @@ pub fn render_results_panel(
             // Show cursor in filter input
             if state.results_filter_active && is_active {
                 // +1 border, +2 for 🔍 emoji (2 cells wide), +1 space = +4
-                let cursor_x = filter_rect.x + 4 + state.results_filter[..state.results_filter_cursor].len() as u16;
+                let cursor_x = filter_rect.x
+                    + 4
+                    + state.results_filter[..state.results_filter_cursor].len() as u16;
                 let cursor_y = filter_rect.y + 1;
                 frame.set_cursor_position((cursor_x, cursor_y));
             }

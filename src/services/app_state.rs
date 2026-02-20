@@ -295,7 +295,8 @@ pub struct AppState {
     // Results state
     pub query_result: Option<QueryResult>,
     pub results_scroll: usize,
-    pub results_scroll_x: usize, // Horizontal scroll offset
+    pub results_scroll_x: usize,       // Horizontal scroll offset
+    pub results_visible_height: usize, // Updated each frame by render
     pub selected_row: usize,
     pub results_filter: String,       // Filter text for results
     pub results_filter_active: bool,  // Whether filter input is active
@@ -321,6 +322,9 @@ pub struct AppState {
     pub schema_cursor_pos: usize,
     /// Pending operation for column selection: "view", "modify", "drop", "rename"
     pub schema_pending_operation: Option<String>,
+
+    // Cached column widths for results (computed once when results change)
+    pub cached_col_widths: Vec<u16>,
 
     // Export/Import state
     pub export_state: Option<ExportState>,
@@ -371,6 +375,7 @@ impl AppState {
             query_result: None,
             results_scroll: 0,
             results_scroll_x: 0,
+            results_visible_height: 0,
             selected_row: 0,
             results_filter: String::new(),
             results_filter_active: false,
@@ -389,6 +394,7 @@ impl AppState {
             schema_field_index: 0,
             schema_cursor_pos: 0,
             schema_pending_operation: None,
+            cached_col_widths: Vec::new(),
             export_state: None,
             import_state: None,
             status_message: String::from("Press ? for help"),
@@ -518,6 +524,31 @@ impl AppState {
         }
     }
 
+    /// Compute and cache column widths for the results table.
+    /// Call this once when query_result changes, not every frame.
+    pub fn compute_col_widths(&mut self) {
+        if let Some(ref result) = self.query_result {
+            self.cached_col_widths = result
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(col_idx, col)| {
+                    let mut max_len = col.name.len();
+                    // Sample up to 200 rows for performance
+                    for row in result.rows.iter().take(200) {
+                        if let Some(cell) = row.get(col_idx) {
+                            max_len = max_len.max(cell.len());
+                        }
+                    }
+                    // Cap at 30 chars max, minimum 25
+                    (max_len.min(30).max(25)) as u16
+                })
+                .collect();
+        } else {
+            self.cached_col_widths.clear();
+        }
+    }
+
     /// Get all known table names for autocompletion
     pub fn get_known_tables(&self) -> Vec<String> {
         let mut tables = Vec::new();
@@ -625,6 +656,7 @@ impl AppState {
                 if let Some(ref result) = self.query_result {
                     if !result.rows.is_empty() {
                         self.selected_row = (self.selected_row + 1) % result.rows.len();
+                        self.adjust_results_scroll();
                     }
                 }
             }
@@ -652,10 +684,24 @@ impl AppState {
                             .selected_row
                             .checked_sub(1)
                             .unwrap_or(result.rows.len() - 1);
+                        self.adjust_results_scroll();
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Keep results_scroll in sync with selected_row
+    fn adjust_results_scroll(&mut self) {
+        let vh = self.results_visible_height;
+        if vh == 0 {
+            return;
+        }
+        if self.selected_row < self.results_scroll {
+            self.results_scroll = self.selected_row;
+        } else if self.selected_row >= self.results_scroll + vh {
+            self.results_scroll = self.selected_row - vh + 1;
         }
     }
 

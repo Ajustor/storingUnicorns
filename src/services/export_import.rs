@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::models::{Column, QueryResult};
+use crate::models::QueryResult;
 
 /// Export format options
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +45,7 @@ pub struct ExportState {
 }
 
 impl ExportState {
-    pub fn new(table_name: Option<String>, result: &QueryResult) -> Self {
+    pub fn new(table_name: Option<String>, _result: &QueryResult) -> Self {
         let default_name = table_name
             .as_deref()
             .unwrap_or("export")

@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::centered_rect;
-use crate::services::{AppState, DialogMode, ExportFormat};
+use crate::services::{AppState, DialogMode};
 
 pub fn render_export_dialog(frame: &mut Frame, state: &AppState) {
     if state.dialog_mode != DialogMode::Export {

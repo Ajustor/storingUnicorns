@@ -143,17 +143,44 @@ async fn run_app<B: ratatui::backend::Backend>(
     // Clickable registry for mouse handling
     let clickable_registry = ClickableRegistry::new();
 
-    loop {
-        let registry_clone = clickable_registry.clone();
-        terminal.draw(|f| render_ui(f, state, &registry_clone))?;
+    // Only redraw when state has changed — avoids expensive re-render every 100ms
+    let mut needs_redraw = true;
 
-        if event::poll(std::time::Duration::from_millis(100))? {
+    loop {
+        if needs_redraw {
+            let registry_clone = clickable_registry.clone();
+            terminal.draw(|f| render_ui(f, state, &registry_clone))?;
+            needs_redraw = false;
+
+            // Update results_visible_height for scroll calculations.
+            // Approximate from terminal size using the same layout logic.
+            let term_size = terminal.size()?;
+            let content_h = term_size.height.saturating_sub(2); // status + help bars
+            let right_h = if state.should_show_results() {
+                content_h.saturating_sub(
+                    (content_h as u32 * state.query_editor_height as u32 / 100) as u16,
+                )
+            } else {
+                0
+            };
+            // results inner: -2 borders -1 header = 3, -3 if filter bar visible
+            let filter_overhead: u16 =
+                if state.results_filter_active || !state.results_filter.is_empty() {
+                    3
+                } else {
+                    0
+                };
+            state.results_visible_height = right_h.saturating_sub(3 + filter_overhead) as usize;
+        }
+
+        if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
                     // Only handle key press events, not release events
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
+                    needs_redraw = true;
 
                     // Handle dialog input first
                     if state.is_dialog_open() {
@@ -848,6 +875,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 Event::Mouse(mouse) => {
+                    needs_redraw = true;
                     if !state.is_dialog_open() {
                         handle_mouse_event(
                             state,
@@ -860,7 +888,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         .await;
                     }
                 }
-                _ => {}
+                _ => {
+                    needs_redraw = true; // Resize and other events
+                }
             }
         }
 
@@ -2046,6 +2076,7 @@ async fn handle_execute_query(state: &mut AppState) {
 
             state.query_result = Some(result);
             state.update_known_columns(); // Update columns for autocompletion
+            state.compute_col_widths(); // Cache column widths once
             state.selected_row = 0;
             state.results_scroll_x = 0; // Reset horizontal scroll
             state.set_status(format!("Query executed: {} rows in {}ms", row_count, time));
@@ -2127,6 +2158,7 @@ async fn handle_execute_current_query(state: &mut AppState) {
             }
 
             state.query_result = Some(result);
+            state.compute_col_widths(); // Cache column widths once
             state.selected_row = 0;
             state.results_scroll_x = 0;
             state.set_status(format!("Query executed: {} rows in {}ms", row_count, time));
@@ -2784,7 +2816,8 @@ fn handle_export_dialog_input(state: &mut AppState, key: KeyCode) -> bool {
         }
         KeyCode::Backspace if export_state.active_field == 1 => {
             if export_state.cursor_position > 0 {
-                let prev = prev_char_boundary(&export_state.file_path, export_state.cursor_position);
+                let prev =
+                    prev_char_boundary(&export_state.file_path, export_state.cursor_position);
                 export_state.file_path.remove(prev);
                 export_state.cursor_position = prev;
             }
@@ -2908,8 +2941,7 @@ fn handle_import_dialog_input(state: &mut AppState, key: KeyCode) -> bool {
                 1 => &import_state.target_table,
                 _ => return false,
             };
-            import_state.cursor_position =
-                prev_char_boundary(field, import_state.cursor_position);
+            import_state.cursor_position = prev_char_boundary(field, import_state.cursor_position);
             false
         }
         KeyCode::Right => {
@@ -2918,8 +2950,7 @@ fn handle_import_dialog_input(state: &mut AppState, key: KeyCode) -> bool {
                 1 => &import_state.target_table,
                 _ => return false,
             };
-            import_state.cursor_position =
-                next_char_boundary(field, import_state.cursor_position);
+            import_state.cursor_position = next_char_boundary(field, import_state.cursor_position);
             false
         }
         _ => false,
@@ -2951,10 +2982,7 @@ fn handle_export(state: &mut AppState) {
         return;
     }
 
-    let table_name = export_state
-        .table_name
-        .as_deref()
-        .unwrap_or("table");
+    let table_name = export_state.table_name.as_deref().unwrap_or("table");
     let (quote_start, quote_end) = get_quote_chars(state);
 
     match services::export_import::export_to_file(
@@ -3069,10 +3097,7 @@ async fn handle_import(state: &mut AppState) {
             success_count, total, err
         ));
     } else {
-        state.set_status(format!(
-            "Import: {}/{} rows inserted",
-            success_count, total
-        ));
+        state.set_status(format!("Import: {}/{} rows inserted", success_count, total));
     }
 
     state.close_dialog();

@@ -2,7 +2,10 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row, Table, TableState},
+    widgets::{
+        Block, Borders, List, ListItem, ListState, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table, TableState,
+    },
     Frame,
 };
 
@@ -203,6 +206,18 @@ pub fn render_connections_panel(
     list_state.select(Some(visible_selection));
 
     frame.render_stateful_widget(list, area, &mut list_state);
+
+    // Render scrollbar if content overflows
+    if total > visible_height {
+        let mut scrollbar_state =
+            ScrollbarState::new(total.saturating_sub(visible_height)).position(scroll_offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█");
+        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+    }
 }
 
 pub fn render_tables_panel(
@@ -414,6 +429,18 @@ pub fn render_tables_panel(
     );
 
     frame.render_widget(list, list_area);
+
+    // Render scrollbar if content overflows
+    if total_items > visible_height {
+        let mut scrollbar_state =
+            ScrollbarState::new(total_items.saturating_sub(visible_height)).position(scroll_offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█");
+        frame.render_stateful_widget(scrollbar, list_area, &mut scrollbar_state);
+    }
 }
 
 pub fn render_query_editor(
@@ -522,7 +549,7 @@ pub fn render_query_editor(
         " Query Editor [F5/Ctrl+Enter | Ctrl+Space:Complete | Shift+Arrow:Select] "
     };
 
-    let paragraph = Paragraph::new(highlighted_content)
+    let paragraph = Paragraph::new(highlighted_content.clone())
         .wrap(ratatui::widgets::Wrap { trim: false })
         .block(
             Block::default()
@@ -531,44 +558,91 @@ pub fn render_query_editor(
                 .border_style(panel_style(is_active)),
         );
 
+    // Single pass: compute cursor position, total visual lines, and editor scroll
+    let inner_height = editor_area.height.saturating_sub(2) as usize;
+    let inner_width = editor_area.width.saturating_sub(2) as usize;
+
+    let (editor_scroll, total_visual_lines, cursor_visual_line, cursor_visual_col) =
+        if inner_width > 0 && inner_height > 0 {
+            let cursor_byte = cursor_position.min(query_input.len());
+            let mut visual_line: usize = 0;
+            let mut visual_col: usize = 0;
+            let mut byte_offset: usize = 0;
+            let mut cursor_vline: usize = 0;
+            let mut cursor_vcol: usize = 0;
+            let mut found_cursor = false;
+
+            for c in query_input.chars() {
+                // Record cursor position when we reach its byte offset
+                if !found_cursor && byte_offset >= cursor_byte {
+                    cursor_vline = visual_line;
+                    cursor_vcol = visual_col;
+                    found_cursor = true;
+                }
+
+                if c == '\n' {
+                    visual_line += 1;
+                    visual_col = 0;
+                } else {
+                    visual_col += 1;
+                    if visual_col >= inner_width {
+                        visual_line += 1;
+                        visual_col = 0;
+                    }
+                }
+
+                byte_offset += c.len_utf8();
+            }
+
+            // Handle cursor at end of text
+            if !found_cursor {
+                cursor_vline = visual_line;
+                cursor_vcol = visual_col;
+            }
+
+            let total_lines = visual_line + 1;
+            let scroll = if cursor_vline >= inner_height {
+                cursor_vline - inner_height + 1
+            } else {
+                0
+            };
+
+            (scroll, total_lines, cursor_vline, cursor_vcol)
+        } else {
+            (0, 1, 0, 0)
+        };
+
+    let paragraph = paragraph.scroll((editor_scroll as u16, 0));
+
     frame.render_widget(paragraph, editor_area);
+
+    // Render scrollbar for editor if content overflows
+    if total_visual_lines > inner_height {
+        let mut scrollbar_state =
+            ScrollbarState::new(total_visual_lines.saturating_sub(inner_height))
+                .position(editor_scroll);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█");
+        frame.render_stateful_widget(scrollbar, editor_area, &mut scrollbar_state);
+    }
 
     // Render completion popup if active
     if is_active && state.show_completion && !state.completion_suggestions.is_empty() {
         render_completion_popup(frame, editor_area, state, cursor_position, query_input);
     }
 
-    // Show cursor when editing (calculate position with real line breaks)
-    if is_active && !state.results_filter_active && !state.tables_filter_active {
-        let inner_width = editor_area.width.saturating_sub(2) as usize; // Account for borders
-        if inner_width > 0 {
-            // Calculate cursor position considering actual newlines
-            let text_before_cursor = &query_input[..cursor_position.min(query_input.len())];
+    // Show cursor when editing
+    if is_active && !state.results_filter_active && !state.tables_filter_active && inner_width > 0 {
+        let adjusted_line = cursor_visual_line.saturating_sub(editor_scroll);
+        let cursor_x = editor_area.x + 1 + cursor_visual_col as u16;
+        let cursor_y = editor_area.y + 1 + adjusted_line as u16;
 
-            let mut visual_line = 0;
-            let mut visual_col = 0;
-
-            for c in text_before_cursor.chars() {
-                if c == '\n' {
-                    visual_line += 1;
-                    visual_col = 0;
-                } else {
-                    visual_col += 1;
-                    // Handle wrapping
-                    if visual_col >= inner_width {
-                        visual_line += 1;
-                        visual_col = 0;
-                    }
-                }
-            }
-
-            let cursor_x = editor_area.x + 1 + visual_col as u16;
-            let cursor_y = editor_area.y + 1 + visual_line as u16;
-
-            // Only show cursor if it's within the visible area
-            if cursor_y < editor_area.y + editor_area.height - 1 {
-                frame.set_cursor_position((cursor_x, cursor_y));
-            }
+        // Only show cursor if it's within the visible area
+        if cursor_y < editor_area.y + editor_area.height - 1 && cursor_y >= editor_area.y + 1 {
+            frame.set_cursor_position((cursor_x, cursor_y));
         }
     }
 }
@@ -755,86 +829,12 @@ pub fn render_results_panel(
             }
         }
 
-        // Get filtered rows
-        let filtered_rows = state.get_filtered_results().unwrap_or_default();
-        let total_filtered_rows = filtered_rows.len();
-
-        // Calculate column widths adaptively based on available space
-        let available_width = table_area.width.saturating_sub(2) as usize; // subtract borders
-        let num_visible_cols = result.columns.len().saturating_sub(state.results_scroll_x);
-
-        // First pass: compute ideal widths (content-based, capped at 50)
-        let ideal_widths: Vec<usize> = result
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(col_idx, col)| {
-                let mut max_len = col.name.len();
-                // Sample up to 100 rows for performance
-                for row in result.rows.iter().take(100) {
-                    if let Some(cell) = row.get(col_idx) {
-                        max_len = max_len.max(cell.len());
-                    }
-                }
-                max_len.min(50).max(3)
-            })
-            .collect();
-
-        // Second pass: fit columns to available width
-        let col_widths: Vec<u16> = if num_visible_cols > 0 {
-            let visible_ideals: Vec<usize> = ideal_widths.iter().skip(state.results_scroll_x).cloned().collect();
-            let total_ideal: usize = visible_ideals.iter().sum::<usize>() + visible_ideals.len().saturating_sub(1); // +1 spacing per col
-
-            if total_ideal <= available_width {
-                // Everything fits, use ideal widths
-                ideal_widths.iter().map(|&w| w as u16).collect()
-            } else {
-                // Need to shrink: distribute available width proportionally
-                // Reserve 1 char spacing between columns
-                let spacing = num_visible_cols.saturating_sub(1);
-                let usable_width = available_width.saturating_sub(spacing);
-                let min_col_width: usize = 5;
-
-                // Give each column at least min_col_width, then distribute the rest proportionally
-                let total_over_min: usize = ideal_widths.iter().map(|&w| w.saturating_sub(min_col_width)).sum();
-
-                ideal_widths
-                    .iter()
-                    .map(|&ideal| {
-                        if total_over_min == 0 || usable_width <= num_visible_cols * min_col_width {
-                            // All columns get equal minimum
-                            (usable_width / num_visible_cols.max(1)).max(min_col_width) as u16
-                        } else {
-                            let base = min_col_width;
-                            let extra_budget = usable_width.saturating_sub(ideal_widths.len() * min_col_width);
-                            let extra = (ideal.saturating_sub(min_col_width)) * extra_budget / total_over_min;
-                            (base + extra).min(ideal).max(min_col_width) as u16
-                        }
-                    })
-                    .collect()
-            }
-        } else {
-            ideal_widths.iter().map(|&w| w as u16).collect()
-        };
+        // Use cached column widths (computed once when results change, not every frame)
+        let col_widths = &state.cached_col_widths;
 
         // Apply horizontal scroll by skipping columns
         let col_offset = state.results_scroll_x;
         let visible_col_start = col_offset.min(result.columns.len().saturating_sub(1));
-
-        // Build header with column offset
-        let header_cells: Vec<&str> = result
-            .columns
-            .iter()
-            .skip(visible_col_start)
-            .map(|c| c.name.as_str())
-            .collect();
-        let header = Row::new(header_cells)
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .height(1);
 
         // Calculate visible area for rows
         // Inner area: border (1) + header row (1) = start at y+2
@@ -848,44 +848,151 @@ pub fn render_results_panel(
         let visible_height = inner_area.height as usize;
         let scroll_offset = state.results_scroll;
 
-        // Build rows from filtered results with column offset and vertical scroll
-        let rows: Vec<Row> = filtered_rows
+        // Determine how many columns fit on screen to avoid rendering offscreen ones
+        let available_width = inner_area.width as usize;
+        let mut visible_col_end = visible_col_start;
+        let mut used_width: usize = 0;
+        for &w in col_widths.iter().skip(visible_col_start) {
+            let col_total = w as usize + 1; // +1 for column_spacing
+            if used_width + col_total > available_width + 1 && visible_col_end > visible_col_start {
+                break;
+            }
+            used_width += col_total;
+            visible_col_end += 1;
+        }
+        // Ensure at least one column is visible
+        if visible_col_end == visible_col_start {
+            visible_col_end = (visible_col_start + 1).min(result.columns.len());
+        }
+        let visible_col_range = visible_col_start..visible_col_end;
+
+        // Build header with only visible columns
+        let header_cells: Vec<&str> = result
+            .columns
             .iter()
-            .skip(scroll_offset)
-            .take(visible_height)
-            .map(|(orig_idx, row)| {
-                let style =
-                    if *orig_idx == state.selected_row && is_active && !state.results_filter_active
+            .skip(visible_col_range.start)
+            .take(visible_col_range.len())
+            .map(|c| c.name.as_str())
+            .collect();
+        let header = Row::new(header_cells)
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .height(1);
+
+        // Count filtered rows without allocating full vec when no filter
+        let has_filter = !state.results_filter.is_empty();
+        let filter_lower = state.results_filter.to_lowercase();
+
+        let total_filtered_rows = if has_filter {
+            result
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.iter()
+                        .any(|cell| cell.to_lowercase().contains(&filter_lower))
+                })
+                .count()
+        } else {
+            result.rows.len()
+        };
+
+        // Build rows: only visible slice, only visible columns, no String cloning
+        let rows: Vec<Row> = if has_filter {
+            result
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    row.iter()
+                        .any(|cell| cell.to_lowercase().contains(&filter_lower))
+                })
+                .skip(scroll_offset)
+                .take(visible_height)
+                .map(|(orig_idx, row)| {
+                    let style = if orig_idx == state.selected_row
+                        && is_active
+                        && !state.results_filter_active
                     {
                         highlight_style()
                     } else {
                         Style::default()
                     };
-                let cells: Vec<String> = row.iter().skip(visible_col_start).cloned().collect();
-                Row::new(cells).style(style)
-            })
-            .collect();
+                    let cells: Vec<&str> = row[visible_col_range.clone()]
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect();
+                    Row::new(cells).style(style)
+                })
+                .collect()
+        } else {
+            result
+                .rows
+                .iter()
+                .enumerate()
+                .skip(scroll_offset)
+                .take(visible_height)
+                .map(|(orig_idx, row)| {
+                    let style = if orig_idx == state.selected_row
+                        && is_active
+                        && !state.results_filter_active
+                    {
+                        highlight_style()
+                    } else {
+                        Style::default()
+                    };
+                    let cells: Vec<&str> = row
+                        .get(visible_col_range.clone())
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect();
+                    Row::new(cells).style(style)
+                })
+                .collect()
+        };
 
         // Register clickable areas for visible result rows
-        for (display_idx, (orig_idx, _)) in filtered_rows
-            .iter()
-            .skip(scroll_offset)
-            .take(visible_height)
-            .enumerate()
         {
-            let row_rect = Rect {
-                x: inner_area.x,
-                y: inner_area.y + display_idx as u16,
-                width: inner_area.width,
-                height: 1,
+            let row_iter: Box<dyn Iterator<Item = usize>> = if has_filter {
+                Box::new(
+                    result
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| {
+                            row.iter()
+                                .any(|cell| cell.to_lowercase().contains(&filter_lower))
+                        })
+                        .map(|(i, _)| i)
+                        .skip(scroll_offset)
+                        .take(visible_height),
+                )
+            } else {
+                Box::new(
+                    scroll_offset
+                        ..scroll_offset
+                            + visible_height.min(result.rows.len().saturating_sub(scroll_offset)),
+                )
             };
-            registry.register(row_rect, ClickableType::ResultRow(*orig_idx));
+            for (display_idx, orig_idx) in row_iter.enumerate() {
+                let row_rect = Rect {
+                    x: inner_area.x,
+                    y: inner_area.y + display_idx as u16,
+                    width: inner_area.width,
+                    height: 1,
+                };
+                registry.register(row_rect, ClickableType::ResultRow(orig_idx));
+            }
         }
 
-        // Use calculated widths with offset
+        // Use calculated widths for visible columns only
         let widths: Vec<Constraint> = col_widths
             .iter()
-            .skip(visible_col_start)
+            .skip(visible_col_range.start)
+            .take(visible_col_range.len())
             .map(|&w| Constraint::Length(w))
             .collect();
 
@@ -940,16 +1047,51 @@ pub fn render_results_panel(
             .row_highlight_style(highlight_style())
             .column_spacing(1);
 
-        // Adjust selection for scroll offset (find position in filtered list)
-        let visible_selection = filtered_rows
-            .iter()
-            .position(|(idx, _)| *idx == state.selected_row)
-            .unwrap_or(0)
-            .saturating_sub(scroll_offset);
+        // Adjust selection for scroll offset
+        let visible_selection = if has_filter {
+            result
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| {
+                    row.iter()
+                        .any(|cell| cell.to_lowercase().contains(&filter_lower))
+                })
+                .position(|(idx, _)| idx == state.selected_row)
+                .unwrap_or(0)
+                .saturating_sub(scroll_offset)
+        } else {
+            state.selected_row.saturating_sub(scroll_offset)
+        };
         let mut table_state = TableState::default();
         table_state.select(Some(visible_selection));
 
         frame.render_stateful_widget(table, table_area, &mut table_state);
+
+        // Render vertical scrollbar if rows overflow
+        if total_filtered_rows > visible_height {
+            let mut scrollbar_state =
+                ScrollbarState::new(total_filtered_rows.saturating_sub(visible_height))
+                    .position(scroll_offset);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓"))
+                .track_symbol(Some("│"))
+                .thumb_symbol("█");
+            frame.render_stateful_widget(scrollbar, table_area, &mut scrollbar_state);
+        }
+
+        // Render horizontal scrollbar if columns overflow
+        if result.columns.len() > 1 && visible_col_start > 0 {
+            let mut h_scrollbar_state = ScrollbarState::new(result.columns.len().saturating_sub(1))
+                .position(visible_col_start);
+            let h_scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+                .begin_symbol(Some("◄"))
+                .end_symbol(Some("►"))
+                .track_symbol(Some("─"))
+                .thumb_symbol("█");
+            frame.render_stateful_widget(h_scrollbar, table_area, &mut h_scrollbar_state);
+        }
     } else {
         let paragraph = Paragraph::new("No results yet. Execute a query with F5.")
             .style(Style::default().fg(Color::DarkGray))

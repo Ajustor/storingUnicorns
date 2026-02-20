@@ -143,17 +143,44 @@ async fn run_app<B: ratatui::backend::Backend>(
     // Clickable registry for mouse handling
     let clickable_registry = ClickableRegistry::new();
 
-    loop {
-        let registry_clone = clickable_registry.clone();
-        terminal.draw(|f| render_ui(f, state, &registry_clone))?;
+    // Only redraw when state has changed — avoids expensive re-render every 100ms
+    let mut needs_redraw = true;
 
-        if event::poll(std::time::Duration::from_millis(100))? {
+    loop {
+        if needs_redraw {
+            let registry_clone = clickable_registry.clone();
+            terminal.draw(|f| render_ui(f, state, &registry_clone))?;
+            needs_redraw = false;
+
+            // Update results_visible_height for scroll calculations.
+            // Approximate from terminal size using the same layout logic.
+            let term_size = terminal.size()?;
+            let content_h = term_size.height.saturating_sub(2); // status + help bars
+            let right_h = if state.should_show_results() {
+                content_h.saturating_sub(
+                    (content_h as u32 * state.query_editor_height as u32 / 100) as u16,
+                )
+            } else {
+                0
+            };
+            // results inner: -2 borders -1 header = 3, -3 if filter bar visible
+            let filter_overhead: u16 =
+                if state.results_filter_active || !state.results_filter.is_empty() {
+                    3
+                } else {
+                    0
+                };
+            state.results_visible_height = right_h.saturating_sub(3 + filter_overhead) as usize;
+        }
+
+        if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => {
                     // Only handle key press events, not release events
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
+                    needs_redraw = true;
 
                     // Handle dialog input first
                     if state.is_dialog_open() {
@@ -163,6 +190,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 DialogMode::EditRow => handle_save_row(state).await,
                                 DialogMode::AddRow => handle_insert_row(state).await,
                                 DialogMode::SchemaModify => handle_schema_action(state).await,
+                                DialogMode::Export => handle_export(state),
+                                DialogMode::Import => handle_import(state).await,
                                 _ => {}
                             }
                         }
@@ -478,6 +507,31 @@ async fn run_app<B: ratatui::backend::Backend>(
                         // Execute query
                         KeyCode::F(5) => {
                             handle_execute_query(state).await;
+                        }
+
+                        // Export results
+                        KeyCode::F(6) => {
+                            if state.query_result.is_some() {
+                                state.open_export_dialog();
+                            } else {
+                                state.set_status("No results to export. Execute a query first.");
+                            }
+                        }
+
+                        // Import CSV
+                        KeyCode::F(7) => {
+                            if state.is_connected() {
+                                state.open_import_dialog();
+                            } else {
+                                state.set_status("Not connected. Connect to a database first.");
+                            }
+                        }
+
+                        // Export shortcut from Results panel
+                        KeyCode::Char('x') if state.active_panel == ActivePanel::Results => {
+                            if state.query_result.is_some() {
+                                state.open_export_dialog();
+                            }
                         }
 
                         // Execute current query at cursor with Ctrl+Enter
@@ -821,6 +875,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 Event::Mouse(mouse) => {
+                    needs_redraw = true;
                     if !state.is_dialog_open() {
                         handle_mouse_event(
                             state,
@@ -833,7 +888,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         .await;
                     }
                 }
-                _ => {}
+                _ => {
+                    needs_redraw = true; // Resize and other events
+                }
             }
         }
 
@@ -1159,6 +1216,8 @@ fn handle_dialog_input(state: &mut AppState, key: KeyCode, modifiers: KeyModifie
         DialogMode::EditRow => handle_edit_row_dialog(state, key),
         DialogMode::AddRow => handle_add_row_dialog(state, key),
         DialogMode::SchemaModify => handle_schema_dialog(state, key),
+        DialogMode::Export => handle_export_dialog_input(state, key),
+        DialogMode::Import => handle_import_dialog_input(state, key),
         DialogMode::DeleteConfirm => {
             // TODO: implement delete confirmation
             false
@@ -2017,6 +2076,7 @@ async fn handle_execute_query(state: &mut AppState) {
 
             state.query_result = Some(result);
             state.update_known_columns(); // Update columns for autocompletion
+            state.compute_col_widths(); // Cache column widths once
             state.selected_row = 0;
             state.results_scroll_x = 0; // Reset horizontal scroll
             state.set_status(format!("Query executed: {} rows in {}ms", row_count, time));
@@ -2098,6 +2158,7 @@ async fn handle_execute_current_query(state: &mut AppState) {
             }
 
             state.query_result = Some(result);
+            state.compute_col_widths(); // Cache column widths once
             state.selected_row = 0;
             state.results_scroll_x = 0;
             state.set_status(format!("Query executed: {} rows in {}ms", row_count, time));
@@ -2705,4 +2766,339 @@ async fn update_completions_from_context(state: &mut AppState) {
             }
         }
     }
+}
+
+/// Handle export dialog input
+fn handle_export_dialog_input(state: &mut AppState, key: KeyCode) -> bool {
+    let export_state = match state.export_state.as_mut() {
+        Some(s) => s,
+        None => return false,
+    };
+
+    match key {
+        KeyCode::Esc => {
+            state.close_dialog();
+            false
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            export_state.active_field = (export_state.active_field + 1) % 2;
+            if export_state.active_field == 1 {
+                export_state.cursor_position = export_state.file_path.len();
+            }
+            false
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            export_state.active_field = if export_state.active_field == 0 { 1 } else { 0 };
+            if export_state.active_field == 1 {
+                export_state.cursor_position = export_state.file_path.len();
+            }
+            false
+        }
+        KeyCode::Left if export_state.active_field == 0 => {
+            export_state.format = export_state.format.next();
+            export_state.update_extension();
+            false
+        }
+        KeyCode::Right if export_state.active_field == 0 => {
+            export_state.format = export_state.format.next();
+            export_state.update_extension();
+            false
+        }
+        KeyCode::Enter => {
+            // Signal to perform export
+            true
+        }
+        KeyCode::Char(c) if export_state.active_field == 1 => {
+            let pos = export_state.cursor_position;
+            export_state.file_path.insert(pos, c);
+            export_state.cursor_position += c.len_utf8();
+            false
+        }
+        KeyCode::Backspace if export_state.active_field == 1 => {
+            if export_state.cursor_position > 0 {
+                let prev =
+                    prev_char_boundary(&export_state.file_path, export_state.cursor_position);
+                export_state.file_path.remove(prev);
+                export_state.cursor_position = prev;
+            }
+            false
+        }
+        KeyCode::Delete if export_state.active_field == 1 => {
+            let pos = export_state.cursor_position;
+            if pos < export_state.file_path.len() {
+                export_state.file_path.remove(pos);
+            }
+            false
+        }
+        KeyCode::Home if export_state.active_field == 1 => {
+            export_state.cursor_position = 0;
+            false
+        }
+        KeyCode::End if export_state.active_field == 1 => {
+            export_state.cursor_position = export_state.file_path.len();
+            false
+        }
+        KeyCode::Left if export_state.active_field == 1 => {
+            export_state.cursor_position =
+                prev_char_boundary(&export_state.file_path, export_state.cursor_position);
+            false
+        }
+        KeyCode::Right if export_state.active_field == 1 => {
+            export_state.cursor_position =
+                next_char_boundary(&export_state.file_path, export_state.cursor_position);
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Handle import dialog input
+fn handle_import_dialog_input(state: &mut AppState, key: KeyCode) -> bool {
+    let import_state = match state.import_state.as_mut() {
+        Some(s) => s,
+        None => return false,
+    };
+
+    match key {
+        KeyCode::Esc => {
+            state.close_dialog();
+            false
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            import_state.active_field = (import_state.active_field + 1) % 2;
+            import_state.cursor_position = match import_state.active_field {
+                0 => import_state.file_path.len(),
+                1 => import_state.target_table.len(),
+                _ => 0,
+            };
+            false
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            import_state.active_field = if import_state.active_field == 0 { 1 } else { 0 };
+            import_state.cursor_position = match import_state.active_field {
+                0 => import_state.file_path.len(),
+                1 => import_state.target_table.len(),
+                _ => 0,
+            };
+            false
+        }
+        KeyCode::Enter => {
+            // Signal to perform import
+            true
+        }
+        KeyCode::Char(c) => {
+            let pos = import_state.cursor_position;
+            let field = match import_state.active_field {
+                0 => &mut import_state.file_path,
+                1 => &mut import_state.target_table,
+                _ => return false,
+            };
+            field.insert(pos, c);
+            import_state.cursor_position += c.len_utf8();
+            false
+        }
+        KeyCode::Backspace => {
+            if import_state.cursor_position > 0 {
+                let field = match import_state.active_field {
+                    0 => &mut import_state.file_path,
+                    1 => &mut import_state.target_table,
+                    _ => return false,
+                };
+                let prev = prev_char_boundary(field, import_state.cursor_position);
+                field.remove(prev);
+                import_state.cursor_position = prev;
+            }
+            false
+        }
+        KeyCode::Delete => {
+            let field = match import_state.active_field {
+                0 => &mut import_state.file_path,
+                1 => &mut import_state.target_table,
+                _ => return false,
+            };
+            let pos = import_state.cursor_position;
+            if pos < field.len() {
+                field.remove(pos);
+            }
+            false
+        }
+        KeyCode::Home => {
+            import_state.cursor_position = 0;
+            false
+        }
+        KeyCode::End => {
+            let field = match import_state.active_field {
+                0 => &import_state.file_path,
+                1 => &import_state.target_table,
+                _ => return false,
+            };
+            import_state.cursor_position = field.len();
+            false
+        }
+        KeyCode::Left => {
+            let field = match import_state.active_field {
+                0 => &import_state.file_path,
+                1 => &import_state.target_table,
+                _ => return false,
+            };
+            import_state.cursor_position = prev_char_boundary(field, import_state.cursor_position);
+            false
+        }
+        KeyCode::Right => {
+            let field = match import_state.active_field {
+                0 => &import_state.file_path,
+                1 => &import_state.target_table,
+                _ => return false,
+            };
+            import_state.cursor_position = next_char_boundary(field, import_state.cursor_position);
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Handle export action
+fn handle_export(state: &mut AppState) {
+    let export_state = match state.export_state.clone() {
+        Some(s) => s,
+        None => {
+            state.set_status("Export error: no export state");
+            state.close_dialog();
+            return;
+        }
+    };
+
+    let result = match &state.query_result {
+        Some(r) => r,
+        None => {
+            state.set_status("No results to export");
+            state.close_dialog();
+            return;
+        }
+    };
+
+    if export_state.file_path.is_empty() {
+        state.set_status("File path is required");
+        return;
+    }
+
+    let table_name = export_state.table_name.as_deref().unwrap_or("table");
+    let (quote_start, quote_end) = get_quote_chars(state);
+
+    match services::export_import::export_to_file(
+        result,
+        export_state.format,
+        &export_state.file_path,
+        table_name,
+        quote_start,
+        quote_end,
+    ) {
+        Ok(row_count) => {
+            state.set_status(format!(
+                "Exported {} rows to {} ({})",
+                row_count,
+                export_state.file_path,
+                export_state.format.label()
+            ));
+        }
+        Err(e) => {
+            state.set_status(format!("Export failed: {}", e));
+        }
+    }
+
+    state.close_dialog();
+}
+
+/// Handle import action
+async fn handle_import(state: &mut AppState) {
+    let import_state = match state.import_state.clone() {
+        Some(s) => s,
+        None => {
+            state.set_status("Import error: no import state");
+            state.close_dialog();
+            return;
+        }
+    };
+
+    if import_state.file_path.is_empty() {
+        state.set_status("File path is required");
+        return;
+    }
+
+    if import_state.target_table.is_empty() {
+        state.set_status("Target table name is required");
+        return;
+    }
+
+    if state.connection.is_none() {
+        state.set_status("Not connected to a database");
+        state.close_dialog();
+        return;
+    }
+
+    // Read the CSV file
+    let content = match std::fs::read_to_string(&import_state.file_path) {
+        Ok(c) => c,
+        Err(e) => {
+            state.set_status(format!("Failed to read file: {}", e));
+            state.close_dialog();
+            return;
+        }
+    };
+
+    // Parse CSV
+    let (columns, rows) = match services::export_import::parse_csv(&content) {
+        Ok(data) => data,
+        Err(e) => {
+            state.set_status(format!("CSV parse error: {}", e));
+            state.close_dialog();
+            return;
+        }
+    };
+
+    let (quote_start, quote_end) = get_quote_chars(state);
+    let queries = services::export_import::build_import_queries(
+        &import_state.target_table,
+        &columns,
+        &rows,
+        quote_start,
+        quote_end,
+    );
+
+    let total = queries.len();
+    let mut success_count = 0;
+    let mut last_error: Option<String> = None;
+
+    state.set_status(format!("Importing {} rows...", total));
+
+    for query in &queries {
+        match state
+            .connection
+            .as_ref()
+            .unwrap()
+            .execute_query(query)
+            .await
+        {
+            Ok(_) => success_count += 1,
+            Err(e) => {
+                last_error = Some(format!("{}", e));
+            }
+        }
+    }
+
+    if success_count == total {
+        state.set_status(format!(
+            "Import complete: {} rows inserted into {}",
+            success_count, import_state.target_table
+        ));
+    } else if let Some(err) = last_error {
+        state.set_status(format!(
+            "Import partial: {}/{} rows inserted. Last error: {}",
+            success_count, total, err
+        ));
+    } else {
+        state.set_status(format!("Import: {}/{} rows inserted", success_count, total));
+    }
+
+    state.close_dialog();
 }

@@ -6,7 +6,10 @@ use ratatui::{
 use crate::services::AppState;
 
 use super::clickable::ClickableRegistry;
-use super::modals::{render_edit_row_dialog, render_new_connection_dialog, render_schema_dialog};
+use super::modals::{
+    render_edit_row_dialog, render_export_dialog, render_import_dialog,
+    render_new_connection_dialog, render_schema_dialog,
+};
 use super::widgets::{
     render_connections_panel, render_help_bar, render_query_editor, render_results_panel,
     render_status_bar, render_tables_panel,
@@ -100,4 +103,6 @@ pub fn render_ui(frame: &mut Frame, state: &AppState, clickable_registry: &Click
     render_new_connection_dialog(frame, state);
     render_edit_row_dialog(frame, state);
     render_schema_dialog(frame, state);
+    render_export_dialog(frame, state);
+    render_import_dialog(frame, state);
 }

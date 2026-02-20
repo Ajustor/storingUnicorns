@@ -1,8 +1,10 @@
 mod edit_row;
+mod export_import;
 mod new_connection;
 mod schema_dialog;
 
 pub use edit_row::render_edit_row_dialog;
+pub use export_import::{render_export_dialog, render_import_dialog};
 pub use new_connection::render_new_connection_dialog;
 pub use schema_dialog::{render_schema_dialog, SchemaAction};
 

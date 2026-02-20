@@ -31,6 +31,17 @@ fn selection_style() -> Style {
     Style::default().bg(Color::Blue).fg(Color::White)
 }
 
+/// Draw a software cursor (reverse-video cell) instead of using the terminal hardware cursor.
+/// This avoids blink-timer resets caused by continuous 30fps redraws.
+pub fn draw_cursor(frame: &mut Frame, x: u16, y: u16) {
+    let buf = frame.buffer_mut();
+    let area = buf.area;
+    if x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height {
+        let cell = &mut buf[(x, y)];
+        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+    }
+}
+
 /// Highlight SQL with text selection overlay
 fn highlight_sql_with_selection(
     text: &str,
@@ -273,7 +284,7 @@ pub fn render_tables_panel(
             let cursor_x =
                 filter_rect.x + 4 + state.tables_filter[..state.tables_filter_cursor].len() as u16;
             let cursor_y = filter_rect.y + 1;
-            frame.set_cursor_position((cursor_x, cursor_y));
+            draw_cursor(frame, cursor_x, cursor_y);
         }
     }
 
@@ -642,7 +653,7 @@ pub fn render_query_editor(
 
         // Only show cursor if it's within the visible area
         if cursor_y < editor_area.y + editor_area.height - 1 && cursor_y >= editor_area.y + 1 {
-            frame.set_cursor_position((cursor_x, cursor_y));
+            draw_cursor(frame, cursor_x, cursor_y);
         }
     }
 }
@@ -825,7 +836,7 @@ pub fn render_results_panel(
                     + 4
                     + state.results_filter[..state.results_filter_cursor].len() as u16;
                 let cursor_y = filter_rect.y + 1;
-                frame.set_cursor_position((cursor_x, cursor_y));
+                draw_cursor(frame, cursor_x, cursor_y);
             }
         }
 
@@ -846,6 +857,7 @@ pub fn render_results_panel(
         };
 
         let visible_height = inner_area.height as usize;
+        state.results_visible_height.set(visible_height);
         let scroll_offset = state.results_scroll;
 
         // Determine how many columns fit on screen to avoid rendering offscreen ones

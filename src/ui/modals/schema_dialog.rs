@@ -8,6 +8,7 @@ use ratatui::{
 
 use super::centered_rect;
 use crate::services::{AppState, ColumnDefinition, DialogMode};
+use crate::ui::widgets::draw_cursor;
 
 /// Render the schema modification dialog
 pub fn render_schema_dialog(frame: &mut Frame, state: &AppState) {
@@ -464,7 +465,7 @@ fn render_text_field(
     if is_active {
         let cursor_x = area.x + label.len() as u16 + 2 + cursor_pos as u16;
         let cursor_y = area.y;
-        frame.set_cursor_position((cursor_x.min(area.x + area.width - 1), cursor_y));
+        draw_cursor(frame, cursor_x.min(area.x + area.width - 1), cursor_y);
     }
 }
 

@@ -8,6 +8,7 @@ use ratatui::{
 use super::centered_rect;
 use crate::models::{AzureAuthMethod, DatabaseType};
 use crate::services::{AppState, ConnectionField, DialogMode};
+use crate::ui::widgets::draw_cursor;
 
 pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     if state.dialog_mode != DialogMode::NewConnection
@@ -101,7 +102,7 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
         if is_active && field != ConnectionField::DbType && field != ConnectionField::AzureAuth {
             let cursor_x = area.x + label.len() as u16 + 2 + nc.cursor_position as u16;
             let cursor_y = area.y;
-            frame.set_cursor_position((cursor_x.min(area.x + area.width - 1), cursor_y));
+            draw_cursor(frame, cursor_x.min(area.x + area.width - 1), cursor_y);
         }
     };
 

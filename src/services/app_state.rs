@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use super::export_import::{ExportState, ImportState};
 use super::query_tabs::QueryTabsState;
 use super::table_cache::{FetchQueue, TableCache};
@@ -295,8 +297,8 @@ pub struct AppState {
     // Results state
     pub query_result: Option<QueryResult>,
     pub results_scroll: usize,
-    pub results_scroll_x: usize,       // Horizontal scroll offset
-    pub results_visible_height: usize, // Updated each frame by render
+    pub results_scroll_x: usize,             // Horizontal scroll offset
+    pub results_visible_height: Cell<usize>, // Updated each frame by render
     pub selected_row: usize,
     pub results_filter: String,       // Filter text for results
     pub results_filter_active: bool,  // Whether filter input is active
@@ -375,7 +377,7 @@ impl AppState {
             query_result: None,
             results_scroll: 0,
             results_scroll_x: 0,
-            results_visible_height: 0,
+            results_visible_height: Cell::new(0),
             selected_row: 0,
             results_filter: String::new(),
             results_filter_active: false,
@@ -694,7 +696,7 @@ impl AppState {
 
     /// Keep results_scroll in sync with selected_row
     fn adjust_results_scroll(&mut self) {
-        let vh = self.results_visible_height;
+        let vh = self.results_visible_height.get();
         if vh == 0 {
             return;
         }
@@ -1134,23 +1136,5 @@ impl AppState {
     pub fn adjust_query_editor_height(&mut self, delta: i16) {
         let new_height = (self.query_editor_height as i16 + delta).clamp(20, 80) as u16;
         self.query_editor_height = new_height;
-    }
-
-    /// Toggle tables filter mode
-    pub fn toggle_tables_filter(&mut self) {
-        self.tables_filter_active = !self.tables_filter_active;
-        if !self.tables_filter_active {
-            // Optionally clear filter when deactivating
-            // self.tables_filter.clear();
-        }
-    }
-
-    /// Toggle results filter mode
-    pub fn toggle_results_filter(&mut self) {
-        self.results_filter_active = !self.results_filter_active;
-        if !self.results_filter_active {
-            // Optionally clear filter when deactivating
-            // self.results_filter.clear();
-        }
     }
 }

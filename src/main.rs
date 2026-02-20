@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::Result;
 use crossterm::{
+    cursor,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         MouseButton, MouseEventKind,
@@ -96,7 +97,12 @@ async fn main() -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        cursor::Hide
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -118,7 +124,8 @@ async fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        cursor::Show
     )?;
     terminal.show_cursor()?;
 
@@ -201,25 +208,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 panel_animations = None;
             }
 
-            // Update results_visible_height for scroll calculations.
-            // Approximate from terminal size using the same layout logic.
-            let term_size = terminal.size()?;
-            let content_h = term_size.height.saturating_sub(2); // status + help bars
-            let right_h = if state.should_show_results() {
-                content_h.saturating_sub(
-                    (content_h as u32 * state.query_editor_height as u32 / 100) as u16,
-                )
-            } else {
-                0
-            };
-            // results inner: -2 borders -1 header = 3, -3 if filter bar visible
-            let filter_overhead: u16 =
-                if state.results_filter_active || !state.results_filter.is_empty() {
-                    3
-                } else {
-                    0
-                };
-            state.results_visible_height = right_h.saturating_sub(3 + filter_overhead) as usize;
+            // results_visible_height is updated by render_results_panel each frame
         }
 
         // Use ~30fps poll for neon border animation; shorter during startup
@@ -2769,10 +2758,9 @@ async fn fetch_table_columns(
         match conn.get_table_column_details(table_name).await {
             Ok(columns) => {
                 // Store in cache
-                let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
                 state
                     .table_cache
-                    .set(table_name.to_string(), column_names, columns.clone())
+                    .set(table_name.to_string(), columns.clone())
                     .await;
 
                 return Some(

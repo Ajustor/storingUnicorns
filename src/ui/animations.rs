@@ -131,6 +131,17 @@ impl ModalAnimation {
 
 // ─── Neon border effect ────────────────────────────────────────────────────
 
+/// Returns true for box-drawing / border characters that should receive neon colouring.
+fn is_border_char(s: &str) -> bool {
+    matches!(
+        s,
+        "│" | "─" | "┐" | "┘" | "└" | "┌" | "┬" | "┴" | "├" | "┤" | "┼"
+            | "═" | "║" | "╔" | "╗" | "╚" | "╝" | "╠" | "╣" | "╦" | "╩" | "╬"
+            | "╭" | "╮" | "╯" | "╰"
+            | "▏" | "▕" | "▁" | "▔"
+    )
+}
+
 /// Pulse speed: controls how fast the neon breathes (radians per millisecond)
 const NEON_PULSE_SPEED: f32 = 0.003;
 
@@ -158,17 +169,21 @@ pub fn render_neon_border(frame: &mut Frame, area: Rect, elapsed_ms: u128) {
     let y0 = area.y;
     let y1 = area.y + area.height.saturating_sub(1);
 
-    // Top & bottom edges
+    // Top & bottom edges — only color box-drawing characters
     for x in x0..=x1 {
-        buf[(x, y0)].set_fg(color);
-        if y1 > y0 {
+        if is_border_char(buf[(x, y0)].symbol()) {
+            buf[(x, y0)].set_fg(color);
+        }
+        if y1 > y0 && is_border_char(buf[(x, y1)].symbol()) {
             buf[(x, y1)].set_fg(color);
         }
     }
     // Left & right edges (excluding corners already done)
     for y in (y0 + 1)..y1 {
-        buf[(x0, y)].set_fg(color);
-        if x1 > x0 {
+        if is_border_char(buf[(x0, y)].symbol()) {
+            buf[(x0, y)].set_fg(color);
+        }
+        if x1 > x0 && is_border_char(buf[(x1, y)].symbol()) {
             buf[(x1, y)].set_fg(color);
         }
     }

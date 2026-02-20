@@ -10,7 +10,7 @@ use ratatui::{
     widgets::Paragraph,
     Terminal,
 };
-use tachyonfx::{fx, Duration, Effect, EffectRenderer, Interpolation, Shader};
+use tachyonfx::{fx, Duration, Effect, EffectRenderer, HslConvertable, Interpolation, Shader};
 
 const UNICORN_ART: &str = r"
               \
@@ -60,7 +60,8 @@ pub fn run_splash_screen<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
 
         terminal.draw(|f| {
             let area = f.area();
-            render_splash_content(f, area);
+            let elapsed_ms = now.duration_since(start).as_millis();
+            render_splash_content(f, area, elapsed_ms);
 
             if let Some(ref mut fade_out) = fade_out_effect {
                 f.render_effect(fade_out, area, tick);
@@ -96,7 +97,8 @@ pub fn run_splash_screen<B: Backend>(terminal: &mut Terminal<B>) -> Result<()> {
 }
 
 /// Render the splash screen content (unicorn + app name) centered on screen.
-fn render_splash_content(frame: &mut ratatui::Frame, area: Rect) {
+/// `elapsed_ms` drives the rainbow neon cycling on the unicorn art.
+fn render_splash_content(frame: &mut ratatui::Frame, area: Rect, elapsed_ms: u128) {
     let art_lines: Vec<&str> = UNICORN_ART.lines().collect();
     let art_height = art_lines.len() as u16;
     let name_height = 2; // app name + version
@@ -124,22 +126,59 @@ fn render_splash_content(frame: &mut ratatui::Frame, area: Rect) {
         ])
         .split(center_area);
 
-    // Render unicorn art (centered)
+    // Render unicorn art with rainbow neon effect
+    // Each non-space character gets a hue based on its position + time
+    let base_hue = (elapsed_ms as f32 * 0.15) % 360.0;
+    let mut char_index: usize = 0;
+
     let art_styled: Vec<Line> = art_lines
         .iter()
-        .map(|line| Line::from(Span::styled(*line, Style::default().fg(Color::Magenta))))
+        .map(|line| {
+            let spans: Vec<Span> = line
+                .chars()
+                .map(|ch| {
+                    if ch != ' ' {
+                        let hue = (base_hue + char_index as f32 * 8.0) % 360.0;
+                        // Pulsating brightness for neon glow effect
+                        let pulse = ((elapsed_ms as f32 * 0.003 + char_index as f32 * 0.1).sin()
+                            + 1.0)
+                            * 0.5;
+                        let lightness = 50.0 + pulse * 25.0;
+                        let color = Color::from_hsl(hue, 100.0, lightness);
+                        char_index += 1;
+                        Span::styled(
+                            ch.to_string(),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::raw(ch.to_string())
+                    }
+                })
+                .collect();
+            Line::from(spans)
+        })
         .collect();
 
     let art_paragraph = Paragraph::new(art_styled).alignment(Alignment::Center);
     frame.render_widget(art_paragraph, content_chunks[0]);
 
-    // Render app name
-    let name_line = Line::from(vec![Span::styled(
-        APP_NAME,
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )]);
+    // Render app name with rainbow neon too
+    let name_spans: Vec<Span> = APP_NAME
+        .chars()
+        .enumerate()
+        .map(|(i, ch)| {
+            let hue = (base_hue + i as f32 * 25.0) % 360.0;
+            let pulse = ((elapsed_ms as f32 * 0.004 + i as f32 * 0.5).sin() + 1.0) * 0.5;
+            let lightness = 55.0 + pulse * 20.0;
+            let color = Color::from_hsl(hue, 100.0, lightness);
+            Span::styled(
+                ch.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect();
+    let name_line = Line::from(name_spans);
+
     let version_line = Line::from(vec![Span::styled(
         format!("v{}", APP_VERSION),
         Style::default().fg(Color::DarkGray),

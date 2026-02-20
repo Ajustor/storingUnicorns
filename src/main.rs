@@ -27,7 +27,10 @@ use update_notifier::check_version;
 use config::AppConfig;
 use db::DatabaseConnection;
 use services::{ActivePanel, AppState, ColumnDefinition, ConnectionField, DialogMode};
-use ui::{render_ui, run_splash_screen, ClickableRegistry, PanelAnimations};
+use ui::{
+    compute_active_panel_area, compute_modal_area, render_neon_border, render_ui,
+    run_splash_screen, ClickableRegistry, ModalAnimation, PanelAnimations,
+};
 
 use crate::models::DatabaseType;
 
@@ -149,25 +152,49 @@ async fn run_app<B: ratatui::backend::Backend>(
     // Startup panel reveal animations
     let mut panel_animations: Option<PanelAnimations> = Some(PanelAnimations::new());
 
-    // Only redraw when state has changed — avoids expensive re-render every 100ms
-    let mut needs_redraw = true;
+    // Modal open animation
+    let mut modal_animation: Option<ModalAnimation> = None;
+    // Track which dialog was open last frame to detect open transitions
+    let mut prev_dialog_mode = DialogMode::None;
+
+    // Neon border: track app start time for continuous animation
+    let app_start = Instant::now();
 
     loop {
-        // Force redraws while animations are running
-        if panel_animations.as_ref().is_some_and(|a| a.any_running()) {
-            needs_redraw = true;
+        // Detect modal open transition
+        if state.dialog_mode != DialogMode::None && state.dialog_mode != prev_dialog_mode {
+            modal_animation = Some(ModalAnimation::new(state.dialog_mode));
         }
+        if state.dialog_mode == DialogMode::None {
+            modal_animation = None;
+        }
+        prev_dialog_mode = state.dialog_mode;
 
-        if needs_redraw {
+        {
+            let elapsed_ms = app_start.elapsed().as_millis();
             let registry_clone = clickable_registry.clone();
             terminal.draw(|f| {
                 render_ui(f, state, &registry_clone);
+
                 // Apply panel reveal animations on top of rendered content
                 if let Some(ref mut anims) = panel_animations {
                     anims.apply(f, state);
                 }
+
+                // Neon border on active panel
+                let panel_area = compute_active_panel_area(f.area(), state);
+                render_neon_border(f, panel_area, elapsed_ms);
+
+                // Neon border + animation on open modal
+                if state.dialog_mode != DialogMode::None {
+                    let modal_area = compute_modal_area(f.area(), state.dialog_mode);
+                    render_neon_border(f, modal_area, elapsed_ms);
+
+                    if let Some(ref mut anim) = modal_animation {
+                        anim.apply(f, modal_area);
+                    }
+                }
             })?;
-            needs_redraw = false;
 
             // Clean up animations once all done
             if panel_animations.as_ref().is_some_and(|a| a.all_done()) {
@@ -195,8 +222,8 @@ async fn run_app<B: ratatui::backend::Backend>(
             state.results_visible_height = right_h.saturating_sub(3 + filter_overhead) as usize;
         }
 
-        // Use shorter poll during animations for smooth rendering
-        let poll_ms = if panel_animations.is_some() { 16 } else { 50 };
+        // Use ~30fps poll for neon border animation; shorter during startup
+        let poll_ms = if panel_animations.is_some() { 16 } else { 33 };
         if event::poll(std::time::Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Key(key) => {
@@ -204,7 +231,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    needs_redraw = true;
 
                     // Handle dialog input first
                     if state.is_dialog_open() {
@@ -900,7 +926,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 Event::Mouse(mouse) => {
-                    needs_redraw = true;
                     if !state.is_dialog_open() {
                         handle_mouse_event(
                             state,
@@ -913,9 +938,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         .await;
                     }
                 }
-                _ => {
-                    needs_redraw = true; // Resize and other events
-                }
+                _ => {}
             }
         }
 

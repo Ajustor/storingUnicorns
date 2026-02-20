@@ -27,7 +27,7 @@ use update_notifier::check_version;
 use config::AppConfig;
 use db::DatabaseConnection;
 use services::{ActivePanel, AppState, ColumnDefinition, ConnectionField, DialogMode};
-use ui::{render_ui, ClickableRegistry};
+use ui::{render_ui, run_splash_screen, ClickableRegistry, PanelAnimations};
 
 use crate::models::DatabaseType;
 
@@ -104,6 +104,9 @@ async fn main() -> Result<()> {
         state.set_status("Debug mode enabled - queries will be shown in editor");
     }
 
+    // Splash screen animation
+    run_splash_screen(&mut terminal)?;
+
     // Main loop
     let res = run_app(&mut terminal, &mut state).await;
 
@@ -143,14 +146,33 @@ async fn run_app<B: ratatui::backend::Backend>(
     // Clickable registry for mouse handling
     let clickable_registry = ClickableRegistry::new();
 
+    // Startup panel reveal animations
+    let mut panel_animations: Option<PanelAnimations> = Some(PanelAnimations::new());
+
     // Only redraw when state has changed — avoids expensive re-render every 100ms
     let mut needs_redraw = true;
 
     loop {
+        // Force redraws while animations are running
+        if panel_animations.as_ref().is_some_and(|a| a.any_running()) {
+            needs_redraw = true;
+        }
+
         if needs_redraw {
             let registry_clone = clickable_registry.clone();
-            terminal.draw(|f| render_ui(f, state, &registry_clone))?;
+            terminal.draw(|f| {
+                render_ui(f, state, &registry_clone);
+                // Apply panel reveal animations on top of rendered content
+                if let Some(ref mut anims) = panel_animations {
+                    anims.apply(f, state);
+                }
+            })?;
             needs_redraw = false;
+
+            // Clean up animations once all done
+            if panel_animations.as_ref().is_some_and(|a| a.all_done()) {
+                panel_animations = None;
+            }
 
             // Update results_visible_height for scroll calculations.
             // Approximate from terminal size using the same layout logic.
@@ -173,7 +195,9 @@ async fn run_app<B: ratatui::backend::Backend>(
             state.results_visible_height = right_h.saturating_sub(3 + filter_overhead) as usize;
         }
 
-        if event::poll(std::time::Duration::from_millis(50))? {
+        // Use shorter poll during animations for smooth rendering
+        let poll_ms = if panel_animations.is_some() { 16 } else { 50 };
+        if event::poll(std::time::Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Key(key) => {
                     // Only handle key press events, not release events

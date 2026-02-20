@@ -131,15 +131,11 @@ impl ModalAnimation {
 
 // ─── Neon border effect ────────────────────────────────────────────────────
 
-/// Speed of the neon border cycle in degrees per millisecond
-const NEON_CYCLE_SPEED: f32 = 0.12;
-/// How many border cells the "glow" highlight spans
-const NEON_GLOW_LENGTH: usize = 12;
-/// How many border cells between the start of one glow and the next
-const NEON_GLOW_GAP: usize = 8;
+/// Pulse speed: controls how fast the neon breathes (radians per millisecond)
+const NEON_PULSE_SPEED: f32 = 0.003;
 
-/// Render a neon cycling border effect around the given rectangle.
-/// `elapsed_ms` is the total time since app start, used for animation cycling.
+/// Render a pulsing blue neon border effect around the given rectangle.
+/// The entire border breathes in and out uniformly.
 pub fn render_neon_border(frame: &mut Frame, area: Rect, elapsed_ms: u128) {
     if area.width < 2 || area.height < 2 {
         return;
@@ -147,74 +143,35 @@ pub fn render_neon_border(frame: &mut Frame, area: Rect, elapsed_ms: u128) {
 
     let buf = frame.buffer_mut();
 
-    // Collect all border cell positions in clockwise order
-    let perimeter = border_positions(area);
-    let total = perimeter.len();
-    if total == 0 {
-        return;
-    }
+    // Smooth sine pulse: 0.0 to 1.0
+    let pulse = ((elapsed_ms as f32 * NEON_PULSE_SPEED).sin() + 1.0) * 0.5;
 
-    let cycle_len = NEON_GLOW_LENGTH + NEON_GLOW_GAP;
+    // Lightness oscillates between dim (25) and bright (55)
+    let lightness = 25.0 + pulse * 30.0;
+    // Saturation oscillates between subtle (40) and vivid (85)
+    let saturation = 40.0 + pulse * 45.0;
 
-    // Base hue shifts over time for a rotating rainbow feel
-    let base_hue = (elapsed_ms as f32 * NEON_CYCLE_SPEED) % 360.0;
-
-    for (i, (x, y)) in perimeter.iter().enumerate() {
-        // Position along the border, shifted by time to create movement
-        let moving_pos = (i as f32 + elapsed_ms as f32 * 0.08) % total as f32;
-        let pos_in_cycle = moving_pos as usize % cycle_len;
-
-        let (hue, saturation, lightness) = if pos_in_cycle < NEON_GLOW_LENGTH {
-            // Inside the glow: bright neon with position-based hue shift
-            let glow_progress = pos_in_cycle as f32 / NEON_GLOW_LENGTH as f32;
-            let hue = (base_hue + i as f32 * 1.5) % 360.0;
-            // Brightness peaks in the middle of the glow
-            let brightness = 50.0 + 30.0 * (1.0 - (glow_progress - 0.5).abs() * 2.0);
-            (hue, 100.0, brightness)
-        } else {
-            // Gap between glows: dimmer base color
-            let hue = (base_hue + i as f32 * 1.5) % 360.0;
-            (hue, 60.0, 30.0)
-        };
-
-        let color = Color::from_hsl(hue, saturation, lightness);
-
-        let cell = &mut buf[(*x, *y)];
-        cell.set_fg(color);
-    }
-}
-
-/// Get all border cell positions of a Rect in clockwise order.
-fn border_positions(area: Rect) -> Vec<(u16, u16)> {
-    let mut positions = Vec::with_capacity(2 * (area.width + area.height) as usize);
+    let color = Color::from_hsl(210.0, saturation, lightness);
 
     let x0 = area.x;
     let x1 = area.x + area.width.saturating_sub(1);
     let y0 = area.y;
     let y1 = area.y + area.height.saturating_sub(1);
 
-    // Top edge: left to right
+    // Top & bottom edges
     for x in x0..=x1 {
-        positions.push((x, y0));
-    }
-    // Right edge: top+1 to bottom
-    for y in (y0 + 1)..=y1 {
-        positions.push((x1, y));
-    }
-    // Bottom edge: right-1 to left
-    if y1 > y0 {
-        for x in (x0..x1).rev() {
-            positions.push((x, y1));
+        buf[(x, y0)].set_fg(color);
+        if y1 > y0 {
+            buf[(x, y1)].set_fg(color);
         }
     }
-    // Left edge: bottom-1 to top+1
-    if x1 > x0 {
-        for y in ((y0 + 1)..y1).rev() {
-            positions.push((x0, y));
+    // Left & right edges (excluding corners already done)
+    for y in (y0 + 1)..y1 {
+        buf[(x0, y)].set_fg(color);
+        if x1 > x0 {
+            buf[(x1, y)].set_fg(color);
         }
     }
-
-    positions
 }
 
 // ─── Utilities ─────────────────────────────────────────────────────────────

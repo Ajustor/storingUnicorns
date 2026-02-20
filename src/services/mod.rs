@@ -6,4 +6,3 @@ pub mod table_cache;
 
 pub use app_state::*;
 pub use schema_service::*;
-pub use table_cache::*;

@@ -8,8 +8,6 @@ use crate::models::Column;
 /// Cached table information for autocompletion
 #[derive(Debug, Clone)]
 pub struct CachedTableInfo {
-    /// Column names for this table
-    pub columns: Vec<String>,
     /// Full column metadata
     pub column_details: Vec<Column>,
     /// When this cache entry was last updated
@@ -17,9 +15,8 @@ pub struct CachedTableInfo {
 }
 
 impl CachedTableInfo {
-    pub fn new(columns: Vec<String>, column_details: Vec<Column>) -> Self {
+    pub fn new(column_details: Vec<Column>) -> Self {
         Self {
-            columns,
             column_details,
             last_updated: Instant::now(),
         }
@@ -55,18 +52,6 @@ impl TableCache {
         }
     }
 
-    /// Get cached column names for a table
-    pub async fn get_columns(&self, table_name: &str) -> Option<Vec<String>> {
-        let cache = self.cache.read().await;
-        cache.get(table_name).and_then(|info| {
-            if info.is_valid(self.max_age) {
-                Some(info.columns.clone())
-            } else {
-                None
-            }
-        })
-    }
-
     /// Get cached column details for a table
     pub async fn get_column_details(&self, table_name: &str) -> Option<Vec<Column>> {
         let cache = self.cache.read().await;
@@ -80,23 +65,9 @@ impl TableCache {
     }
 
     /// Store column information in the cache
-    pub async fn set(&self, table_name: String, columns: Vec<String>, column_details: Vec<Column>) {
+    pub async fn set(&self, table_name: String, column_details: Vec<Column>) {
         let mut cache = self.cache.write().await;
-        cache.insert(table_name, CachedTableInfo::new(columns, column_details));
-    }
-
-    /// Store just column names (simpler version)
-    pub async fn set_columns(&self, table_name: String, columns: Vec<String>) {
-        let column_details: Vec<Column> = columns
-            .iter()
-            .map(|name| Column {
-                name: name.clone(),
-                type_name: String::new(),
-                nullable: true,
-                is_primary_key: false,
-            })
-            .collect();
-        self.set(table_name, columns, column_details).await;
+        cache.insert(table_name, CachedTableInfo::new(column_details));
     }
 
     /// Remove a table from the cache
@@ -106,32 +77,10 @@ impl TableCache {
     }
 
     /// Clear the entire cache
+    #[allow(dead_code)]
     pub async fn clear(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
-    }
-
-    /// Get all cached table names with their column counts
-    pub async fn get_all_tables(&self) -> Vec<(String, usize)> {
-        let cache = self.cache.read().await;
-        cache
-            .iter()
-            .filter(|(_, info)| info.is_valid(self.max_age))
-            .map(|(name, info)| (name.clone(), info.columns.len()))
-            .collect()
-    }
-
-    /// Get all columns from all cached tables (for global autocompletion)
-    pub async fn get_all_columns(&self) -> Vec<String> {
-        let cache = self.cache.read().await;
-        let mut all_columns: Vec<String> = cache
-            .values()
-            .filter(|info| info.is_valid(self.max_age))
-            .flat_map(|info| info.columns.clone())
-            .collect();
-        all_columns.sort();
-        all_columns.dedup();
-        all_columns
     }
 }
 

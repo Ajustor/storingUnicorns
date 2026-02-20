@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::Result;
 use crossterm::{
+    cursor,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         MouseButton, MouseEventKind,
@@ -27,7 +28,10 @@ use update_notifier::check_version;
 use config::AppConfig;
 use db::DatabaseConnection;
 use services::{ActivePanel, AppState, ColumnDefinition, ConnectionField, DialogMode};
-use ui::{render_ui, ClickableRegistry};
+use ui::{
+    compute_active_panel_area, compute_modal_area, render_neon_border, render_ui,
+    run_splash_screen, ClickableRegistry, ModalAnimation, PanelAnimations,
+};
 
 use crate::models::DatabaseType;
 
@@ -69,6 +73,9 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "-d");
+    let no_animations = args
+        .iter()
+        .any(|arg| arg == "--no-animations" || arg == "-na");
     let version = args.iter().any(|arg| arg == "--version" || arg == "-v");
 
     if version {
@@ -93,15 +100,25 @@ async fn main() -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        cursor::Hide
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     // Create app state
-    let mut state = AppState::new(config, debug_mode);
+    let mut state = AppState::new(config, debug_mode, no_animations);
 
     if debug_mode {
         state.set_status("Debug mode enabled - queries will be shown in editor");
+    }
+
+    // Splash screen animation
+    if !no_animations {
+        run_splash_screen(&mut terminal)?;
     }
 
     // Main loop
@@ -112,7 +129,8 @@ async fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        cursor::Show
     )?;
     terminal.show_cursor()?;
 
@@ -143,44 +161,86 @@ async fn run_app<B: ratatui::backend::Backend>(
     // Clickable registry for mouse handling
     let clickable_registry = ClickableRegistry::new();
 
-    // Only redraw when state has changed — avoids expensive re-render every 100ms
-    let mut needs_redraw = true;
+    // Startup panel reveal animations
+    let mut panel_animations: Option<PanelAnimations> = if state.no_animations {
+        None
+    } else {
+        Some(PanelAnimations::new())
+    };
+
+    // Modal open animation
+    let mut modal_animation: Option<ModalAnimation> = None;
+    // Track which dialog was open last frame to detect open transitions
+    let mut prev_dialog_mode = DialogMode::None;
+
+    // Neon border: track app start time for continuous animation
+    let app_start = Instant::now();
 
     loop {
-        if needs_redraw {
-            let registry_clone = clickable_registry.clone();
-            terminal.draw(|f| render_ui(f, state, &registry_clone))?;
-            needs_redraw = false;
+        // Detect modal open transition
+        if !state.no_animations
+            && state.dialog_mode != DialogMode::None
+            && state.dialog_mode != prev_dialog_mode
+        {
+            modal_animation = Some(ModalAnimation::new(state.dialog_mode));
+        }
+        if state.dialog_mode == DialogMode::None {
+            modal_animation = None;
+        }
+        prev_dialog_mode = state.dialog_mode;
 
-            // Update results_visible_height for scroll calculations.
-            // Approximate from terminal size using the same layout logic.
-            let term_size = terminal.size()?;
-            let content_h = term_size.height.saturating_sub(2); // status + help bars
-            let right_h = if state.should_show_results() {
-                content_h.saturating_sub(
-                    (content_h as u32 * state.query_editor_height as u32 / 100) as u16,
-                )
-            } else {
-                0
-            };
-            // results inner: -2 borders -1 header = 3, -3 if filter bar visible
-            let filter_overhead: u16 =
-                if state.results_filter_active || !state.results_filter.is_empty() {
-                    3
-                } else {
-                    0
-                };
-            state.results_visible_height = right_h.saturating_sub(3 + filter_overhead) as usize;
+        {
+            let elapsed_ms = app_start.elapsed().as_millis();
+            let registry_clone = clickable_registry.clone();
+            terminal.draw(|f| {
+                render_ui(f, state, &registry_clone);
+
+                // Apply panel reveal animations on top of rendered content
+                if let Some(ref mut anims) = panel_animations {
+                    anims.apply(f, state);
+                }
+
+                if !state.no_animations {
+                    // Neon border on active panel
+                    let panel_area = compute_active_panel_area(f.area(), state);
+                    render_neon_border(f, panel_area, elapsed_ms);
+
+                    // Neon border + animation on open modal
+                    if state.dialog_mode != DialogMode::None {
+                        let modal_area = compute_modal_area(f.area(), state.dialog_mode);
+                        render_neon_border(f, modal_area, elapsed_ms);
+
+                        if let Some(ref mut anim) = modal_animation {
+                            anim.apply(f, modal_area);
+                        }
+                    }
+                }
+            })?;
+
+            // Clean up animations once all done
+            if panel_animations.as_ref().is_some_and(|a| a.all_done()) {
+                panel_animations = None;
+            }
+
+            // results_visible_height is updated by render_results_panel each frame
         }
 
-        if event::poll(std::time::Duration::from_millis(50))? {
+        // Use ~30fps poll for neon border animation; shorter during startup;
+        // no continuous redraw needed when animations are disabled
+        let poll_ms = if state.no_animations {
+            250
+        } else if panel_animations.is_some() {
+            16
+        } else {
+            33
+        };
+        if event::poll(std::time::Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Key(key) => {
                     // Only handle key press events, not release events
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    needs_redraw = true;
 
                     // Handle dialog input first
                     if state.is_dialog_open() {
@@ -876,7 +936,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 Event::Mouse(mouse) => {
-                    needs_redraw = true;
                     if !state.is_dialog_open() {
                         handle_mouse_event(
                             state,
@@ -889,9 +948,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         .await;
                     }
                 }
-                _ => {
-                    needs_redraw = true; // Resize and other events
-                }
+                _ => {}
             }
         }
 
@@ -2722,10 +2779,9 @@ async fn fetch_table_columns(
         match conn.get_table_column_details(table_name).await {
             Ok(columns) => {
                 // Store in cache
-                let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
                 state
                     .table_cache
-                    .set(table_name.to_string(), column_names, columns.clone())
+                    .set(table_name.to_string(), columns.clone())
                     .await;
 
                 return Some(

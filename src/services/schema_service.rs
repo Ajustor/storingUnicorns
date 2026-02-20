@@ -1,7 +1,3 @@
-use anyhow::Result;
-
-use crate::db::DatabaseConnection;
-
 /// Represents a column definition for schema operations
 #[derive(Debug, Clone)]
 pub struct ColumnDefinition {
@@ -285,17 +281,6 @@ impl SchemaService {
         }
     }
 
-    /// Execute a schema modification
-    pub async fn execute(
-        conn: &DatabaseConnection,
-        modification: &SchemaModification,
-        db_type: &crate::models::DatabaseType,
-    ) -> Result<()> {
-        let sql = Self::generate_sql(modification, db_type);
-        conn.execute_query(&sql).await?;
-        Ok(())
-    }
-
     fn get_quote_chars(db_type: &crate::models::DatabaseType) -> (char, char) {
         match db_type {
             crate::models::DatabaseType::Postgres => ('"', '"'),
@@ -305,79 +290,5 @@ impl SchemaService {
                 ('[', ']')
             }
         }
-    }
-}
-
-/// Common data types for each database
-pub fn get_common_data_types(db_type: &crate::models::DatabaseType) -> Vec<&'static str> {
-    match db_type {
-        crate::models::DatabaseType::Postgres => vec![
-            "INTEGER",
-            "BIGINT",
-            "SERIAL",
-            "BIGSERIAL",
-            "SMALLINT",
-            "DECIMAL",
-            "NUMERIC",
-            "REAL",
-            "DOUBLE PRECISION",
-            "VARCHAR(255)",
-            "CHAR(1)",
-            "TEXT",
-            "BOOLEAN",
-            "DATE",
-            "TIME",
-            "TIMESTAMP",
-            "TIMESTAMPTZ",
-            "UUID",
-            "JSONB",
-            "JSON",
-            "BYTEA",
-        ],
-        crate::models::DatabaseType::MySQL => vec![
-            "INT",
-            "BIGINT",
-            "SMALLINT",
-            "TINYINT",
-            "DECIMAL(10,2)",
-            "FLOAT",
-            "DOUBLE",
-            "VARCHAR(255)",
-            "CHAR(1)",
-            "TEXT",
-            "MEDIUMTEXT",
-            "LONGTEXT",
-            "BOOLEAN",
-            "DATE",
-            "TIME",
-            "DATETIME",
-            "TIMESTAMP",
-            "BLOB",
-            "JSON",
-        ],
-        crate::models::DatabaseType::SQLite => vec!["INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC"],
-        crate::models::DatabaseType::SQLServer | crate::models::DatabaseType::Azure => vec![
-            "INT",
-            "BIGINT",
-            "SMALLINT",
-            "TINYINT",
-            "DECIMAL(10,2)",
-            "FLOAT",
-            "REAL",
-            "VARCHAR(255)",
-            "NVARCHAR(255)",
-            "CHAR(1)",
-            "NCHAR(1)",
-            "TEXT",
-            "NTEXT",
-            "BIT",
-            "DATE",
-            "TIME",
-            "DATETIME",
-            "DATETIME2",
-            "DATETIMEOFFSET",
-            "UNIQUEIDENTIFIER",
-            "VARBINARY(MAX)",
-        ],
     }
 }

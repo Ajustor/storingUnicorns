@@ -1,6 +1,6 @@
 [package]
 name = "storingUnicorns"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "A terminal-based database client inspired by DataGrip"
 license = "MIT"
@@ -46,6 +46,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Misc
 dirs = "5.0"
+
+# Terminal effects
+tachyonfx = "0.9"
 
 # Azure AD authentication
 azure_identity = "0.22"

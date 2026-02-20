@@ -8,6 +8,7 @@ use ratatui::{
 
 use super::centered_rect;
 use crate::services::{AppState, DialogMode};
+use crate::ui::widgets::draw_cursor;
 
 pub fn render_export_dialog(frame: &mut Frame, state: &AppState) {
     if state.dialog_mode != DialogMode::Export {
@@ -109,7 +110,7 @@ pub fn render_export_dialog(frame: &mut Frame, state: &AppState) {
             + 9 // "File:    " length
             + export_state.file_path[..export_state.cursor_position].len() as u16;
         let cursor_y = inner.y + 4; // line index of file path
-        frame.set_cursor_position((cursor_x, cursor_y));
+        draw_cursor(frame, cursor_x, cursor_y);
     }
 }
 
@@ -200,14 +201,14 @@ pub fn render_import_dialog(frame: &mut Frame, state: &AppState) {
                 + 11 // "CSV File:  " length
                 + import_state.file_path[..import_state.cursor_position].len() as u16;
             let cursor_y = inner.y;
-            frame.set_cursor_position((cursor_x, cursor_y));
+            draw_cursor(frame, cursor_x, cursor_y);
         }
         1 => {
             let cursor_x = inner.x
                 + 11 // "Table:     " length
                 + import_state.target_table[..import_state.cursor_position].len() as u16;
             let cursor_y = inner.y + 2;
-            frame.set_cursor_position((cursor_x, cursor_y));
+            draw_cursor(frame, cursor_x, cursor_y);
         }
         _ => {}
     }

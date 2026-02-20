@@ -8,6 +8,7 @@ use ratatui::{
 
 use super::centered_rect;
 use crate::services::{AppState, DialogMode};
+use crate::ui::widgets::draw_cursor;
 
 pub fn render_edit_row_dialog(frame: &mut Frame, state: &AppState) {
     if state.dialog_mode != DialogMode::EditRow && state.dialog_mode != DialogMode::AddRow {
@@ -114,7 +115,7 @@ pub fn render_edit_row_dialog(frame: &mut Frame, state: &AppState) {
                 + 2
                 + state.editing_cursor as u16;
             let cursor_y = chunk.y;
-            frame.set_cursor_position((cursor_x.min(chunk.x + chunk.width - 1), cursor_y));
+            draw_cursor(frame, cursor_x.min(chunk.x + chunk.width - 1), cursor_y);
         }
     }
 }

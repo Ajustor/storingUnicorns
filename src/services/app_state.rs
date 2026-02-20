@@ -1,3 +1,4 @@
+use super::export_import::{ExportState, ImportState};
 use super::query_tabs::QueryTabsState;
 use super::table_cache::{FetchQueue, TableCache};
 use crate::config::AppConfig;
@@ -25,6 +26,8 @@ pub enum DialogMode {
     #[allow(dead_code)]
     DeleteConfirm,
     SchemaModify,
+    Export,
+    Import,
 }
 
 /// Fields in the new connection dialog
@@ -319,6 +322,10 @@ pub struct AppState {
     /// Pending operation for column selection: "view", "modify", "drop", "rename"
     pub schema_pending_operation: Option<String>,
 
+    // Export/Import state
+    pub export_state: Option<ExportState>,
+    pub import_state: Option<ImportState>,
+
     // Status
     pub status_message: String,
     pub is_loading: bool,
@@ -382,6 +389,8 @@ impl AppState {
             schema_field_index: 0,
             schema_cursor_pos: 0,
             schema_pending_operation: None,
+            export_state: None,
+            import_state: None,
             status_message: String::from("Press ? for help"),
             is_loading: false,
             is_connecting: false,
@@ -431,6 +440,8 @@ impl AppState {
         self.schema_field_index = 0;
         self.schema_cursor_pos = 0;
         self.schema_pending_operation = None;
+        self.export_state = None;
+        self.import_state = None;
     }
 
     pub fn is_dialog_open(&self) -> bool {
@@ -454,6 +465,22 @@ impl AppState {
         self.schema_action = Some(action);
         self.schema_field_index = 0;
         self.schema_cursor_pos = 0;
+    }
+
+    /// Open the export dialog for current results
+    pub fn open_export_dialog(&mut self) {
+        if let Some(ref result) = self.query_result {
+            let table_name = self.extract_table_from_query();
+            self.export_state = Some(ExportState::new(table_name, result));
+            self.dialog_mode = DialogMode::Export;
+        }
+    }
+
+    /// Open the import dialog
+    pub fn open_import_dialog(&mut self) {
+        let table_name = self.extract_table_from_query();
+        self.import_state = Some(ImportState::new(table_name));
+        self.dialog_mode = DialogMode::Import;
     }
 
     // Query tab helper methods

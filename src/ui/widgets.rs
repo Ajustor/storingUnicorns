@@ -759,24 +759,63 @@ pub fn render_results_panel(
         let filtered_rows = state.get_filtered_results().unwrap_or_default();
         let total_filtered_rows = filtered_rows.len();
 
-        // Calculate column widths: min(30, max_content_length)
-        let col_widths: Vec<u16> = result
+        // Calculate column widths adaptively based on available space
+        let available_width = table_area.width.saturating_sub(2) as usize; // subtract borders
+        let num_visible_cols = result.columns.len().saturating_sub(state.results_scroll_x);
+
+        // First pass: compute ideal widths (content-based, capped at 50)
+        let ideal_widths: Vec<usize> = result
             .columns
             .iter()
             .enumerate()
             .map(|(col_idx, col)| {
-                // Start with column name length
                 let mut max_len = col.name.len();
-                // Check all rows for max content length
-                for row in &result.rows {
+                // Sample up to 100 rows for performance
+                for row in result.rows.iter().take(100) {
                     if let Some(cell) = row.get(col_idx) {
                         max_len = max_len.max(cell.len());
                     }
                 }
-                // Min between 30 and max_len, with minimum of 5
-                (max_len.min(30).max(5)) as u16
+                max_len.min(50).max(3)
             })
             .collect();
+
+        // Second pass: fit columns to available width
+        let col_widths: Vec<u16> = if num_visible_cols > 0 {
+            let visible_ideals: Vec<usize> = ideal_widths.iter().skip(state.results_scroll_x).cloned().collect();
+            let total_ideal: usize = visible_ideals.iter().sum::<usize>() + visible_ideals.len().saturating_sub(1); // +1 spacing per col
+
+            if total_ideal <= available_width {
+                // Everything fits, use ideal widths
+                ideal_widths.iter().map(|&w| w as u16).collect()
+            } else {
+                // Need to shrink: distribute available width proportionally
+                // Reserve 1 char spacing between columns
+                let spacing = num_visible_cols.saturating_sub(1);
+                let usable_width = available_width.saturating_sub(spacing);
+                let min_col_width: usize = 5;
+
+                // Give each column at least min_col_width, then distribute the rest proportionally
+                let total_over_min: usize = ideal_widths.iter().map(|&w| w.saturating_sub(min_col_width)).sum();
+
+                ideal_widths
+                    .iter()
+                    .map(|&ideal| {
+                        if total_over_min == 0 || usable_width <= num_visible_cols * min_col_width {
+                            // All columns get equal minimum
+                            (usable_width / num_visible_cols.max(1)).max(min_col_width) as u16
+                        } else {
+                            let base = min_col_width;
+                            let extra_budget = usable_width.saturating_sub(ideal_widths.len() * min_col_width);
+                            let extra = (ideal.saturating_sub(min_col_width)) * extra_budget / total_over_min;
+                            (base + extra).min(ideal).max(min_col_width) as u16
+                        }
+                    })
+                    .collect()
+            }
+        } else {
+            ideal_widths.iter().map(|&w| w as u16).collect()
+        };
 
         // Apply horizontal scroll by skipping columns
         let col_offset = state.results_scroll_x;
@@ -995,8 +1034,9 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
                     vec![
                         ("F5", "Execute"),
                         ("Ctrl+↵", "Run current"),
+                        ("F6", "Export"),
+                        ("F7", "Import"),
                         ("Shift+←→", "Select"),
-                        ("Alt+±", "Resize"),
                     ]
                 }
             }
@@ -1004,6 +1044,7 @@ pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
                 ("/", "Filter"),
                 ("↑/↓", "Navigate"),
                 ("Enter", "Edit"),
+                ("x", "Export"),
                 ("Alt+±", "Resize"),
             ],
         }

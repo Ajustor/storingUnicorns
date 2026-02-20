@@ -73,6 +73,9 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "-d");
+    let no_animations = args
+        .iter()
+        .any(|arg| arg == "--no-animations" || arg == "-na");
     let version = args.iter().any(|arg| arg == "--version" || arg == "-v");
 
     if version {
@@ -107,14 +110,16 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app state
-    let mut state = AppState::new(config, debug_mode);
+    let mut state = AppState::new(config, debug_mode, no_animations);
 
     if debug_mode {
         state.set_status("Debug mode enabled - queries will be shown in editor");
     }
 
     // Splash screen animation
-    run_splash_screen(&mut terminal)?;
+    if !no_animations {
+        run_splash_screen(&mut terminal)?;
+    }
 
     // Main loop
     let res = run_app(&mut terminal, &mut state).await;
@@ -157,7 +162,11 @@ async fn run_app<B: ratatui::backend::Backend>(
     let clickable_registry = ClickableRegistry::new();
 
     // Startup panel reveal animations
-    let mut panel_animations: Option<PanelAnimations> = Some(PanelAnimations::new());
+    let mut panel_animations: Option<PanelAnimations> = if state.no_animations {
+        None
+    } else {
+        Some(PanelAnimations::new())
+    };
 
     // Modal open animation
     let mut modal_animation: Option<ModalAnimation> = None;
@@ -169,7 +178,10 @@ async fn run_app<B: ratatui::backend::Backend>(
 
     loop {
         // Detect modal open transition
-        if state.dialog_mode != DialogMode::None && state.dialog_mode != prev_dialog_mode {
+        if !state.no_animations
+            && state.dialog_mode != DialogMode::None
+            && state.dialog_mode != prev_dialog_mode
+        {
             modal_animation = Some(ModalAnimation::new(state.dialog_mode));
         }
         if state.dialog_mode == DialogMode::None {
@@ -188,17 +200,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                     anims.apply(f, state);
                 }
 
-                // Neon border on active panel
-                let panel_area = compute_active_panel_area(f.area(), state);
-                render_neon_border(f, panel_area, elapsed_ms);
+                if !state.no_animations {
+                    // Neon border on active panel
+                    let panel_area = compute_active_panel_area(f.area(), state);
+                    render_neon_border(f, panel_area, elapsed_ms);
 
-                // Neon border + animation on open modal
-                if state.dialog_mode != DialogMode::None {
-                    let modal_area = compute_modal_area(f.area(), state.dialog_mode);
-                    render_neon_border(f, modal_area, elapsed_ms);
+                    // Neon border + animation on open modal
+                    if state.dialog_mode != DialogMode::None {
+                        let modal_area = compute_modal_area(f.area(), state.dialog_mode);
+                        render_neon_border(f, modal_area, elapsed_ms);
 
-                    if let Some(ref mut anim) = modal_animation {
-                        anim.apply(f, modal_area);
+                        if let Some(ref mut anim) = modal_animation {
+                            anim.apply(f, modal_area);
+                        }
                     }
                 }
             })?;
@@ -211,8 +225,15 @@ async fn run_app<B: ratatui::backend::Backend>(
             // results_visible_height is updated by render_results_panel each frame
         }
 
-        // Use ~30fps poll for neon border animation; shorter during startup
-        let poll_ms = if panel_animations.is_some() { 16 } else { 33 };
+        // Use ~30fps poll for neon border animation; shorter during startup;
+        // no continuous redraw needed when animations are disabled
+        let poll_ms = if state.no_animations {
+            250
+        } else if panel_animations.is_some() {
+            16
+        } else {
+            33
+        };
         if event::poll(std::time::Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Key(key) => {

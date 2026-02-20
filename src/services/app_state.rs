@@ -340,13 +340,15 @@ pub struct AppState {
 
     // Debug mode
     pub debug_mode: bool,
+    // Disable all animations
+    pub no_animations: bool,
 
     // App control
     pub should_quit: bool,
 }
 
 impl AppState {
-    pub fn new(config: AppConfig, debug_mode: bool) -> Self {
+    pub fn new(config: AppConfig, debug_mode: bool, no_animations: bool) -> Self {
         Self {
             config,
             active_panel: ActivePanel::Connections,
@@ -404,6 +406,7 @@ impl AppState {
             is_connecting: false,
             connection_error: None,
             debug_mode,
+            no_animations,
             should_quit: false,
         }
     }

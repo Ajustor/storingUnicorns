@@ -69,9 +69,9 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "-d");
-    let check_version = args.iter().any(|arg| arg == "--version" || arg == "-v");
+    let version = args.iter().any(|arg| arg == "--version" || arg == "-v");
 
-    if check_version {
+    if version {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
@@ -594,10 +594,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                             state.hide_completion();
                         }
 
-                        // Query editor input (exclude Ctrl combinations)
+                        // Query editor input (exclude Ctrl combinations, but allow AltGr = Ctrl+Alt)
                         KeyCode::Char(c)
                             if state.active_panel == ActivePanel::QueryEditor
-                                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                && (!key.modifiers.contains(KeyModifiers::CONTROL)
+                                    || key.modifiers.contains(KeyModifiers::ALT)) =>
                         {
                             // If there's a selection, delete it first
                             if state.has_selection() {

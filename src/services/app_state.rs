@@ -325,12 +325,6 @@ pub struct AppState {
     pub is_connecting: bool,
     pub connection_error: Option<String>,
 
-    // Azure Interactive auth background task
-    pub pending_azure_task: Option<(
-        tokio::task::JoinHandle<anyhow::Result<DatabaseConnection>>,
-        ConnectionConfig,
-    )>,
-
     // Debug mode
     pub debug_mode: bool,
 
@@ -392,7 +386,6 @@ impl AppState {
             is_loading: false,
             is_connecting: false,
             connection_error: None,
-            pending_azure_task: None,
             debug_mode,
             should_quit: false,
         }

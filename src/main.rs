@@ -83,8 +83,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Setup logging
-    let file = File::create("debug.log");
+    // Setup logging — store log next to config in ~/.config/storing-unicorns/
+    let log_path = dirs::config_dir()
+        .expect("Could not determine config directory")
+        .join("storing-unicorns");
+    std::fs::create_dir_all(&log_path).expect("Could not create config directory");
+    let file = File::create(log_path.join("debug.log"));
     let file = match file {
         Ok(file) => file,
         Err(error) => panic!("Error: {:?}", error),

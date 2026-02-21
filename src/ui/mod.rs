@@ -2,6 +2,7 @@ pub mod animations;
 pub mod clickable;
 pub mod layout;
 pub mod modals;
+pub mod panels;
 pub mod splash;
 pub mod sql_highlight;
 pub mod widgets;

@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use super::export_import::{ExportState, ImportState};
+use super::export_import::{BatchExportState, BatchImportState, BatchTruncateState, ExportState, ImportState};
 use super::query_tabs::QueryTabsState;
 use super::table_cache::{FetchQueue, TableCache};
 use crate::config::AppConfig;
@@ -25,11 +25,14 @@ pub enum DialogMode {
     EditConnection,
     EditRow,
     AddRow,
-    #[allow(dead_code)]
-    DeleteConfirm,
+    DeleteRowConfirm,
+    TruncateConfirm,
+    BatchTruncate,
     SchemaModify,
     Export,
     Import,
+    BatchExport,
+    BatchImport,
 }
 
 /// Fields in the new connection dialog
@@ -331,6 +334,11 @@ pub struct AppState {
     // Export/Import state
     pub export_state: Option<ExportState>,
     pub import_state: Option<ImportState>,
+    pub batch_export_state: Option<BatchExportState>,
+    pub batch_import_state: Option<BatchImportState>,
+    pub batch_truncate_state: Option<BatchTruncateState>,
+    /// Table name pending truncation confirmation
+    pub truncate_table_name: Option<String>,
 
     // Status
     pub status_message: String,
@@ -401,6 +409,10 @@ impl AppState {
             cached_col_widths: Vec::new(),
             export_state: None,
             import_state: None,
+            batch_export_state: None,
+            batch_import_state: None,
+            batch_truncate_state: None,
+            truncate_table_name: None,
             status_message: String::from("Press ? for help"),
             is_loading: false,
             is_connecting: false,
@@ -453,6 +465,8 @@ impl AppState {
         self.schema_pending_operation = None;
         self.export_state = None;
         self.import_state = None;
+        self.batch_export_state = None;
+        self.batch_import_state = None;
     }
 
     pub fn is_dialog_open(&self) -> bool {
@@ -492,6 +506,42 @@ impl AppState {
         let table_name = self.extract_table_from_query();
         self.import_state = Some(ImportState::new(table_name));
         self.dialog_mode = DialogMode::Import;
+    }
+
+    /// Open the batch export dialog
+    pub fn open_batch_export_dialog(&mut self) {
+        self.batch_export_state = Some(BatchExportState::new(&self.schemas));
+        self.dialog_mode = DialogMode::BatchExport;
+    }
+
+    /// Open the batch import dialog
+    pub fn open_batch_import_dialog(&mut self) {
+        let mut batch_state = BatchImportState::new(&self.schemas);
+        batch_state.auto_select_matching_files();
+        self.batch_import_state = Some(batch_state);
+        self.dialog_mode = DialogMode::BatchImport;
+    }
+
+    /// Open delete row confirmation dialog
+    pub fn open_delete_row_confirm(&mut self) {
+        if self.query_result.is_some() {
+            self.editing_table_name = self.extract_table_from_query();
+            self.dialog_mode = DialogMode::DeleteRowConfirm;
+        }
+    }
+
+    /// Open truncate table confirmation dialog
+    pub fn open_truncate_confirm(&mut self) {
+        if let Some(table_name) = self.get_selected_table_full_name() {
+            self.truncate_table_name = Some(table_name);
+            self.dialog_mode = DialogMode::TruncateConfirm;
+        }
+    }
+
+    /// Open batch truncate dialog
+    pub fn open_batch_truncate_dialog(&mut self) {
+        self.batch_truncate_state = Some(BatchTruncateState::new(&self.schemas));
+        self.dialog_mode = DialogMode::BatchTruncate;
     }
 
     // Query tab helper methods
@@ -632,14 +682,26 @@ impl AppState {
         self.active_panel = match self.active_panel {
             ActivePanel::Connections => ActivePanel::Tables,
             ActivePanel::Tables => ActivePanel::QueryEditor,
-            ActivePanel::QueryEditor => ActivePanel::Results,
+            ActivePanel::QueryEditor => {
+                if self.should_show_results() {
+                    ActivePanel::Results
+                } else {
+                    ActivePanel::Connections
+                }
+            }
             ActivePanel::Results => ActivePanel::Connections,
         };
     }
 
     pub fn prev_panel(&mut self) {
         self.active_panel = match self.active_panel {
-            ActivePanel::Connections => ActivePanel::Results,
+            ActivePanel::Connections => {
+                if self.should_show_results() {
+                    ActivePanel::Results
+                } else {
+                    ActivePanel::QueryEditor
+                }
+            }
             ActivePanel::Tables => ActivePanel::Connections,
             ActivePanel::QueryEditor => ActivePanel::Tables,
             ActivePanel::Results => ActivePanel::QueryEditor,

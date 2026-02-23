@@ -454,6 +454,73 @@ pub fn render_tables_panel(
     }
 }
 
+/// Wrap highlighted lines at character boundaries to match cursor position calculation.
+/// Each logical line is split into visual lines of at most `max_width` characters.
+fn wrap_lines_char_boundary<'a>(lines: Vec<Line<'a>>, max_width: usize) -> Vec<Line<'a>> {
+    if max_width == 0 {
+        return lines;
+    }
+
+    let mut result: Vec<Line<'a>> = Vec::new();
+
+    for line in lines {
+        // Calculate total character width of this line
+        let total_chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+
+        if total_chars <= max_width {
+            result.push(line);
+            continue;
+        }
+
+        // Need to split this line into chunks of max_width characters
+        let mut current_spans: Vec<Span<'a>> = Vec::new();
+        let mut current_width: usize = 0;
+
+        for span in line.spans {
+            let style = span.style;
+            let content = span.content.into_owned();
+            let mut remaining = content.as_str();
+
+            while !remaining.is_empty() {
+                let space_left = max_width - current_width;
+                let char_count = remaining.chars().count();
+
+                if char_count <= space_left {
+                    // Whole remaining content fits on current line
+                    current_spans.push(Span::styled(remaining.to_string(), style));
+                    current_width += char_count;
+                    break;
+                } else {
+                    // Split at space_left characters
+                    let split_byte = remaining
+                        .char_indices()
+                        .nth(space_left)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(remaining.len());
+
+                    let (first, rest) = remaining.split_at(split_byte);
+                    if !first.is_empty() {
+                        current_spans.push(Span::styled(first.to_string(), style));
+                    }
+
+                    // Push current visual line
+                    result.push(Line::from(current_spans));
+                    current_spans = Vec::new();
+                    current_width = 0;
+                    remaining = rest;
+                }
+            }
+        }
+
+        // Push remaining spans as the last visual line
+        if !current_spans.is_empty() || total_chars % max_width == 0 {
+            result.push(Line::from(current_spans));
+        }
+    }
+
+    result
+}
+
 pub fn render_query_editor(
     frame: &mut Frame,
     area: Rect,
@@ -560,18 +627,19 @@ pub fn render_query_editor(
         " Query Editor [F5/Ctrl+Enter | Ctrl+Space:Complete | Shift+Arrow:Select] "
     };
 
-    let paragraph = Paragraph::new(highlighted_content.clone())
-        .wrap(ratatui::widgets::Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(panel_style(is_active)),
-        );
-
     // Single pass: compute cursor position, total visual lines, and editor scroll
     let inner_height = editor_area.height.saturating_sub(2) as usize;
     let inner_width = editor_area.width.saturating_sub(2) as usize;
+
+    // Pre-wrap lines at character boundaries so rendering matches cursor calculation
+    let wrapped_content = wrap_lines_char_boundary(highlighted_content, inner_width);
+
+    let paragraph = Paragraph::new(wrapped_content).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(panel_style(is_active)),
+    );
 
     let (editor_scroll, total_visual_lines, cursor_visual_line, cursor_visual_col) =
         if inner_width > 0 && inner_height > 0 {
@@ -723,33 +791,36 @@ fn render_completion_popup(
     frame.render_widget(Clear, popup_area);
 
     // Build completion list items
-    let items: Vec<Line> = state
+    let items: Vec<ListItem> = state
         .completion_suggestions
         .iter()
-        .enumerate()
-        .map(|(i, suggestion)| {
-            let style = if i == state.completion_selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            Line::from(Span::styled(format!(" {} ", suggestion), style))
+        .map(|suggestion| {
+            ListItem::new(Line::from(Span::styled(
+                format!(" {} ", suggestion),
+                Style::default().fg(Color::White),
+            )))
         })
         .collect();
 
-    let popup = Paragraph::new(items)
+    let list = List::new(items)
         .block(
             Block::default()
                 .title(" Completions ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(Color::Black))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
 
-    frame.render_widget(popup, popup_area);
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.completion_selected));
+
+    frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
 pub fn render_results_panel(
@@ -1133,93 +1204,6 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     ]);
 
     let paragraph = Paragraph::new(status).style(Style::default().bg(Color::DarkGray));
-
-    frame.render_widget(paragraph, area);
-}
-
-pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
-    let help_items = if state.is_dialog_open() {
-        vec![
-            ("Tab", "Next field"),
-            ("Enter", "Save"),
-            ("Esc", "Cancel"),
-            ("←/→", "Cycle type"),
-        ]
-    } else if state.tables_filter_active {
-        vec![
-            ("Type", "Filter"),
-            ("Enter", "Apply"),
-            ("Esc", "Cancel"),
-            ("Backspace", "Delete"),
-        ]
-    } else if state.results_filter_active {
-        vec![
-            ("Type", "Filter"),
-            ("Enter", "Apply"),
-            ("Esc", "Cancel"),
-            ("Backspace", "Delete"),
-        ]
-    } else {
-        match state.active_panel {
-            ActivePanel::Connections => vec![
-                ("Enter", "Connect"),
-                ("n", "New"),
-                ("d", "Delete"),
-                ("Tab", "Next panel"),
-                ("?", "Help"),
-                ("q", "Quit"),
-            ],
-            ActivePanel::Tables => vec![
-                ("/", "Filter"),
-                ("Enter", "Select"),
-                ("s", "Schema"),
-                ("Ctrl+R", "Refresh"),
-                ("Alt+±", "Resize"),
-            ],
-            ActivePanel::QueryEditor => {
-                if state.has_selection() {
-                    vec![
-                        ("Ctrl+C", "Copy"),
-                        ("Ctrl+X", "Cut"),
-                        ("Ctrl+A", "Select all"),
-                        ("Esc", "Deselect"),
-                    ]
-                } else {
-                    vec![
-                        ("F5", "Execute"),
-                        ("Ctrl+↵", "Run current"),
-                        ("F6", "Export"),
-                        ("F7", "Import"),
-                        ("Shift+←→", "Select"),
-                    ]
-                }
-            }
-            ActivePanel::Results => vec![
-                ("/", "Filter"),
-                ("↑/↓", "Navigate"),
-                ("Enter", "Edit"),
-                ("x", "Export"),
-                ("Alt+±", "Resize"),
-            ],
-        }
-    };
-
-    let spans: Vec<Span> = help_items
-        .iter()
-        .flat_map(|(key, desc)| {
-            vec![
-                Span::styled(
-                    format!(" {} ", key),
-                    Style::default().bg(Color::DarkGray).fg(Color::White),
-                ),
-                Span::styled(format!("{} ", desc), Style::default().fg(Color::Gray)),
-                Span::raw(" "),
-            ]
-        })
-        .collect();
-
-    let help_line = Line::from(spans);
-    let paragraph = Paragraph::new(help_line);
 
     frame.render_widget(paragraph, area);
 }

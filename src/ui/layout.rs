@@ -6,13 +6,15 @@ use ratatui::{
 use crate::services::AppState;
 
 use super::clickable::ClickableRegistry;
+use super::help_bar::render_help_bar;
 use super::modals::{
-    render_edit_row_dialog, render_export_dialog, render_import_dialog,
-    render_new_connection_dialog, render_schema_dialog,
+    render_batch_export_dialog, render_batch_import_dialog, render_batch_truncate_dialog,
+    render_delete_row_confirm, render_edit_row_dialog, render_export_dialog, render_import_dialog,
+    render_new_connection_dialog, render_schema_dialog, render_truncate_confirm,
 };
 use super::widgets::{
-    render_connections_panel, render_help_bar, render_query_editor, render_results_panel,
-    render_status_bar, render_tables_panel,
+    render_connections_panel, render_query_editor, render_results_panel, render_status_bar,
+    render_tables_panel,
 };
 
 /// Panel types for click detection
@@ -105,4 +107,9 @@ pub fn render_ui(frame: &mut Frame, state: &AppState, clickable_registry: &Click
     render_schema_dialog(frame, state);
     render_export_dialog(frame, state);
     render_import_dialog(frame, state);
+    render_batch_export_dialog(frame, state);
+    render_batch_import_dialog(frame, state);
+    render_delete_row_confirm(frame, state);
+    render_truncate_confirm(frame, state);
+    render_batch_truncate_dialog(frame, state);
 }

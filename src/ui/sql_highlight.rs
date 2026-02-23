@@ -451,9 +451,9 @@ pub fn get_completions(
         }
     }
 
-    // Limit and sort suggestions
-    suggestions.sort();
-    suggestions.dedup();
+    // Remove duplicates while preserving order (DB fields first)
+    let mut seen = std::collections::HashSet::new();
+    suggestions.retain(|s| seen.insert(s.clone()));
     suggestions.truncate(10);
     suggestions
 }

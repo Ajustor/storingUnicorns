@@ -1,5 +1,6 @@
 pub mod animations;
 pub mod clickable;
+pub mod help_bar;
 pub mod layout;
 pub mod modals;
 pub mod splash;

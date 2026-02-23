@@ -11,7 +11,7 @@ use ratatui::{
 
 use super::clickable::{ClickableRegistry, ClickableType};
 use super::layout::PanelType;
-use crate::services::{ActivePanel, AppState, DialogMode};
+use crate::services::{ActivePanel, AppState};
 
 fn panel_style(active: bool) -> Style {
     if active {
@@ -1204,132 +1204,6 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     ]);
 
     let paragraph = Paragraph::new(status).style(Style::default().bg(Color::DarkGray));
-
-    frame.render_widget(paragraph, area);
-}
-
-pub fn render_help_bar(frame: &mut Frame, area: Rect, state: &AppState) {
-    let help_items = if state.is_dialog_open() {
-        match state.dialog_mode {
-            DialogMode::NewConnection | DialogMode::EditConnection => vec![
-                ("Tab", "Next field"),
-                ("Enter", "Save"),
-                ("Esc", "Cancel"),
-                ("←/→", "Cycle type"),
-            ],
-            DialogMode::EditRow | DialogMode::AddRow => {
-                vec![("Tab", "Next field"), ("Enter", "Save"), ("Esc", "Cancel")]
-            }
-            DialogMode::SchemaModify => vec![
-                ("v", "View"),
-                ("a", "Add col"),
-                ("m", "Modify"),
-                ("r", "Rename"),
-                ("d", "Drop"),
-                ("Esc", "Close"),
-            ],
-            DialogMode::Export | DialogMode::Import => vec![
-                ("Tab", "Completion"),
-                ("Enter", "Confirm"),
-                ("Esc", "Cancel"),
-                ("←/→", "Cycle format"),
-            ],
-            DialogMode::BatchExport | DialogMode::BatchImport => vec![
-                ("Tab", "Completion"),
-                ("Space", "Toggle"),
-                ("a/n", "All/None"),
-                ("Enter", "Start"),
-                ("Esc", "Cancel"),
-            ],
-            DialogMode::DeleteRowConfirm | DialogMode::TruncateConfirm => {
-                vec![("y/Enter", "Confirm"), ("n/Esc", "Cancel")]
-            }
-            DialogMode::BatchTruncate => vec![
-                ("Space", "Toggle"),
-                ("a/n", "All/None"),
-                ("Enter", "Truncate"),
-                ("Esc", "Cancel"),
-            ],
-            _ => vec![("Tab", "Next field"), ("Enter", "Save"), ("Esc", "Cancel")],
-        }
-    } else if state.tables_filter_active || state.results_filter_active {
-        vec![
-            ("Type", "Filter"),
-            ("Enter", "Apply"),
-            ("Esc", "Cancel"),
-            ("Backspace", "Delete"),
-        ]
-    } else {
-        match state.active_panel {
-            ActivePanel::Connections => vec![
-                ("Enter", "Connect"),
-                ("n", "New"),
-                ("e", "Edit"),
-                ("d", "Delete"),
-                ("Tab", "Next panel"),
-                ("q", "Quit"),
-            ],
-            ActivePanel::Tables => vec![
-                ("/", "Filter"),
-                ("Enter", "Select"),
-                ("Space", "Expand"),
-                ("s", "Schema"),
-                ("t", "Truncate"),
-                ("T", "Bulk trunc"),
-            ],
-            ActivePanel::QueryEditor => {
-                if state.show_completion {
-                    vec![
-                        ("↑/↓", "Navigate"),
-                        ("Enter", "Accept"),
-                        ("Esc", "Dismiss"),
-                        ("Ctrl+Space", "Refresh"),
-                    ]
-                } else if state.has_selection() {
-                    vec![
-                        ("Ctrl+C", "Copy"),
-                        ("Ctrl+X", "Cut"),
-                        ("Ctrl+A", "Select all"),
-                        ("Esc", "Deselect"),
-                    ]
-                } else {
-                    vec![
-                        ("F5", "Execute"),
-                        ("Ctrl+↵", "Run current"),
-                        ("Ctrl+T", "New tab"),
-                        ("Ctrl+W", "Close tab"),
-                        ("F6", "Export"),
-                        ("F7", "Import"),
-                    ]
-                }
-            }
-            ActivePanel::Results => vec![
-                ("/", "Filter"),
-                ("↑/↓", "Navigate"),
-                ("Enter", "Edit"),
-                ("d/Del", "Delete"),
-                ("a", "Add row"),
-                ("x", "Export"),
-            ],
-        }
-    };
-
-    let spans: Vec<Span> = help_items
-        .iter()
-        .flat_map(|(key, desc)| {
-            vec![
-                Span::styled(
-                    format!(" {} ", key),
-                    Style::default().bg(Color::DarkGray).fg(Color::White),
-                ),
-                Span::styled(format!("{} ", desc), Style::default().fg(Color::Gray)),
-                Span::raw(" "),
-            ]
-        })
-        .collect();
-
-    let help_line = Line::from(spans);
-    let paragraph = Paragraph::new(help_line);
 
     frame.render_widget(paragraph, area);
 }

@@ -115,12 +115,11 @@ cargo run
 
 ## TODO
 
-- [ ] Multi-line query editor with proper cursor movement
-- [ ] Table structure view (columns, types, indexes)
-- [ ] Query history
-- [ ] Result set export (CSV, JSON)
-- [ ] Syntax highlighting for SQL
+- [x] Multi-line query editor with proper cursor movement
+- [x] Table structure view (columns, types, indexes)
+- [x] Query history
+- [x] Result set export (CSV, JSON)
+- [x] Syntax highlighting for SQL
 - [ ] Async query execution with cancellation
-- [ ] SSH tunnel support
 - [ ] Tab completion for table/column names
 - [x] Edit existing connections

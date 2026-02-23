@@ -178,3 +178,52 @@ pub fn build_insert_query(
         table_name, columns_part, values_part
     ))
 }
+
+/// Build a WHERE clause for identifying a specific row (for DELETE).
+/// Uses primary key columns if available, otherwise all columns.
+pub fn build_where_clause(
+    columns: &[Column],
+    values: &[String],
+    quote_start: char,
+    quote_end: char,
+) -> String {
+    let has_primary_keys = columns.iter().any(|c| c.is_primary_key);
+
+    let where_parts: Vec<String> = columns
+        .iter()
+        .zip(values.iter())
+        .filter(|(col, _)| !has_primary_keys || col.is_primary_key)
+        .map(|(col, val)| {
+            if val == "NULL" {
+                format!("{}{}{} IS NULL", quote_start, col.name, quote_end)
+            } else {
+                let escaped_value = val.replace('\'', "''");
+                if is_numeric_type(&col.type_name) {
+                    format!(
+                        "{}{}{} = {}",
+                        quote_start, col.name, quote_end, escaped_value
+                    )
+                } else {
+                    format!(
+                        "{}{}{} = '{}'",
+                        quote_start, col.name, quote_end, escaped_value
+                    )
+                }
+            }
+        })
+        .collect();
+
+    where_parts.join(" AND ")
+}
+
+/// Build a complete DELETE query string for a single row
+pub fn build_delete_query(
+    table_name: &str,
+    columns: &[Column],
+    values: &[String],
+    quote_start: char,
+    quote_end: char,
+) -> String {
+    let where_clause = build_where_clause(columns, values, quote_start, quote_end);
+    format!("DELETE FROM {} WHERE {}", table_name, where_clause)
+}

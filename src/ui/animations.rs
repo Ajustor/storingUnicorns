@@ -224,7 +224,11 @@ pub fn compute_modal_area(frame_area: Rect, dialog_mode: DialogMode) -> Rect {
         DialogMode::EditRow | DialogMode::AddRow => centered_rect(70, 80, frame_area),
         DialogMode::SchemaModify => centered_rect(70, 80, frame_area),
         DialogMode::Export | DialogMode::Import => centered_rect(50, 30, frame_area),
-        DialogMode::DeleteConfirm => centered_rect(40, 20, frame_area),
+        DialogMode::BatchExport | DialogMode::BatchImport => centered_rect(60, 70, frame_area),
+        DialogMode::DeleteRowConfirm | DialogMode::TruncateConfirm => {
+            centered_rect(50, 20, frame_area)
+        }
+        DialogMode::BatchTruncate => centered_rect(60, 70, frame_area),
         DialogMode::None => Rect::default(),
     }
 }

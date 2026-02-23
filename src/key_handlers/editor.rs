@@ -112,9 +112,7 @@ pub async fn handle_editor_keys(
         }
 
         // Shift+Left: extend selection left
-        KeyCode::Left
-            if modifiers.contains(KeyModifiers::SHIFT) && !state.show_completion =>
-        {
+        KeyCode::Left if modifiers.contains(KeyModifiers::SHIFT) && !state.show_completion => {
             let pos = state.cursor_position();
             let query = state.query_input().to_string();
             if !state.has_selection() {
@@ -127,9 +125,7 @@ pub async fn handle_editor_keys(
         }
 
         // Shift+Right: extend selection right
-        KeyCode::Right
-            if modifiers.contains(KeyModifiers::SHIFT) && !state.show_completion =>
-        {
+        KeyCode::Right if modifiers.contains(KeyModifiers::SHIFT) && !state.show_completion => {
             let pos = state.cursor_position();
             let query = state.query_input().to_string();
             if !state.has_selection() {
@@ -142,9 +138,7 @@ pub async fn handle_editor_keys(
         }
 
         // Shift+Up: extend selection up
-        KeyCode::Up
-            if modifiers.contains(KeyModifiers::SHIFT) && !state.show_completion =>
-        {
+        KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) && !state.show_completion => {
             if !state.has_selection() {
                 state.start_selection();
             }
@@ -154,9 +148,7 @@ pub async fn handle_editor_keys(
         }
 
         // Shift+Down: extend selection down
-        KeyCode::Down
-            if modifiers.contains(KeyModifiers::SHIFT) && !state.show_completion =>
-        {
+        KeyCode::Down if modifiers.contains(KeyModifiers::SHIFT) && !state.show_completion => {
             if !state.has_selection() {
                 state.start_selection();
             }

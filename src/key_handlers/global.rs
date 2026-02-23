@@ -49,15 +49,11 @@ pub async fn handle_global_keys(
         }
 
         // List navigation (Up/Down/k/j shared across non-editor panels)
-        KeyCode::Up | KeyCode::Char('k')
-            if state.active_panel != ActivePanel::QueryEditor =>
-        {
+        KeyCode::Up | KeyCode::Char('k') if state.active_panel != ActivePanel::QueryEditor => {
             state.select_prev();
             KeyAction::Consumed
         }
-        KeyCode::Down | KeyCode::Char('j')
-            if state.active_panel != ActivePanel::QueryEditor =>
-        {
+        KeyCode::Down | KeyCode::Char('j') if state.active_panel != ActivePanel::QueryEditor => {
             state.select_next();
             KeyAction::Consumed
         }

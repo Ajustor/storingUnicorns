@@ -1,6 +1,8 @@
 use std::cell::Cell;
 
-use super::export_import::{BatchExportState, BatchImportState, BatchTruncateState, ExportState, ImportState};
+use super::export_import::{
+    BatchExportState, BatchImportState, BatchTruncateState, ExportState, ImportState,
+};
 use super::query_tabs::QueryTabsState;
 use super::table_cache::{FetchQueue, TableCache};
 use crate::config::AppConfig;

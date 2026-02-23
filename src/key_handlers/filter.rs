@@ -16,18 +16,14 @@ pub fn handle_filter_keys(state: &mut AppState, key_code: KeyCode) -> KeyAction 
             }
             KeyCode::Left => {
                 if state.tables_filter_cursor > 0 {
-                    state.tables_filter_cursor = crate::prev_char_boundary(
-                        &state.tables_filter,
-                        state.tables_filter_cursor,
-                    );
+                    state.tables_filter_cursor =
+                        crate::prev_char_boundary(&state.tables_filter, state.tables_filter_cursor);
                 }
             }
             KeyCode::Right => {
                 if state.tables_filter_cursor < state.tables_filter.len() {
-                    state.tables_filter_cursor = crate::next_char_boundary(
-                        &state.tables_filter,
-                        state.tables_filter_cursor,
-                    );
+                    state.tables_filter_cursor =
+                        crate::next_char_boundary(&state.tables_filter, state.tables_filter_cursor);
                 }
             }
             KeyCode::Home => {
@@ -44,10 +40,8 @@ pub fn handle_filter_keys(state: &mut AppState, key_code: KeyCode) -> KeyAction 
             }
             KeyCode::Backspace => {
                 if state.tables_filter_cursor > 0 {
-                    let new_cursor = crate::prev_char_boundary(
-                        &state.tables_filter,
-                        state.tables_filter_cursor,
-                    );
+                    let new_cursor =
+                        crate::prev_char_boundary(&state.tables_filter, state.tables_filter_cursor);
                     state.tables_filter.remove(new_cursor);
                     state.tables_filter_cursor = new_cursor;
                 }

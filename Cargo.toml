@@ -5,8 +5,13 @@ edition = "2021"
 description = "A terminal-based database client inspired by DataGrip"
 license = "MIT"
 
+[lib]
+name = "storing_unicorns"
+path = "src/lib.rs"
+
 [[bin]]
 name = "storingUnicorns"
+path = "src/main.rs"
 
 [dependencies]
 # TUI

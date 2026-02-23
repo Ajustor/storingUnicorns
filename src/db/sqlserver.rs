@@ -330,6 +330,12 @@ fn get_value(row: &tiberius::Row, index: usize) -> String {
                 .map(|v| v.to_string())
         })
         .or_else(|| {
+            row.try_get::<rust_decimal::Decimal, _>(index)
+                .ok()
+                .flatten()
+                .map(|v| v.to_string())
+        })
+        .or_else(|| {
             row.try_get::<bool, _>(index)
                 .ok()
                 .flatten()

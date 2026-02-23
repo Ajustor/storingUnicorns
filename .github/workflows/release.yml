@@ -12,9 +12,15 @@ permissions:
   contents: write
 
 jobs:
+  version-check:
+    uses: Ajustor/workflows/.github/workflows/cargo-version-detect.yml@master
+
   release:
+    needs: version-check
+    if: needs.version-check.outputs.version_changed == 'true'
     uses: Ajustor/workflows/.github/workflows/cargo-release.yml@master
     with:
+      version: ${{ needs.version-check.outputs.new_version }}
       targets: '["windows", "linux", "macos"]'
       publish_to_crate: true
       # package_name: "my-binary"  # Optional: defaults to Cargo.toml name

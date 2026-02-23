@@ -284,6 +284,10 @@ fn get_value(row: &MySqlRow, index: usize) -> String {
         .or_else(|_| row.try_get::<i32, _>(index).map(|v| v.to_string()))
         .or_else(|_| row.try_get::<i64, _>(index).map(|v| v.to_string()))
         .or_else(|_| row.try_get::<f64, _>(index).map(|v| v.to_string()))
+        .or_else(|_| {
+            row.try_get::<rust_decimal::Decimal, _>(index)
+                .map(|v| v.to_string())
+        })
         .or_else(|_| row.try_get::<bool, _>(index).map(|v| v.to_string()))
         .unwrap_or_else(|_| "NULL".to_string())
 }

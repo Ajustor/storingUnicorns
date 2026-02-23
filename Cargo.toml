@@ -1,6 +1,6 @@
 [package]
 name = "storingUnicorns"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "A terminal-based database client inspired by DataGrip"
 license = "MIT"
@@ -22,13 +22,18 @@ sqlx = { version = "0.8", features = [
   "postgres",
   "mysql",
   "sqlite",
+  "rust_decimal",
 ] }
 
 # SQL Server connector
 tiberius = { version = "0.12", default-features = false, features = [
   "tds73",
   "rustls",
+  "rust_decimal",
 ] }
+
+# Decimal support
+rust_decimal = "1"
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Error handling

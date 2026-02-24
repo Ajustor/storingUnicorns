@@ -37,7 +37,7 @@ const UNICORN_ART: &str = r"
                       <.'_.''
                         <'";
 
-const APP_NAME: &str = "storingUnicorns";
+const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Run the splash screen animation.

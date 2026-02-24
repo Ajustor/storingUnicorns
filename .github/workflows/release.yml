@@ -25,6 +25,7 @@ jobs:
       version: ${{ needs.version-check.outputs.new_version }}
       targets: '["windows", "linux", "macos"]'
       publish_to_crate: true
+      deploy_pages: true
       # package_name: "my-binary"  # Optional: defaults to Cargo.toml name
     secrets:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

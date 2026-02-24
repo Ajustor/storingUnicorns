@@ -113,9 +113,7 @@ async fn main() -> Result<()> {
     }
 
     // Splash screen animation
-    if !no_animations {
-        run_splash_screen(&mut terminal)?;
-    }
+    run_splash_screen(&mut terminal)?;
 
     // Main loop
     let res = run_app(&mut terminal, &mut state).await;

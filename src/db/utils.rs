@@ -39,6 +39,11 @@ pub fn build_update_clauses(
                 format!("{}{}{} = NULL", quote_start, col.name, quote_end)
             } else {
                 let escaped_value = new.replace('\'', "''");
+                let escaped_value = if is_bit_type(&col.type_name) {
+                    map_bit_value(&escaped_value)
+                } else {
+                    escaped_value
+                };
                 if is_numeric_type(&col.type_name) {
                     format!(
                         "{}{}{} = {}",
@@ -67,6 +72,11 @@ pub fn build_update_clauses(
                 format!("{}{}{} IS NULL", quote_start, col.name, quote_end)
             } else {
                 let escaped_value = val.replace('\'', "''");
+                let escaped_value = if is_bit_type(&col.type_name) {
+                    map_bit_value(&escaped_value)
+                } else {
+                    escaped_value
+                };
                 if is_numeric_type(&col.type_name) {
                     format!(
                         "{}{}{} = {}",
@@ -100,6 +110,20 @@ fn is_numeric_type(type_name: &str) -> bool {
         || type_lower == "bit"
 }
 
+/// Check if a SQL type is a BIT type
+fn is_bit_type(type_name: &str) -> bool {
+    type_name.to_lowercase() == "bit"
+}
+
+/// Map boolean string values ("true"/"false") to bit values ("1"/"0")
+fn map_bit_value(value: &str) -> String {
+    match value.to_lowercase().as_str() {
+        "true" => "1".to_string(),
+        "false" => "0".to_string(),
+        _ => value.to_string(),
+    }
+}
+
 /// Build INSERT query column list and values list
 /// Returns (columns_part, values_part) excluding system-generated columns
 pub fn build_insert_parts(
@@ -124,6 +148,11 @@ pub fn build_insert_parts(
             val_parts.push("NULL".to_string());
         } else {
             let escaped_value = val.replace('\'', "''");
+            let escaped_value = if is_bit_type(&col.type_name) {
+                map_bit_value(&escaped_value)
+            } else {
+                escaped_value
+            };
             if is_numeric_type(&col.type_name) {
                 val_parts.push(escaped_value);
             } else {
@@ -198,6 +227,11 @@ pub fn build_where_clause(
                 format!("{}{}{} IS NULL", quote_start, col.name, quote_end)
             } else {
                 let escaped_value = val.replace('\'', "''");
+                let escaped_value = if is_bit_type(&col.type_name) {
+                    map_bit_value(&escaped_value)
+                } else {
+                    escaped_value
+                };
                 if is_numeric_type(&col.type_name) {
                     format!(
                         "{}{}{} = {}",

@@ -461,6 +461,20 @@ fn is_numeric_type(type_name: &str) -> bool {
         || type_lower == "bit"
 }
 
+/// Check if a SQL type is a BIT type
+fn is_bit_type(type_name: &str) -> bool {
+    type_name.to_lowercase() == "bit"
+}
+
+/// Map boolean string values ("true"/"false") to bit values ("1"/"0")
+fn map_bit_value(value: &str) -> String {
+    match value.to_lowercase().as_str() {
+        "true" => "1".to_string(),
+        "false" => "0".to_string(),
+        _ => value.to_string(),
+    }
+}
+
 /// Export query results to CSV format
 pub fn export_to_csv(result: &QueryResult) -> String {
     let mut output = String::new();
@@ -476,7 +490,17 @@ pub fn export_to_csv(result: &QueryResult) -> String {
 
     // Data rows
     for row in &result.rows {
-        let fields: Vec<String> = row.iter().map(|v| escape_csv_field(v)).collect();
+        let fields: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(idx, v)| {
+                if idx < result.columns.len() && is_bit_type(&result.columns[idx].type_name) {
+                    escape_csv_field(&map_bit_value(v))
+                } else {
+                    escape_csv_field(v)
+                }
+            })
+            .collect();
         output.push_str(&fields.join(","));
         output.push('\n');
     }
@@ -516,6 +540,13 @@ pub fn export_to_sql_insert(
                     "NULL".to_string()
                 } else {
                     let escaped = val.replace('\'', "''");
+                    let escaped = if idx < result.columns.len()
+                        && is_bit_type(&result.columns[idx].type_name)
+                    {
+                        map_bit_value(&escaped)
+                    } else {
+                        escaped
+                    };
                     if idx < result.columns.len() && is_numeric_type(&result.columns[idx].type_name)
                     {
                         escaped

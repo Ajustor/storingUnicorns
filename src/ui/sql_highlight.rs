@@ -354,6 +354,154 @@ pub fn highlight_sql(query: &str, known_columns: &[String]) -> Vec<Line<'static>
     lines
 }
 
+/// Find the last whole-word occurrence of `kw` (uppercase) in `text` (uppercase).
+/// Returns the byte position just after the keyword, or None.
+fn last_keyword_pos(text: &str, kw: &str) -> Option<usize> {
+    if kw.is_empty() || text.len() < kw.len() {
+        return None;
+    }
+    let kw_len = kw.len();
+    let mut result = None;
+    let mut start = 0;
+    while start + kw_len <= text.len() {
+        if text[start..].starts_with(kw) {
+            let end = start + kw_len;
+            let before_ok = start == 0
+                || text[..start]
+                    .chars()
+                    .last()
+                    .map(|c| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(true);
+            let after_ok = end >= text.len()
+                || text[end..]
+                    .chars()
+                    .next()
+                    .map(|c| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(true);
+            if before_ok && after_ok {
+                result = Some(end);
+            }
+        }
+        let next = text[start..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        start += next;
+    }
+    result
+}
+
+/// Extract the current SQL token from text ending at the cursor.
+/// Handles quoted identifiers (`"…"`, `` `…` ``, `[…]`).
+/// Returns `(token_start_byte, inner_text, opening_quote_char)`.
+/// `token_start_byte` points to the opening quote if in a quote, else the first word char.
+/// `inner_text` is the text without the opening quote.
+pub(crate) fn extract_token(text: &str) -> (usize, String, Option<char>) {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut in_quote: Option<char> = None;
+    let mut quote_start = 0usize;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let (pos, c) = chars[i];
+        match (c, in_quote) {
+            ('"', None) | ('`', None) => {
+                in_quote = Some(c);
+                quote_start = pos;
+                i += 1;
+            }
+            ('[', None) => {
+                in_quote = Some('[');
+                quote_start = pos;
+                i += 1;
+            }
+            (c2, Some(open)) if c2 == open && open != '[' => {
+                // Check for doubled/escaped quote (e.g. "" inside a string)
+                if i + 1 < chars.len() && chars[i + 1].1 == open {
+                    i += 2;
+                } else {
+                    in_quote = None;
+                    i += 1;
+                }
+            }
+            (']', Some('[')) => {
+                in_quote = None;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    if let Some(open_q) = in_quote {
+        let inner_start = quote_start + open_q.len_utf8();
+        return (quote_start, text[inner_start..].to_string(), Some(open_q));
+    }
+
+    // No unclosed quote — find the word boundary (alphanumeric + underscore only)
+    let word_start = text
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_alphanumeric() && *c != '_')
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+
+    (word_start, text[word_start..].to_string(), None)
+}
+
+/// If `text` ends with a schema qualifier like `schema.` or `"schema".` or `[schema].`,
+/// return the schema name (unquoted).
+fn extract_schema_qualifier(text: &str) -> Option<String> {
+    if !text.ends_with('.') {
+        return None;
+    }
+    let before_dot = &text[..text.len() - 1];
+    if before_dot.is_empty() {
+        return None;
+    }
+    let last = before_dot.chars().last().unwrap();
+    match last {
+        '"' | '`' => {
+            let inner_end = before_dot.len() - last.len_utf8();
+            before_dot[..inner_end]
+                .rfind(last)
+                .map(|p| before_dot[p + last.len_utf8()..inner_end].to_string())
+        }
+        ']' => before_dot
+            .rfind('[')
+            .map(|p| before_dot[p + 1..before_dot.len() - 1].to_string()),
+        c if c.is_alphanumeric() || c == '_' => {
+            let start = before_dot
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !c.is_alphanumeric() && *c != '_')
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            let name = &before_dot[start..];
+            if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Format an identifier, wrapping in quotes if it contains special characters
+/// or if the user started typing with a specific quote style.
+fn format_identifier(name: &str, quote_char: Option<char>) -> String {
+    match quote_char {
+        Some('[') => format!("[{}]", name),
+        Some(q) => format!("{}{}{}", q, name, q),
+        None if name
+            .chars()
+            .any(|c| !c.is_alphanumeric() && c != '_') =>
+        {
+            format!("\"{}\"", name)
+        }
+        None => name.to_string(),
+    }
+}
+
 /// Get completion suggestions based on current word and context
 pub fn get_completions(
     query: &str,
@@ -361,89 +509,142 @@ pub fn get_completions(
     known_columns: &[String],
     known_tables: &[String],
 ) -> Vec<String> {
-    // Find the current word being typed
     let before_cursor = &query[..cursor_pos.min(query.len())];
 
-    // Find the start of the current word
-    let word_start = before_cursor
-        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    // Find the current token, handling quoted identifiers
+    let (word_start, current_word, quote_char) = extract_token(before_cursor);
+    let before_token = &before_cursor[..word_start];
 
-    let current_word = &before_cursor[word_start..];
+    // Check for a schema qualifier immediately before the current token (e.g. "schema".)
+    let schema_qualifier = extract_schema_qualifier(before_token);
 
-    if current_word.is_empty() {
+    // Only bail out if there's nothing to complete and no schema context
+    if current_word.is_empty() && quote_char.is_none() && schema_qualifier.is_none() {
         return Vec::new();
     }
+
+    // Use the uppercase text before the token for context detection.
+    // Strip the schema qualifier part so it doesn't confuse keyword detection.
+    let context_text = if schema_qualifier.is_some() {
+        // Drop trailing "schema." (and any quote chars around schema name)
+        before_token
+            .trim_end_matches(|c: char| {
+                c.is_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '`' || c == '[' || c == ']'
+            })
+            .to_uppercase()
+    } else {
+        before_token.to_uppercase()
+    };
+
+    // Determine context via last-keyword wins
+    const TABLE_KWS: &[&str] = &["FROM", "JOIN", "INTO", "UPDATE", "TABLE"];
+    const COLUMN_KWS: &[&str] = &[
+        "SELECT", "WHERE", "AND", "OR", "SET", "ON", "BY", "HAVING", "DISTINCT",
+    ];
+
+    let last_table = TABLE_KWS
+        .iter()
+        .filter_map(|kw| last_keyword_pos(&context_text, kw))
+        .max();
+    let last_column = COLUMN_KWS
+        .iter()
+        .filter_map(|kw| last_keyword_pos(&context_text, kw))
+        .max();
+
+    // A schema qualifier always means table context
+    let table_context = schema_qualifier.is_some()
+        || matches!((last_table, last_column), (Some(t), Some(c)) if t > c)
+        || matches!((last_table, last_column), (Some(_), None));
+
+    // SELECT clause: last column-context keyword was SELECT itself
+    let last_select = last_keyword_pos(&context_text, "SELECT");
+    let in_select_clause = !table_context && last_select.is_some() && last_select == last_column;
 
     let word_upper = current_word.to_uppercase();
     let mut suggestions = Vec::new();
 
-    // Check context - are we after FROM, JOIN, INTO, UPDATE?
-    let context_before = before_cursor[..word_start].to_uppercase();
-    let table_context = context_before.ends_with("FROM ")
-        || context_before.ends_with("JOIN ")
-        || context_before.ends_with("INTO ")
-        || context_before.ends_with("UPDATE ")
-        || context_before.ends_with("TABLE ");
-
-    // Check if we're in SELECT clause (before FROM)
-    let in_select_clause = context_before.contains("SELECT") && !context_before.contains("FROM");
-
-    // Check if we're after WHERE, AND, OR, SET
-    let in_condition_clause = context_before.ends_with("WHERE ")
-        || context_before.ends_with("AND ")
-        || context_before.ends_with("OR ")
-        || context_before.ends_with("SET ")
-        || context_before.ends_with("ON ")
-        || context_before.ends_with("BY ");
-
     if table_context {
-        // Suggest tables
         for table in known_tables {
-            if table.to_uppercase().starts_with(&word_upper) {
-                suggestions.push(table.clone());
+            // Tables are stored as "schema.table" or just "table"
+            let (t_schema, t_name) = table
+                .find('.')
+                .map(|d| (Some(&table[..d]), &table[d + 1..]))
+                .unwrap_or((None, table.as_str()));
+
+            let matches = if let Some(ref schema) = schema_qualifier {
+                // Must match schema name and table prefix
+                t_schema
+                    .map(|s| s.eq_ignore_ascii_case(schema))
+                    .unwrap_or(false)
+                    && t_name.to_uppercase().starts_with(&word_upper)
+            } else {
+                // Match against the full "schema.table" or just "table"
+                table.to_uppercase().starts_with(&word_upper)
+                    || t_name.to_uppercase().starts_with(&word_upper)
+            };
+
+            if matches {
+                let suggestion = if schema_qualifier.is_some() {
+                    // Schema already typed — suggest only the table part
+                    format_identifier(t_name, quote_char)
+                } else if quote_char.is_some() {
+                    // Inside an open quote — suggest full name, will be closed on apply
+                    table.clone()
+                } else {
+                    // Unquoted — format the full reference, quoting if needed
+                    match (t_schema, t_name) {
+                        (Some(s), n)
+                            if s.chars().any(|c| !c.is_alphanumeric() && c != '_')
+                                || n.chars().any(|c| !c.is_alphanumeric() && c != '_') =>
+                        {
+                            format!("\"{}\".\"{}\"", s, n)
+                        }
+                        _ => table.clone(),
+                    }
+                };
+                suggestions.push(suggestion);
             }
         }
-    } else if in_select_clause || in_condition_clause {
-        // Prioritize columns in SELECT and WHERE clauses
+    } else if in_select_clause {
         for col in known_columns {
             if col.to_uppercase().starts_with(&word_upper) {
                 suggestions.push(col.clone());
             }
         }
-
-        // Then add functions (especially aggregate functions in SELECT)
-        if in_select_clause {
-            for func in SQL_FUNCTIONS {
-                if func.starts_with(&word_upper) {
-                    suggestions.push(format!("{}()", func));
-                }
+        for func in SQL_FUNCTIONS {
+            if func.starts_with(&word_upper) {
+                suggestions.push(format!("{}()", func));
             }
         }
-
-        // Then keywords
+        for kw in SQL_KEYWORDS {
+            if kw.starts_with(&word_upper) {
+                suggestions.push(kw.to_string());
+            }
+        }
+    } else if last_column.is_some() {
+        // Condition / general column context
+        for col in known_columns {
+            if col.to_uppercase().starts_with(&word_upper) {
+                suggestions.push(col.clone());
+            }
+        }
         for kw in SQL_KEYWORDS {
             if kw.starts_with(&word_upper) {
                 suggestions.push(kw.to_string());
             }
         }
     } else {
-        // Default behavior: suggest columns first
+        // Default: columns → keywords → functions
         for col in known_columns {
             if col.to_uppercase().starts_with(&word_upper) {
                 suggestions.push(col.clone());
             }
         }
-
-        // Then keywords
         for kw in SQL_KEYWORDS {
             if kw.starts_with(&word_upper) {
                 suggestions.push(kw.to_string());
             }
         }
-
-        // Then functions
         for func in SQL_FUNCTIONS {
             if func.starts_with(&word_upper) {
                 suggestions.push(format!("{}()", func));
@@ -451,7 +652,7 @@ pub fn get_completions(
         }
     }
 
-    // Remove duplicates while preserving order (DB fields first)
+    // Remove duplicates while preserving order
     let mut seen = std::collections::HashSet::new();
     suggestions.retain(|s| seen.insert(s.clone()));
     suggestions.truncate(10);

@@ -640,16 +640,24 @@ impl AppState {
         let query = self.query_input().to_string();
         let cursor = self.cursor_position();
 
-        // Find the word being completed
         let before_cursor = &query[..cursor.min(query.len())];
-        let word_start = before_cursor
-            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let (token_start, _inner, quote_char) = crate::ui::sql_highlight::extract_token(before_cursor);
 
-        // Replace the current word with the suggestion
-        let new_query = format!("{}{}{}", &query[..word_start], suggestion, &query[cursor..]);
-        let new_cursor = word_start + suggestion.len();
+        // If inside an open quote and the suggestion is unquoted inner text, wrap it.
+        let full_suggestion = if quote_char.is_some()
+            && !suggestion.starts_with(|c: char| c == '"' || c == '`' || c == '[')
+        {
+            match quote_char {
+                Some('[') => format!("[{}]", suggestion),
+                Some(q) => format!("{}{}{}", q, suggestion, q),
+                None => unreachable!(),
+            }
+        } else {
+            suggestion
+        };
+
+        let new_query = format!("{}{}{}", &query[..token_start], full_suggestion, &query[cursor..]);
+        let new_cursor = token_start + full_suggestion.len();
 
         self.set_query(new_query);
         self.set_cursor_position(new_cursor);

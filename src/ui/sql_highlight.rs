@@ -382,7 +382,11 @@ fn last_keyword_pos(text: &str, kw: &str) -> Option<usize> {
                 result = Some(end);
             }
         }
-        let next = text[start..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let next = text[start..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
         start += next;
     }
     result
@@ -492,10 +496,7 @@ fn format_identifier(name: &str, quote_char: Option<char>) -> String {
     match quote_char {
         Some('[') => format!("[{}]", name),
         Some(q) => format!("{}{}{}", q, name, q),
-        None if name
-            .chars()
-            .any(|c| !c.is_alphanumeric() && c != '_') =>
-        {
+        None if name.chars().any(|c| !c.is_alphanumeric() && c != '_') => {
             format!("\"{}\"", name)
         }
         None => name.to_string(),
@@ -529,7 +530,13 @@ pub fn get_completions(
         // Drop trailing "schema." (and any quote chars around schema name)
         before_token
             .trim_end_matches(|c: char| {
-                c.is_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '`' || c == '[' || c == ']'
+                c.is_alphanumeric()
+                    || c == '_'
+                    || c == '.'
+                    || c == '"'
+                    || c == '`'
+                    || c == '['
+                    || c == ']'
             })
             .to_uppercase()
     } else {

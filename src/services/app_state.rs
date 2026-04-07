@@ -641,7 +641,8 @@ impl AppState {
         let cursor = self.cursor_position();
 
         let before_cursor = &query[..cursor.min(query.len())];
-        let (token_start, _inner, quote_char) = crate::ui::sql_highlight::extract_token(before_cursor);
+        let (token_start, _inner, quote_char) =
+            crate::ui::sql_highlight::extract_token(before_cursor);
 
         // If inside an open quote and the suggestion is unquoted inner text, wrap it.
         let full_suggestion = if quote_char.is_some()
@@ -656,7 +657,12 @@ impl AppState {
             suggestion
         };
 
-        let new_query = format!("{}{}{}", &query[..token_start], full_suggestion, &query[cursor..]);
+        let new_query = format!(
+            "{}{}{}",
+            &query[..token_start],
+            full_suggestion,
+            &query[cursor..]
+        );
         let new_cursor = token_start + full_suggestion.len();
 
         self.set_query(new_query);

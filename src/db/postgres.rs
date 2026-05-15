@@ -257,5 +257,29 @@ fn get_value(row: &PgRow, index: usize) -> String {
                 .map(|v| v.to_string())
         })
         .or_else(|_| row.try_get::<bool, _>(index).map(|v| v.to_string()))
+        .or_else(|_| {
+            row.try_get::<chrono::DateTime<chrono::Utc>, _>(index)
+                .map(|v| v.to_rfc3339())
+        })
+        .or_else(|_| {
+            row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(index)
+                .map(|v| v.to_rfc3339())
+        })
+        .or_else(|_| {
+            row.try_get::<chrono::NaiveDateTime, _>(index)
+                .map(|v| v.to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<chrono::NaiveDate, _>(index)
+                .map(|v| v.to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<chrono::NaiveTime, _>(index)
+                .map(|v| v.to_string())
+        })
+        .or_else(|_| {
+            row.try_get::<Vec<u8>, _>(index)
+                .map(|v| String::from_utf8_lossy(&v).into_owned())
+        })
         .unwrap_or_else(|_| "NULL".to_string())
 }

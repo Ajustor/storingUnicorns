@@ -341,5 +341,41 @@ fn get_value(row: &tiberius::Row, index: usize) -> String {
                 .flatten()
                 .map(|v| v.to_string())
         })
+        .or_else(|| {
+            row.try_get::<chrono::DateTime<chrono::Utc>, _>(index)
+                .ok()
+                .flatten()
+                .map(|v| v.to_rfc3339())
+        })
+        .or_else(|| {
+            row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(index)
+                .ok()
+                .flatten()
+                .map(|v| v.to_rfc3339())
+        })
+        .or_else(|| {
+            row.try_get::<chrono::NaiveDateTime, _>(index)
+                .ok()
+                .flatten()
+                .map(|v| v.to_string())
+        })
+        .or_else(|| {
+            row.try_get::<chrono::NaiveDate, _>(index)
+                .ok()
+                .flatten()
+                .map(|v| v.to_string())
+        })
+        .or_else(|| {
+            row.try_get::<chrono::NaiveTime, _>(index)
+                .ok()
+                .flatten()
+                .map(|v| v.to_string())
+        })
+        .or_else(|| {
+            row.try_get::<&[u8], _>(index)
+                .ok()
+                .flatten()
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+        })
         .unwrap_or_else(|| "NULL".to_string())
 }

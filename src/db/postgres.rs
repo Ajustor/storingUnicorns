@@ -11,12 +11,10 @@ pub async fn connect(conn_str: &str) -> Result<PgPool> {
     Ok(pool)
 }
 
-/// Execute a query on PostgreSQL
-pub async fn execute_query(pool: &PgPool, query: &str) -> Result<QueryResult> {
-    let rows: Vec<PgRow> = sqlx::query(query).fetch_all(pool).await?;
-
+/// Convert fetched rows into a `QueryResult`.
+fn rows_to_result(rows: &[PgRow]) -> QueryResult {
     if rows.is_empty() {
-        return Ok(QueryResult::default());
+        return QueryResult::default();
     }
 
     let columns: Vec<Column> = rows[0]
@@ -35,12 +33,42 @@ pub async fn execute_query(pool: &PgPool, query: &str) -> Result<QueryResult> {
         .map(|row| (0..columns.len()).map(|i| get_value(row, i)).collect())
         .collect();
 
-    Ok(QueryResult {
+    QueryResult {
         columns,
         rows: data,
         rows_affected: rows.len() as u64,
         execution_time_ms: 0,
-    })
+    }
+}
+
+/// Execute a query on PostgreSQL
+pub async fn execute_query(pool: &PgPool, query: &str) -> Result<QueryResult> {
+    let rows: Vec<PgRow> = sqlx::query(query).fetch_all(pool).await?;
+    Ok(rows_to_result(&rows))
+}
+
+/// Execute a sequence of statements as one transaction on a single dedicated
+/// connection. Statements include the user's `BEGIN`/`COMMIT`/`ROLLBACK`.
+/// On any error the transaction is rolled back and the error is returned.
+pub async fn execute_transaction(pool: &PgPool, statements: &[String]) -> Result<QueryResult> {
+    let mut conn = pool.acquire().await?;
+    let mut last = QueryResult::default();
+
+    for stmt in statements {
+        match sqlx::query(stmt).fetch_all(&mut *conn).await {
+            Ok(rows) => {
+                if !rows.is_empty() {
+                    last = rows_to_result(&rows);
+                }
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(e.into());
+            }
+        }
+    }
+
+    Ok(last)
 }
 
 /// Get tables grouped by schema

@@ -65,6 +65,34 @@ impl DatabaseConnection {
         })
     }
 
+    /// Execute a transaction block (the statements between `BEGIN` and
+    /// `COMMIT`/`ROLLBACK`, inclusive) atomically on a single dedicated
+    /// connection. On any error the transaction is rolled back.
+    pub async fn execute_transaction(&self, statements: &[String]) -> Result<QueryResult> {
+        let start = Instant::now();
+
+        let result = match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::execute_transaction(pool, statements).await?
+            }
+            DatabaseConnection::MySQL(pool) => mysql::execute_transaction(pool, statements).await?,
+            DatabaseConnection::SQLite(pool) => {
+                sqlite::execute_transaction(pool, statements).await?
+            }
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::execute_transaction(client, statements).await?
+            }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::execute_transaction(client, statements).await?
+            }
+        };
+
+        Ok(QueryResult {
+            execution_time_ms: start.elapsed().as_millis(),
+            ..result
+        })
+    }
+
     /// Test the connection
     #[allow(dead_code)]
     pub async fn test(&self) -> Result<()> {

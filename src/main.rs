@@ -1564,7 +1564,59 @@ pub(crate) async fn handle_execute_current_query(state: &mut AppState) {
     // Find the query at the cursor position
     let query_text = state.query_input().to_string();
     let cursor_pos = state.cursor_position();
-    let query = get_query_at_cursor(&query_text, cursor_pos);
+    let query = match get_execution_unit_at_cursor(&query_text, cursor_pos) {
+        ExecutionUnit::UnterminatedTransaction => {
+            state.set_status("Transaction not terminated: add COMMIT or ROLLBACK");
+            return;
+        }
+        ExecutionUnit::Transaction(statements) => {
+            state.set_status(format!(
+                "Executing transaction ({} statements)...",
+                statements.len()
+            ));
+            state.is_loading = true;
+
+            let result = state
+                .connection
+                .as_ref()
+                .unwrap()
+                .execute_transaction(&statements)
+                .await;
+
+            match result {
+                Ok(result) => {
+                    let row_count = result.rows.len();
+                    let time = result.execution_time_ms;
+                    let stmt_count = statements.len();
+                    state.query_result = Some(result);
+                    state.update_known_columns();
+                    state.compute_col_widths();
+                    state.selected_row = 0;
+                    state.results_scroll_x = 0;
+                    if row_count > 0 {
+                        state.set_status(format!(
+                            "Transaction committed: {} rows in {}ms",
+                            row_count, time
+                        ));
+                    } else {
+                        state.set_status(format!(
+                            "Transaction committed: {} statements in {}ms",
+                            stmt_count, time
+                        ));
+                    }
+                    state.active_panel = ActivePanel::Results;
+                }
+                Err(e) => {
+                    state.set_status(format!("Transaction rolled back: {}", e));
+                }
+            }
+
+            state.is_loading = false;
+            return;
+        }
+        ExecutionUnit::Single(query) => query,
+    };
+
     if query.trim().is_empty() {
         state.set_status("No query at cursor position");
         return;
@@ -1632,26 +1684,147 @@ pub(crate) async fn handle_execute_current_query(state: &mut AppState) {
     state.is_loading = false;
 }
 
-/// Get the SQL statement at the given cursor position
-/// Statements are separated by semicolons
-fn get_query_at_cursor(input: &str, cursor_pos: usize) -> String {
-    // Find statement boundaries (separated by ;)
-    let mut start = 0;
-    let mut end = input.len();
+/// The unit of SQL to execute when the user triggers execution.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ExecutionUnit {
+    /// A single statement (the historical behavior).
+    Single(String),
+    /// A full transaction block: ordered statements including the opening
+    /// `BEGIN`/`START TRANSACTION` and the closing `COMMIT`/`ROLLBACK`/`END`.
+    Transaction(Vec<String>),
+    /// The cursor is inside a `BEGIN` that has no matching terminator.
+    UnterminatedTransaction,
+}
 
-    // Find the start of the current statement
-    for (i, c) in input[..cursor_pos].char_indices() {
-        if c == ';' {
-            start = i + 1;
+/// Split SQL into top-level statements, ignoring `;` inside string literals
+/// (`'…'`, `"…"`) and comments (`-- …`, `/* … */`).
+/// Returns `(start_byte, end_byte, trimmed_text)` for each non-empty statement.
+fn split_statements(input: &str) -> Vec<(usize, usize, String)> {
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut statements = Vec::new();
+    let mut stmt_start = 0usize;
+    let mut i = 0usize;
+
+    let push_stmt = |statements: &mut Vec<(usize, usize, String)>, start: usize, end: usize| {
+        let text = input[start..end].trim();
+        if !text.is_empty() {
+            statements.push((start, end, text.to_string()));
+        }
+    };
+
+    while i < chars.len() {
+        let (pos, c) = chars[i];
+        match c {
+            '\'' | '"' => {
+                let quote = c;
+                i += 1;
+                while i < chars.len() {
+                    let cc = chars[i].1;
+                    if cc == quote {
+                        // Doubled quote = escaped quote inside the literal
+                        if i + 1 < chars.len() && chars[i + 1].1 == quote {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '-' if i + 1 < chars.len() && chars[i + 1].1 == '-' => {
+                while i < chars.len() && chars[i].1 != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < chars.len() && chars[i + 1].1 == '*' => {
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i].1 == '*' && chars[i + 1].1 == '/') {
+                    i += 1;
+                }
+                if i + 1 < chars.len() {
+                    i += 2; // skip */
+                }
+            }
+            ';' => {
+                push_stmt(&mut statements, stmt_start, pos);
+                stmt_start = pos + 1;
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
 
-    // Find the end of the current statement
-    if let Some(semicolon_pos) = input[cursor_pos..].find(';') {
-        end = cursor_pos + semicolon_pos;
+    // Trailing statement without a terminating ';'
+    push_stmt(&mut statements, stmt_start, input.len());
+    statements
+}
+
+/// Classify a statement as a transaction start, returning true for
+/// `BEGIN`, `BEGIN TRANSACTION`, `BEGIN TRAN`, `START TRANSACTION`.
+fn is_transaction_start(stmt: &str) -> bool {
+    let mut words = stmt.split_whitespace();
+    match words.next().map(|w| w.to_uppercase()) {
+        Some(w) if w == "BEGIN" => true,
+        Some(w) if w == "START" => words
+            .next()
+            .map(|w2| w2.eq_ignore_ascii_case("TRANSACTION"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Classify a statement as a transaction terminator:
+/// `COMMIT`, `ROLLBACK`, `END` (and their `… TRANSACTION/TRAN` variants).
+fn is_transaction_end(stmt: &str) -> bool {
+    match stmt.split_whitespace().next().map(|w| w.to_uppercase()) {
+        Some(w) => w == "COMMIT" || w == "ROLLBACK" || w == "END",
+        None => false,
+    }
+}
+
+/// Determine what to execute given the cursor position.
+/// If the cursor sits inside a `BEGIN … COMMIT/ROLLBACK/END` block, the whole
+/// block is returned; otherwise the single statement at the cursor.
+pub(crate) fn get_execution_unit_at_cursor(input: &str, cursor_pos: usize) -> ExecutionUnit {
+    let statements = split_statements(input);
+    if statements.is_empty() {
+        return ExecutionUnit::Single(String::new());
     }
 
-    input[start..end].trim().to_string()
+    // Index of the statement containing (or following) the cursor.
+    let cursor_idx = statements
+        .iter()
+        .position(|(_, end, _)| cursor_pos <= *end)
+        .unwrap_or(statements.len() - 1);
+
+    // Walk backward to find an enclosing transaction start.
+    let mut start_idx = None;
+    for j in (0..=cursor_idx).rev() {
+        let text = &statements[j].2;
+        if is_transaction_start(text) {
+            start_idx = Some(j);
+            break;
+        }
+        if j < cursor_idx && is_transaction_end(text) {
+            // A previous transaction already closed before the cursor.
+            break;
+        }
+    }
+
+    let Some(si) = start_idx else {
+        return ExecutionUnit::Single(statements[cursor_idx].2.clone());
+    };
+
+    // Find the matching terminator at or after the start.
+    let end_idx = (si..statements.len()).find(|&j| is_transaction_end(&statements[j].2));
+
+    match end_idx {
+        Some(ei) => {
+            ExecutionUnit::Transaction(statements[si..=ei].iter().map(|s| s.2.clone()).collect())
+        }
+        None => ExecutionUnit::UnterminatedTransaction,
+    }
 }
 
 /// Move cursor up one line in the query editor
@@ -3548,4 +3721,106 @@ async fn handle_batch_truncate<B: ratatui::backend::Backend>(
     }
 
     state.close_dialog();
+}
+
+#[cfg(test)]
+mod execution_unit_tests {
+    use super::{get_execution_unit_at_cursor, ExecutionUnit};
+
+    fn tx(stmts: &[&str]) -> ExecutionUnit {
+        ExecutionUnit::Transaction(stmts.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn single_statement_outside_transaction() {
+        assert_eq!(
+            get_execution_unit_at_cursor("SELECT 1", 0),
+            ExecutionUnit::Single("SELECT 1".into())
+        );
+    }
+
+    #[test]
+    fn picks_statement_at_cursor_among_many() {
+        let sql = "SELECT 1; SELECT 2; SELECT 3";
+        // cursor inside "SELECT 2"
+        assert_eq!(
+            get_execution_unit_at_cursor(sql, 12),
+            ExecutionUnit::Single("SELECT 2".into())
+        );
+    }
+
+    #[test]
+    fn detects_begin_commit_block_from_begin() {
+        let sql = "BEGIN;\nINSERT INTO t VALUES (1);\nCOMMIT;";
+        assert_eq!(
+            get_execution_unit_at_cursor(sql, 0),
+            tx(&["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"])
+        );
+    }
+
+    #[test]
+    fn detects_block_when_cursor_inside_block() {
+        let sql = "BEGIN;\nINSERT INTO t VALUES (1);\nCOMMIT;";
+        // cursor on the INSERT line
+        let cursor = sql.find("INSERT").unwrap();
+        assert_eq!(
+            get_execution_unit_at_cursor(sql, cursor),
+            tx(&["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"])
+        );
+    }
+
+    #[test]
+    fn supports_start_transaction_keyword() {
+        let sql = "START TRANSACTION;\nUPDATE t SET a = 1;\nCOMMIT;";
+        assert_eq!(
+            get_execution_unit_at_cursor(sql, 0),
+            tx(&["START TRANSACTION", "UPDATE t SET a = 1", "COMMIT"])
+        );
+    }
+
+    #[test]
+    fn supports_begin_tran_and_rollback() {
+        let sql = "BEGIN TRAN;\nDELETE FROM t;\nROLLBACK;";
+        assert_eq!(
+            get_execution_unit_at_cursor(sql, 0),
+            tx(&["BEGIN TRAN", "DELETE FROM t", "ROLLBACK"])
+        );
+    }
+
+    #[test]
+    fn supports_end_as_terminator() {
+        let sql = "BEGIN;\nINSERT INTO t VALUES (1);\nEND;";
+        assert_eq!(
+            get_execution_unit_at_cursor(sql, 0),
+            tx(&["BEGIN", "INSERT INTO t VALUES (1)", "END"])
+        );
+    }
+
+    #[test]
+    fn semicolon_inside_string_does_not_split() {
+        let sql = "BEGIN;\nINSERT INTO t VALUES (';');\nCOMMIT;";
+        assert_eq!(
+            get_execution_unit_at_cursor(sql, 0),
+            tx(&["BEGIN", "INSERT INTO t VALUES (';')", "COMMIT"])
+        );
+    }
+
+    #[test]
+    fn begin_without_terminator_is_unterminated() {
+        let sql = "BEGIN;\nINSERT INTO t VALUES (1);";
+        assert_eq!(
+            get_execution_unit_at_cursor(sql, 0),
+            ExecutionUnit::UnterminatedTransaction
+        );
+    }
+
+    #[test]
+    fn statement_after_completed_transaction_is_single() {
+        let sql = "BEGIN;\nINSERT INTO t VALUES (1);\nCOMMIT;\nSELECT 2;";
+        let cursor = sql.find("SELECT 2").unwrap();
+        assert_eq!(
+            get_execution_unit_at_cursor(sql, cursor),
+            ExecutionUnit::Single("SELECT 2".into())
+        );
+    }
 }

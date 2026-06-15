@@ -30,17 +30,12 @@ pub async fn connect(config: &ConnectionConfig) -> Result<SqlServerClient> {
     Ok(Arc::new(Mutex::new(client)))
 }
 
-/// Execute a query on SQL Server
-pub async fn execute_query(client: &SqlServerClient, query: &str) -> Result<QueryResult> {
-    let mut client = client.lock().await;
-    let stream = client.simple_query(query).await?;
-    let rows = stream.into_first_result().await?;
-
+/// Convert fetched rows into a `QueryResult`.
+fn rows_to_result(rows: &[tiberius::Row]) -> QueryResult {
     if rows.is_empty() {
-        return Ok(QueryResult::default());
+        return QueryResult::default();
     }
 
-    // Get column info from first row
     let columns: Vec<Column> = rows[0]
         .columns()
         .iter()
@@ -57,12 +52,66 @@ pub async fn execute_query(client: &SqlServerClient, query: &str) -> Result<Quer
         .map(|row| (0..columns.len()).map(|i| get_value(row, i)).collect())
         .collect();
 
-    Ok(QueryResult {
+    QueryResult {
         columns,
         rows: data,
         rows_affected: rows.len() as u64,
         execution_time_ms: 0,
-    })
+    }
+}
+
+/// Execute a query on SQL Server
+pub async fn execute_query(client: &SqlServerClient, query: &str) -> Result<QueryResult> {
+    let mut client = client.lock().await;
+    let stream = client.simple_query(query).await?;
+    let rows = stream.into_first_result().await?;
+    Ok(rows_to_result(&rows))
+}
+
+/// Join transaction statements into a single T-SQL batch. Running the whole
+/// block as ONE batch keeps batch-scoped constructs (e.g. `DECLARE @var`)
+/// visible across all statements — running them as separate batches would drop
+/// the variables between statements.
+fn build_tsql_batch(statements: &[String]) -> String {
+    statements.join(";\n")
+}
+
+/// Execute a transaction block as one T-SQL batch. The single tiberius client
+/// is locked for the whole block (atomicity, no interleaving). Statements
+/// include the user's `BEGIN`/`COMMIT`/`ROLLBACK`. If the batch fails, any
+/// transaction it left open is rolled back and the error is returned.
+pub async fn execute_transaction(
+    client: &SqlServerClient,
+    statements: &[String],
+) -> Result<QueryResult> {
+    let batch = build_tsql_batch(statements);
+    let mut client = client.lock().await;
+
+    let outcome = async {
+        let stream = client.simple_query(&batch).await?;
+        let results = stream.into_results().await?;
+        Ok::<_, anyhow::Error>(results)
+    }
+    .await;
+
+    match outcome {
+        Ok(results) => {
+            // Return the last result set that produced rows (typically the
+            // final SELECT); otherwise an empty result.
+            let rows = results
+                .into_iter()
+                .rev()
+                .find(|r| !r.is_empty())
+                .unwrap_or_default();
+            Ok(rows_to_result(&rows))
+        }
+        Err(e) => {
+            // The failed batch may have left a transaction open on the shared
+            // client; roll it back so later queries aren't poisoned.
+            let _ = client.simple_query("IF @@TRANCOUNT > 0 ROLLBACK").await;
+            Err(e)
+        }
+    }
 }
 
 /// Get tables grouped by schema
@@ -378,4 +427,25 @@ fn get_value(row: &tiberius::Row, index: usize) -> String {
                 .map(|v| String::from_utf8_lossy(v).into_owned())
         })
         .unwrap_or_else(|| "NULL".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_tsql_batch;
+
+    #[test]
+    fn declare_and_usage_stay_in_one_batch() {
+        let stmts = [
+            "BEGIN TRAN".to_string(),
+            "DECLARE @x INT = 5".to_string(),
+            "SELECT @x".to_string(),
+            "COMMIT".to_string(),
+        ];
+        // The whole block must be a single batch string so that @x declared in
+        // one statement stays in scope for the SELECT that uses it.
+        assert_eq!(
+            build_tsql_batch(&stmts),
+            "BEGIN TRAN;\nDECLARE @x INT = 5;\nSELECT @x;\nCOMMIT"
+        );
+    }
 }

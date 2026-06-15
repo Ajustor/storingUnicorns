@@ -11,12 +11,10 @@ pub async fn connect(conn_str: &str) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-/// Execute a query on SQLite
-pub async fn execute_query(pool: &SqlitePool, query: &str) -> Result<QueryResult> {
-    let rows: Vec<SqliteRow> = sqlx::query(query).fetch_all(pool).await?;
-
+/// Convert fetched rows into a `QueryResult`.
+fn rows_to_result(rows: &[SqliteRow]) -> QueryResult {
     if rows.is_empty() {
-        return Ok(QueryResult::default());
+        return QueryResult::default();
     }
 
     let columns: Vec<Column> = rows[0]
@@ -35,12 +33,44 @@ pub async fn execute_query(pool: &SqlitePool, query: &str) -> Result<QueryResult
         .map(|row| (0..columns.len()).map(|i| get_value(row, i)).collect())
         .collect();
 
-    Ok(QueryResult {
+    QueryResult {
         columns,
         rows: data,
         rows_affected: rows.len() as u64,
         execution_time_ms: 0,
-    })
+    }
+}
+
+/// Execute a query on SQLite
+pub async fn execute_query(pool: &SqlitePool, query: &str) -> Result<QueryResult> {
+    let rows: Vec<SqliteRow> = sqlx::query(query).fetch_all(pool).await?;
+    Ok(rows_to_result(&rows))
+}
+
+/// Execute a sequence of statements as one transaction on a single dedicated
+/// connection. The statements include the user's `BEGIN`/`COMMIT`/`ROLLBACK`.
+/// On any error the transaction is rolled back and the error is returned.
+/// Returns the last statement's result set (or an empty result).
+pub async fn execute_transaction(pool: &SqlitePool, statements: &[String]) -> Result<QueryResult> {
+    let mut conn = pool.acquire().await?;
+    let mut last = QueryResult::default();
+
+    for stmt in statements {
+        match sqlx::query(stmt).fetch_all(&mut *conn).await {
+            Ok(rows) => {
+                if !rows.is_empty() {
+                    last = rows_to_result(&rows);
+                }
+            }
+            Err(e) => {
+                // Best-effort rollback on the same connection before bubbling up.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(e.into());
+            }
+        }
+    }
+
+    Ok(last)
 }
 
 /// Get tables grouped by schema (SQLite uses "main" as default schema)
@@ -234,4 +264,73 @@ fn get_value(row: &SqliteRow, index: usize) -> String {
                 .map(|v| String::from_utf8_lossy(&v).into_owned())
         })
         .unwrap_or_else(|_| "NULL".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    /// A shared in-memory pool: max_connections(1) ensures every acquisition
+    /// reuses the same connection (and therefore the same in-memory database).
+    async fn mem_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (a INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    async fn count(pool: &SqlitePool) -> i64 {
+        let rows: Vec<(i64,)> = sqlx::query_as("SELECT COUNT(*) FROM t")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        rows[0].0
+    }
+
+    #[tokio::test]
+    async fn transaction_commit_persists_rows() {
+        let pool = mem_pool().await;
+        let stmts = [
+            "BEGIN".to_string(),
+            "INSERT INTO t VALUES (1)".to_string(),
+            "INSERT INTO t VALUES (2)".to_string(),
+            "COMMIT".to_string(),
+        ];
+        execute_transaction(&pool, &stmts).await.unwrap();
+        assert_eq!(count(&pool).await, 2);
+    }
+
+    #[tokio::test]
+    async fn transaction_rolls_back_on_error() {
+        let pool = mem_pool().await;
+        let stmts = [
+            "BEGIN".to_string(),
+            "INSERT INTO t VALUES (1)".to_string(),
+            "INSERT INTO nonexistent_table VALUES (2)".to_string(), // fails
+            "COMMIT".to_string(),
+        ];
+        let result = execute_transaction(&pool, &stmts).await;
+        assert!(result.is_err(), "expected the transaction to fail");
+        assert_eq!(count(&pool).await, 0, "failed transaction must roll back");
+    }
+
+    #[tokio::test]
+    async fn transaction_returns_last_select_result() {
+        let pool = mem_pool().await;
+        let stmts = [
+            "BEGIN".to_string(),
+            "INSERT INTO t VALUES (42)".to_string(),
+            "SELECT a FROM t".to_string(),
+            "COMMIT".to_string(),
+        ];
+        let result = execute_transaction(&pool, &stmts).await.unwrap();
+        assert_eq!(result.rows, vec![vec!["42".to_string()]]);
+    }
 }

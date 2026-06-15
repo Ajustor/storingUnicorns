@@ -247,6 +247,9 @@ pub fn tokenize_sql(query: &str, known_columns: &[String]) -> Vec<SqlToken> {
         // Identifiers and keywords
         if c.is_alphabetic() || c == '_' || c == '@' || c == '#' {
             let start = i;
+            // Always consume the first char (handles '@', '#' prefixes like
+            // SQL Server variables/temp tables, which aren't alphanumeric).
+            i += 1;
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
@@ -743,4 +746,38 @@ pub fn extract_table_from_query(query: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: typing '@' (or '#') used to send tokenize_sql into an infinite
+    // loop because the token-start branch accepted '@'/'#' but the consumption
+    // loop never advanced past them, freezing/crashing the app on every render.
+    #[test]
+    fn tokenize_at_and_hash_do_not_loop() {
+        assert_eq!(tokenize_sql("@", &[]), vec![SqlToken::Identifier("@".into())]);
+        assert_eq!(tokenize_sql("#", &[]), vec![SqlToken::Identifier("#".into())]);
+    }
+
+    #[test]
+    fn tokenize_sql_server_variable() {
+        assert_eq!(
+            tokenize_sql("@var", &[]),
+            vec![SqlToken::Identifier("@var".into())]
+        );
+        assert_eq!(
+            tokenize_sql("#temp", &[]),
+            vec![SqlToken::Identifier("#temp".into())]
+        );
+    }
+
+    #[test]
+    fn tokenize_at_in_context() {
+        // '@' followed by a space, embedded in a real query.
+        let tokens = tokenize_sql("SELECT @ FROM t", &[]);
+        assert!(tokens.contains(&SqlToken::Identifier("@".into())));
+        assert!(tokens.contains(&SqlToken::Keyword("SELECT".into())));
+    }
 }

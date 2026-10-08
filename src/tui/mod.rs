@@ -31,7 +31,6 @@ use crate::engine::ops::{
     self,
     query::{Executed, RunError},
 };
-use crate::engine::sql::statements::quote_chars;
 use ui::{
     compute_active_panel_area, compute_modal_area, render_neon_border, render_ui,
     run_splash_screen, ClickableRegistry, ModalAnimation, PanelAnimations,
@@ -1614,14 +1613,6 @@ pub(crate) fn move_cursor_down(state: &mut AppState) {
 }
 
 /// Get the quote characters for the current database type
-fn get_quote_chars(state: &AppState) -> (char, char) {
-    state
-        .current_connection_config
-        .as_ref()
-        .map(|c| quote_chars(&c.db_type))
-        .unwrap_or(('"', '"'))
-}
-
 async fn handle_save_row(state: &mut AppState) {
     // Get required data for update
     let table_name = match &state.editing_table_name {
@@ -1676,7 +1667,7 @@ async fn handle_save_row(state: &mut AppState) {
 
     // Debug mode: show query in editor instead of executing
     if state.debug_mode {
-        let quote_chars = get_quote_chars(state);
+        let quote_chars = state.get_quote_chars();
         if let Some(query) = db::utils::build_update_query(
             &table_name,
             &columns,
@@ -1771,7 +1762,7 @@ async fn handle_insert_row(state: &mut AppState) {
 
     // Debug mode: show query in editor instead of executing
     if state.debug_mode {
-        let quote_chars = get_quote_chars(state);
+        let quote_chars = state.get_quote_chars();
         if let Some(query) = db::utils::build_insert_query(
             &table_name,
             &columns,
@@ -2378,7 +2369,7 @@ fn handle_export(state: &mut AppState) {
     }
 
     let table_name = export_state.table_name.as_deref().unwrap_or("table");
-    let (quote_start, quote_end) = get_quote_chars(state);
+    let (quote_start, quote_end) = state.get_quote_chars();
 
     match services::export_import::export_to_file(
         result,
@@ -2444,7 +2435,7 @@ async fn handle_import<B: ratatui::backend::Backend>(
         }
     };
 
-    let quotes = get_quote_chars(state);
+    let quotes = state.get_quote_chars();
     state.set_status(format!("Importing into {}...", import_state.target_table));
 
     // Redraw to show the initial status
@@ -2830,7 +2821,7 @@ async fn handle_batch_export<B: ratatui::backend::Backend>(
     }
 
     let total = selected_tables.len();
-    let quotes = get_quote_chars(state);
+    let quotes = state.get_quote_chars();
 
     // See handle_import: the connection is taken out so progress can redraw.
     let conn = state.connection.take().unwrap();
@@ -2907,7 +2898,7 @@ async fn handle_batch_import<B: ratatui::backend::Backend>(
     }
 
     let total = selected_tables.len();
-    let quotes = get_quote_chars(state);
+    let quotes = state.get_quote_chars();
 
     // See handle_import: the connection is taken out so progress can redraw.
     let conn = state.connection.take().unwrap();
@@ -3036,7 +3027,7 @@ async fn handle_delete_row(state: &mut AppState) {
         return;
     }
 
-    let quote_chars = get_quote_chars(state);
+    let quote_chars = state.get_quote_chars();
 
     // Debug mode: show query
     if state.debug_mode {
@@ -3146,7 +3137,7 @@ async fn handle_batch_truncate<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state: &mut AppState,
 ) {
-    let quote_chars = get_quote_chars(state);
+    let quote_chars = state.get_quote_chars();
     let batch = match state.batch_truncate_state.clone() {
         Some(b) => b,
         None => {
@@ -3184,12 +3175,17 @@ async fn handle_batch_truncate<B: ratatui::backend::Backend>(
     }
 
     let total = selected_tables.len();
-    let report = ops::rows::truncate_tables(
-        state.connection.as_ref().unwrap(),
-        &selected_tables,
-        |_, _, _| {},
-    )
+    // See handle_import: the connection is taken out so progress can redraw.
+    let conn = state.connection.take().unwrap();
+    let report = ops::rows::truncate_tables(&conn, &selected_tables, |done, total, table| {
+        if let Some(ref mut bs) = state.batch_truncate_state {
+            bs.progress = Some((done, total, table.to_string()));
+        }
+        let temp_registry = ClickableRegistry::new();
+        let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
+    })
     .await;
+    state.connection = Some(conn);
 
     // Final progress
     if let Some(ref mut bs) = state.batch_truncate_state {

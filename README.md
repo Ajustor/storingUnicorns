@@ -27,7 +27,7 @@ src/
 │   │   ├── lexer.rs         # SQL tokenizer + completions
 │   │   └── statements.rs    # statement splitting, table extraction, quote chars
 │   └── ops/                 # business operations shared by the front-ends
-│       ├── query.rs         # run_query, run_unit, refresh_schemas
+│       ├── query.rs         # run_query, run_at_cursor, run_all, refresh_schemas
 │       ├── rows.rs          # update/insert/delete row, truncate, system columns
 │       ├── schema.rs        # fetch_columns, apply_modification
 │       └── transfer.rs      # import_csv, import_tables, export_tables

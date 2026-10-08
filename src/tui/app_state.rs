@@ -906,16 +906,10 @@ impl AppState {
 
     /// Get quote characters for the current database type
     pub fn get_quote_chars(&self) -> (char, char) {
-        match &self.current_connection_config {
-            Some(config) => match config.db_type {
-                crate::engine::models::DatabaseType::Postgres => ('"', '"'),
-                crate::engine::models::DatabaseType::MySQL => ('`', '`'),
-                crate::engine::models::DatabaseType::SQLite => ('"', '"'),
-                crate::engine::models::DatabaseType::SQLServer => ('[', ']'),
-                crate::engine::models::DatabaseType::Azure => ('[', ']'),
-            },
-            None => ('"', '"'), // Default to double quotes
-        }
+        self.current_connection_config
+            .as_ref()
+            .map(|c| crate::engine::sql::statements::quote_chars(&c.db_type))
+            .unwrap_or(('"', '"')) // Default to double quotes
     }
 
     /// Get total visible items count in tables panel

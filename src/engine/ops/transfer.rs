@@ -77,7 +77,8 @@ pub fn qualified(schema: &str, table: &str, (q0, q1): (char, char)) -> String {
     format!("{q0}{schema}{q1}.{q0}{table}{q1}")
 }
 
-/// Export each `(schema, table)` to `<dir>/<table>.<ext>`.
+/// Export each `(schema, table)` to `<dir>/<table>.<ext>`. `dir` must exist:
+/// the caller creates it so it can report that failure on its own.
 /// `progress(done, total, table)` is called before each table.
 pub async fn export_tables(
     conn: &DatabaseConnection,
@@ -91,10 +92,6 @@ pub async fn export_tables(
         total: tables.len(),
         ..Default::default()
     };
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        report.errors.push(format!("{}: {e}", dir.display()));
-        return report;
-    }
     for (i, (schema, table)) in tables.iter().enumerate() {
         progress(i, tables.len(), table);
         let full = qualified(schema, table, quotes);

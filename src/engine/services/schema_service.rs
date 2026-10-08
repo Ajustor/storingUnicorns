@@ -73,7 +73,7 @@ impl SchemaService {
         modification: &SchemaModification,
         db_type: &crate::engine::models::DatabaseType,
     ) -> String {
-        let (quote_start, quote_end) = Self::get_quote_chars(db_type);
+        let (quote_start, quote_end) = crate::engine::sql::statements::quote_chars(db_type);
 
         match modification {
             SchemaModification::AddColumn { table_name, column } => {
@@ -278,17 +278,6 @@ impl SchemaService {
                     )
                 }
             },
-        }
-    }
-
-    fn get_quote_chars(db_type: &crate::engine::models::DatabaseType) -> (char, char) {
-        match db_type {
-            crate::engine::models::DatabaseType::Postgres => ('"', '"'),
-            crate::engine::models::DatabaseType::MySQL => ('`', '`'),
-            crate::engine::models::DatabaseType::SQLite => ('"', '"'),
-            crate::engine::models::DatabaseType::SQLServer | crate::engine::models::DatabaseType::Azure => {
-                ('[', ']')
-            }
         }
     }
 }

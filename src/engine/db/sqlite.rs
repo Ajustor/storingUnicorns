@@ -1,7 +1,7 @@
 use anyhow::Result;
 use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, SqlitePool, TypeInfo};
 
-use crate::engine::models::{Column, QueryResult, SchemaInfo};
+use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
 
 use super::utils::{build_update_clauses, fetch_rows_and_result, is_dml};
 
@@ -267,6 +267,92 @@ pub async fn get_table_column_details(
     }
 
     Ok(columns)
+}
+
+/// `table_name` unquoted the same way as `get_table_column_details`, then
+/// escaped for use inside a single-quoted PRAGMA argument.
+fn pragma_table_arg(table_name: &str) -> String {
+    table_name
+        .trim_matches('"')
+        .replace("main.", "")
+        .replace('\'', "''")
+}
+
+/// Get the indexes of a table (`PRAGMA index_list` + `PRAGMA index_info`).
+/// An `INTEGER PRIMARY KEY` is the rowid and has no index, so it is not listed.
+pub async fn get_indexes(pool: &SqlitePool, table_name: &str) -> Result<Vec<IndexInfo>> {
+    let table = pragma_table_arg(table_name);
+    let rows: Vec<SqliteRow> = sqlx::query(&format!("PRAGMA index_list('{}')", table))
+        .fetch_all(pool)
+        .await?;
+
+    let mut indexes = Vec::new();
+    for row in rows {
+        let name: String = row.try_get("name")?;
+        let unique: i64 = row.try_get("unique")?;
+        let origin: String = row.try_get("origin")?;
+        let info: Vec<SqliteRow> = sqlx::query(&format!(
+            "PRAGMA index_info('{}')",
+            name.replace('\'', "''")
+        ))
+        .fetch_all(pool)
+        .await?;
+        let columns = info
+            .iter()
+            .map(|r| {
+                // NULL name: an expression column.
+                let col: Option<String> = r.try_get("name")?;
+                Ok(col.unwrap_or_else(|| "<expression>".to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        indexes.push(IndexInfo {
+            name,
+            columns,
+            unique: unique != 0,
+            primary: origin == "pk",
+        });
+    }
+
+    Ok(indexes)
+}
+
+/// Get the foreign keys of a table (`PRAGMA foreign_key_list`, one row per
+/// column, grouped by `id`). SQLite does not expose constraint names, so
+/// `name` is empty.
+pub async fn get_foreign_keys(pool: &SqlitePool, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
+    let table = pragma_table_arg(table_name);
+    let rows: Vec<SqliteRow> = sqlx::query(&format!("PRAGMA foreign_key_list('{}')", table))
+        .fetch_all(pool)
+        .await?;
+
+    let mut keys: Vec<(i64, ForeignKeyInfo)> = Vec::new();
+    for row in rows {
+        let id: i64 = row.try_get("id")?;
+        let ref_table: String = row.try_get("table")?;
+        let from: String = row.try_get("from")?;
+        // NULL `to`: the referenced table's primary key, left implicit.
+        let to: Option<String> = row.try_get("to")?;
+        let pos = match keys.iter().position(|(k, _)| *k == id) {
+            Some(pos) => pos,
+            None => {
+                keys.push((
+                    id,
+                    ForeignKeyInfo {
+                        name: String::new(),
+                        columns: Vec::new(),
+                        ref_table,
+                        ref_columns: Vec::new(),
+                    },
+                ));
+                keys.len() - 1
+            }
+        };
+        let fk = &mut keys[pos].1;
+        fk.columns.push(from);
+        fk.ref_columns.push(to.unwrap_or_default());
+    }
+
+    Ok(keys.into_iter().map(|(_, fk)| fk).collect())
 }
 
 /// Test the connection

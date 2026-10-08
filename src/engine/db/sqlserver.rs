@@ -6,12 +6,15 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
-use crate::engine::models::{Column, ConnectionConfig, QueryResult, SchemaInfo};
+use crate::engine::models::{
+    Column, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
+};
 
 use crate::engine::sql::statements::split_statements;
 
 use super::utils::{
-    build_update_clauses, group_tables_by_schema, is_dml, leading_keyword, skip_leading_comments,
+    build_update_clauses, group_foreign_keys, group_indexes, group_tables_by_schema, is_dml,
+    leading_keyword, skip_leading_comments,
 };
 
 /// SQL Server client type alias
@@ -479,6 +482,101 @@ pub async fn get_table_column_details(
     }
 
     Ok(columns)
+}
+
+/// `(schema, table)` of a possibly qualified/bracketed name, parsed the same
+/// way as `get_table_column_details`.
+fn split_table(table_name: &str) -> (&str, &str) {
+    match table_name.split_once('.') {
+        Some((schema, table)) => (
+            schema.trim_matches(|c| c == '[' || c == ']'),
+            table.trim_matches(|c| c == '[' || c == ']'),
+        ),
+        None => ("dbo", table_name.trim_matches(|c| c == '[' || c == ']')),
+    }
+}
+
+/// Get the indexes of a table from `sys.indexes` (heaps and INCLUDE columns
+/// are left out).
+pub async fn get_indexes(client: &SqlServerClient, table_name: &str) -> Result<Vec<IndexInfo>> {
+    let (schema, table) = split_table(table_name);
+    let query = "SELECT i.name, c.name, i.is_unique, i.is_primary_key
+         FROM sys.indexes i
+         JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+         JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+         JOIN sys.tables t ON t.object_id = i.object_id
+         JOIN sys.schemas s ON s.schema_id = t.schema_id
+         WHERE s.name = @P1 AND t.name = @P2
+           AND i.name IS NOT NULL AND ic.is_included_column = 0
+         ORDER BY i.is_primary_key DESC, i.name, ic.key_ordinal";
+
+    let mut client = client.lock().await;
+    let rows = client
+        .query(query, &[&schema, &table])
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: &str = row.try_get(0)?.unwrap_or("");
+        let column: &str = row.try_get(1)?.unwrap_or("");
+        let unique: bool = row.try_get(2)?.unwrap_or(false);
+        let primary: bool = row.try_get(3)?.unwrap_or(false);
+        out.push((name.to_string(), column.to_string(), unique, primary));
+    }
+    Ok(group_indexes(out))
+}
+
+/// Get the foreign keys of a table from `sys.foreign_keys`. The referenced
+/// table is qualified with its schema when it lives in another one.
+pub async fn get_foreign_keys(
+    client: &SqlServerClient,
+    table_name: &str,
+) -> Result<Vec<ForeignKeyInfo>> {
+    let (schema, table) = split_table(table_name);
+    let query = "SELECT fk.name, pc.name, rs.name, rt.name, rc.name
+         FROM sys.foreign_keys fk
+         JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+         JOIN sys.tables t ON t.object_id = fk.parent_object_id
+         JOIN sys.schemas s ON s.schema_id = t.schema_id
+         JOIN sys.columns pc
+              ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+         JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id
+         JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
+         JOIN sys.columns rc
+              ON rc.object_id = fkc.referenced_object_id
+             AND rc.column_id = fkc.referenced_column_id
+         WHERE s.name = @P1 AND t.name = @P2
+         ORDER BY fk.name, fkc.constraint_column_id";
+
+    let mut client = client.lock().await;
+    let rows = client
+        .query(query, &[&schema, &table])
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: &str = row.try_get(0)?.unwrap_or("");
+        let column: &str = row.try_get(1)?.unwrap_or("");
+        let ref_schema: &str = row.try_get(2)?.unwrap_or("");
+        let ref_table: &str = row.try_get(3)?.unwrap_or("");
+        let ref_column: &str = row.try_get(4)?.unwrap_or("");
+        let ref_table = if ref_schema.eq_ignore_ascii_case(schema) {
+            ref_table.to_string()
+        } else {
+            format!("{ref_schema}.{ref_table}")
+        };
+        out.push((
+            name.to_string(),
+            column.to_string(),
+            ref_table,
+            ref_column.to_string(),
+        ));
+    }
+    Ok(group_foreign_keys(out))
 }
 
 /// Test the connection

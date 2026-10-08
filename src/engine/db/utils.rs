@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use futures_util::TryStreamExt;
 use sqlx::{Database, Either, Executor, IntoArguments};
 
-use crate::engine::models::{Column, SchemaInfo};
+use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, SchemaInfo};
 use crate::engine::sql::statements::split_statements;
 
 /// Execute `query` exactly once and collect both its rows and its
@@ -68,6 +68,51 @@ pub fn group_tables_by_schema(rows: Vec<(String, String)>) -> Vec<SchemaInfo> {
             expanded: false,
         })
         .collect()
+}
+
+/// Build indexes from one row per indexed column, `(index, column, unique,
+/// primary)`, ordered so that the columns of an index are consecutive and
+/// in key order.
+pub fn group_indexes(
+    rows: impl IntoIterator<Item = (String, String, bool, bool)>,
+) -> Vec<IndexInfo> {
+    let mut indexes: Vec<IndexInfo> = Vec::new();
+    for (name, column, unique, primary) in rows {
+        match indexes.last_mut() {
+            Some(last) if last.name == name => last.columns.push(column),
+            _ => indexes.push(IndexInfo {
+                name,
+                columns: vec![column],
+                unique,
+                primary,
+            }),
+        }
+    }
+    indexes
+}
+
+/// Build foreign keys from one row per column pair, `(constraint, column,
+/// referenced table, referenced column)`, ordered so that the columns of a
+/// constraint are consecutive and in key order.
+pub fn group_foreign_keys(
+    rows: impl IntoIterator<Item = (String, String, String, String)>,
+) -> Vec<ForeignKeyInfo> {
+    let mut keys: Vec<ForeignKeyInfo> = Vec::new();
+    for (name, column, ref_table, ref_column) in rows {
+        match keys.last_mut() {
+            Some(last) if last.name == name => {
+                last.columns.push(column);
+                last.ref_columns.push(ref_column);
+            }
+            _ => keys.push(ForeignKeyInfo {
+                name,
+                columns: vec![column],
+                ref_table,
+                ref_columns: vec![ref_column],
+            }),
+        }
+    }
+    keys
 }
 
 /// Build UPDATE query SET clause and WHERE clause
@@ -350,6 +395,28 @@ pub(crate) fn is_dml(query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn groups_consecutive_index_and_foreign_key_rows() {
+        let s = |v: &str| v.to_string();
+        let idx = group_indexes([
+            (s("pk"), s("a"), true, true),
+            (s("pk"), s("b"), true, true),
+            (s("ix"), s("c"), false, false),
+        ]);
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx[0].columns, ["a", "b"]);
+        assert!(idx[0].primary && !idx[1].unique);
+        let fks = group_foreign_keys([
+            (s("fk1"), s("x"), s("p"), s("px")),
+            (s("fk1"), s("y"), s("p"), s("py")),
+            (s("fk2"), s("z"), s("q"), s("id")),
+        ]);
+        assert_eq!(fks.len(), 2);
+        assert_eq!(fks[0].columns, ["x", "y"]);
+        assert_eq!(fks[0].ref_columns, ["px", "py"]);
+        assert_eq!(fks[1].ref_table, "q");
+    }
 
     #[test]
     fn is_dml_skips_leading_comments() {

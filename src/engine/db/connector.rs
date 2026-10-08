@@ -2,7 +2,9 @@ use anyhow::Result;
 use sqlx::{MySqlPool, PgPool, SqlitePool};
 use std::time::Instant;
 
-use crate::engine::models::{Column, ConnectionConfig, DatabaseType, QueryResult, SchemaInfo};
+use crate::engine::models::{
+    Column, ConnectionConfig, DatabaseType, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
+};
 
 pub use super::sqlserver::SqlServerClient;
 use super::{azure, mysql, postgres, sqlite, sqlserver};
@@ -290,6 +292,36 @@ impl DatabaseConnection {
             }
             DatabaseConnection::Azure(client) => {
                 sqlserver::get_table_column_details(client, table_name).await
+            }
+        }
+    }
+
+    /// Indexes of a table (including the one backing the primary key).
+    pub async fn get_indexes(&self, table_name: &str) -> Result<Vec<IndexInfo>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => postgres::get_indexes(pool, table_name).await,
+            DatabaseConnection::MySQL(pool) => mysql::get_indexes(pool, table_name).await,
+            DatabaseConnection::SQLite(pool) => sqlite::get_indexes(pool, table_name).await,
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_indexes(client, table_name).await
+            }
+            DatabaseConnection::Azure(client) => sqlserver::get_indexes(client, table_name).await,
+        }
+    }
+
+    /// Foreign keys declared on a table.
+    pub async fn get_foreign_keys(&self, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::get_foreign_keys(pool, table_name).await
+            }
+            DatabaseConnection::MySQL(pool) => mysql::get_foreign_keys(pool, table_name).await,
+            DatabaseConnection::SQLite(pool) => sqlite::get_foreign_keys(pool, table_name).await,
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_foreign_keys(client, table_name).await
+            }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::get_foreign_keys(client, table_name).await
             }
         }
     }

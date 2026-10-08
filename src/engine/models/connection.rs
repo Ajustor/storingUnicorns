@@ -141,6 +141,37 @@ pub struct Column {
     pub is_primary_key: bool,
 }
 
+/// An index of a table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexInfo {
+    pub name: String,
+    /// Indexed columns, in index order.
+    pub columns: Vec<String>,
+    pub unique: bool,
+    /// Whether this index backs the primary key.
+    pub primary: bool,
+}
+
+/// A foreign key of a table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKeyInfo {
+    pub name: String,
+    /// Referencing columns of this table, in key order.
+    pub columns: Vec<String>,
+    pub ref_table: String,
+    /// Referenced columns of `ref_table`, matching `columns` one to one.
+    pub ref_columns: Vec<String>,
+}
+
+/// Columns, indexes and foreign keys of a table.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // used by the GUI (plan 3b)
+pub struct TableDetails {
+    pub columns: Vec<Column>,
+    pub indexes: Vec<IndexInfo>,
+    pub foreign_keys: Vec<ForeignKeyInfo>,
+}
+
 /// Represents query results
 #[derive(Debug, Clone, Default)]
 pub struct QueryResult {

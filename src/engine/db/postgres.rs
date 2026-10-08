@@ -1,7 +1,7 @@
 use anyhow::Result;
 use sqlx::{postgres::PgRow, Column as SqlxColumn, PgPool, Row, TypeInfo};
 
-use crate::engine::models::{Column, QueryResult, SchemaInfo};
+use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
 
 use super::utils::{build_update_clauses, fetch_rows_and_result, group_tables_by_schema};
 
@@ -294,6 +294,102 @@ pub async fn get_table_column_details(
             type_name,
             nullable: nullable == "YES",
             is_primary_key: primary_keys.contains(&name),
+        })
+        .collect())
+}
+
+/// `(schema, table)` of a possibly qualified/quoted name, parsed the same way
+/// as `get_table_column_details`.
+fn split_table(table_name: &str) -> (&str, &str) {
+    match table_name.split_once('.') {
+        Some((schema, table)) => (schema.trim_matches('"'), table.trim_matches('"')),
+        None => ("public", table_name.trim_matches('"')),
+    }
+}
+
+/// Get the indexes of a table from `pg_index`. Expression columns are
+/// rendered with `pg_get_indexdef`; INCLUDE columns are left out.
+pub async fn get_indexes(pool: &PgPool, table_name: &str) -> Result<Vec<IndexInfo>> {
+    let (schema, table) = split_table(table_name);
+
+    let rows: Vec<(String, bool, bool, Vec<String>)> = sqlx::query_as(
+        "SELECT ic.relname::text,
+                i.indisunique,
+                i.indisprimary,
+                ARRAY(
+                    SELECT COALESCE(a.attname::text,
+                                    pg_get_indexdef(i.indexrelid, k.ord::int, true))
+                    FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                    LEFT JOIN pg_attribute a
+                           ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                    WHERE k.ord <= i.indnkeyatts
+                    ORDER BY k.ord
+                )
+         FROM pg_index i
+         JOIN pg_class ic ON ic.oid = i.indexrelid
+         JOIN pg_class t ON t.oid = i.indrelid
+         JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = $1 AND t.relname = $2
+         ORDER BY i.indisprimary DESC, ic.relname",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(name, unique, primary, columns)| IndexInfo {
+            name,
+            columns,
+            unique,
+            primary,
+        })
+        .collect())
+}
+
+/// Get the foreign keys of a table from `pg_constraint` (`conkey`/`confkey`
+/// keep the column pairing of multi-column keys). The referenced table is
+/// qualified with its schema when it lives in another schema.
+pub async fn get_foreign_keys(pool: &PgPool, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
+    let (schema, table) = split_table(table_name);
+
+    let rows: Vec<(String, Vec<String>, String, Vec<String>)> = sqlx::query_as(
+        "SELECT c.conname::text,
+                ARRAY(
+                    SELECT a.attname::text
+                    FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+                    ORDER BY k.ord
+                ),
+                CASE WHEN rn.nspname = n.nspname THEN rt.relname::text
+                     ELSE rn.nspname::text || '.' || rt.relname::text END,
+                ARRAY(
+                    SELECT a.attname::text
+                    FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+                    JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum
+                    ORDER BY k.ord
+                )
+         FROM pg_constraint c
+         JOIN pg_class t ON t.oid = c.conrelid
+         JOIN pg_namespace n ON n.oid = t.relnamespace
+         JOIN pg_class rt ON rt.oid = c.confrelid
+         JOIN pg_namespace rn ON rn.oid = rt.relnamespace
+         WHERE c.contype = 'f' AND n.nspname = $1 AND t.relname = $2
+         ORDER BY c.conname",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(name, columns, ref_table, ref_columns)| ForeignKeyInfo {
+            name,
+            columns,
+            ref_table,
+            ref_columns,
         })
         .collect())
 }

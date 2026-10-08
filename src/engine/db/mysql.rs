@@ -1,9 +1,12 @@
 use anyhow::Result;
 use sqlx::{mysql::MySqlRow, Column as SqlxColumn, MySqlPool, Row, TypeInfo};
 
-use crate::engine::models::{Column, QueryResult, SchemaInfo};
+use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
 
-use super::utils::{build_update_clauses, fetch_rows_and_result, group_tables_by_schema};
+use super::utils::{
+    build_update_clauses, fetch_rows_and_result, group_foreign_keys, group_indexes,
+    group_tables_by_schema,
+};
 
 /// Connect to MySQL
 pub async fn connect(conn_str: &str) -> Result<MySqlPool> {
@@ -328,6 +331,72 @@ pub async fn get_table_column_details(
             },
         )
         .collect())
+}
+
+/// `(schema, table)` of a possibly qualified/quoted name, parsed the same way
+/// as `get_table_column_details`; the schema is empty when not given.
+fn split_table(table_name: &str) -> (&str, &str) {
+    match table_name.split_once('.') {
+        Some((schema, table)) => (schema.trim_matches('`'), table.trim_matches('`')),
+        None => ("", table_name.trim_matches('`')),
+    }
+}
+
+/// Get the indexes of a table from `information_schema.STATISTICS`
+/// (current database when the name is not qualified).
+pub async fn get_indexes(pool: &MySqlPool, table_name: &str) -> Result<Vec<IndexInfo>> {
+    let (schema, table) = split_table(table_name);
+
+    let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE
+         FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = COALESCE(NULLIF(?, ''), DATABASE()) AND TABLE_NAME = ?
+         ORDER BY INDEX_NAME = 'PRIMARY' DESC, INDEX_NAME, SEQ_IN_INDEX",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(group_indexes(rows.into_iter().map(
+        |(name, column, non_unique)| {
+            let primary = name == "PRIMARY";
+            // NULL column: a functional key part.
+            let column = column.unwrap_or_else(|| "<expression>".to_string());
+            (name, column, non_unique == 0, primary)
+        },
+    )))
+}
+
+/// Get the foreign keys of a table from `information_schema.KEY_COLUMN_USAGE`
+/// (current database when the name is not qualified). The referenced table
+/// is qualified with its schema when it lives in another one.
+pub async fn get_foreign_keys(pool: &MySqlPool, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
+    let (schema, table) = split_table(table_name);
+
+    let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT CONSTRAINT_NAME, COLUMN_NAME, TABLE_SCHEMA,
+                REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+         FROM information_schema.KEY_COLUMN_USAGE
+         WHERE TABLE_SCHEMA = COALESCE(NULLIF(?, ''), DATABASE()) AND TABLE_NAME = ?
+           AND REFERENCED_TABLE_NAME IS NOT NULL
+         ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(group_foreign_keys(rows.into_iter().map(
+        |(name, column, own_schema, ref_schema, ref_table, ref_column)| {
+            let ref_table = if ref_schema == own_schema {
+                ref_table
+            } else {
+                format!("{ref_schema}.{ref_table}")
+            };
+            (name, column, ref_table, ref_column)
+        },
+    )))
 }
 
 /// Test the connection

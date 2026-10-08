@@ -1,10 +1,26 @@
 use anyhow::Result;
 
 use crate::engine::db::DatabaseConnection;
-use crate::engine::models::DatabaseType;
+use crate::engine::models::{Column, DatabaseType, TableDetails};
 use crate::engine::services::{
     table_cache::TableCache, ColumnDefinition, SchemaModification, SchemaService,
 };
+
+/// Columns of `table`, served from `cache` when fresh (filled otherwise).
+async fn cached_columns(
+    conn: &DatabaseConnection,
+    cache: &TableCache,
+    table: &str,
+) -> Result<Vec<Column>> {
+    match cache.get_column_details(table).await {
+        Some(cols) => Ok(cols),
+        None => {
+            let cols = conn.get_table_column_details(table).await?;
+            cache.set(table.to_string(), cols.clone()).await;
+            Ok(cols)
+        }
+    }
+}
 
 /// Column definitions of `table`, served from `cache` when fresh.
 pub async fn fetch_columns(
@@ -12,14 +28,7 @@ pub async fn fetch_columns(
     cache: &TableCache,
     table: &str,
 ) -> Result<Vec<ColumnDefinition>> {
-    let columns = match cache.get_column_details(table).await {
-        Some(cols) => cols,
-        None => {
-            let cols = conn.get_table_column_details(table).await?;
-            cache.set(table.to_string(), cols.clone()).await;
-            cols
-        }
-    };
+    let columns = cached_columns(conn, cache, table).await?;
     Ok(columns
         .into_iter()
         .map(|c| ColumnDefinition {
@@ -30,6 +39,26 @@ pub async fn fetch_columns(
             default_value: None,
         })
         .collect())
+}
+
+/// Columns (through `cache`), indexes and foreign keys of `table`, fetched
+/// concurrently.
+#[allow(dead_code)] // used by the GUI (plan 3b)
+pub async fn table_details(
+    conn: &DatabaseConnection,
+    cache: &TableCache,
+    table: &str,
+) -> Result<TableDetails> {
+    let (columns, indexes, foreign_keys) = tokio::try_join!(
+        cached_columns(conn, cache, table),
+        conn.get_indexes(table),
+        conn.get_foreign_keys(table),
+    )?;
+    Ok(TableDetails {
+        columns,
+        indexes,
+        foreign_keys,
+    })
 }
 
 /// The table a modification applies to.
@@ -102,6 +131,28 @@ mod tests {
         assert!(cache.get_column_details("t").await.is_none());
         let cols = fetch_columns(&conn, &cache, "t").await.unwrap();
         assert!(cols.iter().any(|c| c.name == "age"));
+    }
+
+    #[tokio::test]
+    async fn table_details_lists_indexes_and_foreign_keys() {
+        let conn = sqlite_mem(&[
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, code TEXT UNIQUE)",
+            "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER REFERENCES a(id), label TEXT)",
+            "CREATE INDEX b_label ON b(label)",
+        ])
+        .await;
+        let cache = TableCache::default();
+        let d = table_details(&conn, &cache, "b").await.unwrap();
+        assert_eq!(d.columns.len(), 3);
+        assert!(d
+            .indexes
+            .iter()
+            .any(|i| i.name == "b_label" && i.columns == ["label"] && !i.unique));
+        assert_eq!(d.foreign_keys.len(), 1);
+        assert_eq!(d.foreign_keys[0].ref_table, "a");
+        assert_eq!(d.foreign_keys[0].columns, ["a_id"]);
+        let da = table_details(&conn, &cache, "a").await.unwrap();
+        assert!(da.indexes.iter().any(|i| i.unique && i.columns == ["code"]));
     }
 
     #[test]

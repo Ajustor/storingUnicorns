@@ -114,6 +114,11 @@ fn release_from_manifest(text: &str, kind: InstallKind) -> Result<Option<Release
     select_update(manifest, &current, kind)
 }
 
+#[cfg(test)]
+pub(crate) fn release_from_manifest_for_tests(text: &str) -> Result<Option<ReleaseInfo>, String> {
+    release_from_manifest(text, InstallKind::Msi)
+}
+
 fn select_update(
     manifest: Manifest,
     current: &semver::Version,

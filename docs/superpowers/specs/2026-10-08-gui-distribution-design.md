@@ -7,6 +7,8 @@ Statut : approuvé (en attente de revue du spec)
 
 Donner à storingUnicorns une interface graphique propre et rapide, dans la veine
 de codingUnicorns, tout en conservant le TUI et la ligne de commande actuels.
+**Ergonomie de référence : JetBrains DataGrip**, en plus léger et plus rapide
+(démarrage instantané, faible mémoire, grille virtualisée, aucune opération bloquante).
 Simplifier l'installation et rendre les mises à jour automatiques via une page
 de téléchargement GitHub Pages.
 
@@ -15,7 +17,9 @@ de téléchargement GitHub Pages.
 - **Un seul binaire, GUI par défaut.** Un seul fichier à télécharger et à mettre à jour.
 - **CLI inchangée** dans ses capacités (pas de requêtes non interactives) : on ajoute
   seulement les sous-commandes `tui` et `update`.
-- **GUI à parité fonctionnelle avec le TUI** dès cette version.
+- **GUI à parité fonctionnelle avec le TUI** dès cette version, avec en plus les
+  comportements DataGrip retenus : éditeur de données inline, explorateur de base
+  complet, console riche, plusieurs connexions ouvertes en même temps.
 - **Workflow de release dédié** au repo (calqué sur codingUnicorns), qui remplace
   l'appel au workflow partagé `Ajustor/workflows/cargo-release.yml`.
 - **Un seul crate**, réorganisé en `engine` / `tui` / `gui` / `updater` (le nom `core` est évité : il masquerait le crate standard `core`)
@@ -81,52 +85,92 @@ lisent et écrivent les mêmes fichiers.
 ## GUI
 
 Stack : `eframe`/`egui` 0.31, `egui_extras` (tables), `egui-phosphor` (icônes),
-`rfd` (dialogues fichiers pour export/import) — mêmes versions que codingUnicorns.
+`rfd` (dialogues fichiers), `sqlformat` (formatage SQL).
 
-### Disposition
+### Disposition (inspirée de DataGrip)
 
 ```
-┌──────────────┬─────────────────────────────────────────────┐
-│ CONNEXIONS   │ [requête 1] [requête 2] [+]                  │
-│ ● Local PG   │ SELECT * FROM users WHERE …                  │
-│ ○ Prod SQLSrv│                                              │
-├──────────────┤                                              │
-│ TABLES  🔍   ├─────────────────────────────────────────────┤
-│ ▸ public     │ Résultats  🔍 filtre      42 lignes · 12 ms  │
-│   users      │ id │ name  │ email                           │
-│   orders     │ 1  │ Alice │ alice@…                         │
-└──────────────┴─────────────────────────────────────────────┘
- ● Connecté à mydb (Postgres)                  ⬆ v0.9.1 disponible
+┌────────────────┬──────────────────────────────────────────┬───────────┐
+│ EXPLORATEUR 🔍 │ [● console prod] [● users] [● console dev]│ VALEUR    │
+│ ● Prod PG      │ SELECT * FROM users WHERE …               │ {         │
+│  ▾ public      │                                           │  "a": 1   │
+│   ▾ users      ├───────────────────────────────────────────┤ }         │
+│     ▸ colonnes │ [Résultat 1 📌] [Résultat 2] [Sortie]     │           │
+│     ▸ clés     │ id │ name  │ email            ⟳  ✓ Submit │           │
+│     ▸ index    │ 1  │ Alice*│ alice@…                       │           │
+│ ○ Dev MySQL    │ + │ − │ WHERE [        ] ORDER BY [     ] │           │
+└────────────────┴──────────────────────────────────────────┴───────────┘
+ ● 2 connexions · 42 lignes · 12 ms            |< < page 1/9 > >|  v0.9.0
 ```
 
-- **Barre latérale** redimensionnable : liste des connexions (connecter, nouvelle,
-  modifier, supprimer via boutons et menu contextuel), puis arbre schéma → tables
-  avec filtre. Clic sur une table : `SELECT` dans l'onglet courant ; menu contextuel :
-  structure, export, import, truncate. Les opérations par lot (export, import, vidage) passent par une fenêtre
-  listant toutes les tables avec des cases à cocher.
-- **Éditeur SQL** : onglets (ajout/fermeture/renommage), `TextEdit` multi-ligne avec
-  coloration SQL via un `layouter` (réutilise le tokenizer de `sql_highlight`),
-  popup d'autocomplétion des tables/colonnes connues.
-- **Résultats** : grille virtualisée (`TableBuilder`, seules les lignes visibles sont
-  rendues), colonnes redimensionnables, filtre texte, sélection de cellule, copie,
-  double-clic → modale d'édition de ligne, menu contextuel ajouter/supprimer ligne.
-- **Barre de statut** : état de connexion, durée et nombre de lignes, erreurs,
-  indicateur de mise à jour.
-- **Modales** : connexion (tous SGBD, y compris méthodes Azure AD), structure de
-  table (colonnes, types, index, éditeur de colonnes), export (CSV / SQL INSERT) et import CSV, simples et par
-  lot, confirmations destructives, à propos / mise à jour.
+**Explorateur de base** (panneau gauche, filtre en haut)
+- Arbre connexion → schémas → tables → colonnes / clés (PK, FK) / index, chargé
+  paresseusement. Déplier une connexion la connecte.
+- Chaque connexion a une couleur (choisie dans le formulaire), reprise par une
+  pastille sur ses onglets, comme dans DataGrip, pour distinguer prod et dev.
+- Double-clic sur une table : ouvre l'**éditeur de données** de la table dans un
+  onglet. Menu contextuel : ouvrir les données, nouvelle console, DDL, structure,
+  export / import / vidage (simple et par lot), rafraîchir, déconnecter,
+  modifier / supprimer la connexion.
+- `Ctrl+N` : recherche rapide d'une table dans toutes les connexions ouvertes,
+  `Entrée` ouvre ses données.
+
+**Onglets centraux** : des consoles et des éditeurs de données, chacun lié à une
+connexion. Plusieurs connexions peuvent être ouvertes en même temps.
+
+**Console**
+- Éditeur SQL avec coloration, autocomplétion (tables et colonnes de sa connexion),
+  formatage (`Ctrl+Alt+L`).
+- `Ctrl+Entrée` exécute la sélection, sinon l'instruction (ou le bloc de transaction)
+  au curseur ; `F5` exécute tout le script.
+- **Un onglet de résultat par instruction** qui renvoie des lignes, plus un onglet
+  « Sortie » qui journalise chaque exécution (durée, lignes affectées, erreurs).
+  Les onglets de résultat sont remplacés à chaque exécution, sauf ceux épinglés.
+- Les résultats sont limités à 1 000 lignes en console (lecture interrompue au-delà,
+  signalée « 1 000+ lignes »), pour rester rapide sur de grosses tables.
+- **Historique** des requêtes exécutées (`Ctrl+Alt+E`) : recherche, réinsertion
+  dans la console ; persistant (500 dernières).
+
+**Éditeur de données** (onglet d'une table)
+- Grille paginée (500 lignes par page, navigation de page, total compté en arrière-plan).
+- Barre `WHERE` / `ORDER BY` ; clic sur un en-tête de colonne pour trier.
+- **Édition inline** : double-clic (ou `F2`) sur une cellule pour l'éditer dans la
+  grille ; cellules modifiées surlignées, lignes ajoutées en vert, supprimées
+  barrées en rouge. `Alt+Insert` ajoute une ligne, `Ctrl+Suppr` marque la ligne
+  supprimée, « Mettre à NULL » dans le menu contextuel.
+- Les changements restent **en attente** jusqu'à « Submit » (`Ctrl+Entrée` dans la
+  grille) qui les applique dans une transaction unique, ou « Revert ».
+- Les résultats de console issus d'une seule table avec clé primaire sont éditables
+  de la même façon.
+
+**Panneau Valeur** (droite, repliable) : affiche la cellule sélectionnée en entier,
+JSON indenté si la valeur est du JSON ; éditable (alimente les changements en attente).
+
+**DDL** : onglet en lecture seule avec le `CREATE TABLE` (natif pour SQLite et MySQL,
+généré depuis les métadonnées pour PostgreSQL et SQL Server), copiable.
+
+**Structure** : modale d'ajout / modification / renommage / suppression de colonne
+(parité TUI).
+
+**Barre de statut** : connexions ouvertes, durée et lignes de la dernière exécution,
+erreurs en rouge, progression des imports/exports, version et mise à jour.
 
 ### Raccourcis
 
-| Touche              | Action                                   |
-|---------------------|------------------------------------------|
-| `Ctrl+Entrée`       | Exécuter l'instruction (ou bloc de transaction) au curseur |
-| `F5`                | Exécuter tout l'éditeur                  |
-| `Échap`             | Annuler la requête en cours / fermer la modale |
-| `Ctrl+T` / `Ctrl+W` | Nouvel onglet / fermer l'onglet          |
-| `Ctrl+S`            | Sauvegarder les onglets                  |
-| `Ctrl+Espace`       | Autocomplétion                           |
-| `Ctrl+R`            | Rafraîchir les tables                    |
+| Touche                | Action                                                   |
+|-----------------------|----------------------------------------------------------|
+| `Ctrl+Entrée`         | Console : exécuter la sélection / l'instruction au curseur ; grille : Submit |
+| `F5`                  | Exécuter tout le script                                  |
+| `Échap`               | Annuler la requête en cours / l'édition de cellule / fermer la modale |
+| `Ctrl+Alt+L`          | Formater le SQL                                          |
+| `Ctrl+Alt+E`          | Historique des requêtes                                  |
+| `Ctrl+N`              | Rechercher une table                                     |
+| `Ctrl+T` / `Ctrl+W`   | Nouvelle console (connexion courante) / fermer l'onglet  |
+| `Ctrl+S`              | Enregistrer les consoles                                 |
+| `Ctrl+Espace`         | Autocomplétion                                           |
+| `F2` / double-clic    | Éditer la cellule                                        |
+| `Alt+Insert` / `Ctrl+Suppr` | Ajouter / supprimer une ligne                      |
+| `Ctrl+R`              | Rafraîchir (explorateur ou données)                      |
 
 ### Thème
 
@@ -136,20 +180,31 @@ config. Palette inspirée de codingUnicorns. Pas de thèmes personnalisables.
 ### Concurrence
 
 - Un runtime tokio multi-thread est créé au démarrage de la GUI.
-- La GUI envoie des `Command` (`Connect`, `LoadTables`, `Execute`, `SaveRow`,
-  `SchemaAction`, `Export`, `Import`, `Cancel`…) au runtime ; chaque commande est
-  `spawn`ée et son résultat revient en `Event` sur un channel `std::sync::mpsc`,
-  drainé à chaque frame. Le worker appelle `ctx.request_repaint()` après envoi.
-- L'UI ne bloque jamais. Une exécution en cours garde son `JoinHandle` ;
-  `Cancel` fait `abort()` dessus (pour un bloc de transaction, la connexion dédiée
+- Chaque opération est `spawn`ée ; son résultat revient en `Event` (portant
+  l'identifiant de la connexion et de l'onglet concernés) sur un channel drainé
+  à chaque frame. Le worker appelle `ctx.request_repaint()` après envoi.
+- L'UI ne bloque jamais. Une exécution en cours garde son `JoinHandle` par onglet ;
+  `Échap` fait `abort()` dessus (pour un bloc de transaction, la connexion dédiée
   est relâchée sans `COMMIT`, donc le SGBD annule).
-- Une seule connexion active à la fois, comme le TUI.
+- Plusieurs connexions ouvertes simultanément, chacune partagée entre ses onglets
+  (`Arc<DatabaseConnection>`).
 
 ### Erreurs
 
 Toute erreur d'opération remonte en `Event` portant le message d'erreur : affichée
-en rouge dans la barre de statut (et dans le formulaire concerné pour la création
-de connexion). Aucune erreur n'est avalée silencieusement.
+en rouge dans la barre de statut et dans l'onglet « Sortie » de la console concernée
+(et dans le formulaire concerné pour la création de connexion). Aucune erreur n'est
+avalée silencieusement.
+
+### Ajouts au moteur pour la GUI
+
+- Métadonnées : index et clés étrangères par SGBD, DDL (`engine::ops::schema`).
+- Requêtes paginées / triées / filtrées par dialecte (`engine::sql::paging`).
+- Exécution d'un script en plusieurs résultats, avec plafond de lignes (`engine::ops::query`).
+- Application groupée de changements (UPDATE / INSERT / DELETE) en transaction
+  (`engine::ops::rows::submit_changes`).
+- Historique persistant (`engine::services::history`), formatage SQL (`engine::sql::format`).
+- `ConnectionConfig.color` et `QueryTab.connection` (champs optionnels, ignorés par le TUI).
 
 ## Mises à jour
 
@@ -224,4 +279,4 @@ Profil release : `opt-level = "s"`, `lto = true`, `codegen-units = 1`, `strip = 
 - CLI non interactive (`query`, `connections list`).
 - macOS Intel.
 - Thèmes personnalisables, plugins.
-- Connexions multiples simultanées.
+- Plan d'exécution (EXPLAIN visuel), diagrammes, comparaison de schémas.

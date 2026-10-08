@@ -45,7 +45,6 @@ pub async fn delete_row(
 }
 
 /// Pending edits of a data grid, applied together by `submit_changes`.
-#[allow(dead_code)] // used by the GUI (plan 3b)
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct RowChanges {
     /// (original row, edited row)
@@ -68,7 +67,6 @@ impl RowChanges {
 }
 
 /// `(begin, commit)` statements for the dialect.
-#[allow(dead_code)] // used by the GUI (plan 3b)
 pub fn transaction_bounds(db: &DatabaseType) -> (&'static str, &'static str) {
     match db {
         DatabaseType::Postgres | DatabaseType::SQLite => ("BEGIN", "COMMIT"),
@@ -81,7 +79,6 @@ pub fn transaction_bounds(db: &DatabaseType) -> (&'static str, &'static str) {
 /// wrap them in the dialect's BEGIN/COMMIT and run them with
 /// `execute_transaction` (rolled back on any error). Returns the number of
 /// statements applied (unchanged updates are skipped).
-#[allow(dead_code)] // used by the GUI (plan 3b)
 pub async fn submit_changes(
     conn: &DatabaseConnection,
     db: &DatabaseType,

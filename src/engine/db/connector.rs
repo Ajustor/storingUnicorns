@@ -114,7 +114,6 @@ impl DatabaseConnection {
     }
 
     /// Test the connection
-    #[allow(dead_code)]
     pub async fn test(&self) -> Result<()> {
         match self {
             DatabaseConnection::Postgres(pool) => postgres::test(pool).await,

@@ -39,7 +39,7 @@ pub enum RunError {
 
 /// One executed unit of a script (a statement, or a whole transaction block).
 #[derive(Debug)]
-#[allow(dead_code)] // used by the GUI (plan 3b)
+#[allow(dead_code)] // fields read by the console tab (plan 3b)
 pub struct StatementOutcome {
     /// The SQL as executed (a transaction block is joined with ";\n").
     pub sql: String,
@@ -164,7 +164,6 @@ async fn unit_outcome(
 /// Execution stops after the first failing unit (its error is the last outcome).
 /// Row-returning results are capped at `max_rows` and enriched with
 /// PK/nullability like `run_query` when they read a single table.
-#[allow(dead_code)] // used by the GUI (plan 3b)
 pub async fn run_script(
     conn: &DatabaseConnection,
     text: &str,
@@ -207,7 +206,6 @@ pub async fn run_script(
 
 /// Execute the statement or transaction block under the cursor (Ctrl+Enter
 /// without selection), with the same outcome shape as `run_script`.
-#[allow(dead_code)] // used by the GUI (plan 3b)
 pub async fn run_at_cursor_outcomes(
     conn: &DatabaseConnection,
     text: &str,

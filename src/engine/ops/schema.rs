@@ -46,7 +46,6 @@ pub async fn fetch_columns(
 
 /// Columns (through `cache`), indexes and foreign keys of `table`, fetched
 /// concurrently.
-#[allow(dead_code)] // used by the GUI (plan 3b)
 pub async fn table_details(
     conn: &DatabaseConnection,
     cache: &TableCache,
@@ -76,7 +75,6 @@ fn quote_table(table: &str, (q0, q1): (char, char)) -> String {
 /// `CREATE TABLE` (+ `CREATE INDEX`) for `table`: native for SQLite
 /// (`sqlite_master.sql`) and MySQL (`SHOW CREATE TABLE`), generated from
 /// metadata for Postgres and SQL Server.
-#[allow(dead_code)] // used by the GUI (plan 3b)
 pub async fn table_ddl(
     conn: &DatabaseConnection,
     cache: &TableCache,
@@ -140,7 +138,6 @@ pub async fn table_ddl(
 /// Pure DDL generator used for Postgres / SQL Server. `table` is used as
 /// given (already quoted/qualified). Statements are separated by `;\n\n`;
 /// the primary-key index is part of the table body, not a `CREATE INDEX`.
-#[allow(dead_code)] // used by the GUI (plan 3b)
 pub fn generate_ddl(table: &str, details: &TableDetails, quotes: (char, char)) -> String {
     let (q0, q1) = quotes;
     let quote = |name: &str| format!("{q0}{}{q1}", name.replace(q1, &format!("{q1}{q1}")));

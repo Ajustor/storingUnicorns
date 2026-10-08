@@ -3,6 +3,9 @@ mod app;
 // Colours and helpers are picked up by the app shell (plan 3b, Task 4 onward).
 #[allow(dead_code)]
 mod theme;
+// Driven by the app shell (plan 3b, Task 4 onward).
+#[allow(dead_code)]
+mod worker;
 
 use std::sync::{Arc, Mutex};
 

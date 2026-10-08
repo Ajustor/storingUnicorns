@@ -165,7 +165,6 @@ pub struct ForeignKeyInfo {
 
 /// Columns, indexes and foreign keys of a table.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // used by the GUI (plan 3b)
 pub struct TableDetails {
     pub columns: Vec<Column>,
     pub indexes: Vec<IndexInfo>,

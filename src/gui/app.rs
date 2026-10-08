@@ -7,6 +7,7 @@ use crate::engine::config::AppConfig;
 use crate::engine::models::ConnectionConfig;
 use crate::engine::services::history::{History, HistoryEntry};
 use crate::engine::services::query_tabs::{QueryTab, QueryTabsState};
+use crate::engine::sql::paging::{build_count, build_select};
 use crate::updater::{ExitAction, Updater};
 
 use super::dialogs::{self, connection::same_target, Dialog};
@@ -14,7 +15,8 @@ use super::history_popup::{self, HistoryPopup};
 use super::sessions::{Session, Sessions};
 use super::status::{self, Status, StatusKind};
 use super::tabs::console::{self, ConsoleAction, ConsoleContext, ConsoleTab, RunKind};
-use super::tabs::{self, data::DataTab, ddl::DdlTab, TabId, TabKind, Tabs};
+use super::tabs::data::{DataAction, DataContext, DataTab, Nav};
+use super::tabs::{self, ddl::DdlTab, TabId, TabKind, Tabs};
 use super::theme::{self, ThemeChoice, ERROR};
 use super::worker::{Event, Worker};
 
@@ -257,11 +259,83 @@ impl App {
         match self.tabs.find_data(connection, table) {
             Some(i) => self.tabs.active = i,
             None => {
-                self.tabs.add(
+                let quotes = self
+                    .sessions
+                    .get(connection)
+                    .map_or(('"', '"'), |s| s.quotes);
+                let id = self.tabs.add(
                     connection.to_string(),
                     title.to_string(),
-                    TabKind::Data(DataTab::new(table.to_string())),
+                    TabKind::Data(Box::new(DataTab::new(table.to_string(), quotes))),
                 );
+                self.data_action(id, DataAction::Load { count: true });
+            }
+        }
+    }
+
+    /// Apply what data tab `id` asked for.
+    pub fn data_action(&mut self, id: TabId, action: DataAction) {
+        let Some(tab) = self.tabs.find(id) else {
+            return;
+        };
+        let TabKind::Data(d) = &mut tab.kind else {
+            return;
+        };
+        match action {
+            DataAction::Load { count } => {
+                let Some(session) = self.sessions.get(&tab.connection) else {
+                    return;
+                };
+                let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
+                d.needs_load = false;
+                d.loading = true;
+                let sql = build_select(&d.query, &db_type);
+                tab.runs.page = Some(self.worker.load_page(id, conn.clone(), sql));
+                if count {
+                    d.total = None;
+                    tab.runs.count = Some(self.worker.count(id, conn, build_count(&d.query)));
+                }
+            }
+            DataAction::Submit => {
+                if tab.runs.submit.is_some() || d.grid.edits.is_empty() {
+                    d.after_submit = None;
+                    return;
+                }
+                let Some(result) = &d.result else {
+                    return;
+                };
+                let Some(session) = self.sessions.get(&tab.connection) else {
+                    d.after_submit = None;
+                    let text = format!("{} n'est pas connectée", tab.connection);
+                    self.error(text);
+                    return;
+                };
+                let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
+                let run = self.worker.submit(
+                    id,
+                    conn,
+                    db_type,
+                    d.table.clone(),
+                    result.columns.clone(),
+                    d.system_columns.clone(),
+                    d.grid.edits.to_row_changes(&result.rows),
+                );
+                d.error = None;
+                tab.runs.submit = Some(run);
+                tab.summary = Some("Submit…".into());
+            }
+            DataAction::Confirm => self.dialog = Some(Dialog::DiscardEdits(id)),
+            DataAction::Ddl => {
+                let (connection, table, title) =
+                    (tab.connection.clone(), d.table.clone(), tab.title.clone());
+                self.open_ddl(&connection, &table, &title);
+            }
+            DataAction::Applied(n) => {
+                self.success(format!("{n} modification(s) appliquée(s)"));
+                self.data_action(id, DataAction::Load { count: true });
+            }
+            DataAction::SubmitFailed(e) => {
+                self.error(format!("Submit annulé (transaction annulée) : {e}"))
             }
         }
     }
@@ -370,8 +444,11 @@ impl App {
             | Event::Submitted { .. }
             | Event::Ddl { .. }) => {
                 // Tabs closed meanwhile simply drop their outcome.
-                if let Some(tab) = ev.tab().and_then(|id| self.tabs.find(id)) {
-                    tab.on_event(ev);
+                let Some(id) = ev.tab() else {
+                    return;
+                };
+                if let Some(action) = self.tabs.find(id).and_then(|tab| tab.on_event(ev)) {
+                    self.data_action(id, action);
                 }
             }
             Event::Progress { done, total, label } => self.progress = Some((done, total, label)),
@@ -607,9 +684,15 @@ impl App {
             }
         }
         if pressed(&REFRESH) {
-            // Data tabs reload their page instead (plan 3b, Task 8).
-            if let Some(c) = self.tabs.active().map(|t| t.connection.clone()) {
-                self.refresh(&c);
+            // A data tab reloads its page, other tabs their connection.
+            let active = self.tabs.active_mut().map(|t| match &mut t.kind {
+                TabKind::Data(d) => Err((t.id, d.navigate(Nav::Refresh))),
+                _ => Ok(t.connection.clone()),
+            });
+            match active {
+                Some(Ok(c)) => self.refresh(&c),
+                Some(Err((id, action))) => self.data_action(id, action),
+                None => {}
             }
         }
     }
@@ -726,6 +809,7 @@ impl App {
         let Some(tab) = self.tabs.list.get_mut(index) else {
             return;
         };
+        let mut data_action = None;
         let action = match &mut tab.kind {
             TabKind::Console(c) => {
                 let name = tab.connection.as_str();
@@ -744,7 +828,14 @@ impl App {
                 )
             }
             TabKind::Data(d) => {
-                d.show(ui);
+                data_action = d.show(
+                    ui,
+                    DataContext {
+                        tab: tab.id,
+                        connected: sessions.open.contains_key(&tab.connection),
+                        submitting: tab.runs.submit.is_some(),
+                    },
+                );
                 None
             }
             TabKind::Ddl(d) => {
@@ -752,8 +843,12 @@ impl App {
                 None
             }
         };
+        let id = tab.id;
         if let Some(action) = action {
             self.console_action(index, action);
+        }
+        if let Some(action) = data_action {
+            self.data_action(id, action);
         }
     }
 }

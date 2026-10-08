@@ -64,13 +64,11 @@ pub enum Event {
     Page {
         tab: TabId,
         run: RunId,
-        #[allow(dead_code)] // data tab (plan 3b, Task 8)
         outcome: Result<QueryResult, String>,
     },
     Count {
         tab: TabId,
         run: RunId,
-        #[allow(dead_code)] // data tab (plan 3b, Task 8)
         outcome: Result<u64, String>,
     },
     /// Number of statements applied by a Submit.
@@ -347,7 +345,6 @@ impl Worker {
         run
     }
 
-    #[allow(dead_code)] // data tab (plan 3b, Task 8)
     /// Load one page of a data editor; replaces the tab's pending load.
     pub fn load_page(&mut self, tab: TabId, conn: Conn, sql: String) -> RunId {
         let run = self.next_run();
@@ -358,7 +355,6 @@ impl Worker {
         run
     }
 
-    #[allow(dead_code)] // data tab (plan 3b, Task 8)
     /// Run a `COUNT(*)` query and parse its first cell.
     pub fn count(&mut self, tab: TabId, conn: Conn, sql: String) -> RunId {
         let run = self.next_run();

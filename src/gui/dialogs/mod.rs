@@ -4,7 +4,7 @@ pub mod connection;
 
 use super::app::App;
 use super::history_popup::{HistoryAction, HistoryPopup};
-use super::tabs::TabKind;
+use super::tabs::{TabId, TabKind};
 use super::worker::Event;
 use connection::{ConnectionForm, FormAction};
 
@@ -14,6 +14,8 @@ pub enum Dialog {
     ConfirmDeleteConnection(String),
     /// Query history (Ctrl+Alt+E) of the active console.
     History(HistoryPopup),
+    /// "Abandonner les modifications ?" before data tab `TabId` changes page.
+    DiscardEdits(TabId),
 }
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
@@ -55,6 +57,28 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     keep = false;
                 }
             }
+            Dialog::DiscardEdits(id) => {
+                let id = *id;
+                ui.heading("Abandonner les modifications ?");
+                ui.label("Les modifications en attente seront perdues.");
+                ui.add_space(8.0);
+                let mut answer = None;
+                ui.horizontal(|ui| {
+                    if ui.button("Submit").clicked() {
+                        answer = Some(Discard::Submit);
+                    }
+                    if ui.button("Abandonner").clicked() {
+                        answer = Some(Discard::Drop);
+                    }
+                    if ui.button("Annuler").clicked() {
+                        answer = Some(Discard::Cancel);
+                    }
+                });
+                if let Some(answer) = answer {
+                    keep = false;
+                    answer_discard(app, id, answer);
+                }
+            }
             Dialog::ConfirmDeleteConnection(name) => {
                 ui.heading("Supprimer la connexion");
                 ui.label(format!(
@@ -75,10 +99,37 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     });
     // Escape or a click outside cancels the dialog.
     if modal.should_close() {
+        if let (true, Dialog::DiscardEdits(id)) = (keep, &dialog) {
+            answer_discard(app, *id, Discard::Cancel);
+        }
         keep = false;
     }
     if keep {
         app.dialog = Some(dialog);
+    }
+}
+
+/// Answers to "Abandonner les modifications ?".
+enum Discard {
+    Submit,
+    Drop,
+    Cancel,
+}
+
+fn answer_discard(app: &mut App, id: TabId, answer: Discard) {
+    let action = app.tabs.find(id).and_then(|t| match &mut t.kind {
+        TabKind::Data(d) => match answer {
+            Discard::Submit => Some(d.submit_and_continue()),
+            Discard::Drop => d.discard_and_continue(),
+            Discard::Cancel => {
+                d.confirm = None;
+                None
+            }
+        },
+        _ => None,
+    });
+    if let Some(action) = action {
+        app.data_action(id, action);
     }
 }
 

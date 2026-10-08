@@ -13,7 +13,7 @@ pub type TabId = super::worker::TabId;
 
 pub enum TabKind {
     Console(console::ConsoleTab),
-    Data(data::DataTab),
+    Data(Box<data::DataTab>),
     Ddl(ddl::DdlTab),
 }
 
@@ -73,15 +73,25 @@ pub struct Tab {
 
 impl Tab {
     /// Hand an outcome of this tab to its body. Stale runs are dropped.
-    pub fn on_event(&mut self, ev: Event) {
+    /// Returns what a data tab asks the app to do next.
+    pub fn on_event(&mut self, ev: Event) -> Option<data::DataAction> {
         if !self.runs.accept(&ev) {
-            return;
+            return None;
         }
         match &mut self.kind {
             // Script outcomes are applied by the app (history, summary).
-            TabKind::Console(_) => {}
-            TabKind::Data(d) => d.on_event(ev),
-            TabKind::Ddl(d) => d.on_event(ev),
+            TabKind::Console(_) => None,
+            TabKind::Data(d) => {
+                let action = d.on_event(ev);
+                if let Some(summary) = d.summary() {
+                    self.summary = Some(summary);
+                }
+                action
+            }
+            TabKind::Ddl(d) => {
+                d.on_event(ev);
+                None
+            }
         }
     }
 }
@@ -203,7 +213,7 @@ mod tests {
     }
 
     fn data(table: &str) -> TabKind {
-        TabKind::Data(data::DataTab::new(table.into()))
+        TabKind::Data(Box::new(data::DataTab::new(table.into(), ('"', '"'))))
     }
 
     #[test]

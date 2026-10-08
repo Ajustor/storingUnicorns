@@ -9,7 +9,11 @@
 //!
 //! Ported from codingUnicorns (`src/updater/mod.rs`), without the egui dependency.
 
+// Used by the GUI (plan 3b).
+#[allow(dead_code)]
 mod background;
+// Used by the GUI (plan 3b).
+#[allow(unused_imports)]
 pub use background::{UpdateEvent, UpdateState, Updater};
 
 use std::path::{Path, PathBuf};
@@ -64,7 +68,11 @@ struct ManifestAsset {
 #[derive(Debug, Clone)]
 pub struct ReleaseInfo {
     pub version: semver::Version,
+    // Used by the GUI (plan 3b).
+    #[allow(dead_code)]
     pub notes: String,
+    // Used by the GUI (plan 3b).
+    #[allow(dead_code)]
     pub page_url: String,
     asset: ManifestAsset,
     kind: InstallKind,
@@ -81,10 +89,14 @@ enum InstallKind {
 /// What to do on exit to apply a ready update.
 #[derive(Debug, Clone)]
 pub enum ExitAction {
+    // Used by the GUI (plan 3b).
+    #[allow(dead_code)]
     Relaunch,
     /// Install the MSI; the app stays closed.
     RunMsi(PathBuf),
     /// Install the MSI, then start the upgraded app.
+    // Used by the GUI (plan 3b).
+    #[allow(dead_code)]
     RunMsiThenRelaunch(PathBuf),
 }
 
@@ -285,6 +297,47 @@ fn stage_and_apply(
     match info.kind {
         InstallKind::Msi => stage_msi(&info.asset.name, bytes, dir).map(Some),
         InstallKind::ReplaceBinary => replace_binary(bytes, dir).map(|_| None),
+    }
+}
+
+/// Staging directories older than this are considered abandoned.
+const STALE_STAGING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Best effort: remove abandoned staging directories (e.g. MSIs kept for
+/// msiexec) from the system temp dir. Errors, such as directories owned by
+/// another user, are ignored.
+pub fn cleanup_stale_staging() {
+    cleanup_stale_in(&std::env::temp_dir(), std::time::SystemTime::now());
+}
+
+fn cleanup_stale_in(root: &Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STAGING_PREFIX)
+        {
+            continue;
+        }
+        // `DirEntry::metadata` doesn't follow symlinks: only real directories.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > STALE_STAGING_AGE);
+        if meta.is_dir() && stale {
+            let path = entry.path();
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => tracing::debug!("removed stale {}", path.display()),
+                Err(e) => tracing::debug!("removing stale {}: {e}", path.display()),
+            }
+        }
     }
 }
 
@@ -658,5 +711,50 @@ mod tests {
         assert!(!should_check(Some(now - day), now));
         assert!(should_check(Some(now - day - 1), now));
         assert!(should_check(Some(now + 10), now));
+    }
+
+    #[test]
+    fn encode_powershell_command_padding() {
+        // One padding char for 4 bytes, none for 6 (3 UTF-16 units).
+        assert_eq!(encode_powershell_command("AB"), "QQBCAA==");
+        assert_eq!(encode_powershell_command("ABC"), "QQBCAEMA");
+    }
+
+    #[test]
+    fn msi_relaunch_script_quotes_paths() {
+        let script = msi_relaunch_script(
+            Path::new(r"C:\Users\O'Brien\My Files\setup.msi"),
+            Path::new(r"C:\Program Files\it's here\app.exe"),
+        );
+        assert!(
+            script.contains(r#"'/i','"C:\Users\O''Brien\My Files\setup.msi"','/passive'"#),
+            "{script}"
+        );
+        assert!(
+            script.contains(r"Start-Process -FilePath 'C:\Program Files\it''s here\app.exe'"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_only_old_staging_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join(format!("{STAGING_PREFIX}abc123"));
+        let other = root.path().join("unrelated");
+        let file = root.path().join(format!("{STAGING_PREFIX}.txt"));
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join(MSI_ASSET), b"x").unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+
+        // Fresh: kept.
+        cleanup_stale_in(root.path(), std::time::SystemTime::now());
+        assert!(staged.exists());
+
+        let later = std::time::SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60);
+        cleanup_stale_in(root.path(), later);
+        assert!(!staged.exists());
+        assert!(other.exists());
+        assert!(file.exists());
     }
 }

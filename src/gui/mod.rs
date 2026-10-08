@@ -1,5 +1,8 @@
 //! Graphical interface (egui).
 mod app;
+// Used by the data grid and data editor (plan 3b, Task 7 onward).
+#[allow(dead_code)]
+mod grid;
 // Colours and helpers are picked up by the app shell (plan 3b, Task 4 onward).
 #[allow(dead_code)]
 mod theme;

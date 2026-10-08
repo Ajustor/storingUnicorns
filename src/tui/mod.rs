@@ -1704,12 +1704,14 @@ async fn handle_save_row(state: &mut AppState) {
     state.set_status("Saving row...");
 
     // Perform the update
-    let result = state
-        .connection
-        .as_ref()
-        .unwrap()
-        .update_row(&table_name, &columns, &original_values, &new_values)
-        .await;
+    let result = ops::rows::update_row(
+        state.connection.as_ref().unwrap(),
+        &table_name,
+        &columns,
+        &original_values,
+        &new_values,
+    )
+    .await;
 
     match result {
         Ok(rows_affected) => {
@@ -1796,12 +1798,14 @@ async fn handle_insert_row(state: &mut AppState) {
     state.set_status("Inserting row...");
 
     // Perform the insert
-    let result = state
-        .connection
-        .as_ref()
-        .unwrap()
-        .insert_row(&table_name, &columns, &values, &system_cols)
-        .await;
+    let result = ops::rows::insert_row(
+        state.connection.as_ref().unwrap(),
+        &table_name,
+        &columns,
+        &values,
+        &system_cols,
+    )
+    .await;
 
     match result {
         Ok(rows_affected) => {
@@ -3221,26 +3225,20 @@ async fn handle_delete_row(state: &mut AppState) {
         return;
     }
 
-    let query = db::utils::build_delete_query(
+    state.set_status("Deleting row...");
+
+    let result = ops::rows::delete_row(
+        state.connection.as_ref().unwrap(),
         &table_name,
         &columns,
         &row_values,
-        quote_chars.0,
-        quote_chars.1,
-    );
-
-    state.set_status("Deleting row...");
-
-    let result = state
-        .connection
-        .as_ref()
-        .unwrap()
-        .execute_query(&query)
-        .await;
+        quote_chars,
+    )
+    .await;
 
     match result {
-        Ok(result) => {
-            if result.rows_affected > 0 {
+        Ok(rows_affected) => {
+            if rows_affected > 0 {
                 // Remove the row from the current result set
                 if let Some(ref mut qr) = state.query_result {
                     if state.selected_row < qr.rows.len() {
@@ -3250,10 +3248,7 @@ async fn handle_delete_row(state: &mut AppState) {
                         }
                     }
                 }
-                state.set_status(format!(
-                    "Row deleted ({} row(s) affected)",
-                    result.rows_affected
-                ));
+                state.set_status(format!("Row deleted ({rows_affected} row(s) affected)"));
             } else {
                 state.set_status("No rows were deleted (row may have been modified)");
             }
@@ -3359,35 +3354,12 @@ async fn handle_batch_truncate<B: ratatui::backend::Backend>(
     }
 
     let total = selected_tables.len();
-    let mut success_count = 0;
-    let mut total_rows: u64 = 0;
-    let mut last_error: Option<String> = None;
-
-    for (i, table_name) in selected_tables.iter().enumerate() {
-        // Update progress
-        if let Some(ref mut bs) = state.batch_truncate_state {
-            bs.progress = Some((i + 1, total, table_name.clone()));
-        }
-        let temp_registry = ClickableRegistry::new();
-        let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
-
-        let query = format!("DELETE FROM {}", table_name);
-        match state
-            .connection
-            .as_ref()
-            .unwrap()
-            .execute_query(&query)
-            .await
-        {
-            Ok(result) => {
-                total_rows += result.rows_affected;
-                success_count += 1;
-            }
-            Err(e) => {
-                last_error = Some(format!("{}: {}", table_name, e));
-            }
-        }
-    }
+    let report = ops::rows::truncate_tables(
+        state.connection.as_ref().unwrap(),
+        &selected_tables,
+        |_, _, _| {},
+    )
+    .await;
 
     // Final progress
     if let Some(ref mut bs) = state.batch_truncate_state {
@@ -3396,20 +3368,20 @@ async fn handle_batch_truncate<B: ratatui::backend::Backend>(
     let temp_registry = ClickableRegistry::new();
     let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
 
-    if success_count == total {
+    if report.succeeded == report.total {
         state.set_status(format!(
             "Batch truncate complete: {}/{} tables, {} total rows deleted",
-            success_count, total, total_rows
+            report.succeeded, report.total, report.rows_affected
         ));
-    } else if let Some(err) = last_error {
+    } else if let Some(err) = report.errors.last() {
         state.set_status(format!(
             "Batch truncate partial: {}/{} tables, {} rows deleted. Last error: {}",
-            success_count, total, total_rows, err
+            report.succeeded, report.total, report.rows_affected, err
         ));
     } else {
         state.set_status(format!(
             "Batch truncate: {}/{} tables, {} rows deleted",
-            success_count, total, total_rows
+            report.succeeded, report.total, report.rows_affected
         ));
     }
 

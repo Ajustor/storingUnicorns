@@ -6,5 +6,4 @@ pub mod schema;
 pub mod transfer;
 
 #[cfg(test)]
-#[allow(dead_code)] // helpers are used by the ops tests added in later tasks
 pub(crate) mod test_support;

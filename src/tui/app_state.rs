@@ -950,44 +950,7 @@ impl AppState {
             let empty_row: Vec<String> = result.columns.iter().map(|_| String::new()).collect();
 
             // Detect system columns (auto-generated: id, created_at, updated_at, etc.)
-            self.system_columns = result
-                .columns
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| {
-                    let name_lower = col.name.to_lowercase();
-                    let type_lower = col.type_name.to_lowercase();
-
-                    // Detect common auto-generated column patterns
-                    let is_auto_id = name_lower == "id"
-                        || name_lower.ends_with("_id")
-                            && name_lower.starts_with(
-                                &result
-                                    .columns
-                                    .first()
-                                    .map(|c| c.name.to_lowercase())
-                                    .unwrap_or_default(),
-                            )
-                        || type_lower.contains("serial")
-                        || type_lower.contains("identity")
-                        || type_lower.contains("auto_increment");
-
-                    let is_timestamp = name_lower.contains("created_at")
-                        || name_lower.contains("updated_at")
-                        || name_lower.contains("createdat")
-                        || name_lower.contains("updatedat")
-                        || name_lower.contains("created_on")
-                        || name_lower.contains("updated_on")
-                        || name_lower.contains("inserted_at")
-                        || name_lower.contains("modified_at");
-
-                    if is_auto_id || is_timestamp {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            self.system_columns = crate::engine::ops::rows::detect_system_columns(&result.columns);
 
             self.editing_row = Some(empty_row);
             self.original_editing_row = None; // No original for new rows

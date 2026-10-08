@@ -125,9 +125,13 @@ pub async fn export_tables(
     report
 }
 
+/// Rows between two progress reports of a batch import.
+pub const ROW_PROGRESS_STEP: usize = 100;
+
 /// Import `<dir>/<table>.csv` into each `(schema, table)`. A table stops at
-/// its first failing row and counts as failed. `progress(done, total, table)`
-/// is called before each table.
+/// its first failing row and counts as failed. `progress(done, total, label)`
+/// is called before each table (label `table`) and every
+/// [`ROW_PROGRESS_STEP`] rows (label `table row/rows`).
 pub async fn import_tables(
     conn: &DatabaseConnection,
     tables: &[(String, String)],
@@ -157,13 +161,22 @@ pub async fn import_tables(
             }
         };
         let full = qualified(schema, table, quotes);
-        for action in build_upsert_import_actions(&full, &columns, &rows, quotes.0, quotes.1) {
-            match apply_action(conn, &action).await {
+        let actions = build_upsert_import_actions(&full, &columns, &rows, quotes.0, quotes.1);
+        for (r, action) in actions.iter().enumerate() {
+            match apply_action(conn, action).await {
                 Ok(_) => report.rows_affected += 1,
                 Err(e) => {
                     report.errors.push(format!("{table}: {e}"));
                     continue 'tables;
                 }
+            }
+            let done = r + 1;
+            if done % ROW_PROGRESS_STEP == 0 || done == actions.len() {
+                progress(
+                    i,
+                    tables.len(),
+                    &format!("{table} {done}/{}", actions.len()),
+                );
             }
         }
         report.succeeded += 1;
@@ -227,9 +240,16 @@ mod tests {
         assert!(dir.path().join("t.csv").exists());
 
         conn.execute_query("DELETE FROM t").await.unwrap();
-        let report = import_tables(&conn, &tables, dir.path(), ('"', '"'), |_, _, _| {}).await;
+        let mut labels = Vec::new();
+        let report = import_tables(&conn, &tables, dir.path(), ('"', '"'), |d, t, l| {
+            labels.push((d, t, l.to_string()))
+        })
+        .await;
         assert_eq!(report.succeeded, 1, "{:?}", report.errors);
         assert_eq!(report.rows_affected, 2);
+        // Before the table, then its rows.
+        assert_eq!(labels.first(), Some(&(0, 1, "t".to_string())));
+        assert_eq!(labels.last(), Some(&(0, 1, "t 2/2".to_string())));
         assert_eq!(count(&conn, "t").await, "2");
     }
 }

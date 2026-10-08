@@ -492,7 +492,9 @@ mod tests {
         let pool = mem_pool().await;
         // Enough rows that the driver can't have produced them all before the
         // cap is reached.
-        let sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 50000)                    SELECT x FROM n; INSERT INTO t VALUES (99)";
+        let sql =
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 50000) \
+                   SELECT x FROM n; INSERT INTO t VALUES (99)";
         let r = execute_query_limited(&pool, sql, Some(1)).await.unwrap();
         assert_eq!(r.rows.len(), 1);
         assert!(r.truncated);

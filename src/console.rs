@@ -28,6 +28,9 @@ pub fn prepare_gui() -> GuiLaunch {
     use std::os::windows::process::CommandExt;
 
     if std::env::var_os(DETACHED_ENV).is_some() {
+        // Don't leak the flag to our own children (e.g. an updater relaunch),
+        // which would then skip detaching.
+        std::env::remove_var(DETACHED_ENV);
         unsafe { sys::FreeConsole() };
         return GuiLaunch::Continue;
     }

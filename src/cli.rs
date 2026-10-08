@@ -37,16 +37,34 @@ impl Mode {
     pub fn parse(args: impl IntoIterator<Item = String>) -> Mode {
         let mut tui = None::<TuiOptions>;
         let mut update = false;
+        // `tui` or a TUI flag was given (they can't be combined with `update`).
+        let mut tui_requested = false;
         let mut opts = TuiOptions::default();
         for arg in args {
-            match arg.as_str() {
+            let is_tui_arg = match arg.as_str() {
                 "-v" | "--version" => return Mode::Version,
                 "-h" | "--help" => return Mode::Help,
-                "tui" => tui = Some(TuiOptions::default()),
-                "update" => update = true,
-                "-d" | "--debug" => opts.debug = true,
-                "-na" | "--no-animations" => opts.no_animations = true,
+                "tui" => {
+                    tui = Some(TuiOptions::default());
+                    true
+                }
+                "update" => {
+                    update = true;
+                    false
+                }
+                "-d" | "--debug" => {
+                    opts.debug = true;
+                    true
+                }
+                "-na" | "--no-animations" => {
+                    opts.no_animations = true;
+                    true
+                }
                 _ => return Mode::Invalid(arg),
+            };
+            tui_requested |= is_tui_arg;
+            if update && tui_requested {
+                return Mode::Invalid(arg);
             }
         }
         if update {
@@ -116,5 +134,16 @@ mod tests {
     #[test]
     fn unknown_argument_is_an_error() {
         assert_eq!(parse(&["frobnicate"]), Mode::Invalid("frobnicate".into()));
+    }
+
+    #[test]
+    fn update_cannot_be_combined_with_tui() {
+        assert_eq!(parse(&["update", "tui"]), Mode::Invalid("tui".into()));
+        assert_eq!(parse(&["tui", "update"]), Mode::Invalid("update".into()));
+        assert_eq!(
+            parse(&["update", "--debug"]),
+            Mode::Invalid("--debug".into())
+        );
+        assert_eq!(parse(&["-na", "update"]), Mode::Invalid("update".into()));
     }
 }

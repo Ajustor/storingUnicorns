@@ -1,6 +1,34 @@
 use std::collections::BTreeMap;
 
+use futures_util::TryStreamExt;
+use sqlx::{Database, Either, Executor, IntoArguments};
+
 use crate::engine::models::{Column, SchemaInfo};
+
+/// Execute `query` exactly once and collect both its rows and its
+/// `DB::QueryResult` (affected-row counts summed via `Extend`) from the same
+/// `fetch_many` stream. `fetch_all` would discard the affected-row counts,
+/// and `execute` would discard the rows.
+pub async fn fetch_rows_and_result<'c, DB, E>(
+    executor: E,
+    query: &str,
+) -> sqlx::Result<(Vec<DB::Row>, DB::QueryResult)>
+where
+    DB: Database,
+    E: Executor<'c, Database = DB>,
+    for<'q> DB::Arguments<'q>: IntoArguments<'q, DB>,
+{
+    let mut stream = executor.fetch_many(sqlx::query(query));
+    let mut rows = Vec::new();
+    let mut done = DB::QueryResult::default();
+    while let Some(item) = stream.try_next().await? {
+        match item {
+            Either::Left(result) => done.extend(Some(result)),
+            Either::Right(row) => rows.push(row),
+        }
+    }
+    Ok((rows, done))
+}
 
 /// Group tables by schema name
 pub fn group_tables_by_schema(rows: Vec<(String, String)>) -> Vec<SchemaInfo> {

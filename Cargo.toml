@@ -26,6 +26,9 @@ sqlx = { version = "0.8", features = [
   "chrono",
 ] }
 
+# Stream combinators (to drain sqlx `fetch_many` streams)
+futures-util = "0.3"
+
 # SQL Server connector
 tiberius = { version = "0.12", default-features = false, features = [
   "tds73",

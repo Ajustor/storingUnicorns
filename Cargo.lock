@@ -2944,6 +2944,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "dirs 5.0.1",
+ "futures-util",
  "ratatui",
  "rust_decimal",
  "serde",

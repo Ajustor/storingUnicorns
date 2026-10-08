@@ -152,11 +152,10 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(count(&conn, "t").await, "3");
-        // The sqlx connectors' `execute_query` reports the number of returned
-        // rows as `rows_affected` (0 for DML), so check the effect instead.
-        delete_row(&conn, "t", &cols(), &row("2", "b"), ('"', '"'))
+        let n = delete_row(&conn, "t", &cols(), &row("2", "b"), ('"', '"'))
             .await
             .unwrap();
+        assert_eq!(n, 1);
         assert_eq!(count(&conn, "t").await, "2");
     }
 
@@ -180,7 +179,7 @@ mod tests {
         .await;
         assert_eq!(report.total, 3);
         assert_eq!(report.succeeded, 2);
-        // `rows_affected` is 0 on SQLite (see `update_insert_delete_roundtrip`).
+        assert_eq!(report.rows_affected, 5);
         assert_eq!(count(&conn, "t").await, "0");
         assert_eq!(count(&conn, "u").await, "0");
         assert_eq!(report.errors.len(), 1);

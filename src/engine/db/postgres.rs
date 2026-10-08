@@ -3,7 +3,7 @@ use sqlx::{postgres::PgRow, Column as SqlxColumn, PgPool, Row, TypeInfo};
 
 use crate::engine::models::{Column, QueryResult, SchemaInfo};
 
-use super::utils::{build_update_clauses, group_tables_by_schema};
+use super::utils::{build_update_clauses, fetch_rows_and_result, group_tables_by_schema};
 
 /// Connect to PostgreSQL
 pub async fn connect(conn_str: &str) -> Result<PgPool> {
@@ -12,9 +12,16 @@ pub async fn connect(conn_str: &str) -> Result<PgPool> {
 }
 
 /// Convert fetched rows into a `QueryResult`.
-fn rows_to_result(rows: &[PgRow]) -> QueryResult {
+///
+/// When the statement returned rows (SELECT, `... RETURNING`), `rows_affected`
+/// is the number of rows returned; otherwise it is `affected`, the count
+/// reported by the database (UPDATE/DELETE/INSERT).
+fn rows_to_result(rows: &[PgRow], affected: u64) -> QueryResult {
     if rows.is_empty() {
-        return QueryResult::default();
+        return QueryResult {
+            rows_affected: affected,
+            ..QueryResult::default()
+        };
     }
 
     let columns: Vec<Column> = rows[0]
@@ -41,10 +48,19 @@ fn rows_to_result(rows: &[PgRow]) -> QueryResult {
     }
 }
 
+/// Execute one statement exactly once, collecting its rows and affected-row
+/// count from the same stream.
+async fn run_statement<'c, E>(executor: E, query: &str) -> Result<QueryResult>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Postgres>,
+{
+    let (rows, done) = fetch_rows_and_result(executor, query).await?;
+    Ok(rows_to_result(&rows, done.rows_affected()))
+}
+
 /// Execute a query on PostgreSQL
 pub async fn execute_query(pool: &PgPool, query: &str) -> Result<QueryResult> {
-    let rows: Vec<PgRow> = sqlx::query(query).fetch_all(pool).await?;
-    Ok(rows_to_result(&rows))
+    run_statement(pool, query).await
 }
 
 /// Execute a sequence of statements as one transaction on a single dedicated
@@ -55,15 +71,17 @@ pub async fn execute_transaction(pool: &PgPool, statements: &[String]) -> Result
     let mut last = QueryResult::default();
 
     for stmt in statements {
-        match sqlx::query(stmt).fetch_all(&mut *conn).await {
-            Ok(rows) => {
-                if !rows.is_empty() {
-                    last = rows_to_result(&rows);
+        match run_statement(&mut *conn, stmt).await {
+            // Keep the last statement that returned rows or changed rows, so
+            // trailing `COMMIT`/`ROLLBACK` don't hide the interesting result.
+            Ok(result) => {
+                if !result.rows.is_empty() || result.rows_affected > 0 {
+                    last = result;
                 }
             }
             Err(e) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                return Err(e.into());
+                return Err(e);
             }
         }
     }

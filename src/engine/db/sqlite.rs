@@ -3,7 +3,7 @@ use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, SqlitePool, TypeInfo};
 
 use crate::engine::models::{Column, QueryResult, SchemaInfo};
 
-use super::utils::build_update_clauses;
+use super::utils::{build_update_clauses, fetch_rows_and_result};
 
 /// Connect to SQLite
 pub async fn connect(conn_str: &str) -> Result<SqlitePool> {
@@ -12,9 +12,16 @@ pub async fn connect(conn_str: &str) -> Result<SqlitePool> {
 }
 
 /// Convert fetched rows into a `QueryResult`.
-fn rows_to_result(rows: &[SqliteRow]) -> QueryResult {
+///
+/// When the statement returned rows (SELECT, `... RETURNING`), `rows_affected`
+/// is the number of rows returned; otherwise it is `affected`, the count
+/// reported by the database (UPDATE/DELETE/INSERT).
+fn rows_to_result(rows: &[SqliteRow], affected: u64) -> QueryResult {
     if rows.is_empty() {
-        return QueryResult::default();
+        return QueryResult {
+            rows_affected: affected,
+            ..QueryResult::default()
+        };
     }
 
     let columns: Vec<Column> = rows[0]
@@ -41,31 +48,75 @@ fn rows_to_result(rows: &[SqliteRow]) -> QueryResult {
     }
 }
 
+/// Execute one statement exactly once, collecting its rows and affected-row
+/// count from the same stream.
+async fn run_statement<'c, E>(executor: E, query: &str) -> Result<QueryResult>
+where
+    E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+{
+    let (rows, done) = fetch_rows_and_result(executor, query).await?;
+    // SQLite reports `sqlite3_changes()`, which is NOT reset by statements
+    // that modify nothing (SELECT, DDL, COMMIT...): it keeps the count of the
+    // last INSERT/UPDATE/DELETE on the connection. Only trust it for DML.
+    let affected = if is_dml(query) {
+        done.rows_affected()
+    } else {
+        0
+    };
+    Ok(rows_to_result(&rows, affected))
+}
+
+/// Whether `query` starts (after whitespace and comments) with a
+/// row-modifying keyword. `WITH ... DELETE/UPDATE` is deliberately not
+/// recognised: a CTE is far more often a SELECT, and an empty SELECT would
+/// otherwise report a stale count.
+fn is_dml(query: &str) -> bool {
+    let mut rest = query;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+        } else {
+            break;
+        }
+    }
+    let keyword = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    matches!(keyword.as_str(), "INSERT" | "UPDATE" | "DELETE" | "REPLACE")
+}
+
 /// Execute a query on SQLite
 pub async fn execute_query(pool: &SqlitePool, query: &str) -> Result<QueryResult> {
-    let rows: Vec<SqliteRow> = sqlx::query(query).fetch_all(pool).await?;
-    Ok(rows_to_result(&rows))
+    run_statement(pool, query).await
 }
 
 /// Execute a sequence of statements as one transaction on a single dedicated
 /// connection. The statements include the user's `BEGIN`/`COMMIT`/`ROLLBACK`.
 /// On any error the transaction is rolled back and the error is returned.
-/// Returns the last statement's result set (or an empty result).
+/// Returns the result of the last statement that returned or changed rows
+/// (or an empty result).
 pub async fn execute_transaction(pool: &SqlitePool, statements: &[String]) -> Result<QueryResult> {
     let mut conn = pool.acquire().await?;
     let mut last = QueryResult::default();
 
     for stmt in statements {
-        match sqlx::query(stmt).fetch_all(&mut *conn).await {
-            Ok(rows) => {
-                if !rows.is_empty() {
-                    last = rows_to_result(&rows);
+        match run_statement(&mut *conn, stmt).await {
+            // Keep the last statement that returned rows or changed rows, so
+            // trailing `COMMIT`/`ROLLBACK` don't hide the interesting result.
+            Ok(result) => {
+                if !result.rows.is_empty() || result.rows_affected > 0 {
+                    last = result;
                 }
             }
             Err(e) => {
                 // Best-effort rollback on the same connection before bubbling up.
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                return Err(e.into());
+                return Err(e);
             }
         }
     }
@@ -332,5 +383,79 @@ mod tests {
         ];
         let result = execute_transaction(&pool, &stmts).await.unwrap();
         assert_eq!(result.rows, vec![vec!["42".to_string()]]);
+    }
+
+    async fn seed(pool: &SqlitePool) {
+        sqlx::query("INSERT INTO t VALUES (1), (2), (3)")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_reports_rows_affected() {
+        let pool = mem_pool().await;
+        seed(&pool).await;
+        let result = execute_query(&pool, "UPDATE t SET a = a + 10 WHERE a >= 2")
+            .await
+            .unwrap();
+        assert_eq!(result.rows_affected, 2);
+        assert!(result.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_reports_rows_affected() {
+        let pool = mem_pool().await;
+        seed(&pool).await;
+        let result = execute_query(&pool, "DELETE FROM t WHERE a = 1")
+            .await
+            .unwrap();
+        assert_eq!(result.rows_affected, 1);
+        assert_eq!(count(&pool).await, 2);
+    }
+
+    #[tokio::test]
+    async fn select_rows_affected_equals_row_count() {
+        let pool = mem_pool().await;
+        seed(&pool).await;
+        let result = execute_query(&pool, "SELECT a FROM t ORDER BY a")
+            .await
+            .unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows_affected, 3);
+    }
+
+    #[tokio::test]
+    async fn transaction_reports_last_statement_rows_affected() {
+        let pool = mem_pool().await;
+        seed(&pool).await;
+        let stmts = [
+            "BEGIN".to_string(),
+            "DELETE FROM t WHERE a <= 2".to_string(),
+            "COMMIT".to_string(),
+        ];
+        let result = execute_transaction(&pool, &stmts).await.unwrap();
+        assert_eq!(result.rows_affected, 2);
+    }
+
+    #[tokio::test]
+    async fn empty_select_after_dml_reports_zero() {
+        let pool = mem_pool().await;
+        seed(&pool).await;
+        execute_query(&pool, "DELETE FROM t WHERE a = 1")
+            .await
+            .unwrap();
+        let result = execute_query(&pool, "SELECT a FROM t WHERE a > 100")
+            .await
+            .unwrap();
+        assert_eq!(result.rows_affected, 0);
+    }
+
+    #[test]
+    fn is_dml_skips_leading_comments() {
+        assert!(is_dml("  -- note\n/* c */ delete from t"));
+        assert!(is_dml("INSERT INTO t VALUES (1)"));
+        assert!(!is_dml("SELECT 1"));
+        assert!(!is_dml("COMMIT"));
     }
 }

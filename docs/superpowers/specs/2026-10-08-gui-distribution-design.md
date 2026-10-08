@@ -18,7 +18,7 @@ de téléchargement GitHub Pages.
 - **GUI à parité fonctionnelle avec le TUI** dès cette version.
 - **Workflow de release dédié** au repo (calqué sur codingUnicorns), qui remplace
   l'appel au workflow partagé `Ajustor/workflows/cargo-release.yml`.
-- **Un seul crate**, réorganisé en `core` / `tui` / `gui` / `updater`
+- **Un seul crate**, réorganisé en `engine` / `tui` / `gui` / `updater` (le nom `core` est évité : il masquerait le crate standard `core`)
   (pas de workspace Cargo).
 
 ## Lancement
@@ -45,7 +45,7 @@ pour le TUI.
 ```
 src/
 ├── main.rs        # Parsing des arguments, dispatch GUI / TUI / update
-├── core/          # Indépendant de toute UI
+├── engine/        # Indépendant de toute UI
 │   ├── config/    # AppConfig (déplacé)
 │   ├── db/        # Connecteurs (déplacés)
 │   ├── models/    # ConnectionConfig, QueryResult… (déplacés)
@@ -56,7 +56,7 @@ src/
 └── updater/       # NOUVEAU : porté de codingUnicorns
 ```
 
-### `core::ops`
+### `engine::ops`
 
 Fonctions async sans état UI, extraites de `main.rs` :
 
@@ -64,14 +64,18 @@ Fonctions async sans état UI, extraites de `main.rs` :
   (instruction au curseur, script complet, bloc `BEGIN…COMMIT` sur connexion dédiée).
 - `save_row`, `insert_row`, `delete_row`, `truncate_table(s)`.
 - `apply_schema_action` (créer/modifier/supprimer table et colonnes).
-- `export_table(s)`, `import_table(s)` (simple et par lot).
+- `export_tables` (par lot), `import_csv` / `import_tables` (simple et par lot) ;
+  l'export simple reste `services::export_import::export_to_file`.
+- `detect_system_columns` (colonnes auto-générées exclues de l'INSERT).
+- Tokenizer SQL et autocomplétion (`tokenize_sql`, `get_completions`) déplacés
+  dans `engine::sql` ; seul le rendu ratatui reste dans le TUI.
 - `extract_table_from_query`, quoting par SGBD.
 
 Chaque fonction prend une `&DatabaseConnection` (ou la config) et des paramètres
 explicites, et renvoie un `Result<…>` typé. Le TUI est rebranché sur ces fonctions :
 son comportement ne doit pas changer.
 
-`services::query_tabs` (onglets et historique persistés) est partagé : GUI et TUI
+`services::query_tabs` (onglets de requêtes persistés) est partagé : GUI et TUI
 lisent et écrivent les mêmes fichiers.
 
 ## GUI
@@ -98,7 +102,8 @@ Stack : `eframe`/`egui` 0.31, `egui_extras` (tables), `egui-phosphor` (icônes),
 - **Barre latérale** redimensionnable : liste des connexions (connecter, nouvelle,
   modifier, supprimer via boutons et menu contextuel), puis arbre schéma → tables
   avec filtre. Clic sur une table : `SELECT` dans l'onglet courant ; menu contextuel :
-  structure, export, import, truncate. Sélection multiple pour les opérations par lot.
+  structure, export, import, truncate. Les opérations par lot (export, import, vidage) passent par une fenêtre
+  listant toutes les tables avec des cases à cocher.
 - **Éditeur SQL** : onglets (ajout/fermeture/renommage), `TextEdit` multi-ligne avec
   coloration SQL via un `layouter` (réutilise le tokenizer de `sql_highlight`),
   popup d'autocomplétion des tables/colonnes connues.
@@ -108,8 +113,8 @@ Stack : `eframe`/`egui` 0.31, `egui_extras` (tables), `egui-phosphor` (icônes),
 - **Barre de statut** : état de connexion, durée et nombre de lignes, erreurs,
   indicateur de mise à jour.
 - **Modales** : connexion (tous SGBD, y compris méthodes Azure AD), structure de
-  table (colonnes, types, index, éditeur de colonnes), export/import simple et par
-  lot (CSV/JSON), confirmations destructives, à propos / mise à jour.
+  table (colonnes, types, index, éditeur de colonnes), export (CSV / SQL INSERT) et import CSV, simples et par
+  lot, confirmations destructives, à propos / mise à jour.
 
 ### Raccourcis
 
@@ -142,9 +147,9 @@ config. Palette inspirée de codingUnicorns. Pas de thèmes personnalisables.
 
 ### Erreurs
 
-Toute erreur d'opération remonte en `Event::Failed { op, message }` : affichée
-dans la barre de statut, et dans une notification (toast) pour les opérations
-déclenchées depuis une modale. Aucune erreur n'est avalée silencieusement.
+Toute erreur d'opération remonte en `Event` portant le message d'erreur : affichée
+en rouge dans la barre de statut (et dans le formulaire concerné pour la création
+de connexion). Aucune erreur n'est avalée silencieusement.
 
 ## Mises à jour
 
@@ -204,7 +209,7 @@ Profil release : `opt-level = "s"`, `lto = true`, `codegen-units = 1`, `strip = 
 
 ## Tests
 
-- `core::ops` : tests unitaires sur SQLite en mémoire — découpage d'instructions,
+- `engine::ops` : tests unitaires sur SQLite en mémoire — découpage d'instructions,
   détection et exécution de blocs de transaction (commit et rollback sur erreur),
   save/insert/delete, export puis import aller-retour.
 - `updater` : tests repris de codingUnicorns (manifeste, sélection d'asset, digest,

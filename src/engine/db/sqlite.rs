@@ -3,7 +3,7 @@ use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, SqlitePool, TypeInfo};
 
 use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
 
-use super::utils::{build_update_clauses, fetch_rows_and_result, is_dml};
+use super::utils::{build_update_clauses, fetch_rows_and_result, is_dml, split_qualified};
 
 /// Connect to SQLite
 pub async fn connect(conn_str: &str) -> Result<SqlitePool> {
@@ -58,7 +58,7 @@ async fn run_statement<'c, E>(
 where
     E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
 {
-    let (rows, done, truncated) = fetch_rows_and_result(executor, query, max_rows).await?;
+    let (rows, done, truncated) = fetch_rows_and_result(executor, query, max_rows, true).await?;
     // SQLite reports `sqlite3_changes()`, which is NOT reset by statements
     // that modify nothing (SELECT, DDL, COMMIT...): it keeps the count of the
     // last INSERT/UPDATE/DELETE on the connection. Only trust it for DML.
@@ -183,62 +183,75 @@ pub async fn insert_row(
     Ok(result.rows_affected())
 }
 
+/// `PRAGMA [schema.]pragma('arg')`, the schema (`main`, `temp` or an
+/// attached database) quoted, the argument escaped.
+fn pragma_on(schema: Option<&str>, pragma: &str, arg: &str) -> String {
+    let arg = arg.replace('\'', "''");
+    match schema {
+        Some(schema) => format!(
+            "PRAGMA \"{}\".{pragma}('{arg}')",
+            schema.replace('"', "\"\"")
+        ),
+        None => format!("PRAGMA {pragma}('{arg}')"),
+    }
+}
+
+/// `PRAGMA table_info` of a bare, qualified or quoted table name (`t`,
+/// `main.t`, `"main"."t"`), as `(name, type, nullable, pk position)` where
+/// the pk position is 0 outside the primary key.
+async fn table_info(
+    pool: &SqlitePool,
+    table_name: &str,
+) -> Result<Vec<(String, String, bool, i64)>> {
+    let (schema, table) = split_qualified(table_name);
+    let rows: Vec<SqliteRow> = sqlx::query(&pragma_on(schema.as_deref(), "table_info", &table))
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let notnull: i64 = row.try_get("notnull")?;
+            Ok((
+                row.try_get("name")?,
+                row.try_get("type")?,
+                notnull == 0,
+                row.try_get("pk")?,
+            ))
+        })
+        .collect()
+}
+
 /// Get column nullability information for a table
 pub async fn get_column_nullability(
     pool: &SqlitePool,
     table_name: &str,
 ) -> Result<std::collections::HashMap<String, bool>> {
-    // SQLite uses PRAGMA table_info to get column info
-    let table = table_name.trim_matches('"').replace("main.", "");
-    let query = format!("PRAGMA table_info('{}')", table);
-
-    let rows: Vec<SqliteRow> = sqlx::query(&query).fetch_all(pool).await?;
-
-    let mut result = std::collections::HashMap::new();
-    for row in rows {
-        let name: String = row.try_get(1).unwrap_or_default();
-        let notnull: i32 = row.try_get(3).unwrap_or(0);
-        result.insert(name, notnull == 0); // notnull=0 means nullable=true
-    }
-
-    Ok(result)
+    Ok(table_info(pool, table_name)
+        .await?
+        .into_iter()
+        .map(|(name, _, nullable, _)| (name, nullable))
+        .collect())
 }
 
-/// Get primary key columns for a table
+/// Get primary key columns for a table, in key order
 pub async fn get_primary_keys(pool: &SqlitePool, table_name: &str) -> Result<Vec<String>> {
-    // SQLite uses PRAGMA table_info - pk column (index 5) indicates primary key
-    let table = table_name.trim_matches('"').replace("main.", "");
-    let query = format!("PRAGMA table_info('{}')", table);
-
-    let rows: Vec<SqliteRow> = sqlx::query(&query).fetch_all(pool).await?;
-
-    let mut primary_keys = Vec::new();
-    for row in rows {
-        let name: String = row.try_get(1).unwrap_or_default();
-        let pk: i32 = row.try_get(5).unwrap_or(0);
-        if pk > 0 {
-            primary_keys.push(name);
-        }
-    }
-
-    Ok(primary_keys)
+    let mut keys: Vec<(i64, String)> = table_info(pool, table_name)
+        .await?
+        .into_iter()
+        .filter(|(.., pk)| *pk > 0)
+        .map(|(name, _, _, pk)| (pk, name))
+        .collect();
+    keys.sort();
+    Ok(keys.into_iter().map(|(_, name)| name).collect())
 }
 
 /// Get column names for a table (for autocompletion)
 #[allow(dead_code)]
 pub async fn get_table_columns(pool: &SqlitePool, table_name: &str) -> Result<Vec<String>> {
-    let table = table_name.trim_matches('"').replace("main.", "");
-    let query = format!("PRAGMA table_info('{}')", table);
-
-    let rows: Vec<SqliteRow> = sqlx::query(&query).fetch_all(pool).await?;
-
-    let mut columns = Vec::new();
-    for row in rows {
-        let name: String = row.try_get(1).unwrap_or_default();
-        columns.push(name);
-    }
-
-    Ok(columns)
+    Ok(table_info(pool, table_name)
+        .await?
+        .into_iter()
+        .map(|(name, ..)| name)
+        .collect())
 }
 
 /// Get full column details for a table (for schema modification)
@@ -246,43 +259,26 @@ pub async fn get_table_column_details(
     pool: &SqlitePool,
     table_name: &str,
 ) -> Result<Vec<crate::engine::models::Column>> {
-    let table = table_name.trim_matches('"').replace("main.", "");
-    let query = format!("PRAGMA table_info('{}')", table);
-
-    let rows: Vec<SqliteRow> = sqlx::query(&query).fetch_all(pool).await?;
-
-    let mut columns = Vec::new();
-    for row in rows {
-        let name: String = row.try_get(1).unwrap_or_default();
-        let type_name: String = row.try_get(2).unwrap_or_default();
-        let notnull: i32 = row.try_get(3).unwrap_or(0);
-        let pk: i32 = row.try_get(5).unwrap_or(0);
-
-        columns.push(crate::engine::models::Column {
-            name,
-            type_name,
-            nullable: notnull == 0,
-            is_primary_key: pk > 0,
-        });
-    }
-
-    Ok(columns)
-}
-
-/// `table_name` unquoted the same way as `get_table_column_details`, then
-/// escaped for use inside a single-quoted PRAGMA argument.
-fn pragma_table_arg(table_name: &str) -> String {
-    table_name
-        .trim_matches('"')
-        .replace("main.", "")
-        .replace('\'', "''")
+    Ok(table_info(pool, table_name)
+        .await?
+        .into_iter()
+        .map(
+            |(name, type_name, nullable, pk)| crate::engine::models::Column {
+                name,
+                type_name,
+                nullable,
+                is_primary_key: pk > 0,
+            },
+        )
+        .collect())
 }
 
 /// Get the indexes of a table (`PRAGMA index_list` + `PRAGMA index_info`).
 /// An `INTEGER PRIMARY KEY` is the rowid and has no index, so it is not listed.
 pub async fn get_indexes(pool: &SqlitePool, table_name: &str) -> Result<Vec<IndexInfo>> {
-    let table = pragma_table_arg(table_name);
-    let rows: Vec<SqliteRow> = sqlx::query(&format!("PRAGMA index_list('{}')", table))
+    let (schema, table) = split_qualified(table_name);
+    let schema = schema.as_deref();
+    let rows: Vec<SqliteRow> = sqlx::query(&pragma_on(schema, "index_list", &table))
         .fetch_all(pool)
         .await?;
 
@@ -291,12 +287,9 @@ pub async fn get_indexes(pool: &SqlitePool, table_name: &str) -> Result<Vec<Inde
         let name: String = row.try_get("name")?;
         let unique: i64 = row.try_get("unique")?;
         let origin: String = row.try_get("origin")?;
-        let info: Vec<SqliteRow> = sqlx::query(&format!(
-            "PRAGMA index_info('{}')",
-            name.replace('\'', "''")
-        ))
-        .fetch_all(pool)
-        .await?;
+        let info: Vec<SqliteRow> = sqlx::query(&pragma_on(schema, "index_info", &name))
+            .fetch_all(pool)
+            .await?;
         let columns = info
             .iter()
             .map(|r| {
@@ -320,10 +313,11 @@ pub async fn get_indexes(pool: &SqlitePool, table_name: &str) -> Result<Vec<Inde
 /// column, grouped by `id`). SQLite does not expose constraint names, so
 /// `name` is empty.
 pub async fn get_foreign_keys(pool: &SqlitePool, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
-    let table = pragma_table_arg(table_name);
-    let rows: Vec<SqliteRow> = sqlx::query(&format!("PRAGMA foreign_key_list('{}')", table))
-        .fetch_all(pool)
-        .await?;
+    let (schema, table) = split_qualified(table_name);
+    let rows: Vec<SqliteRow> =
+        sqlx::query(&pragma_on(schema.as_deref(), "foreign_key_list", &table))
+            .fetch_all(pool)
+            .await?;
 
     let mut keys: Vec<(i64, ForeignKeyInfo)> = Vec::new();
     for row in rows {
@@ -546,6 +540,67 @@ mod tests {
         let result = execute_transaction(&pool, &stmts).await.unwrap();
         assert_eq!(result.rows, vec![vec!["7".to_string()]]);
         assert_eq!(result.rows_affected, 1);
+    }
+
+    /// Every metadata function accepts bare, qualified and quoted names,
+    /// for `main` and for an attached schema.
+    #[tokio::test]
+    async fn metadata_accepts_qualified_quoted_names() {
+        let pool = mem_pool().await;
+        for sql in [
+            "CREATE TABLE p (a INTEGER NOT NULL, b INTEGER NOT NULL, x TEXT, PRIMARY KEY (b, a))",
+            "CREATE TABLE \"we'ird\" (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, \
+             FOREIGN KEY (b, a) REFERENCES p (b, a))",
+            "CREATE INDEX \"we'ird_ix\" ON \"we'ird\" (a)",
+            "ATTACH DATABASE ':memory:' AS aux",
+            "CREATE TABLE aux.p (z TEXT PRIMARY KEY, y INT NOT NULL)",
+            "CREATE INDEX aux.p_y ON p (y)",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        for name in ["p", "main.p", "\"main\".\"p\"", "\"p\""] {
+            let cols = get_table_column_details(&pool, name).await.unwrap();
+            assert_eq!(cols.len(), 3, "{name}");
+            assert_eq!(
+                get_primary_keys(&pool, name).await.unwrap(),
+                ["b", "a"],
+                "{name}"
+            );
+            let nullability = get_column_nullability(&pool, name).await.unwrap();
+            assert_eq!(nullability.get("x"), Some(&true), "{name}");
+            assert_eq!(
+                get_table_columns(&pool, name).await.unwrap(),
+                ["a", "b", "x"]
+            );
+            let indexes = get_indexes(&pool, name).await.unwrap();
+            assert!(
+                indexes.iter().any(|i| i.primary && i.columns == ["b", "a"]),
+                "{name}"
+            );
+        }
+        let weird = "\"main\".\"we'ird\"";
+        assert_eq!(
+            get_table_column_details(&pool, weird).await.unwrap().len(),
+            3
+        );
+        let fks = get_foreign_keys(&pool, weird).await.unwrap();
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0].columns, ["b", "a"]);
+        assert_eq!(fks[0].ref_table, "p");
+        let indexes = get_indexes(&pool, weird).await.unwrap();
+        assert_eq!(indexes[0].columns, ["a"]);
+
+        // The attached schema's `p` is a different table.
+        let aux = "\"aux\".\"p\"";
+        let cols = get_table_column_details(&pool, aux).await.unwrap();
+        let names: Vec<_> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["z", "y"]);
+        assert_eq!(get_primary_keys(&pool, aux).await.unwrap(), ["z"]);
+        let indexes = get_indexes(&pool, aux).await.unwrap();
+        assert!(indexes
+            .iter()
+            .any(|i| i.name == "p_y" && i.columns == ["y"]));
+        assert!(get_foreign_keys(&pool, aux).await.unwrap().is_empty());
     }
 
     #[tokio::test]

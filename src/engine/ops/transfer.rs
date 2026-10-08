@@ -72,9 +72,11 @@ pub async fn import_csv(
     Ok(stats)
 }
 
-/// `"schema"."table"` with the database's identifier quotes.
+/// `"schema"."table"` with the database's identifier quotes (a closing
+/// quote inside a name is doubled).
 pub fn qualified(schema: &str, table: &str, (q0, q1): (char, char)) -> String {
-    format!("{q0}{schema}{q1}.{q0}{table}{q1}")
+    let esc = |name: &str| name.replace(q1, &format!("{q1}{q1}"));
+    format!("{q0}{}{q1}.{q0}{}{q1}", esc(schema), esc(table))
 }
 
 /// Export each `(schema, table)` to `<dir>/<table>.<ext>`. `dir` must exist:

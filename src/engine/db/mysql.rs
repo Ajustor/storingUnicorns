@@ -5,7 +5,7 @@ use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, Sche
 
 use super::utils::{
     build_update_clauses, fetch_rows_and_result, group_foreign_keys, group_indexes,
-    group_tables_by_schema,
+    group_tables_by_schema, split_qualified,
 };
 
 /// Connect to MySQL
@@ -52,7 +52,9 @@ fn rows_to_result(rows: &[MySqlRow], affected: u64) -> QueryResult {
 }
 
 /// Execute one statement exactly once, collecting its rows and affected-row
-/// count from the same stream.
+/// count from the same stream. User SQL goes through the text protocol: the
+/// prepared-statement protocol rejects `START TRANSACTION`, `LOCK TABLES`,
+/// several statements in one string, etc.
 async fn run_statement<'c, E>(
     executor: E,
     query: &str,
@@ -61,7 +63,7 @@ async fn run_statement<'c, E>(
 where
     E: sqlx::Executor<'c, Database = sqlx::MySql>,
 {
-    let (rows, done, truncated) = fetch_rows_and_result(executor, query, max_rows).await?;
+    let (rows, done, truncated) = fetch_rows_and_result(executor, query, max_rows, false).await?;
     Ok(QueryResult {
         truncated,
         ..rows_to_result(&rows, done.rows_affected())
@@ -111,7 +113,8 @@ pub async fn execute_transaction(pool: &MySqlPool, statements: &[String]) -> Res
 /// Get tables grouped by schema
 pub async fn get_tables_by_schema(pool: &MySqlPool) -> Result<Vec<SchemaInfo>> {
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.tables 
+        "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR)
+         FROM information_schema.tables
          WHERE TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
          ORDER BY TABLE_SCHEMA, TABLE_NAME",
     )
@@ -170,78 +173,65 @@ pub async fn insert_row(
     Ok(result.rows_affected())
 }
 
+/// `(schema, table)` of a possibly qualified/quoted name; the schema is
+/// empty when not given, which the queries turn into `DATABASE()`.
+fn split_table(table_name: &str) -> (String, String) {
+    let (schema, table) = split_qualified(table_name);
+    (schema.unwrap_or_default(), table)
+}
+
+/// Columns of a table as `(name, type, nullable, primary key)`, in order
+/// (current database when the name is not qualified). `information_schema`
+/// columns are cast to CHAR: MySQL 8 reports them with a binary collation,
+/// which would not decode as text.
+async fn column_rows(
+    pool: &MySqlPool,
+    table_name: &str,
+) -> Result<Vec<(String, String, bool, bool)>> {
+    let (schema, table) = split_table(table_name);
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR),
+                CAST(IS_NULLABLE AS CHAR), CAST(COLUMN_KEY AS CHAR)
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = COALESCE(NULLIF(?, ''), DATABASE()) AND TABLE_NAME = ?
+         ORDER BY ORDINAL_POSITION",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, ty, nullable, key)| (name, ty, nullable == "YES", key == "PRI"))
+        .collect())
+}
+
 /// Get column nullability information for a table
 pub async fn get_column_nullability(
     pool: &MySqlPool,
     table_name: &str,
 ) -> Result<std::collections::HashMap<String, bool>> {
-    // Parse schema.table or just table
-    let (schema, table) = if table_name.contains('.') {
-        let parts: Vec<&str> = table_name.split('.').collect();
-        (parts[0].trim_matches('`'), parts[1].trim_matches('`'))
-    } else {
-        ("", table_name.trim_matches('`'))
-    };
-
-    let rows: Vec<(String, String)> = if schema.is_empty() {
-        sqlx::query_as(
-            "SELECT column_name, is_nullable 
-             FROM information_schema.columns 
-             WHERE table_name = ?",
-        )
-        .bind(table)
-        .fetch_all(pool)
+    Ok(column_rows(pool, table_name)
         .await?
-    } else {
-        sqlx::query_as(
-            "SELECT column_name, is_nullable 
-             FROM information_schema.columns 
-             WHERE table_schema = ? AND table_name = ?",
-        )
-        .bind(schema)
-        .bind(table)
-        .fetch_all(pool)
-        .await?
-    };
-
-    Ok(rows
         .into_iter()
-        .map(|(name, nullable)| (name, nullable == "YES"))
+        .map(|(name, _, nullable, _)| (name, nullable))
         .collect())
 }
 
-/// Get primary key columns for a table
+/// Get primary key columns for a table, in key order
 pub async fn get_primary_keys(pool: &MySqlPool, table_name: &str) -> Result<Vec<String>> {
-    // Parse schema.table or just table
-    let (schema, table) = if table_name.contains('.') {
-        let parts: Vec<&str> = table_name.split('.').collect();
-        (parts[0].trim_matches('`'), parts[1].trim_matches('`'))
-    } else {
-        ("", table_name.trim_matches('`'))
-    };
-
-    let rows: Vec<(String,)> = if schema.is_empty() {
-        sqlx::query_as(
-            "SELECT column_name 
-             FROM information_schema.key_column_usage 
-             WHERE table_name = ? AND constraint_name = 'PRIMARY'
-             ORDER BY ordinal_position",
-        )
-        .bind(table)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT column_name 
-             FROM information_schema.key_column_usage 
-             WHERE table_schema = ? AND table_name = ? AND constraint_name = 'PRIMARY'
-             ORDER BY ordinal_position",
-        )
-        .bind(schema)
-        .bind(table)
-        .fetch_all(pool)
-        .await?
-    };
+    let (schema, table) = split_table(table_name);
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT CAST(COLUMN_NAME AS CHAR)
+         FROM information_schema.KEY_COLUMN_USAGE
+         WHERE TABLE_SCHEMA = COALESCE(NULLIF(?, ''), DATABASE()) AND TABLE_NAME = ?
+           AND CONSTRAINT_NAME = 'PRIMARY'
+         ORDER BY ORDINAL_POSITION",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows.into_iter().map(|(name,)| name).collect())
 }
@@ -249,97 +239,31 @@ pub async fn get_primary_keys(pool: &MySqlPool, table_name: &str) -> Result<Vec<
 /// Get column names for a table (for autocompletion)
 #[allow(dead_code)]
 pub async fn get_table_columns(pool: &MySqlPool, table_name: &str) -> Result<Vec<String>> {
-    // Parse schema.table or just table
-    let (schema, table) = if table_name.contains('.') {
-        let parts: Vec<&str> = table_name.split('.').collect();
-        (parts[0].trim_matches('`'), parts[1].trim_matches('`'))
-    } else {
-        ("", table_name.trim_matches('`'))
-    };
-
-    let rows: Vec<(String,)> = if schema.is_empty() {
-        sqlx::query_as(
-            "SELECT column_name 
-             FROM information_schema.columns 
-             WHERE table_name = ?
-             ORDER BY ordinal_position",
-        )
-        .bind(table)
-        .fetch_all(pool)
+    Ok(column_rows(pool, table_name)
         .await?
-    } else {
-        sqlx::query_as(
-            "SELECT column_name 
-             FROM information_schema.columns 
-             WHERE table_schema = ? AND table_name = ?
-             ORDER BY ordinal_position",
-        )
-        .bind(schema)
-        .bind(table)
-        .fetch_all(pool)
-        .await?
-    };
-
-    Ok(rows.into_iter().map(|(name,)| name).collect())
+        .into_iter()
+        .map(|(name, ..)| name)
+        .collect())
 }
 
-/// Get full column details for a table (for schema modification)
+/// Get full column details for a table (for schema modification). The type
+/// is the full `COLUMN_TYPE` (`varchar(50)`, `int unsigned`).
 pub async fn get_table_column_details(
     pool: &MySqlPool,
     table_name: &str,
 ) -> Result<Vec<crate::engine::models::Column>> {
-    // Parse schema.table or just table
-    let (schema, table) = if table_name.contains('.') {
-        let parts: Vec<&str> = table_name.split('.').collect();
-        (parts[0].trim_matches('`'), parts[1].trim_matches('`'))
-    } else {
-        ("", table_name.trim_matches('`'))
-    };
-
-    // Get column info with primary key
-    let rows: Vec<(String, String, String, String)> = if schema.is_empty() {
-        sqlx::query_as(
-            "SELECT column_name, data_type, is_nullable, column_key
-             FROM information_schema.columns 
-             WHERE table_name = ?
-             ORDER BY ordinal_position",
-        )
-        .bind(table)
-        .fetch_all(pool)
+    Ok(column_rows(pool, table_name)
         .await?
-    } else {
-        sqlx::query_as(
-            "SELECT column_name, data_type, is_nullable, column_key
-             FROM information_schema.columns 
-             WHERE table_schema = ? AND table_name = ?
-             ORDER BY ordinal_position",
-        )
-        .bind(schema)
-        .bind(table)
-        .fetch_all(pool)
-        .await?
-    };
-
-    Ok(rows
         .into_iter()
         .map(
-            |(name, type_name, nullable, column_key)| crate::engine::models::Column {
+            |(name, type_name, nullable, is_primary_key)| crate::engine::models::Column {
                 name,
                 type_name,
-                nullable: nullable == "YES",
-                is_primary_key: column_key == "PRI",
+                nullable,
+                is_primary_key,
             },
         )
         .collect())
-}
-
-/// `(schema, table)` of a possibly qualified/quoted name, parsed the same way
-/// as `get_table_column_details`; the schema is empty when not given.
-fn split_table(table_name: &str) -> (&str, &str) {
-    match table_name.split_once('.') {
-        Some((schema, table)) => (schema.trim_matches('`'), table.trim_matches('`')),
-        None => ("", table_name.trim_matches('`')),
-    }
 }
 
 /// Get the indexes of a table from `information_schema.STATISTICS`
@@ -348,7 +272,7 @@ pub async fn get_indexes(pool: &MySqlPool, table_name: &str) -> Result<Vec<Index
     let (schema, table) = split_table(table_name);
 
     let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE
+        "SELECT CAST(INDEX_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR), NON_UNIQUE
          FROM information_schema.STATISTICS
          WHERE TABLE_SCHEMA = COALESCE(NULLIF(?, ''), DATABASE()) AND TABLE_NAME = ?
          ORDER BY INDEX_NAME = 'PRIMARY' DESC, INDEX_NAME, SEQ_IN_INDEX",
@@ -375,8 +299,9 @@ pub async fn get_foreign_keys(pool: &MySqlPool, table_name: &str) -> Result<Vec<
     let (schema, table) = split_table(table_name);
 
     let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
-        "SELECT CONSTRAINT_NAME, COLUMN_NAME, TABLE_SCHEMA,
-                REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+        "SELECT CAST(CONSTRAINT_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR),
+                CAST(TABLE_SCHEMA AS CHAR), CAST(REFERENCED_TABLE_SCHEMA AS CHAR),
+                CAST(REFERENCED_TABLE_NAME AS CHAR), CAST(REFERENCED_COLUMN_NAME AS CHAR)
          FROM information_schema.KEY_COLUMN_USAGE
          WHERE TABLE_SCHEMA = COALESCE(NULLIF(?, ''), DATABASE()) AND TABLE_NAME = ?
            AND REFERENCED_TABLE_NAME IS NOT NULL
@@ -410,35 +335,17 @@ pub async fn close(pool: MySqlPool) {
     pool.close().await;
 }
 
+/// Text of a value. Rows come from the text protocol (`run_statement`), so
+/// every non-NULL value already is its textual form, exactly as MySQL prints
+/// it (DATETIME without offset, DECIMAL scale kept, JSON as stored, BIGINT
+/// UNSIGNED in full); BLOB-like values are shown lossily.
 fn get_value(row: &MySqlRow, index: usize) -> String {
-    row.try_get::<String, _>(index)
-        .or_else(|_| row.try_get::<i32, _>(index).map(|v| v.to_string()))
-        .or_else(|_| row.try_get::<i64, _>(index).map(|v| v.to_string()))
-        .or_else(|_| row.try_get::<f64, _>(index).map(|v| v.to_string()))
-        .or_else(|_| {
-            row.try_get::<rust_decimal::Decimal, _>(index)
-                .map(|v| v.to_string())
-        })
-        .or_else(|_| row.try_get::<bool, _>(index).map(|v| v.to_string()))
-        .or_else(|_| {
-            row.try_get::<chrono::DateTime<chrono::Utc>, _>(index)
-                .map(|v| v.to_rfc3339())
-        })
-        .or_else(|_| {
-            row.try_get::<chrono::NaiveDateTime, _>(index)
-                .map(|v| v.to_string())
-        })
-        .or_else(|_| {
-            row.try_get::<chrono::NaiveDate, _>(index)
-                .map(|v| v.to_string())
-        })
-        .or_else(|_| {
-            row.try_get::<chrono::NaiveTime, _>(index)
-                .map(|v| v.to_string())
-        })
-        .or_else(|_| {
-            row.try_get::<Vec<u8>, _>(index)
-                .map(|v| String::from_utf8_lossy(&v).into_owned())
-        })
+    use sqlx::ValueRef;
+    match row.try_get_raw(index) {
+        Ok(raw) if !raw.is_null() => {}
+        _ => return "NULL".to_string(),
+    }
+    row.try_get_unchecked::<&[u8], _>(index)
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
         .unwrap_or_else(|_| "NULL".to_string())
 }

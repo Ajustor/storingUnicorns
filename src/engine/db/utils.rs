@@ -17,17 +17,27 @@ use crate::engine::sql::statements::split_statements;
 /// When `query` holds several statements, the rest of the stream is still
 /// drained (rows discarded) so that the following statements run: some
 /// drivers (SQLite) execute them lazily, while the stream is being read.
+///
+/// `prepared` selects the prepared-statement protocol; otherwise the text
+/// (simple query) protocol is used, which MySQL needs for statements it does
+/// not support as prepared statements (`START TRANSACTION`, `LOCK TABLES`…)
+/// and for several statements in one string.
 pub async fn fetch_rows_and_result<'c, DB, E>(
     executor: E,
     query: &str,
     max_rows: Option<usize>,
+    prepared: bool,
 ) -> sqlx::Result<(Vec<DB::Row>, DB::QueryResult, bool)>
 where
     DB: Database,
     E: Executor<'c, Database = DB>,
     for<'q> DB::Arguments<'q>: IntoArguments<'q, DB>,
 {
-    let mut stream = executor.fetch_many(sqlx::query(query));
+    let mut stream = if prepared {
+        executor.fetch_many(sqlx::query(query))
+    } else {
+        executor.fetch_many(query)
+    };
     let mut rows = Vec::new();
     let mut done = DB::QueryResult::default();
     let mut truncated = false;
@@ -50,6 +60,52 @@ where
         }
     }
     Ok((rows, done, truncated))
+}
+
+/// Split a table name, bare (`t`), qualified (`s.t`, `db.s.t`) and/or quoted
+/// with any dialect's quotes (`"s"."t"`, `` `s`.`t` ``, `[s].[t]`), into
+/// `(schema, table)`, both unquoted. Doubled quotes inside a quoted part are
+/// unescaped and dots inside quotes are kept. With more than two parts the
+/// last two are used; an empty schema counts as none.
+pub fn split_qualified(name: &str) -> (Option<String>, String) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut chars = name.trim().chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut part = String::new();
+        let close = match chars.peek() {
+            Some('"') => Some('"'),
+            Some('`') => Some('`'),
+            Some('[') => Some(']'),
+            _ => None,
+        };
+        if let Some(close) = close {
+            chars.next();
+            while let Some(c) = chars.next() {
+                if c != close {
+                    part.push(c);
+                } else if chars.next_if_eq(&close).is_some() {
+                    part.push(close);
+                } else {
+                    break;
+                }
+            }
+            // Anything between the closing quote and the next dot is ignored.
+            while chars.next_if(|&c| c != '.').is_some() {}
+        } else {
+            while let Some(c) = chars.next_if(|&c| c != '.') {
+                part.push(c);
+            }
+            part.truncate(part.trim_end().len());
+        }
+        parts.push(part);
+        if chars.next().is_none() {
+            break;
+        }
+    }
+    let table = parts.pop().unwrap_or_default();
+    let schema = parts.pop().filter(|s| !s.is_empty());
+    (schema, table)
 }
 
 /// Group tables by schema name
@@ -193,6 +249,11 @@ pub fn build_update_clauses(
 /// Check if a SQL type is numeric (should not be quoted)
 fn is_numeric_type(type_name: &str) -> bool {
     let type_lower = type_name.to_lowercase();
+    // Arrays (`integer[]`) and types whose name merely contains a numeric
+    // word take a quoted literal.
+    if type_lower.contains('[') || type_lower.contains("interval") || type_lower.contains("point") {
+        return false;
+    }
     type_lower.contains("int")
         || type_lower.contains("serial")
         || type_lower.contains("float")
@@ -416,6 +477,43 @@ mod tests {
         assert_eq!(fks[0].columns, ["x", "y"]);
         assert_eq!(fks[0].ref_columns, ["px", "py"]);
         assert_eq!(fks[1].ref_table, "q");
+    }
+
+    #[test]
+    fn split_qualified_handles_every_quote_style() {
+        let split = |n: &str| {
+            let (schema, table) = split_qualified(n);
+            (schema.as_deref().map(str::to_string), table)
+        };
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(split("t"), (None, "t".into()));
+        assert_eq!(split("  t "), (None, "t".into()));
+        assert_eq!(split("s.t"), (some("s"), "t".into()));
+        assert_eq!(split("\"main\".\"t\""), (some("main"), "t".into()));
+        assert_eq!(split("`db`.`t`"), (some("db"), "t".into()));
+        assert_eq!(split("[dbo].[t]"), (some("dbo"), "t".into()));
+        assert_eq!(split("\"t\""), (None, "t".into()));
+        assert_eq!(split("[My Table]"), (None, "My Table".into()));
+        assert_eq!(split("\"a.b\".\"c.d\""), (some("a.b"), "c.d".into()));
+        assert_eq!(
+            split("\"we\"\"ird\".\"x\"\"y\""),
+            (some("we\"ird"), "x\"y".into())
+        );
+        assert_eq!(split("`a``b`.`c`"), (some("a`b"), "c".into()));
+        assert_eq!(split("[a]]b].[c]"), (some("a]b"), "c".into()));
+        assert_eq!(split("db.[dbo].t"), (some("dbo"), "t".into()));
+        assert_eq!(split("public.\"Mixed\""), (some("public"), "Mixed".into()));
+        assert_eq!(split("\"\".t"), (None, "t".into()));
+    }
+
+    #[test]
+    fn numeric_detection_ignores_arrays_and_lookalikes() {
+        assert!(is_numeric_type("integer"));
+        assert!(is_numeric_type("numeric(10,2)"));
+        assert!(!is_numeric_type("integer[]"));
+        assert!(!is_numeric_type("interval"));
+        assert!(!is_numeric_type("point"));
+        assert!(!is_numeric_type("character varying(50)"));
     }
 
     #[test]

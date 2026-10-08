@@ -14,7 +14,7 @@ use crate::engine::sql::statements::split_statements;
 
 use super::utils::{
     build_update_clauses, group_foreign_keys, group_indexes, group_tables_by_schema, is_dml,
-    leading_keyword, skip_leading_comments,
+    leading_keyword, skip_leading_comments, split_qualified,
 };
 
 /// SQL Server client type alias
@@ -207,8 +207,16 @@ pub async fn execute_query_limited(
 /// block as ONE batch keeps batch-scoped constructs (e.g. `DECLARE @var`)
 /// visible across all statements — running them as separate batches would drop
 /// the variables between statements.
+///
+/// The batch runs with `XACT_ABORT ON`: otherwise most errors (constraint
+/// violations…) only end their statement, the batch goes on and its `COMMIT`
+/// commits the statements that succeeded. The session setting is restored at
+/// the end of the batch (and by the error path of `execute_transaction`).
 fn build_tsql_batch(statements: &[String]) -> String {
-    statements.join(";\n")
+    format!(
+        "SET XACT_ABORT ON;\n{};\nSET XACT_ABORT OFF",
+        statements.join(";\n")
+    )
 }
 
 /// Execute a transaction block as one T-SQL batch. The single tiberius client
@@ -244,7 +252,9 @@ pub async fn execute_transaction(
         Err(e) => {
             // The failed batch may have left a transaction open on the shared
             // client; roll it back so later queries aren't poisoned.
-            let _ = client.simple_query("IF @@TRANCOUNT > 0 ROLLBACK").await;
+            let _ = client
+                .simple_query("IF @@TRANCOUNT > 0 ROLLBACK; SET XACT_ABORT OFF")
+                .await;
             Err(e)
         }
     }
@@ -324,68 +334,97 @@ pub async fn insert_row(
     Ok(result.total())
 }
 
+/// `(schema, table)` of a possibly qualified/bracketed name. `None` schema:
+/// the queries use the user's default schema (`SCHEMA_NAME()`).
+fn split_table(table_name: &str) -> (Option<String>, String) {
+    split_qualified(table_name)
+}
+
+/// Columns of a table as `(name, type, nullable, primary key)`, in order.
+/// The type carries its length/precision (`nvarchar(50)`, `varchar(max)`,
+/// `decimal(10,2)`) so it can be used in DDL.
+async fn column_rows(
+    client: &SqlServerClient,
+    table_name: &str,
+) -> Result<Vec<(String, String, bool, bool)>> {
+    let (schema, table) = split_table(table_name);
+    let query = "SELECT c.COLUMN_NAME,
+                c.DATA_TYPE + CASE
+                    WHEN c.DATA_TYPE IN ('char', 'varchar', 'nchar', 'nvarchar', 'binary', 'varbinary')
+                        THEN '(' + CASE WHEN c.CHARACTER_MAXIMUM_LENGTH = -1 THEN 'max'
+                                        ELSE CAST(c.CHARACTER_MAXIMUM_LENGTH AS varchar(10)) END + ')'
+                    WHEN c.DATA_TYPE IN ('decimal', 'numeric')
+                        THEN '(' + CAST(c.NUMERIC_PRECISION AS varchar(10)) + ','
+                                 + CAST(c.NUMERIC_SCALE AS varchar(10)) + ')'
+                    ELSE '' END,
+                c.IS_NULLABLE,
+                CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END
+         FROM INFORMATION_SCHEMA.COLUMNS c
+         LEFT JOIN (
+             SELECT ku.TABLE_SCHEMA, ku.TABLE_NAME, ku.COLUMN_NAME
+             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku
+             JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+               ON tc.CONSTRAINT_SCHEMA = ku.CONSTRAINT_SCHEMA
+              AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+             WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+         ) pk ON c.TABLE_SCHEMA = pk.TABLE_SCHEMA AND c.TABLE_NAME = pk.TABLE_NAME
+             AND c.COLUMN_NAME = pk.COLUMN_NAME
+         WHERE c.TABLE_SCHEMA = COALESCE(@P1, SCHEMA_NAME()) AND c.TABLE_NAME = @P2
+         ORDER BY c.ORDINAL_POSITION";
+
+    let mut client = client.lock().await;
+    let rows = client
+        .query(query, &[&schema.as_deref(), &table.as_str()])
+        .await?
+        .into_first_result()
+        .await?;
+
+    let mut columns = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: &str = row.try_get(0)?.unwrap_or("");
+        let type_name: &str = row.try_get(1)?.unwrap_or("");
+        let nullable: &str = row.try_get(2)?.unwrap_or("YES");
+        let is_pk: i32 = row.try_get(3)?.unwrap_or(0);
+        columns.push((
+            name.to_string(),
+            type_name.to_string(),
+            nullable == "YES",
+            is_pk == 1,
+        ));
+    }
+    Ok(columns)
+}
+
 /// Get column nullability information for a table
 pub async fn get_column_nullability(
     client: &SqlServerClient,
     table_name: &str,
 ) -> Result<std::collections::HashMap<String, bool>> {
-    // Parse schema.table or just table
-    let (schema, table) = if table_name.contains('.') {
-        let parts: Vec<&str> = table_name.split('.').collect();
-        (
-            parts[0].trim_matches(|c| c == '[' || c == ']'),
-            parts[1].trim_matches(|c| c == '[' || c == ']'),
-        )
-    } else {
-        ("dbo", table_name.trim_matches(|c| c == '[' || c == ']'))
-    };
-
-    let query = format!(
-        "SELECT COLUMN_NAME, IS_NULLABLE 
-         FROM INFORMATION_SCHEMA.COLUMNS 
-         WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}'",
-        schema, table
-    );
-
-    let mut client = client.lock().await;
-    let stream = client.simple_query(&query).await?;
-    let rows = stream.into_first_result().await?;
-
-    let mut result = std::collections::HashMap::new();
-    for row in rows {
-        let name: &str = row.try_get(0)?.unwrap_or("");
-        let nullable: &str = row.try_get(1)?.unwrap_or("YES");
-        result.insert(name.to_string(), nullable == "YES");
-    }
-
-    Ok(result)
+    Ok(column_rows(client, table_name)
+        .await?
+        .into_iter()
+        .map(|(name, _, nullable, _)| (name, nullable))
+        .collect())
 }
 
-/// Get primary key columns for a table
+/// Get primary key columns for a table, in key order
 pub async fn get_primary_keys(client: &SqlServerClient, table_name: &str) -> Result<Vec<String>> {
-    // Parse schema.table or just table
-    let (schema, table) = if table_name.contains('.') {
-        let parts: Vec<&str> = table_name.split('.').collect();
-        (
-            parts[0].trim_matches(|c| c == '[' || c == ']'),
-            parts[1].trim_matches(|c| c == '[' || c == ']'),
-        )
-    } else {
-        ("dbo", table_name.trim_matches(|c| c == '[' || c == ']'))
-    };
-
-    let query = format!(
-        "SELECT COLUMN_NAME 
-         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
-         WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + QUOTENAME(CONSTRAINT_NAME)), 'IsPrimaryKey') = 1
-         AND TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}'
-         ORDER BY ORDINAL_POSITION",
-        schema, table
-    );
+    let (schema, table) = split_table(table_name);
+    let query = "SELECT ku.COLUMN_NAME
+         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku
+         JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+           ON tc.CONSTRAINT_SCHEMA = ku.CONSTRAINT_SCHEMA
+          AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+         WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+           AND ku.TABLE_SCHEMA = COALESCE(@P1, SCHEMA_NAME()) AND ku.TABLE_NAME = @P2
+         ORDER BY ku.ORDINAL_POSITION";
 
     let mut client = client.lock().await;
-    let stream = client.simple_query(&query).await?;
-    let rows = stream.into_first_result().await?;
+    let rows = client
+        .query(query, &[&schema.as_deref(), &table.as_str()])
+        .await?
+        .into_first_result()
+        .await?;
 
     let mut primary_keys = Vec::new();
     for row in rows {
@@ -399,36 +438,11 @@ pub async fn get_primary_keys(client: &SqlServerClient, table_name: &str) -> Res
 /// Get column names for a table (for autocompletion)
 #[allow(dead_code)]
 pub async fn get_table_columns(client: &SqlServerClient, table_name: &str) -> Result<Vec<String>> {
-    // Parse schema.table or just table
-    let (schema, table) = if table_name.contains('.') {
-        let parts: Vec<&str> = table_name.split('.').collect();
-        (
-            parts[0].trim_matches(|c| c == '[' || c == ']'),
-            parts[1].trim_matches(|c| c == '[' || c == ']'),
-        )
-    } else {
-        ("dbo", table_name.trim_matches(|c| c == '[' || c == ']'))
-    };
-
-    let query = format!(
-        "SELECT COLUMN_NAME 
-         FROM INFORMATION_SCHEMA.COLUMNS 
-         WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}'
-         ORDER BY ORDINAL_POSITION",
-        schema, table
-    );
-
-    let mut client = client.lock().await;
-    let stream = client.simple_query(&query).await?;
-    let rows = stream.into_first_result().await?;
-
-    let mut columns = Vec::new();
-    for row in rows {
-        let name: &str = row.try_get(0)?.unwrap_or("");
-        columns.push(name.to_string());
-    }
-
-    Ok(columns)
+    Ok(column_rows(client, table_name)
+        .await?
+        .into_iter()
+        .map(|(name, ..)| name)
+        .collect())
 }
 
 /// Get full column details for a table (for schema modification)
@@ -436,64 +450,18 @@ pub async fn get_table_column_details(
     client: &SqlServerClient,
     table_name: &str,
 ) -> Result<Vec<crate::engine::models::Column>> {
-    // Parse schema.table or just table
-    let (schema, table) = if table_name.contains('.') {
-        let parts: Vec<&str> = table_name.split('.').collect();
-        (
-            parts[0].trim_matches(|c| c == '[' || c == ']'),
-            parts[1].trim_matches(|c| c == '[' || c == ']'),
+    Ok(column_rows(client, table_name)
+        .await?
+        .into_iter()
+        .map(
+            |(name, type_name, nullable, is_primary_key)| crate::engine::models::Column {
+                name,
+                type_name,
+                nullable,
+                is_primary_key,
+            },
         )
-    } else {
-        ("dbo", table_name.trim_matches(|c| c == '[' || c == ']'))
-    };
-
-    // Get column info
-    let query = format!(
-        "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE,
-                CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS is_pk
-         FROM INFORMATION_SCHEMA.COLUMNS c
-         LEFT JOIN (
-             SELECT ku.TABLE_SCHEMA, ku.TABLE_NAME, ku.COLUMN_NAME
-             FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE ku
-             WHERE OBJECTPROPERTY(OBJECT_ID(ku.CONSTRAINT_SCHEMA + '.' + QUOTENAME(ku.CONSTRAINT_NAME)), 'IsPrimaryKey') = 1
-         ) pk ON c.TABLE_SCHEMA = pk.TABLE_SCHEMA AND c.TABLE_NAME = pk.TABLE_NAME AND c.COLUMN_NAME = pk.COLUMN_NAME
-         WHERE c.TABLE_SCHEMA = '{}' AND c.TABLE_NAME = '{}'
-         ORDER BY c.ORDINAL_POSITION",
-        schema, table
-    );
-
-    let mut client = client.lock().await;
-    let stream = client.simple_query(&query).await?;
-    let rows = stream.into_first_result().await?;
-
-    let mut columns = Vec::new();
-    for row in rows {
-        let name: &str = row.try_get(0)?.unwrap_or("");
-        let type_name: &str = row.try_get(1)?.unwrap_or("");
-        let nullable: &str = row.try_get(2)?.unwrap_or("YES");
-        let is_pk: i32 = row.try_get(3)?.unwrap_or(0);
-
-        columns.push(crate::engine::models::Column {
-            name: name.to_string(),
-            type_name: type_name.to_string(),
-            nullable: nullable == "YES",
-            is_primary_key: is_pk == 1,
-        });
-    }
-
-    Ok(columns)
-}
-
-/// `(schema, table)` of a possibly qualified/bracketed name, parsed the same
-/// way as `get_table_column_details`.
-fn split_table(table_name: &str) -> (&str, &str) {
-    match table_name.split_once('.') {
-        Some((schema, table)) => (
-            schema.trim_matches(|c| c == '[' || c == ']'),
-            table.trim_matches(|c| c == '[' || c == ']'),
-        ),
-        None => ("dbo", table_name.trim_matches(|c| c == '[' || c == ']')),
-    }
+        .collect())
 }
 
 /// Get the indexes of a table from `sys.indexes` (heaps and INCLUDE columns
@@ -506,13 +474,13 @@ pub async fn get_indexes(client: &SqlServerClient, table_name: &str) -> Result<V
          JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
          JOIN sys.tables t ON t.object_id = i.object_id
          JOIN sys.schemas s ON s.schema_id = t.schema_id
-         WHERE s.name = @P1 AND t.name = @P2
+         WHERE s.name = COALESCE(@P1, SCHEMA_NAME()) AND t.name = @P2
            AND i.name IS NOT NULL AND ic.is_included_column = 0
          ORDER BY i.is_primary_key DESC, i.name, ic.key_ordinal";
 
     let mut client = client.lock().await;
     let rows = client
-        .query(query, &[&schema, &table])
+        .query(query, &[&schema.as_deref(), &table.as_str()])
         .await?
         .into_first_result()
         .await?;
@@ -535,7 +503,7 @@ pub async fn get_foreign_keys(
     table_name: &str,
 ) -> Result<Vec<ForeignKeyInfo>> {
     let (schema, table) = split_table(table_name);
-    let query = "SELECT fk.name, pc.name, rs.name, rt.name, rc.name
+    let query = "SELECT fk.name, pc.name, rs.name, rt.name, rc.name, s.name
          FROM sys.foreign_keys fk
          JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
          JOIN sys.tables t ON t.object_id = fk.parent_object_id
@@ -547,12 +515,12 @@ pub async fn get_foreign_keys(
          JOIN sys.columns rc
               ON rc.object_id = fkc.referenced_object_id
              AND rc.column_id = fkc.referenced_column_id
-         WHERE s.name = @P1 AND t.name = @P2
+         WHERE s.name = COALESCE(@P1, SCHEMA_NAME()) AND t.name = @P2
          ORDER BY fk.name, fkc.constraint_column_id";
 
     let mut client = client.lock().await;
     let rows = client
-        .query(query, &[&schema, &table])
+        .query(query, &[&schema.as_deref(), &table.as_str()])
         .await?
         .into_first_result()
         .await?;
@@ -564,7 +532,8 @@ pub async fn get_foreign_keys(
         let ref_schema: &str = row.try_get(2)?.unwrap_or("");
         let ref_table: &str = row.try_get(3)?.unwrap_or("");
         let ref_column: &str = row.try_get(4)?.unwrap_or("");
-        let ref_table = if ref_schema.eq_ignore_ascii_case(schema) {
+        let own_schema: &str = row.try_get(5)?.unwrap_or("");
+        let ref_table = if ref_schema.eq_ignore_ascii_case(own_schema) {
             ref_table.to_string()
         } else {
             format!("{ref_schema}.{ref_table}")
@@ -586,78 +555,57 @@ pub async fn test(client: &SqlServerClient) -> Result<()> {
     Ok(())
 }
 
+/// Text of a cell, decoded from its TDS type (so that tinyint, smallint,
+/// real, uniqueidentifier… are not mistaken for NULL).
 fn get_value(row: &tiberius::Row, index: usize) -> String {
-    row.try_get::<&str, _>(index)
-        .ok()
-        .flatten()
-        .map(|s| s.to_string())
-        .or_else(|| {
-            row.try_get::<i32, _>(index)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-        })
-        .or_else(|| {
-            row.try_get::<i64, _>(index)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-        })
-        .or_else(|| {
-            row.try_get::<f64, _>(index)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-        })
-        .or_else(|| {
-            row.try_get::<rust_decimal::Decimal, _>(index)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-        })
-        .or_else(|| {
-            row.try_get::<bool, _>(index)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-        })
-        .or_else(|| {
-            row.try_get::<chrono::DateTime<chrono::Utc>, _>(index)
-                .ok()
-                .flatten()
-                .map(|v| v.to_rfc3339())
-        })
-        .or_else(|| {
-            row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(index)
-                .ok()
-                .flatten()
-                .map(|v| v.to_rfc3339())
-        })
-        .or_else(|| {
-            row.try_get::<chrono::NaiveDateTime, _>(index)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-        })
-        .or_else(|| {
-            row.try_get::<chrono::NaiveDate, _>(index)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-        })
-        .or_else(|| {
-            row.try_get::<chrono::NaiveTime, _>(index)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-        })
-        .or_else(|| {
-            row.try_get::<&[u8], _>(index)
-                .ok()
-                .flatten()
-                .map(|v| String::from_utf8_lossy(v).into_owned())
-        })
-        .unwrap_or_else(|| "NULL".to_string())
+    use tiberius::ColumnData;
+    fn text<T: ToString>(v: &Option<T>) -> Option<String> {
+        v.as_ref().map(ToString::to_string)
+    }
+    let Some((_, data)) = row.cells().nth(index) else {
+        return "NULL".to_string();
+    };
+    let value = match data {
+        ColumnData::U8(v) => text(v),
+        ColumnData::I16(v) => text(v),
+        ColumnData::I32(v) => text(v),
+        ColumnData::I64(v) => text(v),
+        ColumnData::F32(v) => text(v),
+        ColumnData::F64(v) => text(v),
+        ColumnData::Bit(v) => text(v),
+        ColumnData::Guid(v) => text(v),
+        ColumnData::Numeric(v) => text(v),
+        ColumnData::String(v) => v.as_deref().map(str::to_string),
+        ColumnData::Xml(v) => v.as_deref().map(ToString::to_string),
+        ColumnData::Binary(v) => v
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned()),
+        // Date/time types: no offset unless the column has one.
+        _ => row
+            .try_get::<chrono::NaiveDateTime, _>(index)
+            .ok()
+            .flatten()
+            .map(|v| v.to_string())
+            .or_else(|| {
+                row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(index)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_rfc3339())
+            })
+            .or_else(|| {
+                row.try_get::<chrono::NaiveDate, _>(index)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+            })
+            .or_else(|| {
+                row.try_get::<chrono::NaiveTime, _>(index)
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+            }),
+    };
+    value.unwrap_or_else(|| "NULL".to_string())
 }
 
 #[cfg(test)]
@@ -726,7 +674,8 @@ mod tests {
         // one statement stays in scope for the SELECT that uses it.
         assert_eq!(
             build_tsql_batch(&stmts),
-            "BEGIN TRAN;\nDECLARE @x INT = 5;\nSELECT @x;\nCOMMIT"
+            "SET XACT_ABORT ON;\nBEGIN TRAN;\nDECLARE @x INT = 5;\nSELECT @x;\nCOMMIT;\n\
+             SET XACT_ABORT OFF"
         );
     }
 }

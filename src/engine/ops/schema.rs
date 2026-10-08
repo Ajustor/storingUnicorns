@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 
+use crate::engine::db::utils::split_qualified;
 use crate::engine::db::DatabaseConnection;
 use crate::engine::models::{Column, DatabaseType, TableDetails};
 use crate::engine::ops::transfer::qualified;
@@ -66,10 +67,9 @@ pub async fn table_details(
 /// `table` (optionally `schema.table`, possibly already quoted) quoted with
 /// `quotes`, each part separately.
 fn quote_table(table: &str, (q0, q1): (char, char)) -> String {
-    let unquote = |s: &str| s.trim_matches(|c| c == q0 || c == q1).to_string();
-    match table.split_once('.') {
-        Some((schema, name)) => qualified(&unquote(schema), &unquote(name), (q0, q1)),
-        None => format!("{q0}{}{q1}", unquote(table)),
+    match split_qualified(table) {
+        (Some(schema), name) => qualified(&schema, &name, (q0, q1)),
+        (None, name) => format!("{q0}{}{q1}", name.replace(q1, &format!("{q1}{q1}"))),
     }
 }
 
@@ -85,14 +85,15 @@ pub async fn table_ddl(
 ) -> Result<String> {
     match db {
         DatabaseType::SQLite => {
-            // Same unquoting as the SQLite connector's metadata queries.
-            let bare = table
-                .trim_matches('"')
-                .replace("main.", "")
-                .replace('\'', "''");
+            let (schema, bare) = split_qualified(table);
+            let master = match schema {
+                Some(schema) => format!("\"{}\".sqlite_master", schema.replace('"', "\"\"")),
+                None => "sqlite_master".to_string(),
+            };
+            let bare = bare.replace('\'', "''");
             let r = conn
                 .execute_query(&format!(
-                    "SELECT sql FROM sqlite_master \
+                    "SELECT sql FROM {master} \
                      WHERE tbl_name = '{bare}' AND type IN ('table', 'index') \
                      AND sql IS NOT NULL \
                      ORDER BY type = 'table' DESC, name"
@@ -106,7 +107,10 @@ pub async fn table_ddl(
         }
         DatabaseType::MySQL => {
             let r = conn
-                .execute_query(&format!("SHOW CREATE TABLE {table}"))
+                .execute_query(&format!(
+                    "SHOW CREATE TABLE {}",
+                    quote_table(table, quote_chars(db))
+                ))
                 .await?;
             match r.rows.first().and_then(|row| row.get(1)) {
                 Some(ddl) => Ok(format!("{ddl};")),
@@ -114,11 +118,20 @@ pub async fn table_ddl(
             }
         }
         DatabaseType::Postgres | DatabaseType::SQLServer | DatabaseType::Azure => {
-            let details = table_details(conn, cache, table).await?;
+            let mut details = table_details(conn, cache, table).await?;
             if details.columns.is_empty() {
                 bail!("table {table} not found");
             }
             let quotes = quote_chars(db);
+            // A referenced table without schema lives in the table's schema:
+            // qualify it so the DDL does not depend on the search path.
+            if let (Some(schema), _) = split_qualified(table) {
+                for fk in &mut details.foreign_keys {
+                    if let (None, ref_table) = split_qualified(&fk.ref_table) {
+                        fk.ref_table = qualified(&schema, &ref_table, quotes);
+                    }
+                }
+            }
             Ok(generate_ddl(&quote_table(table, quotes), &details, quotes))
         }
     }
@@ -130,7 +143,7 @@ pub async fn table_ddl(
 #[allow(dead_code)] // used by the GUI (plan 3b)
 pub fn generate_ddl(table: &str, details: &TableDetails, quotes: (char, char)) -> String {
     let (q0, q1) = quotes;
-    let quote = |name: &str| format!("{q0}{name}{q1}");
+    let quote = |name: &str| format!("{q0}{}{q1}", name.replace(q1, &format!("{q1}{q1}")));
     let quote_list = |names: &[String]| {
         names
             .iter()
@@ -331,6 +344,51 @@ mod tests {
             .unwrap();
         assert!(ddl.contains("CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)"));
         assert!(ddl.contains("CREATE INDEX t_x ON t(x)"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_details_and_ddl_accept_qualified_names() {
+        let conn = sqlite_mem(&[
+            "CREATE TABLE a (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a_id INTEGER REFERENCES a(id), x TEXT)",
+            "CREATE INDEX t_x ON t(x)",
+            "ATTACH DATABASE ':memory:' AS aux",
+            "CREATE TABLE aux.t (other TEXT)",
+        ])
+        .await;
+        for name in ["\"main\".\"t\"", "main.t", "\"t\""] {
+            let d = table_details(&conn, &TableCache::default(), name)
+                .await
+                .unwrap();
+            assert_eq!(d.columns.len(), 3, "{name}");
+            assert!(d.indexes.iter().any(|i| i.name == "t_x"), "{name}");
+            assert_eq!(d.foreign_keys.len(), 1, "{name}");
+            let ddl = table_ddl(&conn, &TableCache::default(), &DatabaseType::SQLite, name)
+                .await
+                .unwrap();
+            assert!(
+                ddl.contains("a_id INTEGER REFERENCES a(id)"),
+                "{name}: {ddl}"
+            );
+            assert!(ddl.contains("CREATE INDEX t_x ON t(x)"), "{name}: {ddl}");
+        }
+        let aux = "\"aux\".\"t\"";
+        let d = table_details(&conn, &TableCache::default(), aux)
+            .await
+            .unwrap();
+        assert_eq!(d.columns.len(), 1);
+        let ddl = table_ddl(&conn, &TableCache::default(), &DatabaseType::SQLite, aux)
+            .await
+            .unwrap();
+        assert_eq!(ddl, "CREATE TABLE t (other TEXT);");
+    }
+
+    #[test]
+    fn quote_table_requotes_any_dialect() {
+        assert_eq!(quote_table("[dbo].[t]", ('"', '"')), "\"dbo\".\"t\"");
+        assert_eq!(quote_table("s.t", ('[', ']')), "[s].[t]");
+        assert_eq!(quote_table("\"a.b\"", ('`', '`')), "`a.b`");
+        assert_eq!(quote_table("[x]]y]", ('[', ']')), "[x]]y]");
     }
 
     #[test]

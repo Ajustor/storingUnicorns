@@ -24,6 +24,8 @@ sqlx = { version = "0.8", features = [
   "sqlite",
   "rust_decimal",
   "chrono",
+  "uuid",
+  "json",
 ] }
 
 # Stream combinators (to drain sqlx `fetch_many` streams)

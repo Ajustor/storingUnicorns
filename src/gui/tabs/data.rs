@@ -12,6 +12,7 @@ use crate::engine::sql::paging::{toggle_order, DataQuery};
 use crate::gui::editor::highlight_job;
 use crate::gui::grid::changes::PendingEdits;
 use crate::gui::grid::{self, GridAction, GridOptions, GridState};
+use crate::gui::status::one_line_label;
 use crate::gui::theme::ERROR;
 use crate::gui::worker::{Event, TabId};
 
@@ -274,12 +275,7 @@ impl DataTab {
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(format!("{} {e}", icon::WARNING)).color(ERROR),
-                        )
-                        .wrap(),
-                    );
+                    one_line_label(ui, &format!("{} {e}", icon::WARNING), ERROR);
                 });
         }
         ui.separator();

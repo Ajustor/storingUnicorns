@@ -8,6 +8,22 @@ use crate::updater::{UpdateEvent, UpdateState};
 use super::app::App;
 use super::theme::{self, ERROR, SUCCESS};
 
+/// First non-blank line of `text`, with " …" when lines were dropped:
+/// multi-line errors must not grow the status bar or a panel.
+pub fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = text.trim();
+    match trimmed.split_once('\n') {
+        None => trimmed.into(),
+        Some((first, _)) => format!("{} …", first.trim_end()).into(),
+    }
+}
+
+/// `text` on one truncated line in `color`, the full text on hover.
+pub fn one_line_label(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Response {
+    ui.add(egui::Label::new(RichText::new(one_line(text)).color(color)).truncate())
+        .on_hover_text(text)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
     Info,
@@ -93,61 +109,71 @@ pub fn status_bar(app: &mut App, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             connections(app, ui);
             ui.separator();
-            if let Some(name) = app.sessions.connecting.iter().next() {
-                ui.spinner();
-                ui.label(format!("Connexion à {name}…"));
-            } else if let Some((done, total, label)) = &app.progress {
-                ui.add(
-                    egui::ProgressBar::new(*done as f32 / (*total).max(1) as f32)
-                        .desired_width(160.0),
-                );
-                ui.label(format!("{done}/{total} {label}"));
-            } else {
-                let color = match app.status.kind {
-                    StatusKind::Info => ui.visuals().text_color(),
-                    StatusKind::Success => SUCCESS,
-                    StatusKind::Error => ERROR,
-                };
-                ui.label(RichText::new(&app.status.text).color(color))
-                    .on_hover_text(&app.status.text);
-            }
-            if let Some(summary) = app.tabs.active().and_then(|t| t.summary.as_deref()) {
-                ui.separator();
+            if let Some(summary) = app.tabs.active().and_then(|t| t.summary.clone()) {
                 ui.label(RichText::new(summary).weak());
+                ui.separator();
             }
+            // Right side first, so the message gets (and is truncated to)
+            // the room left in between.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let version = format!("v{}", crate::updater::current_version());
-                let hover = match &app.updater.state {
-                    UpdateState::Failed(e) => format!("Dernière vérification en échec : {e}"),
-                    _ => "Vérifier les mises à jour".to_string(),
-                };
-                if ui
-                    .link(RichText::new(version).weak())
-                    .on_hover_text(hover)
-                    .clicked()
-                {
-                    app.updater.check(true, None);
-                }
-                if ui
-                    .button(app.theme.icon())
-                    .on_hover_text("Thème : système / sombre / clair")
-                    .clicked()
-                {
-                    app.theme = app.theme.next();
-                    theme::apply(ui.ctx(), app.theme);
-                    app.config.theme = app.theme.to_config();
-                    app.save_config();
-                }
-                if ui
-                    .selectable_label(app.show_value_panel, icon::SIDEBAR_SIMPLE)
-                    .on_hover_text("Panneau Valeur")
-                    .clicked()
-                {
-                    app.show_value_panel = !app.show_value_panel;
-                }
+                right_side(app, ui);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    message(app, ui);
+                });
             });
         });
     });
+}
+
+/// Connection in progress, transfer progress, or the last message.
+fn message(app: &App, ui: &mut egui::Ui) {
+    if let Some(name) = app.sessions.connecting.iter().next() {
+        ui.spinner();
+        ui.label(format!("Connexion à {name}…"));
+    } else if let Some((done, total, label)) = &app.progress {
+        ui.add(egui::ProgressBar::new(*done as f32 / (*total).max(1) as f32).desired_width(160.0));
+        ui.label(format!("{done}/{total} {label}"));
+    } else {
+        let color = match app.status.kind {
+            StatusKind::Info => ui.visuals().text_color(),
+            StatusKind::Success => SUCCESS,
+            StatusKind::Error => ERROR,
+        };
+        one_line_label(ui, &app.status.text, color);
+    }
+}
+
+/// Version / update check, theme toggle, value panel toggle.
+fn right_side(app: &mut App, ui: &mut egui::Ui) {
+    let version = format!("v{}", crate::updater::current_version());
+    let hover = match &app.updater.state {
+        UpdateState::Failed(e) => format!("Dernière vérification en échec : {e}"),
+        _ => "Vérifier les mises à jour".to_string(),
+    };
+    if ui
+        .link(RichText::new(version).weak())
+        .on_hover_text(hover)
+        .clicked()
+    {
+        app.updater.check(true, None);
+    }
+    if ui
+        .button(app.theme.icon())
+        .on_hover_text("Thème : système / sombre / clair")
+        .clicked()
+    {
+        app.theme = app.theme.next();
+        theme::apply(ui.ctx(), app.theme);
+        app.config.theme = app.theme.to_config();
+        app.save_config();
+    }
+    if ui
+        .selectable_label(app.show_value_panel, icon::SIDEBAR_SIMPLE)
+        .on_hover_text("Panneau Valeur")
+        .clicked()
+    {
+        app.show_value_panel = !app.show_value_panel;
+    }
 }
 
 /// "● ● 2 connexions": one dot per open session, in its colour.
@@ -169,4 +195,16 @@ fn connections(app: &App, ui: &mut egui::Ui) {
     } else {
         format!("{n} connexions")
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_line_keeps_the_first_line_only() {
+        assert_eq!(one_line("  ok  "), "ok");
+        assert_eq!(one_line("error: x\n  detail\nmore"), "error: x …");
+        assert_eq!(one_line("\nfirst\r\nsecond"), "first …");
+    }
 }

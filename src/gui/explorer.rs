@@ -13,6 +13,7 @@ use super::app::App;
 use super::dialogs::transfer::{self, BatchKind};
 use super::dialogs::{self, connection::ConnectionForm, Dialog};
 use super::sessions::{Session, Sessions};
+use super::status::one_line;
 use super::theme::{self, ACCENT, ERROR};
 
 /// `(schema, tables)` pairs whose table names contain `filter`
@@ -323,7 +324,7 @@ fn connection_node(
     );
     if session.is_none() {
         if let Some(e) = sessions.errors.get(name) {
-            ui.add(Label::new(RichText::new(e).color(ERROR).small()).wrap());
+            error_line(ui, e);
         }
         if n.just_opened && !connecting {
             actions.push(Action::Connect(name.clone()));
@@ -545,6 +546,12 @@ fn table_node(
     });
 }
 
+/// A (possibly multi-line) error on one small truncated line, full on hover.
+fn error_line(ui: &mut egui::Ui, e: &str) {
+    ui.add(Label::new(RichText::new(one_line(e)).color(ERROR).small()).truncate())
+        .on_hover_text(e);
+}
+
 fn details_body(ui: &mut egui::Ui, details: Option<&Result<TableDetails, String>>) {
     let d = match details {
         None => {
@@ -555,7 +562,7 @@ fn details_body(ui: &mut egui::Ui, details: Option<&Result<TableDetails, String>
             return;
         }
         Some(Err(e)) => {
-            ui.add(Label::new(RichText::new(e).color(ERROR).small()).wrap());
+            error_line(ui, e);
             return;
         }
         Some(Ok(d)) => d,

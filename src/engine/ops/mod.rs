@@ -6,4 +6,6 @@ pub mod schema;
 pub mod transfer;
 
 #[cfg(test)]
+mod integration_tests;
+#[cfg(test)]
 pub(crate) mod test_support;

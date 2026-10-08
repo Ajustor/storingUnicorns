@@ -318,8 +318,9 @@ fn verify_digest(bytes: &[u8], expected: &str) -> Result<(), String> {
 }
 
 /// Apply `action` as the app shuts down. `args` are passed to the relaunched app.
-pub fn run_exit_action(action: &ExitAction, args: &[&str]) {
-    let result = match action {
+/// Fails if the installer / relaunched process could not be started.
+pub fn run_exit_action(action: &ExitAction, args: &[&str]) -> std::io::Result<()> {
+    match action {
         ExitAction::Relaunch => std::env::current_exe().and_then(|exe| {
             std::process::Command::new(exe)
                 .args(args)
@@ -348,9 +349,6 @@ pub fn run_exit_action(action: &ExitAction, args: &[&str]) {
             }
             cmd.spawn().map(|_| ())
         }),
-    };
-    if let Err(e) = result {
-        tracing::error!("failed to apply update on exit: {e}");
     }
 }
 

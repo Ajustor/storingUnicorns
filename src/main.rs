@@ -58,8 +58,15 @@ fn run_update() -> anyhow::Result<()> {
             info.version
         ),
         Some(msi) => {
-            println!("Launching the installer…");
-            updater::run_exit_action(&updater::ExitAction::RunMsi(msi), &[]);
+            let action = updater::ExitAction::RunMsi(msi.clone());
+            if let Err(e) = updater::run_exit_action(&action, &[]) {
+                eprintln!(
+                    "Failed to launch the installer ({e}). Run it manually: {}",
+                    msi.display()
+                );
+                std::process::exit(1);
+            }
+            println!("Installer launched.");
         }
     }
     Ok(())

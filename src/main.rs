@@ -1,4 +1,5 @@
 mod cli;
+mod console;
 mod engine;
 mod tui;
 // Parts of the updater (background state machine) are only used by the GUI (plan 3).

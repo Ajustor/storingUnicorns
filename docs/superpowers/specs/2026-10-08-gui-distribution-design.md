@@ -38,11 +38,11 @@ de téléchargement GitHub Pages.
 
 Le parsing reste manuel (pas de `clap`) : le jeu d'options est minuscule.
 
-Sous Windows, le binaire est compilé en sous-système `windows` (pas de console au
-double-clic). Pour `tui`, `update`, `--version` et `--help`, le programme rattache
-la console du terminal parent (`AttachConsole(ATTACH_PARENT_PROCESS)`) ; si aucune
-console parente n'existe (lancé hors terminal), il en alloue une (`AllocConsole`)
-pour le TUI.
+Sous Windows, le binaire reste en sous-système console (un binaire `windows` qui se
+rattache à la console parente laisse le shell rendre la main et se disputer le
+clavier avec le TUI). En mode GUI : lancé hors terminal (double-clic, menu
+Démarrer), la console créée pour l'occasion est libérée (`FreeConsole`) ; lancé
+depuis un terminal, le programme se relance détaché et rend la main au shell.
 
 ## Architecture
 

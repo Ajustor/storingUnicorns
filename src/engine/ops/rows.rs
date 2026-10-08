@@ -1,7 +1,9 @@
 use anyhow::Result;
 
-use crate::engine::db::{utils::build_delete_query, DatabaseConnection};
-use crate::engine::models::Column;
+use crate::engine::db::utils::{build_delete_query, build_insert_query, build_update_query};
+use crate::engine::db::DatabaseConnection;
+use crate::engine::models::{Column, DatabaseType};
+use crate::engine::sql::statements::quote_chars;
 
 /// Update one row identified by its original values. Returns 0 without
 /// touching the database when nothing changed.
@@ -40,6 +42,80 @@ pub async fn delete_row(
 ) -> Result<u64> {
     let sql = build_delete_query(table, columns, values, quotes.0, quotes.1);
     Ok(conn.execute_query(&sql).await?.rows_affected)
+}
+
+/// Pending edits of a data grid, applied together by `submit_changes`.
+#[allow(dead_code)] // used by the GUI (plan 3b)
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RowChanges {
+    /// (original row, edited row)
+    pub updates: Vec<(Vec<String>, Vec<String>)>,
+    pub inserts: Vec<Vec<String>>,
+    /// Original rows to delete.
+    pub deletes: Vec<Vec<String>>,
+}
+
+#[allow(dead_code)] // used by the GUI (plan 3b)
+impl RowChanges {
+    pub fn is_empty(&self) -> bool {
+        self.updates.is_empty() && self.inserts.is_empty() && self.deletes.is_empty()
+    }
+
+    /// Number of pending edits (updates + inserts + deletes).
+    pub fn len(&self) -> usize {
+        self.updates.len() + self.inserts.len() + self.deletes.len()
+    }
+}
+
+/// `(begin, commit)` statements for the dialect.
+#[allow(dead_code)] // used by the GUI (plan 3b)
+pub fn transaction_bounds(db: &DatabaseType) -> (&'static str, &'static str) {
+    match db {
+        DatabaseType::Postgres | DatabaseType::SQLite => ("BEGIN", "COMMIT"),
+        DatabaseType::MySQL => ("START TRANSACTION", "COMMIT"),
+        DatabaseType::SQLServer | DatabaseType::Azure => ("BEGIN TRANSACTION", "COMMIT"),
+    }
+}
+
+/// Build the statements for `changes` (deletes, then updates, then inserts),
+/// wrap them in the dialect's BEGIN/COMMIT and run them with
+/// `execute_transaction` (rolled back on any error). Returns the number of
+/// statements applied (unchanged updates are skipped).
+#[allow(dead_code)] // used by the GUI (plan 3b)
+pub async fn submit_changes(
+    conn: &DatabaseConnection,
+    db: &DatabaseType,
+    table: &str,
+    columns: &[Column],
+    system_columns: &[usize],
+    changes: &RowChanges,
+) -> Result<usize> {
+    let (qs, qe) = quote_chars(db);
+    let deletes = changes
+        .deletes
+        .iter()
+        .map(|values| build_delete_query(table, columns, values, qs, qe));
+    let updates = changes
+        .updates
+        .iter()
+        .filter_map(|(original, new)| build_update_query(table, columns, original, new, qs, qe));
+    let inserts = changes
+        .inserts
+        .iter()
+        .filter_map(|values| build_insert_query(table, columns, values, system_columns, qs, qe));
+    let statements: Vec<String> = deletes.chain(updates).chain(inserts).collect();
+    if statements.is_empty() {
+        return Ok(0);
+    }
+
+    let applied = statements.len();
+    let (begin, commit) = transaction_bounds(db);
+    let mut block = Vec::with_capacity(applied + 2);
+    block.push(begin.to_string());
+    block.extend(statements);
+    block.push(commit.to_string());
+    conn.execute_transaction(&block).await?;
+    Ok(applied)
 }
 
 /// Result of an operation applied to several tables.
@@ -184,6 +260,85 @@ mod tests {
         assert_eq!(count(&conn, "u").await, "0");
         assert_eq!(report.errors.len(), 1);
         assert!(report.errors[0].starts_with("missing:"));
+    }
+
+    #[tokio::test]
+    async fn submit_applies_all_changes_atomically() {
+        let conn = sqlite_mem(SETUP).await;
+        let changes = RowChanges {
+            updates: vec![(row("1", "a"), row("1", "A"))],
+            inserts: vec![row("", "c")],
+            deletes: vec![row("2", "b")],
+        };
+        let n = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[0], &changes)
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+        let r = conn
+            .execute_query("SELECT name FROM t ORDER BY name")
+            .await
+            .unwrap();
+        let names: Vec<_> = r.rows.iter().map(|r| r[0].clone()).collect();
+        assert_eq!(names, ["A", "c"]);
+    }
+
+    #[tokio::test]
+    async fn submit_rolls_back_everything_on_error() {
+        let conn = sqlite_mem(&[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            "INSERT INTO t (id, name) VALUES (1, 'a')",
+        ])
+        .await;
+        let changes = RowChanges {
+            updates: vec![(row("1", "a"), row("1", "z"))],
+            inserts: vec![row("", "NULL")], // violates NOT NULL
+            deletes: vec![],
+        };
+        assert!(
+            submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[0], &changes)
+                .await
+                .is_err()
+        );
+        let r = conn.execute_query("SELECT name FROM t").await.unwrap();
+        assert_eq!(r.rows[0][0], "a", "update must be rolled back");
+    }
+
+    #[tokio::test]
+    async fn submit_skips_unchanged_updates_and_empty_changes() {
+        let conn = sqlite_mem(SETUP).await;
+        let changes = RowChanges {
+            updates: vec![(row("1", "a"), row("1", "a"))],
+            ..Default::default()
+        };
+        assert!(!changes.is_empty());
+        assert_eq!(changes.len(), 1);
+        let n = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[0], &changes)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        let empty = RowChanges::default();
+        assert!(empty.is_empty());
+        let n = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[0], &empty)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(count(&conn, "t").await, "2");
+    }
+
+    #[test]
+    fn bounds_per_dialect() {
+        assert_eq!(
+            transaction_bounds(&DatabaseType::MySQL).0,
+            "START TRANSACTION"
+        );
+        assert_eq!(
+            transaction_bounds(&DatabaseType::Azure).0,
+            "BEGIN TRANSACTION"
+        );
+        assert_eq!(
+            transaction_bounds(&DatabaseType::SQLite),
+            ("BEGIN", "COMMIT")
+        );
     }
 
     #[test]

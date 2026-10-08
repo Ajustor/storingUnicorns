@@ -106,7 +106,7 @@ pub fn on_applied(app: &mut App, name: String, table: String, outcome: Result<St
     }
     match outcome {
         Ok(_) => {
-            app.success(format!("Structure de {table} modifiée"));
+            app.success(format!("Structure de {} modifiée", display_name(&table)));
             if let Some(s) = app.sessions.get_mut(&name) {
                 s.details.remove(&table);
                 s.loading.insert(table.clone());
@@ -116,9 +116,17 @@ pub fn on_applied(app: &mut App, name: String, table: String, outcome: Result<St
             app.reload_data_tabs(&name, Some(&table));
         }
         Err(e) => app.error(format!(
-            "{table} : modification de structure impossible : {e}"
+            "{} : modification de structure impossible : {e}",
+            display_name(&table)
         )),
     }
+}
+
+/// `"main"."users"` → `users`.
+fn display_name(table: &str) -> String {
+    let last = table.rsplit('.').next().unwrap_or(table);
+    last.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'))
+        .to_string()
 }
 
 fn definition(c: &Column) -> ColumnDefinition {
@@ -281,6 +289,7 @@ fn columns_grid(
     egui::Grid::new("structure_columns")
         .striped(true)
         .num_columns(5)
+        .spacing([18.0, 4.0])
         .show(ui, |ui| {
             for h in ["Colonne", "Type", "Nullable", "Clé", ""] {
                 ui.strong(h);
@@ -365,6 +374,13 @@ mod tests {
             SchemaModification::ModifyColumn { ref table_name, ref column }
                 if table_name == "\"main\".\"t\"" && column.data_type == "INT"
         ));
+    }
+
+    #[test]
+    fn display_name_drops_schema_and_quotes() {
+        assert_eq!(display_name("\"main\".\"users\""), "users");
+        assert_eq!(display_name("[dbo].[t]"), "t");
+        assert_eq!(display_name("t"), "t");
     }
 
     #[test]

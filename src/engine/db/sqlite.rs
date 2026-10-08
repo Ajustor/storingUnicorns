@@ -80,7 +80,16 @@ pub async fn execute_query_limited(
     query: &str,
     max_rows: Option<usize>,
 ) -> Result<QueryResult> {
-    run_statement(pool, query, max_rows).await
+    let mut conn = pool.acquire().await?;
+    // A connection only notices a schema change made by another one when it
+    // next runs a statement; until then it prepares against its old schema
+    // and reports stale column names (e.g. after a RENAME COLUMN). Touching
+    // the schema first makes it reload.
+    sqlx::query("SELECT 1 FROM sqlite_master LIMIT 1")
+        .persistent(false)
+        .fetch_optional(&mut *conn)
+        .await?;
+    run_statement(&mut *conn, query, max_rows).await
 }
 
 /// Execute a sequence of statements as one transaction on a single dedicated
@@ -675,5 +684,48 @@ mod tests {
             1,
             "the INSERT after the capped SELECT must run"
         );
+    }
+
+    #[tokio::test]
+    async fn column_names_follow_a_rename() {
+        let pool = mem_pool().await;
+        execute_query(&pool, "INSERT INTO t VALUES (1)")
+            .await
+            .unwrap();
+        let before = execute_query(&pool, "SELECT * FROM t").await.unwrap();
+        assert_eq!(before.columns[0].name, "a");
+        execute_query(&pool, "ALTER TABLE t RENAME COLUMN a TO b")
+            .await
+            .unwrap();
+        // Same SQL again: a cached statement must not keep the old names.
+        let after = execute_query(&pool, "SELECT * FROM t").await.unwrap();
+        assert_eq!(after.columns[0].name, "b");
+    }
+
+    #[tokio::test]
+    async fn column_names_follow_a_rename_made_on_another_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("t.db").display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        execute_query(&pool, "CREATE TABLE t (a INTEGER)")
+            .await
+            .unwrap();
+        execute_query(&pool, "INSERT INTO t VALUES (1)")
+            .await
+            .unwrap();
+        // Hold one connection: the pool serves the queries with the other.
+        let mut held = pool.acquire().await.unwrap();
+        let before = execute_query(&pool, "SELECT * FROM t").await.unwrap();
+        assert_eq!(before.columns[0].name, "a");
+        sqlx::query("ALTER TABLE t RENAME COLUMN a TO b")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let after = execute_query(&pool, "SELECT * FROM t").await.unwrap();
+        assert_eq!(after.columns[0].name, "b");
     }
 }

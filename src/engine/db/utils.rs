@@ -23,7 +23,9 @@ use crate::engine::sql::statements::split_statements;
 /// `prepared` selects the prepared-statement protocol; otherwise the text
 /// (simple query) protocol is used, which MySQL needs for statements it does
 /// not support as prepared statements (`START TRANSACTION`, `LOCK TABLES`…)
-/// and for several statements in one string.
+/// and for several statements in one string. Prepared statements are not
+/// cached: a cached statement keeps the column names it was prepared with,
+/// which go stale after an `ALTER TABLE … RENAME COLUMN`.
 pub async fn fetch_rows_and_result<'c, DB, E>(
     executor: E,
     query: &str,
@@ -31,12 +33,12 @@ pub async fn fetch_rows_and_result<'c, DB, E>(
     prepared: bool,
 ) -> sqlx::Result<(Vec<DB::Row>, DB::QueryResult, bool)>
 where
-    DB: Database,
+    DB: Database + sqlx::database::HasStatementCache,
     E: Executor<'c, Database = DB>,
     for<'q> DB::Arguments<'q>: IntoArguments<'q, DB>,
 {
     let mut stream = if prepared {
-        executor.fetch_many(sqlx::query(query))
+        executor.fetch_many(sqlx::query(query).persistent(false))
     } else {
         executor.fetch_many(query)
     };

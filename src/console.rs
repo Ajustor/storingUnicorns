@@ -23,7 +23,6 @@ mod sys {
 
 /// Prepare the process for running the GUI.
 #[cfg(windows)]
-#[allow(dead_code)]
 pub fn prepare_gui() -> GuiLaunch {
     use std::os::windows::process::CommandExt;
 
@@ -59,7 +58,6 @@ pub fn prepare_gui() -> GuiLaunch {
 }
 
 #[cfg(not(windows))]
-#[allow(dead_code)]
 pub fn prepare_gui() -> GuiLaunch {
     GuiLaunch::Continue
 }

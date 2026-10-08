@@ -1,6 +1,7 @@
 mod cli;
 mod console;
 mod engine;
+mod gui;
 mod tui;
 mod updater;
 
@@ -15,8 +16,14 @@ fn main() -> anyhow::Result<()> {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned());
     match Mode::parse(args) {
-        // The GUI arrives in plan 3; until then the TUI is the only interface.
-        Mode::Gui => run_tui(Default::default()),
+        Mode::Gui => {
+            if console::prepare_gui() == console::GuiLaunch::Exit {
+                return Ok(());
+            }
+            // Panics in a detached GUI have no console: keep a trace next to the config.
+            tracing_to_file();
+            gui::run()
+        }
         Mode::Tui(opts) => run_tui(opts),
         Mode::Update => run_update(),
         Mode::Version => {
@@ -34,7 +41,25 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Send `tracing` output to `debug.log` in the config directory
+/// (`~/.config/storing-unicorns/` or the platform equivalent).
+fn tracing_to_file() {
+    let log_path = dirs::config_dir()
+        .expect("Could not determine config directory")
+        .join("storing-unicorns");
+    std::fs::create_dir_all(&log_path).expect("Could not create config directory");
+    let file = match std::fs::File::create(log_path.join("debug.log")) {
+        Ok(file) => file,
+        Err(error) => panic!("Error: {:?}", error),
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::sync::Arc::new(file))
+        .init();
+}
+
 fn run_tui(opts: cli::TuiOptions) -> anyhow::Result<()> {
+    tracing_to_file();
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(tui::run(opts));
     // Don't wait for a post-exit update check that outlived its timeout.

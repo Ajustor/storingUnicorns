@@ -27,7 +27,10 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use config::AppConfig;
 use db::DatabaseConnection;
 use services::ColumnDefinition;
-use crate::engine::ops::{self, query::Executed};
+use crate::engine::ops::{
+    self,
+    query::{Executed, RunError},
+};
 use crate::engine::sql::statements::quote_chars;
 use ui::{
     compute_active_panel_area, compute_modal_area, render_neon_border, render_ui,
@@ -1528,6 +1531,7 @@ pub(crate) async fn handle_execute_current_query(state: &mut AppState) {
             show_result(state, result);
             state.set_status(msg);
         }
+        Err(RunError::Query(e)) => state.set_status(format!("Query error: {e}")),
         Err(e) => state.set_status(e.to_string()),
     }
 }

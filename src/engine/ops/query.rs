@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 
 use crate::engine::db::DatabaseConnection;
 use crate::engine::models::{QueryResult, SchemaInfo};
@@ -15,6 +15,23 @@ pub enum Executed {
         result: QueryResult,
         statements: usize,
     },
+}
+
+/// Why the SQL at the cursor could not be run. `Display` gives the message
+/// without any UI prefix; a single-statement failure shows the raw database
+/// error.
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    #[error("Transaction not terminated: add COMMIT or ROLLBACK")]
+    Unterminated,
+    #[error("No query at cursor position")]
+    Empty,
+    /// The single statement at the cursor failed.
+    #[error("{0}")]
+    Query(anyhow::Error),
+    /// A `BEGIN … COMMIT/ROLLBACK` block failed and was rolled back.
+    #[error("Transaction rolled back: {0}")]
+    RolledBack(anyhow::Error),
 }
 
 /// Execute one query and, when it reads from a single table, annotate the
@@ -39,35 +56,26 @@ pub async fn run_query(conn: &DatabaseConnection, sql: &str) -> Result<QueryResu
 }
 
 /// Execute the statement (or transaction block) under `cursor` in `text`.
-///
-/// Errors are prefixed with "Transaction rolled back:" or "Query error:"
-/// depending on the kind of unit that failed.
 pub async fn run_at_cursor(
     conn: &DatabaseConnection,
     text: &str,
     cursor: usize,
-) -> Result<Executed> {
+) -> Result<Executed, RunError> {
     match get_execution_unit_at_cursor(text, cursor) {
-        ExecutionUnit::UnterminatedTransaction => {
-            bail!("Transaction not terminated: add COMMIT or ROLLBACK")
-        }
+        ExecutionUnit::UnterminatedTransaction => Err(RunError::Unterminated),
         ExecutionUnit::Transaction(statements) => {
             let result = conn
                 .execute_transaction(&statements)
                 .await
-                .map_err(|e| anyhow!("Transaction rolled back: {e}"))?;
+                .map_err(RunError::RolledBack)?;
             Ok(Executed::Transaction {
                 result,
                 statements: statements.len(),
             })
         }
-        ExecutionUnit::Single(sql) if sql.trim().is_empty() => {
-            bail!("No query at cursor position")
-        }
+        ExecutionUnit::Single(sql) if sql.trim().is_empty() => Err(RunError::Empty),
         ExecutionUnit::Single(sql) => {
-            let result = run_query(conn, &sql)
-                .await
-                .map_err(|e| anyhow!("Query error: {e}"))?;
+            let result = run_query(conn, &sql).await.map_err(RunError::Query)?;
             Ok(Executed::Query(result))
         }
     }
@@ -127,8 +135,21 @@ mod tests {
         let conn = sqlite_mem(SETUP).await;
         let sql =
             "BEGIN;\nINSERT INTO users (name) VALUES ('C');\nINSERT INTO nope VALUES (1);\nCOMMIT;";
-        assert!(run_at_cursor(&conn, sql, 0).await.is_err());
+        let err = run_at_cursor(&conn, sql, 0).await.unwrap_err();
+        assert!(matches!(err, RunError::RolledBack(_)));
+        assert!(err.to_string().starts_with("Transaction rolled back: "));
         assert_eq!(count(&conn, "users").await, "2");
+    }
+
+    #[tokio::test]
+    async fn single_statement_error_is_raw() {
+        let conn = sqlite_mem(SETUP).await;
+        let err = run_at_cursor(&conn, "SELECT * FROM nope", 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RunError::Query(_)));
+        assert!(err.to_string().contains("nope"));
+        assert!(!err.to_string().starts_with("Query error"));
     }
 
     #[tokio::test]
@@ -137,8 +158,14 @@ mod tests {
         let err = run_at_cursor(&conn, "BEGIN; SELECT 1;", 0)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("COMMIT or ROLLBACK"));
-        assert!(run_at_cursor(&conn, "   ", 0).await.is_err());
+        assert!(matches!(err, RunError::Unterminated));
+        assert_eq!(
+            err.to_string(),
+            "Transaction not terminated: add COMMIT or ROLLBACK"
+        );
+        let err = run_at_cursor(&conn, "   ", 0).await.unwrap_err();
+        assert!(matches!(err, RunError::Empty));
+        assert_eq!(err.to_string(), "No query at cursor position");
     }
 
     #[tokio::test]

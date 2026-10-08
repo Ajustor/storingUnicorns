@@ -16,22 +16,26 @@ A terminal-based database client inspired by JetBrains DataGrip, built with Rust
 
 ```
 src/
-├── main.rs          # Entry point, event loop, keybindings
-├── config/          # Configuration management
-│   └── mod.rs       # AppConfig: load/save connections
-├── db/              # Database layer
+├── main.rs                  # mod declarations, #[tokio::main] calling tui::run
+├── engine/                  # UI-agnostic core
 │   ├── mod.rs
-│   └── connector.rs # DatabaseConnection: unified DB interface
-├── models/          # Data structures
-│   ├── mod.rs
-│   └── connection.rs # ConnectionConfig, QueryResult, Column
-├── services/        # Application logic
-│   ├── mod.rs
-│   └── app_state.rs # AppState: runtime state, dialogs
-└── ui/              # Terminal UI
-    ├── mod.rs
-    ├── layout.rs    # Main layout, panel arrangement
-    └── widgets.rs   # Panel renderers, dialogs, help bar
+│   ├── config/              # AppConfig: load/save connections
+│   ├── db/                  # DatabaseConnection: unified DB interface + per-driver connectors
+│   ├── models/              # ConnectionConfig, QueryResult, Column
+│   ├── services/            # export/import, query tabs, schema SQL, table cache
+│   ├── sql/
+│   │   ├── lexer.rs         # SQL tokenizer + completions
+│   │   └── statements.rs    # statement splitting, table extraction, quote chars
+│   └── ops/                 # business operations shared by the front-ends
+│       ├── query.rs         # run_query, run_unit, refresh_schemas
+│       ├── rows.rs          # update/insert/delete row, truncate, system columns
+│       ├── schema.rs        # fetch_columns, apply_modification
+│       └── transfer.rs      # import_csv, import_tables, export_tables
+└── tui/                     # Terminal UI (ratatui)
+    ├── mod.rs               # run(), event loop, handlers
+    ├── app_state.rs         # AppState: runtime state, dialogs
+    ├── key_handlers/        # per-panel keybindings
+    └── ui/                  # layout, widgets, modals, SQL highlighting
 ```
 
 ## Keybindings

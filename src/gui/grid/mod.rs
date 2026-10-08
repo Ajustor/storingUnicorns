@@ -109,7 +109,10 @@ pub struct GridState {
     /// Rows (address, length) the view was computed for: a replaced result
     /// recomputes it even if the owner forgot `new_result`.
     view_source: (usize, usize),
-    /// Select the whole text of the cell editor on its first frame.
+    /// The cell editor has not been drawn yet: on its first frame it takes
+    /// the focus and selects its whole text. Focus is never requested before
+    /// the editor exists (AccessKit panics on a focused id missing from its
+    /// tree, e.g. when the edit starts after the table was drawn).
     select_all: bool,
     /// Scroll the focused cell into view (after a keyboard move).
     scroll_to_selected: bool,
@@ -307,14 +310,7 @@ impl GridState {
         self.select(row_ref(&self.view, pos), col);
     }
 
-    fn start_edit(
-        &mut self,
-        ctx: &egui::Context,
-        edit_id: egui::Id,
-        rows: &[Vec<String>],
-        r: RowRef,
-        c: usize,
-    ) {
+    fn start_edit(&mut self, ctx: &egui::Context, rows: &[Vec<String>], r: RowRef, c: usize) {
         if self.edits.is_deleted(r) {
             return;
         }
@@ -322,7 +318,7 @@ impl GridState {
         self.editing = Some((r, c, value));
         self.select(r, c);
         self.select_all = true;
-        ctx.memory_mut(|m| m.request_focus(edit_id));
+        ctx.request_repaint();
     }
 
     fn commit_edit(&mut self, rows: &[Vec<String>]) {
@@ -332,7 +328,7 @@ impl GridState {
     }
 
     /// Alt+Insert: a new row, editing its first non-key cell.
-    fn add_row(&mut self, ctx: &egui::Context, edit_id: egui::Id, result: &QueryResult) {
+    fn add_row(&mut self, ctx: &egui::Context, result: &QueryResult) {
         self.commit_edit(&result.rows);
         let r = self.edits.add_row(result.columns.len());
         let c = result
@@ -340,7 +336,7 @@ impl GridState {
             .iter()
             .position(|c| !c.is_primary_key)
             .unwrap_or(0);
-        self.start_edit(ctx, edit_id, &result.rows, r, c);
+        self.start_edit(ctx, &result.rows, r, c);
     }
 
     fn revert(&mut self) {
@@ -381,9 +377,9 @@ impl GridState {
             self.commit_edit(rows);
             self.move_focus(result.columns.len(), 0, if back { -1 } else { 1 }, true);
             if let Some((r, c)) = self.selected {
-                self.start_edit(ctx, edit_id, rows, r, c);
+                self.start_edit(ctx, rows, r, c);
             }
-        } else if !ctx.memory(|m| m.has_focus(edit_id)) {
+        } else if !self.select_all && !ctx.memory(|m| m.has_focus(edit_id)) {
             // Clicked elsewhere, or scrolled away: focus loss commits.
             self.commit_edit(rows);
         }
@@ -394,7 +390,6 @@ impl GridState {
     fn grid_keys(
         &mut self,
         ctx: &egui::Context,
-        edit_id: egui::Id,
         result: &QueryResult,
         editable: bool,
     ) -> GridAction {
@@ -427,12 +422,12 @@ impl GridState {
             return GridAction::None;
         }
         if key(Modifiers::ALT, Key::Insert) {
-            self.add_row(ctx, edit_id, result);
+            self.add_row(ctx, result);
             return GridAction::None;
         }
         if let Some((r, c)) = self.selected {
             if key(Modifiers::NONE, Key::F2) || key(Modifiers::NONE, Key::Enter) {
-                self.start_edit(ctx, edit_id, &result.rows, r, c);
+                self.start_edit(ctx, &result.rows, r, c);
             } else if key(Modifiers::COMMAND, Key::Delete) {
                 self.edits.toggle_delete(r);
             }
@@ -493,7 +488,7 @@ pub fn show(
     let mut action = if state.editing.is_some() {
         state.editing_keys(&ctx, (focus_id, edit_id), result)
     } else if grid_focused {
-        state.grid_keys(&ctx, edit_id, result, opts.editable)
+        state.grid_keys(&ctx, result, opts.editable)
     } else {
         GridAction::None
     };
@@ -631,6 +626,7 @@ pub fn show(
                                                 .desired_width(f32::INFINITY)
                                                 .show(ui);
                                             if std::mem::take(select_all) {
+                                                out.response.request_focus();
                                                 let n = text.chars().count();
                                                 out.state.cursor.set_char_range(Some(
                                                     CCursorRange::two(
@@ -708,7 +704,7 @@ pub fn show(
         Some(CellAction::Edit(r, c)) => {
             if opts.editable {
                 state.commit_edit(rows);
-                state.start_edit(&ctx, edit_id, rows, r, c);
+                state.start_edit(&ctx, rows, r, c);
             } else {
                 state.selected = Some((r, c));
                 focus_grid();
@@ -729,7 +725,7 @@ pub fn show(
             state.selected = Some((r, c));
             focus_grid();
         }
-        Some(CellAction::AddRow) => state.add_row(&ctx, edit_id, result),
+        Some(CellAction::AddRow) => state.add_row(&ctx, result),
         Some(CellAction::ToggleDelete(r)) => {
             state.commit_edit(rows);
             state.edits.toggle_delete(r);

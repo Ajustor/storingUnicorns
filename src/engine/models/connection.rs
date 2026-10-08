@@ -57,6 +57,9 @@ pub struct ConnectionConfig {
     pub azure_auth_method: Option<AzureAuthMethod>,
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// RGB colour used to tag the connection in the GUI.
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
 }
 
 impl ConnectionConfig {
@@ -122,6 +125,7 @@ impl Default for ConnectionConfig {
             database: String::from("postgres"),
             azure_auth_method: None,
             tenant_id: None,
+            color: None,
         }
     }
 }
@@ -145,6 +149,9 @@ pub struct QueryResult {
     #[allow(dead_code)]
     pub rows_affected: u64,
     pub execution_time_ms: u128,
+    /// True when fetching stopped at a row cap (more rows were available).
+    #[allow(dead_code)] // used by the GUI (plan 3b)
+    pub truncated: bool,
 }
 
 /// Represents a table with its schema
@@ -177,4 +184,21 @@ pub struct SchemaInfo {
     pub name: String,
     pub tables: Vec<String>,
     pub expanded: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_connection_toml_still_parses_without_color() {
+        let c: ConnectionConfig =
+            toml::from_str("name = \"x\"\ndb_type = \"SQLite\"\ndatabase = \"a.db\"").unwrap();
+        assert_eq!(c.color, None);
+    }
+
+    #[test]
+    fn query_result_defaults_to_not_truncated() {
+        assert!(!QueryResult::default().truncated);
+    }
 }

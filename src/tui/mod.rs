@@ -3252,8 +3252,7 @@ mod tests {
         state.query_result = Some(QueryResult {
             columns: cols(),
             rows: vec![vec!["1".into(), "a".into()]],
-            rows_affected: 0,
-            execution_time_ms: 0,
+            ..QueryResult::default()
         });
         state
     }

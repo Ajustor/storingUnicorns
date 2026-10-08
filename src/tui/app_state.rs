@@ -181,6 +181,7 @@ impl NewConnectionState {
             } else {
                 None
             },
+            ..Default::default()
         }
     }
 

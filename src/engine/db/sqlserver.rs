@@ -60,7 +60,7 @@ fn rows_to_result(rows: &[tiberius::Row]) -> QueryResult {
         columns,
         rows: data,
         rows_affected: rows.len() as u64,
-        execution_time_ms: 0,
+        ..QueryResult::default()
     }
 }
 

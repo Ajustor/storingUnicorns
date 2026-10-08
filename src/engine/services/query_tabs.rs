@@ -11,6 +11,9 @@ pub struct QueryTab {
     pub cursor_position: usize,
     #[serde(default)]
     pub is_modified: bool,
+    /// Name of the connection this console is bound to (GUI).
+    #[serde(default)]
+    pub connection: Option<String>,
 }
 
 impl Default for QueryTab {
@@ -20,6 +23,7 @@ impl Default for QueryTab {
             query: String::new(),
             cursor_position: 0,
             is_modified: false,
+            connection: None,
         }
     }
 }
@@ -31,6 +35,7 @@ impl QueryTab {
             query: String::new(),
             cursor_position: 0,
             is_modified: false,
+            connection: None,
         }
     }
 
@@ -41,6 +46,7 @@ impl QueryTab {
             cursor_position: query.len(),
             query,
             is_modified: false,
+            connection: None,
         }
     }
 }
@@ -163,5 +169,17 @@ impl QueryTabsState {
     #[allow(dead_code)]
     pub fn rename_current_tab(&mut self, name: String) {
         self.tabs[self.active_tab].name = name;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_tabs_toml_parses_without_connection() {
+        let t: QueryTab =
+            toml::from_str("name = \"Q\"\nquery = \"SELECT 1\"\ncursor_position = 0").unwrap();
+        assert_eq!(t.connection, None);
     }
 }

@@ -98,19 +98,23 @@ pub async fn execute_query(pool: &SqlitePool, query: &str) -> Result<QueryResult
 /// Execute a sequence of statements as one transaction on a single dedicated
 /// connection. The statements include the user's `BEGIN`/`COMMIT`/`ROLLBACK`.
 /// On any error the transaction is rolled back and the error is returned.
-/// Returns the result of the last statement that returned or changed rows
-/// (or an empty result).
+/// Returns the last statement that returned rows; if none did, the last one
+/// that changed rows (or an empty result).
 pub async fn execute_transaction(pool: &SqlitePool, statements: &[String]) -> Result<QueryResult> {
     let mut conn = pool.acquire().await?;
-    let mut last = QueryResult::default();
+    // Prefer the last statement that returned rows; if none did, fall back to
+    // the last one that changed rows, so trailing `COMMIT`/`ROLLBACK` don't
+    // hide the DML count.
+    let mut last_rows: Option<QueryResult> = None;
+    let mut last_changed: Option<QueryResult> = None;
 
     for stmt in statements {
         match run_statement(&mut *conn, stmt).await {
-            // Keep the last statement that returned rows or changed rows, so
-            // trailing `COMMIT`/`ROLLBACK` don't hide the interesting result.
             Ok(result) => {
-                if !result.rows.is_empty() || result.rows_affected > 0 {
-                    last = result;
+                if !result.rows.is_empty() {
+                    last_rows = Some(result);
+                } else if result.rows_affected > 0 {
+                    last_changed = Some(result);
                 }
             }
             Err(e) => {
@@ -121,7 +125,7 @@ pub async fn execute_transaction(pool: &SqlitePool, statements: &[String]) -> Re
         }
     }
 
-    Ok(last)
+    Ok(last_rows.or(last_changed).unwrap_or_default())
 }
 
 /// Get tables grouped by schema (SQLite uses "main" as default schema)
@@ -457,5 +461,20 @@ mod tests {
         assert!(is_dml("INSERT INTO t VALUES (1)"));
         assert!(!is_dml("SELECT 1"));
         assert!(!is_dml("COMMIT"));
+    }
+
+    #[tokio::test]
+    async fn transaction_prefers_last_row_set_over_later_dml() {
+        let pool = mem_pool().await;
+        let stmts = [
+            "BEGIN".to_string(),
+            "INSERT INTO t VALUES (7)".to_string(),
+            "SELECT a FROM t".to_string(),
+            "INSERT INTO t VALUES (8)".to_string(),
+            "COMMIT".to_string(),
+        ];
+        let result = execute_transaction(&pool, &stmts).await.unwrap();
+        assert_eq!(result.rows, vec![vec!["7".to_string()]]);
+        assert_eq!(result.rows_affected, 1);
     }
 }

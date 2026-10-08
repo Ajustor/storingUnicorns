@@ -68,15 +68,19 @@ pub async fn execute_query(pool: &PgPool, query: &str) -> Result<QueryResult> {
 /// On any error the transaction is rolled back and the error is returned.
 pub async fn execute_transaction(pool: &PgPool, statements: &[String]) -> Result<QueryResult> {
     let mut conn = pool.acquire().await?;
-    let mut last = QueryResult::default();
+    // Prefer the last statement that returned rows; if none did, fall back to
+    // the last one that changed rows, so trailing `COMMIT`/`ROLLBACK` don't
+    // hide the DML count.
+    let mut last_rows: Option<QueryResult> = None;
+    let mut last_changed: Option<QueryResult> = None;
 
     for stmt in statements {
         match run_statement(&mut *conn, stmt).await {
-            // Keep the last statement that returned rows or changed rows, so
-            // trailing `COMMIT`/`ROLLBACK` don't hide the interesting result.
             Ok(result) => {
-                if !result.rows.is_empty() || result.rows_affected > 0 {
-                    last = result;
+                if !result.rows.is_empty() {
+                    last_rows = Some(result);
+                } else if result.rows_affected > 0 {
+                    last_changed = Some(result);
                 }
             }
             Err(e) => {
@@ -86,7 +90,7 @@ pub async fn execute_transaction(pool: &PgPool, statements: &[String]) -> Result
         }
     }
 
-    Ok(last)
+    Ok(last_rows.or(last_changed).unwrap_or_default())
 }
 
 /// Get tables grouped by schema

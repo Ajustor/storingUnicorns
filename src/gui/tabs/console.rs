@@ -129,6 +129,11 @@ pub enum ConsoleAction {
     Rebind(String),
     /// Open the history popup with this search.
     History(String),
+    /// Export a result's rows; `table` is the INSERT target.
+    Export {
+        result: QueryResult,
+        table: String,
+    },
     /// Apply the pending edits of result tab `result_index`.
     Submit {
         result_index: usize,
@@ -743,6 +748,12 @@ fn result_view(
             sort_indicator: None,
         },
     );
+    if action == GridAction::Export {
+        return Some(ConsoleAction::Export {
+            result: r.result.clone(),
+            table: extract_table_from_query(&r.sql).unwrap_or_else(|| "table".into()),
+        });
+    }
     if action != GridAction::Submit || r.grid.edits.is_empty() {
         return None;
     }

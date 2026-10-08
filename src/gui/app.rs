@@ -10,7 +10,7 @@ use crate::engine::services::query_tabs::{QueryTab, QueryTabsState};
 use crate::engine::sql::paging::{build_count, build_select};
 use crate::updater::{ExitAction, Updater};
 
-use super::dialogs::{self, connection::same_target, Dialog};
+use super::dialogs::{self, connection::same_target, transfer, Dialog};
 use super::history_popup::{self, HistoryPopup};
 use super::sessions::{Session, Sessions};
 use super::status::{self, Status, StatusKind};
@@ -343,6 +343,13 @@ impl App {
             DataAction::SubmitFailed(e) => {
                 self.error(format!("Submit annulé (transaction annulée) : {e}"))
             }
+            DataAction::Export => {
+                let Some(result) = d.result.clone() else {
+                    return;
+                };
+                let (connection, table) = (tab.connection.clone(), d.table.clone());
+                transfer::export_result(self, &connection, result, table);
+            }
         }
     }
 
@@ -514,8 +521,15 @@ impl App {
                 }
                 Err(e) => self.error(format!("Export impossible : {e}")),
             },
-            Event::Imported { table, outcome } => {
+            Event::Imported {
+                name,
+                table,
+                outcome,
+            } => {
                 self.progress = None;
+                if outcome.as_ref().is_ok_and(|s| s.succeeded() > 0) {
+                    self.reload_data_tabs(&name, Some(&table));
+                }
                 match outcome {
                     Ok(stats) if stats.errors.is_empty() => self.success(format!(
                         "{table} : {} insérée(s), {} mise(s) à jour",
@@ -529,16 +543,19 @@ impl App {
                     Err(e) => self.error(format!("{table} : {e}")),
                 }
             }
-            Event::Batch { kind, report } => {
+            Event::Batch { name, kind, report } => {
                 self.progress = None;
+                if kind != "Export" && report.succeeded > 0 {
+                    self.reload_data_tabs(&name, None);
+                }
                 if report.errors.is_empty() {
                     self.success(format!(
-                        "{kind} : {}/{} table(s)",
-                        report.succeeded, report.total
+                        "{kind} ({name}) : {}/{} table(s), {} ligne(s)",
+                        report.succeeded, report.total, report.rows_affected
                     ));
                 } else {
                     self.error(format!(
-                        "{kind} : {} erreur(s), première : {}",
+                        "{kind} ({name}) : {} erreur(s), première : {}",
                         report.errors.len(),
                         report.errors[0]
                     ));
@@ -674,6 +691,10 @@ impl App {
             }
             ConsoleAction::History(search) => {
                 self.dialog = Some(Dialog::History(HistoryPopup::new(search)));
+            }
+            ConsoleAction::Export { result, table } => {
+                let connection = tab.connection.clone();
+                transfer::export_result(self, &connection, result, table);
             }
             ConsoleAction::Submit {
                 result_index,

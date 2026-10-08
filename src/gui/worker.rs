@@ -91,11 +91,13 @@ pub enum Event {
     /// Rows written and the file path.
     Exported(Result<(usize, PathBuf), String>),
     Imported {
+        name: String,
         table: String,
         outcome: Result<ImportStats, String>,
     },
     /// `kind` is "Export", "Import" or "Vidage".
     Batch {
+        name: String,
         kind: &'static str,
         report: BatchReport,
     },
@@ -431,7 +433,6 @@ impl Worker {
         });
     }
 
-    #[allow(dead_code)] // transfer dialogs (plan 3b, Task 10)
     pub fn export_result(
         &self,
         result: QueryResult,
@@ -459,8 +460,14 @@ impl Worker {
         });
     }
 
-    #[allow(dead_code)] // transfer dialogs (plan 3b, Task 10)
-    pub fn import_csv(&self, conn: Conn, table: String, path: PathBuf, quotes: (char, char)) {
+    pub fn import_csv(
+        &self,
+        name: String,
+        conn: Conn,
+        table: String,
+        path: PathBuf,
+        quotes: (char, char),
+    ) {
         let mut progress = self.progress();
         self.spawn(async move {
             let outcome = match tokio::fs::read_to_string(&path).await {
@@ -473,14 +480,18 @@ impl Worker {
                 }
                 Err(e) => Err(format!("{}: {e}", path.display())),
             };
-            Event::Imported { table, outcome }
+            Event::Imported {
+                name,
+                table,
+                outcome,
+            }
         });
     }
 
-    #[allow(dead_code)] // transfer dialogs (plan 3b, Task 10)
     /// Export each `(schema, table)` to `dir`, created if missing.
     pub fn export_tables(
         &self,
+        name: String,
         conn: Conn,
         tables: Vec<(String, String)>,
         dir: PathBuf,
@@ -501,15 +512,16 @@ impl Worker {
                 },
             };
             Event::Batch {
+                name,
                 kind: "Export",
                 report,
             }
         });
     }
 
-    #[allow(dead_code)] // transfer dialogs (plan 3b, Task 10)
     pub fn import_tables(
         &self,
+        name: String,
         conn: Conn,
         tables: Vec<(String, String)>,
         dir: PathBuf,
@@ -519,19 +531,20 @@ impl Worker {
         self.spawn(async move {
             let report = ops::transfer::import_tables(&conn, &tables, &dir, quotes, progress).await;
             Event::Batch {
+                name,
                 kind: "Import",
                 report,
             }
         });
     }
 
-    #[allow(dead_code)] // transfer dialogs (plan 3b, Task 10)
     /// `DELETE FROM` each (already quoted) table.
-    pub fn truncate_tables(&self, conn: Conn, tables: Vec<String>) {
+    pub fn truncate_tables(&self, name: String, conn: Conn, tables: Vec<String>) {
         let progress = self.progress();
         self.spawn(async move {
             let report = ops::rows::truncate_tables(&conn, &tables, progress).await;
             Event::Batch {
+                name,
                 kind: "Vidage",
                 report,
             }

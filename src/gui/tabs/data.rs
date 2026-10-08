@@ -75,6 +75,8 @@ pub enum DataAction {
     Applied(usize),
     /// Submit failed (rolled back): report it.
     SubmitFailed(String),
+    /// Export the current page.
+    Export,
 }
 
 pub struct DataTab {
@@ -308,6 +310,7 @@ impl DataTab {
             GridAction::Submit if !self.grid.edits.is_empty() && !cx.submitting => {
                 action = Some(DataAction::Submit);
             }
+            GridAction::Export => action = Some(DataAction::Export),
             _ => {}
         }
         action

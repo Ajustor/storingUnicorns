@@ -143,6 +143,8 @@ pub enum GridAction {
     /// The pending edits were dropped by the grid (Ctrl+Z or Revert).
     Revert,
     SelectionChanged,
+    /// "Exporter…" in the footer.
+    Export,
 }
 
 pub struct GridOptions<'a> {
@@ -550,6 +552,8 @@ pub fn show(
                     .sense(Sense::click())
                     .auto_shrink([false, false])
                     .max_scroll_height(f32::INFINITY)
+                    // Default 200 px would push the footer out of a short area.
+                    .min_scrolled_height(0.0)
                     .animate_scrolling(false)
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(TableColumn::exact(num_w))
@@ -807,6 +811,13 @@ fn footer(ui: &mut egui::Ui, state: &mut GridState, result: &QueryResult) -> Gri
             text.push_str(&format!(" · {n}+ (limité)"));
         }
         ui.label(RichText::new(text).weak());
+        if ui
+            .small_button(format!("{} Exporter…", icon::EXPORT))
+            .on_hover_text("Exporter ces lignes en CSV ou SQL INSERT")
+            .clicked()
+        {
+            action = GridAction::Export;
+        }
         if state.edits.is_empty() {
             return;
         }

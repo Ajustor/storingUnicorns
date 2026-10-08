@@ -2,6 +2,7 @@
 
 pub mod connection;
 pub mod structure;
+pub mod transfer;
 
 use super::app::App;
 use super::history_popup::{HistoryAction, HistoryPopup};
@@ -11,6 +12,7 @@ use super::worker::Event;
 use crate::engine::ops::transfer::qualified;
 use connection::{ConnectionForm, FormAction};
 use structure::StructureDialog;
+use transfer::BatchDialog;
 
 pub enum Dialog {
     Connection(Box<ConnectionForm>),
@@ -24,6 +26,13 @@ pub enum Dialog {
     DiscardEdits(TabId),
     /// Columns of one table of one connection.
     Structure(StructureDialog),
+    /// Empty these (qualified) tables of `connection`.
+    ConfirmTruncate {
+        connection: String,
+        tables: Vec<String>,
+    },
+    /// Batch export / import / truncate on one connection.
+    Batch(BatchDialog),
 }
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
@@ -99,6 +108,10 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 }
             }
             Dialog::Structure(d) => keep = structure::ui(app, ui, d),
+            Dialog::ConfirmTruncate { connection, tables } => {
+                keep = transfer::confirm_truncate_ui(app, ui, connection, tables)
+            }
+            Dialog::Batch(b) => keep = transfer::batch_ui(app, ui, b),
             Dialog::ConfirmDeleteConnection(name) => {
                 ui.heading("Supprimer la connexion");
                 ui.label(format!(

@@ -10,6 +10,7 @@ use crate::engine::models::{ConnectionConfig, SchemaInfo, TableDetails};
 use crate::engine::ops::transfer::qualified;
 
 use super::app::App;
+use super::dialogs::transfer::{self, BatchKind};
 use super::dialogs::{self, connection::ConnectionForm, Dialog};
 use super::sessions::{Session, Sessions};
 use super::theme::{self, ACCENT, ERROR};
@@ -64,6 +65,20 @@ enum Action {
         connection: String,
         table: String,
         title: String,
+    },
+    ImportCsv {
+        connection: String,
+        table: String,
+    },
+    Truncate {
+        connection: String,
+        table: String,
+    },
+    /// Batch dialog; `only` = `(schema, table)` ticked alone.
+    Batch {
+        connection: String,
+        kind: BatchKind,
+        only: Option<(String, String)>,
     },
     Copy(String),
 }
@@ -161,6 +176,18 @@ fn apply(app: &mut App, ctx: &egui::Context, action: Action) {
             table,
             title,
         } => dialogs::structure::open(app, &connection, &table, &title),
+        Action::ImportCsv { connection, table } => transfer::open_import(app, &connection, &table),
+        Action::Truncate { connection, table } => {
+            transfer::open_truncate(app, &connection, vec![table])
+        }
+        Action::Batch {
+            connection,
+            kind,
+            only,
+        } => {
+            let only = only.as_ref().map(|(s, t)| (s.as_str(), t.as_str()));
+            transfer::open_batch(app, &connection, kind, only)
+        }
         Action::Copy(text) => ctx.copy_text(text),
     }
 }
@@ -355,11 +382,23 @@ fn connection_node(
             actions.push(Action::Delete(name.clone()));
             ui.close_menu();
         }
-        ui.separator();
-        // Batch dialogs: plan 3b, Task 10.
-        for label in ["Export par lot…", "Import par lot…", "Vidage par lot…"] {
-            ui.add_enabled(false, egui::Button::new(label))
-                .on_disabled_hover_text("Bientôt disponible");
+        if session.is_some() {
+            ui.separator();
+            let batches = [
+                (BatchKind::Export, icon::EXPORT, "Export par lot…"),
+                (BatchKind::Import, icon::DOWNLOAD_SIMPLE, "Import par lot…"),
+                (BatchKind::Truncate, icon::ERASER, "Vidage par lot…"),
+            ];
+            for (kind, glyph, label) in batches {
+                if ui.button(format!("{glyph} {label}")).clicked() {
+                    actions.push(Action::Batch {
+                        connection: name.clone(),
+                        kind,
+                        only: None,
+                    });
+                    ui.close_menu();
+                }
+            }
         }
     });
 }
@@ -470,10 +509,33 @@ fn table_node(
             ui.close_menu();
         }
         ui.separator();
-        // Transfer dialogs: plan 3b, Task 10.
-        for label in ["Importer un CSV…", "Vider la table…"] {
-            ui.add_enabled(false, egui::Button::new(label))
-                .on_disabled_hover_text("Bientôt disponible");
+        if ui.button(format!("{} Exporter…", icon::EXPORT)).clicked() {
+            actions.push(Action::Batch {
+                connection: connection.clone(),
+                kind: BatchKind::Export,
+                only: Some((schema.to_string(), table.to_string())),
+            });
+            ui.close_menu();
+        }
+        if ui
+            .button(format!("{} Importer un CSV…", icon::DOWNLOAD_SIMPLE))
+            .clicked()
+        {
+            actions.push(Action::ImportCsv {
+                connection: connection.clone(),
+                table: key(),
+            });
+            ui.close_menu();
+        }
+        if ui
+            .button(RichText::new(format!("{} Vider la table…", icon::ERASER)).color(ERROR))
+            .clicked()
+        {
+            actions.push(Action::Truncate {
+                connection: connection.clone(),
+                table: key(),
+            });
+            ui.close_menu();
         }
         ui.separator();
         if ui.button(format!("{} Copier le nom", icon::COPY)).clicked() {

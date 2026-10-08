@@ -73,6 +73,15 @@ where
     Ok((rows, done, truncated))
 }
 
+/// A possibly quoted, qualified table name as shown to the user:
+/// `"main"."users"` → `main.users`.
+pub fn display_qualified(name: &str) -> String {
+    match split_qualified(name) {
+        (Some(schema), table) => format!("{schema}.{table}"),
+        (None, table) => table,
+    }
+}
+
 /// Split a table name, bare (`t`), qualified (`s.t`, `db.s.t`) and/or quoted
 /// with any dialect's quotes (`"s"."t"`, `` `s`.`t` ``, `[s].[t]`), into
 /// `(schema, table)`, both unquoted. Doubled quotes inside a quoted part are
@@ -450,6 +459,14 @@ mod tests {
         assert_eq!(fks[0].columns, ["x", "y"]);
         assert_eq!(fks[0].ref_columns, ["px", "py"]);
         assert_eq!(fks[1].ref_table, "q");
+    }
+
+    #[test]
+    fn display_qualified_drops_quotes() {
+        assert_eq!(display_qualified("\"main\".\"users\""), "main.users");
+        assert_eq!(display_qualified("[dbo].[t]"), "dbo.t");
+        assert_eq!(display_qualified("`t`"), "t");
+        assert_eq!(display_qualified("s.t"), "s.t");
     }
 
     #[test]

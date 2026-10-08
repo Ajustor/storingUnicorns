@@ -1,6 +1,8 @@
 use anyhow::Result;
 
-use crate::engine::db::utils::{build_delete_query, build_insert_query, build_update_query};
+use crate::engine::db::utils::{
+    build_delete_query, build_insert_query, build_update_query, display_qualified,
+};
 use crate::engine::db::DatabaseConnection;
 use crate::engine::models::{Column, DatabaseType};
 use crate::engine::sql::statements::quote_chars;
@@ -137,13 +139,14 @@ pub async fn truncate_tables(
         ..Default::default()
     };
     for (i, table) in tables.iter().enumerate() {
-        progress(i, tables.len(), table);
+        let shown = display_qualified(table);
+        progress(i, tables.len(), &shown);
         match conn.execute_query(&format!("DELETE FROM {table}")).await {
             Ok(r) => {
                 report.succeeded += 1;
                 report.rows_affected += r.rows_affected;
             }
-            Err(e) => report.errors.push(format!("{table}: {e}")),
+            Err(e) => report.errors.push(format!("{shown}: {e}")),
         }
     }
     report
@@ -246,7 +249,7 @@ mod tests {
         let conn = sqlite_mem(SETUP).await;
         let report = truncate_tables(
             &conn,
-            &["t".into(), "missing".into(), "u".into()],
+            &["t".into(), "\"main\".\"missing\"".into(), "u".into()],
             |_, _, _| {},
         )
         .await;
@@ -256,7 +259,8 @@ mod tests {
         assert_eq!(count(&conn, "t").await, "0");
         assert_eq!(count(&conn, "u").await, "0");
         assert_eq!(report.errors.len(), 1);
-        assert!(report.errors[0].starts_with("missing:"));
+        // Shown to the user: unquoted.
+        assert!(report.errors[0].starts_with("main.missing:"));
     }
 
     #[tokio::test]

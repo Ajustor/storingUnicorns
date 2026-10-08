@@ -4,6 +4,7 @@ use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_phosphor::regular as icon;
 
 use crate::engine::config::AppConfig;
+use crate::engine::db::utils::display_qualified;
 use crate::engine::models::ConnectionConfig;
 use crate::engine::services::history::{History, HistoryEntry};
 use crate::engine::services::query_tabs::{QueryTab, QueryTabsState};
@@ -533,6 +534,7 @@ impl App {
                 if outcome.as_ref().is_ok_and(|s| s.succeeded() > 0) {
                     self.reload_data_tabs(&name, Some(&table));
                 }
+                let table = display_qualified(&table);
                 match outcome {
                     Ok(stats) if stats.errors.is_empty() => self.success(format!(
                         "{table} : {} insérée(s), {} mise(s) à jour",

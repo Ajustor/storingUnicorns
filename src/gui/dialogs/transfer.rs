@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
+use crate::engine::db::utils::display_qualified;
 use crate::engine::models::{QueryResult, SchemaInfo};
 use crate::engine::ops::transfer::qualified;
 use crate::engine::services::export_import::{BatchExportState, ExportFormat};
@@ -171,7 +172,7 @@ pub fn confirm_truncate_ui(
         RichText::new("Toutes les lignes des tables suivantes seront supprimées :").color(ERROR),
     );
     for t in tables.iter().take(12) {
-        ui.label(format!("• {t}"));
+        ui.label(format!("• {}", display_qualified(t)));
     }
     if tables.len() > 12 {
         ui.label(format!("… et {} autres", tables.len() - 12));

@@ -6,6 +6,7 @@ use egui::text::LayoutJob;
 use egui::{Galley, RichText};
 use egui_phosphor::regular as icon;
 
+use crate::engine::db::utils::display_qualified;
 use crate::gui::editor::highlight_job;
 use crate::gui::theme::ERROR;
 use crate::gui::worker::Event;
@@ -36,7 +37,7 @@ impl DdlTab {
     pub fn show(&mut self, ui: &mut egui::Ui, connected: bool) -> Option<DdlAction> {
         let mut action = None;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&self.table).strong());
+            ui.label(RichText::new(display_qualified(&self.table)).strong());
             let loading = self.ddl.is_none();
             if ui
                 .add_enabled(

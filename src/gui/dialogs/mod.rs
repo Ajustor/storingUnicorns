@@ -1,6 +1,7 @@
 //! Modal dialogs (connection form, confirmations, …).
 
 pub mod connection;
+pub mod structure;
 
 use super::app::App;
 use super::history_popup::{HistoryAction, HistoryPopup};
@@ -9,6 +10,7 @@ use super::tabs::{TabId, TabKind};
 use super::worker::Event;
 use crate::engine::ops::transfer::qualified;
 use connection::{ConnectionForm, FormAction};
+use structure::StructureDialog;
 
 pub enum Dialog {
     Connection(Box<ConnectionForm>),
@@ -20,6 +22,8 @@ pub enum Dialog {
     TableSearch(TableSearch),
     /// "Abandonner les modifications ?" before data tab `TabId` changes page.
     DiscardEdits(TabId),
+    /// Columns of one table of one connection.
+    Structure(StructureDialog),
 }
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
@@ -94,6 +98,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     answer_discard(app, id, answer);
                 }
             }
+            Dialog::Structure(d) => keep = structure::ui(app, ui, d),
             Dialog::ConfirmDeleteConnection(name) => {
                 ui.heading("Supprimer la connexion");
                 ui.label(format!(
@@ -119,7 +124,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         }
         keep = false;
     }
-    if keep {
+    // A dialog may open another one in its place (batch → confirmation).
+    if keep && app.dialog.is_none() {
         app.dialog = Some(dialog);
     }
 }

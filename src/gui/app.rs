@@ -346,6 +346,26 @@ impl App {
         }
     }
 
+    /// Reload the open data tabs of `connection` (only those of `table` when
+    /// given) after their rows or columns changed elsewhere. Tabs with
+    /// pending edits are left alone.
+    pub fn reload_data_tabs(&mut self, connection: &str, table: Option<&str>) {
+        let ids: Vec<TabId> = self
+            .tabs
+            .list
+            .iter()
+            .filter(|t| t.connection == connection)
+            .filter(|t| {
+                matches!(&t.kind, TabKind::Data(d)
+                    if table.is_none_or(|x| d.table == x) && d.grid.edits.is_empty())
+            })
+            .map(|t| t.id)
+            .collect();
+        for id in ids {
+            self.data_action(id, DataAction::Load { count: true });
+        }
+    }
+
     /// Open a DDL tab for `table` (qualified) and request its `CREATE TABLE`.
     pub fn open_ddl(&mut self, connection: &str, table: &str, title: &str) {
         let Some(session) = self.sessions.get(connection) else {
@@ -483,10 +503,11 @@ impl App {
                 }
             }
             Event::Progress { done, total, label } => self.progress = Some((done, total, label)),
-            Event::SchemaApplied { table, outcome, .. } => match outcome {
-                Ok(_) => self.success(format!("{table} modifiée")),
-                Err(e) => self.error(format!("{table} : {e}")),
-            },
+            Event::SchemaApplied {
+                name,
+                table,
+                outcome,
+            } => dialogs::structure::on_applied(self, name, table, outcome),
             Event::Exported(outcome) => match outcome {
                 Ok((n, path)) => {
                     self.success(format!("{n} ligne(s) exportée(s) vers {}", path.display()))

@@ -84,7 +84,6 @@ pub enum Event {
     },
     /// `outcome` is the SQL that ran.
     SchemaApplied {
-        #[allow(dead_code)] // structure dialog (plan 3b, Task 10)
         name: String,
         table: String,
         outcome: Result<String, String>,
@@ -411,7 +410,6 @@ impl Worker {
         run
     }
 
-    #[allow(dead_code)] // structure dialog (plan 3b, Task 10)
     pub fn apply_schema(
         &mut self,
         name: String,

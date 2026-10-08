@@ -10,7 +10,7 @@ use crate::engine::models::{ConnectionConfig, SchemaInfo, TableDetails};
 use crate::engine::ops::transfer::qualified;
 
 use super::app::App;
-use super::dialogs::{connection::ConnectionForm, Dialog};
+use super::dialogs::{self, connection::ConnectionForm, Dialog};
 use super::sessions::{Session, Sessions};
 use super::theme::{self, ACCENT, ERROR};
 
@@ -56,6 +56,11 @@ enum Action {
         title: String,
     },
     Ddl {
+        connection: String,
+        table: String,
+        title: String,
+    },
+    Structure {
         connection: String,
         table: String,
         title: String,
@@ -151,6 +156,11 @@ fn apply(app: &mut App, ctx: &egui::Context, action: Action) {
             table,
             title,
         } => app.open_ddl(&connection, &table, &title),
+        Action::Structure {
+            connection,
+            table,
+            title,
+        } => dialogs::structure::open(app, &connection, &table, &title),
         Action::Copy(text) => ctx.copy_text(text),
     }
 }
@@ -451,9 +461,17 @@ fn table_node(
             });
             ui.close_menu();
         }
+        if ui.button(format!("{} Structure…", icon::COLUMNS)).clicked() {
+            actions.push(Action::Structure {
+                connection: connection.clone(),
+                table: key(),
+                title: table.to_string(),
+            });
+            ui.close_menu();
+        }
         ui.separator();
-        // Structure and transfer dialogs: plan 3b, Task 10.
-        for label in ["Structure…", "Importer un CSV…", "Vider la table…"] {
+        // Transfer dialogs: plan 3b, Task 10.
+        for label in ["Importer un CSV…", "Vider la table…"] {
             ui.add_enabled(false, egui::Button::new(label))
                 .on_disabled_hover_text("Bientôt disponible");
         }

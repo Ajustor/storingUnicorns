@@ -49,6 +49,7 @@ pub const ACCENT: Color32 = Color32::from_rgb(0xB3, 0x6B, 0xFF);
 pub const SUCCESS: Color32 = Color32::from_rgb(0x4C, 0xC3, 0x8A);
 pub const ERROR: Color32 = Color32::from_rgb(0xE5, 0x5C, 0x6C);
 
+#[allow(dead_code)] // connection dialog (plan 3b, Task 5)
 /// Default palette offered in the connection form (DataGrip-like).
 pub const CONNECTION_COLORS: [[u8; 3]; 7] = [
     [0xE5, 0x5C, 0x6C], // prod red
@@ -62,6 +63,18 @@ pub const CONNECTION_COLORS: [[u8; 3]; 7] = [
 
 pub fn rgb(c: [u8; 3]) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
+}
+
+/// Tag colour of a connection; grey when it has none.
+pub fn connection_color(color: Option<[u8; 3]>) -> Color32 {
+    color.map(rgb).unwrap_or(Color32::GRAY)
+}
+
+/// Small filled circle tagging a connection.
+pub fn dot(ui: &mut egui::Ui, color: Color32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+    response
 }
 
 pub fn apply(ctx: &egui::Context, choice: ThemeChoice) {
@@ -86,6 +99,7 @@ pub fn fonts() -> egui::FontDefinitions {
     fonts
 }
 
+#[allow(dead_code)] // SQL editor (plan 3b, Task 6)
 /// Colour of a SQL token for the current background.
 pub fn token_color(token: &SqlToken, dark: bool) -> Color32 {
     let (d, l) = match token {

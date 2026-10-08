@@ -9,11 +9,7 @@
 //!
 //! Ported from codingUnicorns (`src/updater/mod.rs`), without the egui dependency.
 
-// Used by the GUI (plan 3b).
-#[allow(dead_code)]
 mod background;
-// Used by the GUI (plan 3b).
-#[allow(unused_imports)]
 pub use background::{UpdateEvent, UpdateState, Updater};
 
 use std::path::{Path, PathBuf};
@@ -71,8 +67,6 @@ pub struct ReleaseInfo {
     // Used by the GUI (plan 3b).
     #[allow(dead_code)]
     pub notes: String,
-    // Used by the GUI (plan 3b).
-    #[allow(dead_code)]
     pub page_url: String,
     asset: ManifestAsset,
     kind: InstallKind,
@@ -89,14 +83,10 @@ enum InstallKind {
 /// What to do on exit to apply a ready update.
 #[derive(Debug, Clone)]
 pub enum ExitAction {
-    // Used by the GUI (plan 3b).
-    #[allow(dead_code)]
     Relaunch,
     /// Install the MSI; the app stays closed.
     RunMsi(PathBuf),
     /// Install the MSI, then start the upgraded app.
-    // Used by the GUI (plan 3b).
-    #[allow(dead_code)]
     RunMsiThenRelaunch(PathBuf),
 }
 

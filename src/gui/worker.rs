@@ -28,6 +28,10 @@ use crate::engine::services::SchemaModification;
 
 pub type Conn = Arc<DatabaseConnection>;
 pub type TabId = u64;
+/// Identifies one operation started for a tab. A replaced or cancelled run
+/// may still deliver its event; the tab drops events of runs it no longer
+/// waits for.
+pub type RunId = u64;
 
 /// Result of a background operation. Errors are carried as display strings.
 pub enum Event {
@@ -40,7 +44,7 @@ pub enum Event {
         name: String,
         error: String,
     },
-    TestFinished(Result<(), String>),
+    TestFinished(#[allow(dead_code)] /* connection dialog (Task 5) */ Result<(), String>),
     Schemas {
         name: String,
         outcome: Result<Vec<SchemaInfo>, String>,
@@ -53,28 +57,38 @@ pub enum Event {
     /// Console execution, one outcome per executed unit.
     Script {
         tab: TabId,
+        run: RunId,
+        #[allow(dead_code)] // console tab (plan 3b, Task 6)
         outcomes: Vec<StatementOutcome>,
     },
     /// One page of a data editor.
     Page {
         tab: TabId,
+        run: RunId,
+        #[allow(dead_code)] // data tab (plan 3b, Task 8)
         outcome: Result<QueryResult, String>,
     },
     Count {
         tab: TabId,
+        run: RunId,
+        #[allow(dead_code)] // data tab (plan 3b, Task 8)
         outcome: Result<u64, String>,
     },
     /// Number of statements applied by a Submit.
     Submitted {
         tab: TabId,
+        run: RunId,
+        #[allow(dead_code)] // data tab (plan 3b, Task 8)
         outcome: Result<usize, String>,
     },
     Ddl {
         tab: TabId,
+        run: RunId,
         outcome: Result<String, String>,
     },
     /// `outcome` is the SQL that ran.
     SchemaApplied {
+        #[allow(dead_code)] // structure dialog (plan 3b, Task 10)
         name: String,
         table: String,
         outcome: Result<String, String>,
@@ -97,6 +111,20 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// Tab an outcome belongs to (`Script`, `Page`, `Count`, `Submitted`, `Ddl`).
+    pub fn tab(&self) -> Option<TabId> {
+        match self {
+            Event::Script { tab, .. }
+            | Event::Page { tab, .. }
+            | Event::Count { tab, .. }
+            | Event::Submitted { tab, .. }
+            | Event::Ddl { tab, .. } => Some(*tab),
+            _ => None,
+        }
+    }
+}
+
 pub struct Worker {
     rt: Runtime,
     tx: Sender<Event>,
@@ -106,6 +134,8 @@ pub struct Worker {
     running: HashMap<TabId, JoinHandle<()>>,
     /// Column metadata cache per connection name.
     caches: HashMap<String, Arc<TableCache>>,
+    /// Last run id handed out (monotonic).
+    last_run: RunId,
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -134,6 +164,7 @@ impl Worker {
             repaint: Arc::new(repaint),
             running: HashMap::new(),
             caches: HashMap::new(),
+            last_run: 0,
         }
     }
 
@@ -143,10 +174,12 @@ impl Worker {
         self.rx.try_iter().collect()
     }
 
+    #[allow(dead_code)] // console and data tabs (plan 3b, Tasks 6 and 8)
     pub fn is_running(&self, tab: TabId) -> bool {
         self.running.get(&tab).is_some_and(|h| !h.is_finished())
     }
 
+    #[allow(dead_code)] // console and data tabs (plan 3b, Tasks 6 and 8)
     pub fn any_running(&self) -> bool {
         self.running.values().any(|h| !h.is_finished())
     }
@@ -162,6 +195,11 @@ impl Worker {
             }
             _ => false,
         }
+    }
+
+    fn next_run(&mut self) -> RunId {
+        self.last_run += 1;
+        self.last_run
     }
 
     /// Column cache of connection `name`.
@@ -242,6 +280,7 @@ impl Worker {
         });
     }
 
+    #[allow(dead_code)] // connection dialog (plan 3b, Task 5)
     pub fn test_connection(&self, config: ConnectionConfig) {
         self.spawn(async move {
             let outcome = match DatabaseConnection::connect(&config).await {
@@ -263,6 +302,7 @@ impl Worker {
         });
     }
 
+    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     /// Columns, indexes and foreign keys of `table` on connection `name`.
     pub fn table_details(&mut self, name: String, conn: Conn, table: String) {
         let cache = self.cache_for(&name);
@@ -278,14 +318,24 @@ impl Worker {
         });
     }
 
+    #[allow(dead_code)] // console tab (plan 3b, Task 6)
     /// Execute every statement of `text` (F5 / selection).
-    pub fn run_script(&mut self, tab: TabId, conn: Conn, text: String, max_rows: Option<usize>) {
+    pub fn run_script(
+        &mut self,
+        tab: TabId,
+        conn: Conn,
+        text: String,
+        max_rows: Option<usize>,
+    ) -> RunId {
+        let run = self.next_run();
         self.spawn_for_tab(tab, async move {
             let outcomes = ops::query::run_script(&conn, &text, max_rows).await;
-            Event::Script { tab, outcomes }
+            Event::Script { tab, run, outcomes }
         });
+        run
     }
 
+    #[allow(dead_code)] // console tab (plan 3b, Task 6)
     /// Execute the statement or transaction block under `cursor` (byte offset).
     pub fn run_at_cursor(
         &mut self,
@@ -294,36 +344,45 @@ impl Worker {
         text: String,
         cursor: usize,
         max_rows: Option<usize>,
-    ) {
+    ) -> RunId {
+        let run = self.next_run();
         self.spawn_for_tab(tab, async move {
             let outcomes = ops::query::run_at_cursor_outcomes(&conn, &text, cursor, max_rows).await;
-            Event::Script { tab, outcomes }
+            Event::Script { tab, run, outcomes }
         });
+        run
     }
 
+    #[allow(dead_code)] // data tab (plan 3b, Task 8)
     /// Load one page of a data editor; replaces the tab's pending load.
-    pub fn load_page(&mut self, tab: TabId, conn: Conn, sql: String) {
+    pub fn load_page(&mut self, tab: TabId, conn: Conn, sql: String) -> RunId {
+        let run = self.next_run();
         self.spawn_for_tab(tab, async move {
             let outcome = ops::query::run_query(&conn, &sql).await.map_err(err);
-            Event::Page { tab, outcome }
+            Event::Page { tab, run, outcome }
         });
+        run
     }
 
+    #[allow(dead_code)] // data tab (plan 3b, Task 8)
     /// Run a `COUNT(*)` query and parse its first cell.
-    pub fn count(&self, tab: TabId, conn: Conn, sql: String) {
+    pub fn count(&mut self, tab: TabId, conn: Conn, sql: String) -> RunId {
+        let run = self.next_run();
         self.spawn(async move {
             let outcome = match conn.execute_query(&sql).await {
                 Ok(r) => parse_count(&r),
                 Err(e) => Err(err(e)),
             };
-            Event::Count { tab, outcome }
+            Event::Count { tab, run, outcome }
         });
+        run
     }
 
+    #[allow(dead_code)] // data tab (plan 3b, Task 8)
     /// Apply a data editor's pending changes in one transaction.
     #[allow(clippy::too_many_arguments)]
     pub fn submit(
-        &self,
+        &mut self,
         tab: TabId,
         conn: Conn,
         db_type: DatabaseType,
@@ -331,7 +390,8 @@ impl Worker {
         columns: Vec<Column>,
         system_columns: Vec<usize>,
         changes: RowChanges,
-    ) {
+    ) -> RunId {
+        let run = self.next_run();
         self.spawn(async move {
             let outcome = ops::rows::submit_changes(
                 &conn,
@@ -343,21 +403,25 @@ impl Worker {
             )
             .await
             .map_err(err);
-            Event::Submitted { tab, outcome }
+            Event::Submitted { tab, run, outcome }
         });
+        run
     }
 
     /// `CREATE TABLE` of `table`, from fresh metadata.
-    pub fn ddl(&self, tab: TabId, conn: Conn, db_type: DatabaseType, table: String) {
+    pub fn ddl(&mut self, tab: TabId, conn: Conn, db_type: DatabaseType, table: String) -> RunId {
+        let run = self.next_run();
         self.spawn(async move {
             let cache = TableCache::default();
             let outcome = ops::schema::table_ddl(&conn, &cache, &db_type, &table)
                 .await
                 .map_err(err);
-            Event::Ddl { tab, outcome }
+            Event::Ddl { tab, run, outcome }
         });
+        run
     }
 
+    #[allow(dead_code)] // structure dialog (plan 3b, Task 10)
     pub fn apply_schema(
         &mut self,
         name: String,
@@ -379,6 +443,7 @@ impl Worker {
         });
     }
 
+    #[allow(dead_code)] // transfer dialogs (plan 3b, Task 10)
     pub fn export_result(
         &self,
         result: QueryResult,
@@ -406,6 +471,7 @@ impl Worker {
         });
     }
 
+    #[allow(dead_code)] // transfer dialogs (plan 3b, Task 10)
     pub fn import_csv(&self, conn: Conn, table: String, path: PathBuf, quotes: (char, char)) {
         let mut progress = self.progress();
         self.spawn(async move {
@@ -423,6 +489,7 @@ impl Worker {
         });
     }
 
+    #[allow(dead_code)] // transfer dialogs (plan 3b, Task 10)
     /// Export each `(schema, table)` to `dir`, created if missing.
     pub fn export_tables(
         &self,
@@ -452,6 +519,7 @@ impl Worker {
         });
     }
 
+    #[allow(dead_code)] // transfer dialogs (plan 3b, Task 10)
     pub fn import_tables(
         &self,
         conn: Conn,
@@ -469,6 +537,7 @@ impl Worker {
         });
     }
 
+    #[allow(dead_code)] // transfer dialogs (plan 3b, Task 10)
     /// `DELETE FROM` each (already quoted) table.
     pub fn truncate_tables(&self, conn: Conn, tables: Vec<String>) {
         let progress = self.progress();
@@ -556,13 +625,13 @@ mod tests {
         let mut w = Worker::new(|| {});
         let conn = connected(&mut w, &dir);
 
-        w.run_script(1, conn, "SELECT * FROM t".into(), Some(1000));
+        let id = w.run_script(1, conn, "SELECT * FROM t".into(), Some(1000));
         assert!(w.is_running(1));
         assert!(w.any_running());
-        let Event::Script { tab, outcomes } = next_event(&mut w) else {
+        let Event::Script { tab, run, outcomes } = next_event(&mut w) else {
             panic!("expected Script")
         };
-        assert_eq!(tab, 1);
+        assert_eq!((tab, run), (1, id));
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].result.as_ref().unwrap().rows.len(), 2);
         wait_idle(&w, 1);
@@ -576,11 +645,11 @@ mod tests {
         let conn = connected(&mut w, &dir);
 
         let text = "SELECT 1;\nSELECT * FROM t;";
-        w.run_at_cursor(3, conn, text.into(), text.len() - 3, None);
-        let Event::Script { tab, outcomes } = next_event(&mut w) else {
+        let id = w.run_at_cursor(3, conn, text.into(), text.len() - 3, None);
+        let Event::Script { tab, run, outcomes } = next_event(&mut w) else {
             panic!("expected Script")
         };
-        assert_eq!(tab, 3);
+        assert_eq!((tab, run), (3, id));
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].result.as_ref().unwrap().rows.len(), 2);
     }
@@ -623,27 +692,27 @@ mod tests {
         let mut w = Worker::new(|| {});
         let conn = connected(&mut w, &dir);
 
-        w.load_page(7, conn.clone(), "SELECT * FROM t LIMIT 500 OFFSET 0".into());
-        let Event::Page { tab, outcome } = next_event(&mut w) else {
+        let id = w.load_page(7, conn.clone(), "SELECT * FROM t LIMIT 500 OFFSET 0".into());
+        let Event::Page { tab, run, outcome } = next_event(&mut w) else {
             panic!("expected Page")
         };
-        assert_eq!(tab, 7);
+        assert_eq!((tab, run), (7, id));
         let r = outcome.unwrap();
         assert_eq!(r.rows.len(), 2);
         assert!(r.columns[0].is_primary_key, "page results are enriched");
 
-        w.count(7, conn.clone(), "SELECT COUNT(*) FROM t".into());
-        let Event::Count { tab, outcome } = next_event(&mut w) else {
+        let id = w.count(7, conn.clone(), "SELECT COUNT(*) FROM t".into());
+        let Event::Count { tab, run, outcome } = next_event(&mut w) else {
             panic!("expected Count")
         };
-        assert_eq!(tab, 7);
+        assert_eq!((tab, run), (7, id));
         assert_eq!(outcome, Ok(2));
 
         let changes = RowChanges {
             deletes: vec![r.rows[0].clone()],
             ..Default::default()
         };
-        w.submit(
+        let id = w.submit(
             7,
             conn.clone(),
             DatabaseType::SQLite,
@@ -652,10 +721,10 @@ mod tests {
             vec![0],
             changes,
         );
-        let Event::Submitted { tab, outcome } = next_event(&mut w) else {
+        let Event::Submitted { tab, run, outcome } = next_event(&mut w) else {
             panic!("expected Submitted")
         };
-        assert_eq!(tab, 7);
+        assert_eq!((tab, run), (7, id));
         assert_eq!(outcome, Ok(1));
 
         w.count(7, conn, "SELECT COUNT(*) FROM t".into());
@@ -683,11 +752,35 @@ mod tests {
         assert_eq!((name.as_str(), table.as_str()), ("test", "t"));
         assert_eq!(outcome.unwrap().columns.len(), 2);
 
-        w.ddl(4, conn, DatabaseType::SQLite, "t".into());
-        let Event::Ddl { tab, outcome } = next_event(&mut w) else {
+        let id = w.ddl(4, conn, DatabaseType::SQLite, "t".into());
+        let Event::Ddl { tab, run, outcome } = next_event(&mut w) else {
             panic!("expected Ddl")
         };
-        assert_eq!(tab, 4);
+        assert_eq!((tab, run), (4, id));
         assert!(outcome.unwrap().contains("CREATE TABLE t"));
+    }
+
+    #[test]
+    fn superseded_page_load_is_identifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Worker::new(|| {});
+        let conn = connected(&mut w, &dir);
+
+        let first = w.load_page(7, conn.clone(), "SELECT * FROM t".into());
+        let second = w.load_page(7, conn, "SELECT name FROM t".into());
+        assert_ne!(first, second, "each operation gets its own run id");
+        // The first load may or may not have delivered before being aborted;
+        // whatever arrives, only `second` is the run the tab waits for.
+        loop {
+            let Event::Page { tab, run, outcome } = next_event(&mut w) else {
+                panic!("expected Page")
+            };
+            assert_eq!(tab, 7);
+            if run == second {
+                assert_eq!(outcome.unwrap().columns.len(), 1);
+                break;
+            }
+            assert_eq!(run, first, "unexpected run id");
+        }
     }
 }

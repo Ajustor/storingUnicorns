@@ -1,6 +1,9 @@
 mod cli;
 mod engine;
 mod tui;
+// Parts of the updater (background state machine) are only used by the GUI (plan 3).
+#[allow(dead_code, unused_imports)]
+mod updater;
 
 use cli::Mode;
 

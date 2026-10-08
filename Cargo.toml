@@ -69,5 +69,11 @@ azure_core = "0.22"
 
 update-notifier = "0.1.9"
 
+# Self-update from GitHub Pages
+ureq = "3"
+semver = "1"
+sha2 = "0.10"
+self-replace = "1"
+
 [dev-dependencies]
 tempfile = "3"

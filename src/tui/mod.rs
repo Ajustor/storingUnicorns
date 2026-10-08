@@ -1689,6 +1689,7 @@ async fn handle_save_row(state: &mut AppState) {
             state.set_status("Debug: No changes to generate query");
         }
         state.close_dialog();
+        return;
     }
 
     state.set_status("Saving row...");
@@ -1783,6 +1784,7 @@ async fn handle_insert_row(state: &mut AppState) {
             state.set_status("Debug: No columns to insert");
         }
         state.close_dialog();
+        return;
     }
 
     state.set_status("Inserting row...");
@@ -3210,4 +3212,66 @@ async fn handle_batch_truncate<B: ratatui::backend::Backend>(
     }
 
     state.close_dialog();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::models::{Column, QueryResult};
+    use crate::engine::ops::test_support::{count, sqlite_mem};
+
+    fn cols() -> Vec<Column> {
+        ["id", "name"]
+            .iter()
+            .map(|n| Column {
+                name: n.to_string(),
+                type_name: "TEXT".into(),
+                nullable: true,
+                is_primary_key: *n == "id",
+            })
+            .collect()
+    }
+
+    async fn debug_state() -> AppState {
+        let mut state = AppState::new(AppConfig::default(), true, true);
+        state.connection = Some(
+            sqlite_mem(&[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO t (id, name) VALUES (1, 'a')",
+            ])
+            .await,
+        );
+        state.editing_table_name = Some("t".into());
+        state.query_result = Some(QueryResult {
+            columns: cols(),
+            rows: vec![vec!["1".into(), "a".into()]],
+            rows_affected: 0,
+            execution_time_ms: 0,
+        });
+        state
+    }
+
+    #[tokio::test]
+    async fn debug_mode_save_row_does_not_execute() {
+        let mut state = debug_state().await;
+        state.original_editing_row = Some(vec!["1".into(), "a".into()]);
+        state.editing_row = Some(vec!["1".into(), "z".into()]);
+        handle_save_row(&mut state).await;
+        let conn = state.connection.as_ref().unwrap();
+        let r = conn
+            .execute_query("SELECT name FROM t WHERE id = 1")
+            .await
+            .unwrap();
+        assert_eq!(r.rows[0][0], "a");
+        assert!(state.status_message.starts_with("Debug:"));
+    }
+
+    #[tokio::test]
+    async fn debug_mode_insert_row_does_not_execute() {
+        let mut state = debug_state().await;
+        state.editing_row = Some(vec!["2".into(), "b".into()]);
+        handle_insert_row(&mut state).await;
+        assert_eq!(count(state.connection.as_ref().unwrap(), "t").await, "1");
+        assert!(state.status_message.starts_with("Debug:"));
+    }
 }

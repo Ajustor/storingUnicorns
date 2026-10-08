@@ -296,7 +296,10 @@ impl App {
                 d.needs_load = false;
                 d.loading = true;
                 let sql = build_select(&d.query, &db_type);
-                tab.runs.page = Some(self.worker.load_page(id, conn.clone(), sql));
+                tab.runs.page = Some(
+                    self.worker
+                        .load_page(id, conn.clone(), d.table.clone(), sql),
+                );
                 if count {
                     d.total = None;
                     tab.runs.count = Some(self.worker.count(id, conn, build_count(&d.query)));

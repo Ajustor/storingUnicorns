@@ -676,7 +676,7 @@ pub fn show(
             });
     });
 
-    match footer(ui, state, result) {
+    match footer(ui, state, result, opts.editable, &mut cell_action) {
         GridAction::Submit => {
             state.commit_edit(rows);
             action = GridAction::Submit;
@@ -798,9 +798,39 @@ fn context_menu(
 }
 
 /// Row count and pending changes: Submit or Revert (applied here) clicked.
-fn footer(ui: &mut egui::Ui, state: &mut GridState, result: &QueryResult) -> GridAction {
+fn footer(
+    ui: &mut egui::Ui,
+    state: &mut GridState,
+    result: &QueryResult,
+    editable: bool,
+    cell_action: &mut Option<CellAction>,
+) -> GridAction {
     let mut action = GridAction::None;
     ui.horizontal(|ui| {
+        if editable {
+            // Also the only way to add the first row of an empty table.
+            if ui
+                .small_button(RichText::new(icon::PLUS).color(SUCCESS))
+                .on_hover_text("Ajouter une ligne (Alt+Inser)")
+                .clicked()
+            {
+                *cell_action = Some(CellAction::AddRow);
+            }
+            let selected = state.selected.map(|(r, _)| r);
+            if ui
+                .add_enabled(
+                    selected.is_some(),
+                    egui::Button::new(RichText::new(icon::MINUS).color(ERROR)).small(),
+                )
+                .on_hover_text("Supprimer la ligne sélectionnée (Ctrl+Suppr)")
+                .clicked()
+            {
+                if let Some(r) = selected {
+                    *cell_action = Some(CellAction::ToggleDelete(r));
+                }
+            }
+            ui.separator();
+        }
         let n = result.rows.len();
         let mut text = if state.view.len() == n {
             plural_rows(n)

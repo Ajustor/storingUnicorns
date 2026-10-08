@@ -52,6 +52,23 @@ pub async fn run_query(conn: &DatabaseConnection, sql: &str) -> Result<QueryResu
     run_query_limited(conn, sql, None).await
 }
 
+/// `run_query` for a page of `table`'s rows (`SELECT * …`). Drivers read
+/// the column list from the returned rows, so an empty page has none: take
+/// it from the table's metadata then, so headers and inserts still work.
+pub async fn run_table_page(
+    conn: &DatabaseConnection,
+    sql: &str,
+    table: &str,
+) -> Result<QueryResult> {
+    let mut result = run_query(conn, sql).await?;
+    if result.columns.is_empty() && result.rows.is_empty() {
+        if let Ok(columns) = conn.get_table_column_details(table).await {
+            result.columns = columns;
+        }
+    }
+    Ok(result)
+}
+
 /// `run_query` keeping at most `max_rows` rows (all when `None`).
 async fn run_query_limited(
     conn: &DatabaseConnection,
@@ -247,6 +264,30 @@ mod tests {
         let name = r.columns.iter().find(|c| c.name == "name").unwrap();
         assert!(id.is_primary_key);
         assert!(!name.nullable);
+    }
+
+    #[tokio::test]
+    async fn table_page_of_an_empty_table_still_has_its_columns() {
+        let conn =
+            sqlite_mem(&["CREATE TABLE e (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"]).await;
+        let r = run_table_page(&conn, "SELECT * FROM e LIMIT 500", "e")
+            .await
+            .unwrap();
+        assert!(r.rows.is_empty());
+        let names: Vec<&str> = r.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name"]);
+        assert!(r.columns[0].is_primary_key);
+        assert!(!r.columns[1].nullable);
+    }
+
+    #[tokio::test]
+    async fn table_page_with_rows_keeps_the_result_columns() {
+        let conn = sqlite_mem(SETUP).await;
+        let r = run_table_page(&conn, "SELECT * FROM users", "users")
+            .await
+            .unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.columns.len(), 3);
     }
 
     #[tokio::test]

@@ -347,10 +347,12 @@ impl Worker {
     }
 
     /// Load one page of a data editor; replaces the tab's pending load.
-    pub fn load_page(&mut self, tab: TabId, conn: Conn, sql: String) -> RunId {
+    pub fn load_page(&mut self, tab: TabId, conn: Conn, table: String, sql: String) -> RunId {
         let run = self.next_run();
         self.spawn_for_tab(tab, async move {
-            let outcome = ops::query::run_query(&conn, &sql).await.map_err(err);
+            let outcome = ops::query::run_table_page(&conn, &sql, &table)
+                .await
+                .map_err(err);
             Event::Page { tab, run, outcome }
         });
         run
@@ -693,7 +695,12 @@ mod tests {
         let mut w = Worker::new(|| {});
         let conn = connected(&mut w, &dir);
 
-        let id = w.load_page(7, conn.clone(), "SELECT * FROM t LIMIT 500 OFFSET 0".into());
+        let id = w.load_page(
+            7,
+            conn.clone(),
+            "t".into(),
+            "SELECT * FROM t LIMIT 500 OFFSET 0".into(),
+        );
         let Event::Page { tab, run, outcome } = next_event(&mut w) else {
             panic!("expected Page")
         };
@@ -767,8 +774,8 @@ mod tests {
         let mut w = Worker::new(|| {});
         let conn = connected(&mut w, &dir);
 
-        let first = w.load_page(7, conn.clone(), "SELECT * FROM t".into());
-        let second = w.load_page(7, conn, "SELECT name FROM t".into());
+        let first = w.load_page(7, conn.clone(), "t".into(), "SELECT * FROM t".into());
+        let second = w.load_page(7, conn, "t".into(), "SELECT name FROM t".into());
         assert_ne!(first, second, "each operation gets its own run id");
         // The first load may or may not have delivered before being aborted;
         // whatever arrives, only `second` is the run the tab waits for.

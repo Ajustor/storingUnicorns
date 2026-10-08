@@ -885,8 +885,10 @@ mod tests {
         assert!(!c.log[1].ok);
         assert_eq!(summary, "Erreur · 6 ms");
 
-        let mut affected = QueryResult::default();
-        affected.rows_affected = 1;
+        let affected = QueryResult {
+            rows_affected: 1,
+            ..QueryResult::default()
+        };
         apply_outcomes(&mut c, vec![ok("DELETE FROM t", affected)], Local::now());
         assert!(c.results.is_empty(), "unpinned results replaced");
         assert_eq!(c.active_result, 0, "Sortie when nothing returned rows");

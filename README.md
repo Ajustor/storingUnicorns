@@ -1,44 +1,91 @@
 # storingUnicorns 🦄
 
-A terminal-based database client inspired by JetBrains DataGrip, built with Rust and ratatui.
+A fast database client inspired by JetBrains DataGrip, built with Rust: a
+desktop GUI (egui) and a terminal UI (ratatui) sharing the same engine.
 
 ## Features
 
-- Multi-database support (PostgreSQL, MySQL, SQLite, SQL Server)
-- Connection management with dialog-based creation
-- Schema browser (tables list)
-- SQL query editor
-- Results table with navigation
-- Persistent configuration
-- Contextual help bar
+- PostgreSQL, MySQL, SQLite, SQL Server and Azure SQL
+- **GUI** (default) with DataGrip ergonomics:
+  - several connections open at once, each with its own colour (dot on its tabs)
+  - database explorer: connection → schemas → tables → columns / keys / indexes,
+    loaded lazily, with a filter and context menus (data, console, DDL, structure,
+    export / import / truncate, single table or batch)
+  - SQL consoles: highlighting, completion of tables and columns, formatting,
+    one result tab per statement (pinnable) plus an "Sortie" log, results capped
+    at 1 000 rows, persistent query history
+  - table data editor: 500-row pages, total counted in the background, `WHERE` /
+    `ORDER BY` bar, click a header to sort, inline editing (changed cells
+    highlighted, new rows green, deleted rows struck through in red), changes
+    kept pending until **Submit** applies them in one transaction (or **Revert**)
+  - console results read from a single table with a primary key are editable the same way
+  - value panel (indented JSON, editable), read-only DDL tab, structure dialog
+    (add / modify / rename / drop column), quick table search
+  - dark and light themes (follows the system by default)
+  - in-app updates
+- **TUI** (`storingUnicorns tui`): the original terminal client
+- Persistent configuration, consoles and history
 
-## Project Structure
+## Running
 
 ```
-src/
-├── main.rs                  # mod declarations, #[tokio::main] calling tui::run
-├── engine/                  # UI-agnostic core
-│   ├── mod.rs
-│   ├── config/              # AppConfig: load/save connections
-│   ├── db/                  # DatabaseConnection: unified DB interface + per-driver connectors
-│   ├── models/              # ConnectionConfig, QueryResult, Column
-│   ├── services/            # export/import, query tabs, schema SQL, table cache
-│   ├── sql/
-│   │   ├── lexer.rs         # SQL tokenizer + completions
-│   │   └── statements.rs    # statement splitting, table extraction, quote chars
-│   └── ops/                 # business operations shared by the front-ends
-│       ├── query.rs         # run_query, run_at_cursor, run_all, refresh_schemas
-│       ├── rows.rs          # update/insert/delete row, truncate, system columns
-│       ├── schema.rs        # fetch_columns, apply_modification
-│       └── transfer.rs      # import_csv, import_tables, export_tables
-└── tui/                     # Terminal UI (ratatui)
-    ├── mod.rs               # run(), event loop, handlers
-    ├── app_state.rs         # AppState: runtime state, dialogs
-    ├── key_handlers/        # per-panel keybindings
-    └── ui/                  # layout, widgets, modals, SQL highlighting
+storingUnicorns                 Open the graphical interface
+storingUnicorns tui [OPTIONS]   Open the terminal interface
+storingUnicorns update          Download and install the latest version
+storingUnicorns --version       Print the version
+storingUnicorns --help          Print this help
+
+TUI OPTIONS:
+    -d, --debug             Show generated SQL in the editor instead of running it
+    -na, --no-animations    Disable animations
 ```
 
-## Keybindings
+From the sources: `cargo run` (GUI) or `cargo run -- tui`.
+
+## GUI
+
+```
+┌────────────────┬──────────────────────────────────────────┬───────────┐
+│ EXPLORER  🔍   │ [● console prod] [● users] [● console dev]│ VALUE     │
+│ ● Prod PG      │ SELECT * FROM users WHERE …               │ {         │
+│  ▾ public      │                                           │  "a": 1   │
+│   ▾ users      ├───────────────────────────────────────────┤ }         │
+│     ▸ columns  │ [Résultat 1 📌] [Résultat 2] [Sortie]     │           │
+│     ▸ keys     │ id │ name  │ email                        │           │
+│     ▸ indexes  │ 1  │ Alice*│ alice@…                      │           │
+│ ○ Dev MySQL    │ + │ − │ 2 modification(s)  ✓ Submit  Revert│          │
+└────────────────┴──────────────────────────────────────────┴───────────┘
+ ● ● 2 connexions · page 1/9 · 500 lignes · 12 ms              ◐ ▥ v0.9.0
+```
+
+- Expanding a connection in the explorer connects it; double-clicking a table
+  opens its data editor.
+- `Ctrl+Entrée` in a console runs the selection, otherwise the statement (or the
+  whole `BEGIN … COMMIT` block) at the cursor; `F5` runs the whole script.
+- Result tabs are replaced at each run, except pinned ones.
+- `Échap` cancels the running query (a transaction block is rolled back by the
+  database), the cell being edited, or closes the dialog.
+- Errors are shown in red in the status bar (hover for the full text) and in
+  the console's "Sortie" tab; nothing is swallowed.
+
+### Raccourcis (GUI)
+
+| Touche                      | Action                                                   |
+|-----------------------------|----------------------------------------------------------|
+| `Ctrl+Entrée`               | Console : exécuter la sélection / l'instruction au curseur ; grille : Submit |
+| `F5`                        | Exécuter tout le script                                  |
+| `Échap`                     | Annuler la requête en cours / l'édition de cellule / fermer la modale |
+| `Ctrl+Alt+L`                | Formater le SQL                                          |
+| `Ctrl+Alt+E`                | Historique des requêtes                                  |
+| `Ctrl+N`                    | Rechercher une table                                     |
+| `Ctrl+T` / `Ctrl+W`         | Nouvelle console (connexion courante) / fermer l'onglet  |
+| `Ctrl+S`                    | Enregistrer les consoles                                 |
+| `Ctrl+Espace`               | Autocomplétion                                           |
+| `F2` / double-clic          | Éditer la cellule                                        |
+| `Alt+Insert` / `Ctrl+Suppr` | Ajouter / supprimer une ligne                            |
+| `Ctrl+R`                    | Rafraîchir (explorateur ou données)                      |
+
+## Raccourcis (TUI)
 
 ### Main Interface
 
@@ -68,41 +115,7 @@ src/
 | `Enter`     | Save connection                     |
 | `Esc`       | Cancel                              |
 
-## Configuration
-
-Connections are stored in `~/.config/storingUnicorns/config.toml`:
-
-```toml
-[[connections]]
-name = "Local Postgres"
-db_type = "Postgres"
-host = "localhost"
-port = 5432
-username = "postgres"
-password = "secret"
-database = "mydb"
-
-[[connections]]
-name = "SQLite DB"
-db_type = "SQLite"
-database = "./data.db"
-```
-
-## Building
-
-```bash
-cargo build --release
-```
-
-## Running
-
-```bash
-cargo run
-# or after building:
-./target/release/storingUnicorns
-```
-
-## Layout
+### Layout
 
 ```
 ┌─────────────┬─────────────────────────────────┐
@@ -117,6 +130,85 @@ cargo run
 └───────────────────────────────────────────────┘
 ```
 
+## Configuration
+
+Every file lives in the app directory: `storing-unicorns/` under the platform
+config directory (`%APPDATA%` on Windows, `~/.config` on Linux,
+`~/Library/Application Support` on macOS):
+
+| File                | Content                                          |
+|---------------------|--------------------------------------------------|
+| `config.toml`       | connections, theme, skipped update               |
+| `queries.toml`      | saved consoles                                   |
+| `history.json`      | last 500 executed queries (GUI)                  |
+| `last_update_check` | time of the last automatic update check          |
+| `debug.log`         | TUI log                                          |
+
+Set `STORINGUNICORNS_CONFIG_DIR` to use another directory (a test profile, a
+portable install…). The tests never touch the real directory.
+
+```toml
+theme = "dark"          # "system" (default), "dark" or "light"
+
+[[connections]]
+name = "Local Postgres"
+db_type = "Postgres"
+host = "localhost"
+port = 5432
+username = "postgres"
+password = "secret"
+database = "mydb"
+color = [229, 83, 75]   # optional, GUI tab dot
+
+[[connections]]
+name = "SQLite DB"
+db_type = "SQLite"
+database = "./data.db"
+```
+
+## Building
+
+```bash
+cargo build --release
+cargo test
+```
+
+## Project Structure
+
+```
+src/
+├── main.rs                  # entry point: dispatches GUI / TUI / update
+├── cli.rs                   # command line parsing and help
+├── console.rs               # Windows: detach the GUI from the launching console
+├── engine/                  # UI-agnostic core
+│   ├── config/              # AppConfig, app directory
+│   ├── db/                  # DatabaseConnection: unified DB interface + per-driver connectors
+│   ├── models/              # ConnectionConfig, QueryResult, Column, TableDetails
+│   ├── services/            # export/import, query tabs, history, schema SQL, table cache
+│   ├── sql/                 # lexer + completions, statements, paging, formatting
+│   └── ops/                 # business operations shared by the front-ends
+│       ├── query.rs         # run_query, run_table_page, run_at_cursor, run_script
+│       ├── rows.rs          # submit_changes, row edits, truncate, system columns
+│       ├── schema.rs        # table details, DDL, column modifications
+│       └── transfer.rs      # import_csv, import_tables, export_tables
+├── gui/                     # egui desktop client
+│   ├── app.rs               # App: frame loop, event routing, global shortcuts
+│   ├── worker.rs            # async operations on a tokio runtime, Event channel
+│   ├── sessions.rs          # open connections and cached metadata
+│   ├── explorer.rs          # database tree, filter, context menus
+│   ├── tabs/                # console, data editor, DDL tabs
+│   ├── grid/                # virtualised data grid + pending edits model
+│   ├── editor/              # SQL editor, highlighting, completion popup
+│   ├── dialogs/             # connection, structure, import/export
+│   ├── value_panel.rs, history_popup.rs, table_search.rs, status.rs, theme.rs
+├── tui/                     # terminal UI (ratatui)
+│   ├── mod.rs               # run(), event loop, handlers
+│   ├── app_state.rs         # AppState: runtime state, dialogs
+│   ├── key_handlers/        # per-panel keybindings
+│   └── ui/                  # layout, widgets, modals, SQL highlighting
+└── updater/                 # release check, download, install, background check
+```
+
 ## TODO
 
 - [x] Multi-line query editor with proper cursor movement
@@ -124,6 +216,6 @@ cargo run
 - [x] Query history
 - [x] Result set export (CSV, JSON)
 - [x] Syntax highlighting for SQL
-- [ ] Async query execution with cancellation
-- [ ] Tab completion for table/column names
+- [x] Async query execution with cancellation (GUI)
+- [x] Tab completion for table/column names
 - [x] Edit existing connections

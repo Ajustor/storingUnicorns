@@ -1,0 +1,66 @@
+name: Pages
+
+# Rebuild the download page when its sources change on master, without waiting
+# for the next release. The site is rebuilt from the latest stable release's
+# assets (each deploy replaces the whole site).
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'pages/**'
+      - 'CHANGELOG.md'
+      - 'scripts/changelog.py'
+      - 'scripts/build-pages.py'
+      - 'scripts/build-site.sh'
+      - 'scripts/install.sh'
+      - 'scripts/install.ps1'
+      - 'assets/icon.png'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  pages:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Find latest stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+            --limit 1 --json tagName --jq '.[0].tagName // empty')
+          if [ -z "$tag" ]; then
+            echo "::error::No stable release to publish"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" --dir artifacts
+      - id: pages
+        uses: actions/configure-pages@v5
+      - name: Build site
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: bash scripts/build-site.sh "${{ steps.release.outputs.tag }}" "$BASE_URL" artifacts
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

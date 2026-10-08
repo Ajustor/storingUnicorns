@@ -219,3 +219,17 @@ src/
 - [x] Async query execution with cancellation (GUI)
 - [x] Tab completion for table/column names
 - [x] Edit existing connections
+
+## Installer
+
+- Linux / macOS : `curl -fsSL https://ajustor.github.io/storingUnicorns/install.sh | sh`
+- Windows : `irm https://ajustor.github.io/storingUnicorns/install.ps1 | iex`, ou l'installateur `.msi`
+  sur la [page de téléchargement](https://ajustor.github.io/storingUnicorns/)
+- Depuis les sources : `cargo install storingUnicorns`
+
+## Publier une version
+
+1. Mettre à jour `version` dans `Cargo.toml` et ajouter la section `## [X.Y.Z] - AAAA-MM-JJ` dans `CHANGELOG.md`.
+2. Commit, puis `git tag vX.Y.Z && git push origin master vX.Y.Z`.
+3. Le workflow Release construit les binaires et le MSI, crée la release GitHub,
+   publie la page de téléchargement + `latest.json` sur GitHub Pages, puis publie sur crates.io.

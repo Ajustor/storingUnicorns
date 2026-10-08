@@ -1,33 +1,247 @@
-# .github/workflows/release.yml
-# Drop this into any Cargo project repo
-
 name: Release
 
 on:
   push:
-    branches:
-      - master
     tags:
       - 'v*'
 
+env:
+  CARGO_TERM_COLOR: always
+
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 jobs:
-  version-check:
-    uses: Ajustor/workflows/.github/workflows/cargo-version-detect.yml@master
+  verify-version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The in-app updater compares the release tag with CARGO_PKG_VERSION; a
+      # mismatch would make every client re-offer the update forever.
+      - name: Compare versions
+        run: |
+          cargo_version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+
+      - name: Check CHANGELOG.md entry
+        if: ${{ !contains(github.ref_name, '-') }}
+        run: |
+          if ! python3 scripts/changelog.py CHANGELOG.md "$GITHUB_REF_NAME" > /dev/null; then
+            echo "::error::CHANGELOG.md has no '## [${GITHUB_REF_NAME#v}]' section"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.artifact }}
+    needs: verify-version
+    runs-on: ${{ matrix.os }}
+    env:
+      # Authenticode signing is opt-in: it runs only when both secrets are set.
+      HAS_CERT: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: storingUnicorns-linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: storingUnicorns-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: storingUnicorns-windows-x64.exe
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libssl-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libglib2.0-dev \
+            libxkbcommon-x11-dev libwayland-dev
+
+      - name: Test
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare code signing (Windows)
+        if: matrix.os == 'windows-latest' && env.HAS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          "CODESIGN_PFX=$pfx" >> $env:GITHUB_ENV
+          "SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+
+      - name: Sign binary (Windows)
+        if: matrix.os == 'windows-latest' && env.HAS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $exe = "target\${{ matrix.target }}\release\storingUnicorns.exe"
+          & $env:SIGNTOOL sign /f $env:CODESIGN_PFX /p $env:WINDOWS_CERT_PASSWORD `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "storingUnicorns" $exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed" }
+
+      - name: Rename binary (Unix)
+        if: matrix.os != 'windows-latest'
+        run: cp target/${{ matrix.target }}/release/storingUnicorns ${{ matrix.artifact }}
+
+      - name: Rename binary (Windows)
+        if: matrix.os == 'windows-latest'
+        run: cp target/${{ matrix.target }}/release/storingUnicorns.exe ${{ matrix.artifact }}
+
+      - name: Build Windows installer (MSI)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path target\release | Out-Null
+          Copy-Item target\${{ matrix.target }}\release\storingUnicorns.exe target\release\storingUnicorns.exe -Force
+          $wixDir = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*" | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $wixDir) {
+            choco install wixtoolset --no-progress -y
+            $wixDir = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*" | Sort-Object Name -Descending | Select-Object -First 1
+          }
+          $candle = Join-Path $wixDir.FullName "bin\candle.exe"
+          $light  = Join-Path $wixDir.FullName "bin\light.exe"
+          # MSI versions are x.y.z only.
+          $version = "${{ github.ref_name }}".TrimStart('v').Split('-')[0]
+          & $candle -arch x64 "-dProductVersion=$version" -out wix\main.wixobj wix\main.wxs
+          if ($LASTEXITCODE -ne 0) { throw "candle failed" }
+          & $light -ext WixUIExtension -out storingUnicorns-setup.msi wix\main.wixobj
+          if ($LASTEXITCODE -ne 0) { throw "light failed" }
+
+      - name: Sign installer (Windows)
+        if: matrix.os == 'windows-latest' && env.HAS_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          & $env:SIGNTOOL sign /f $env:CODESIGN_PFX /p $env:WINDOWS_CERT_PASSWORD `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "storingUnicorns Installer" storingUnicorns-setup.msi
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed" }
+
+      - name: Remove signing certificate (Windows)
+        if: always() && matrix.os == 'windows-latest' && env.HAS_CERT == 'true'
+        shell: pwsh
+        run: if ($env:CODESIGN_PFX -and (Test-Path $env:CODESIGN_PFX)) { Remove-Item $env:CODESIGN_PFX -Force }
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+      - if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v5
+        with:
+          name: storingUnicorns-setup-msi
+          path: storingUnicorns-setup.msi
 
   release:
-    needs: version-check
-    if: needs.version-check.outputs.version_changed == 'true'
-    uses: Ajustor/workflows/.github/workflows/cargo-release.yml@master
-    with:
-      version: ${{ needs.version-check.outputs.new_version }}
-      targets: '["windows", "linux", "macos"]'
-      publish_to_crate: true
-      deploy_pages: true
-      # package_name: "my-binary"  # Optional: defaults to Cargo.toml name
-    secrets:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts/
+      - name: Release notes
+        id: notes
+        run: |
+          if python3 scripts/changelog.py CHANGELOG.md "$GITHUB_REF_NAME" > release-notes.md; then
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+          else
+            : > release-notes.md
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: storingUnicorns ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body_path: release-notes.md
+          files: artifacts/**/*
+          generate_release_notes: ${{ steps.notes.outputs.generate }}
+
+  # Binaries + latest.json + install scripts on GitHub Pages: what the in-app
+  # updater (src/updater/mod.rs) and scripts/install.* read. Each deploy
+  # replaces the whole site, so only the latest stable release is hosted.
+  pages:
+    name: Publish to GitHub Pages
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts/
+      - id: pages
+        uses: actions/configure-pages@v5
+      - name: Build site
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: bash scripts/build-site.sh "$GITHUB_REF_NAME" "$BASE_URL" artifacts
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  crates:
+    name: Publish to crates.io
+    needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    env:
+      HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux system dependencies
+        if: env.HAS_TOKEN == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libssl-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libglib2.0-dev \
+            libxkbcommon-x11-dev libwayland-dev
+      - name: cargo publish
+        if: env.HAS_TOKEN == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish

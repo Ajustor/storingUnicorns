@@ -3,6 +3,8 @@
 pub mod connection;
 
 use super::app::App;
+use super::history_popup::{HistoryAction, HistoryPopup};
+use super::tabs::TabKind;
 use super::worker::Event;
 use connection::{ConnectionForm, FormAction};
 
@@ -10,6 +12,8 @@ pub enum Dialog {
     Connection(Box<ConnectionForm>),
     /// Delete the connection with this name.
     ConfirmDeleteConnection(String),
+    /// Query history (Ctrl+Alt+E) of the active console.
+    History(HistoryPopup),
 }
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
@@ -40,6 +44,17 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     Err(e) => form.error = Some(e),
                 },
             },
+            Dialog::History(popup) => {
+                ui.set_min_width(640.0);
+                if let HistoryAction::Insert(sql) = popup.ui(ui, &app.history) {
+                    if let Some(tab) = app.tabs.active_mut() {
+                        if let TabKind::Console(c) = &mut tab.kind {
+                            c.insert(ui.ctx(), tab.id, &sql);
+                        }
+                    }
+                    keep = false;
+                }
+            }
             Dialog::ConfirmDeleteConnection(name) => {
                 ui.heading("Supprimer la connexion");
                 ui.label(format!(

@@ -78,7 +78,8 @@ impl Tab {
             return;
         }
         match &mut self.kind {
-            TabKind::Console(c) => c.on_event(ev),
+            // Script outcomes are applied by the app (history, summary).
+            TabKind::Console(_) => {}
             TabKind::Data(d) => d.on_event(ev),
             TabKind::Ddl(d) => d.on_event(ev),
         }

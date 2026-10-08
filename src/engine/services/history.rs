@@ -27,7 +27,6 @@ pub struct History {
     path: PathBuf,
 }
 
-#[allow(dead_code)] // used by the GUI (plan 3b)
 impl History {
     /// Maximum number of entries kept.
     pub const MAX: usize = 500;

@@ -176,11 +176,9 @@ pub struct TableDetails {
 pub struct QueryResult {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<String>>,
-    #[allow(dead_code)]
     pub rows_affected: u64,
     pub execution_time_ms: u128,
     /// True when fetching stopped at a row cap (more rows were available).
-    #[allow(dead_code)] // used by the GUI (plan 3b)
     pub truncated: bool,
 }
 

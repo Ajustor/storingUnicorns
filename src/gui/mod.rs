@@ -1,7 +1,9 @@
 //! Graphical interface (egui).
 mod app;
 mod dialogs;
+mod editor;
 mod explorer;
+mod history_popup;
 // Used by the data grid and data editor (plan 3b, Task 7 onward).
 #[allow(dead_code)]
 mod grid;

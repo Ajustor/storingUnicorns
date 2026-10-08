@@ -49,7 +49,6 @@ impl Sessions {
         self.open.get_mut(name)
     }
 
-    #[allow(dead_code)] // console and data tabs (plan 3b, Tasks 6 and 8)
     pub fn conn(&self, name: &str) -> Option<Conn> {
         self.open.get(name).map(|s| s.conn.clone())
     }
@@ -65,7 +64,6 @@ impl Sessions {
     }
 
     /// Table names of one connection (completion).
-    #[allow(dead_code)] // console completion (plan 3b, Task 6)
     pub fn tables_of(&self, name: &str) -> Vec<String> {
         self.open
             .get(name)

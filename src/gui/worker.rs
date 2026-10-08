@@ -58,7 +58,6 @@ pub enum Event {
     Script {
         tab: TabId,
         run: RunId,
-        #[allow(dead_code)] // console tab (plan 3b, Task 6)
         outcomes: Vec<StatementOutcome>,
     },
     /// One page of a data editor.
@@ -316,7 +315,6 @@ impl Worker {
         });
     }
 
-    #[allow(dead_code)] // console tab (plan 3b, Task 6)
     /// Execute every statement of `text` (F5 / selection).
     pub fn run_script(
         &mut self,
@@ -333,7 +331,6 @@ impl Worker {
         run
     }
 
-    #[allow(dead_code)] // console tab (plan 3b, Task 6)
     /// Execute the statement or transaction block under `cursor` (byte offset).
     pub fn run_at_cursor(
         &mut self,

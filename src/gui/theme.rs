@@ -98,7 +98,6 @@ pub fn fonts() -> egui::FontDefinitions {
     fonts
 }
 
-#[allow(dead_code)] // SQL editor (plan 3b, Task 6)
 /// Colour of a SQL token for the current background.
 pub fn token_color(token: &SqlToken, dark: bool) -> Color32 {
     let (d, l) = match token {

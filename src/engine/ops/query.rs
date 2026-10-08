@@ -39,7 +39,6 @@ pub enum RunError {
 
 /// One executed unit of a script (a statement, or a whole transaction block).
 #[derive(Debug)]
-#[allow(dead_code)] // fields read by the console tab (plan 3b)
 pub struct StatementOutcome {
     /// The SQL as executed (a transaction block is joined with ";\n").
     pub sql: String,

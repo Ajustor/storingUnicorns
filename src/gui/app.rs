@@ -5,14 +5,16 @@ use egui_phosphor::regular as icon;
 
 use crate::engine::config::AppConfig;
 use crate::engine::models::ConnectionConfig;
-use crate::engine::services::history::History;
+use crate::engine::services::history::{History, HistoryEntry};
 use crate::engine::services::query_tabs::{QueryTab, QueryTabsState};
 use crate::updater::{ExitAction, Updater};
 
 use super::dialogs::{self, connection::same_target, Dialog};
+use super::history_popup::{self, HistoryPopup};
 use super::sessions::{Session, Sessions};
 use super::status::{self, Status, StatusKind};
-use super::tabs::{self, console::ConsoleTab, data::DataTab, ddl::DdlTab, TabId, TabKind, Tabs};
+use super::tabs::console::{self, ConsoleAction, ConsoleContext, ConsoleTab, RunKind};
+use super::tabs::{self, data::DataTab, ddl::DdlTab, TabId, TabKind, Tabs};
 use super::theme::{self, ThemeChoice, ERROR};
 use super::worker::{Event, Worker};
 
@@ -361,8 +363,8 @@ impl App {
                     s.details.insert(table, outcome);
                 }
             }
-            ev @ (Event::Script { .. }
-            | Event::Page { .. }
+            ev @ Event::Script { .. } => self.on_script(ev),
+            ev @ (Event::Page { .. }
             | Event::Count { .. }
             | Event::Submitted { .. }
             | Event::Ddl { .. }) => {
@@ -413,6 +415,74 @@ impl App {
                 }
             }
             ev @ Event::TestFinished(_) => dialogs::handle_event(self, ev),
+        }
+    }
+
+    /// Outcomes of a console run: result tabs, log, history, summary.
+    fn on_script(&mut self, ev: Event) {
+        let Some(tab) = ev.tab().and_then(|id| self.tabs.find(id)) else {
+            return;
+        };
+        if !tab.runs.accept(&ev) {
+            return;
+        }
+        let (Event::Script { outcomes, .. }, TabKind::Console(c)) = (ev, &mut tab.kind) else {
+            return;
+        };
+        let at = history_popup::now_secs();
+        for o in outcomes.iter().filter(|o| !o.sql.trim().is_empty()) {
+            self.history.push(HistoryEntry {
+                sql: o.sql.clone(),
+                connection: tab.connection.clone(),
+                at,
+                duration_ms: o.elapsed_ms as u64,
+                ok: o.result.is_ok(),
+            });
+        }
+        tab.summary = Some(console::apply_outcomes(c, outcomes, chrono::Local::now()));
+    }
+
+    /// Apply what the console at `index` asked for.
+    fn console_action(&mut self, index: usize, action: ConsoleAction) {
+        let Some(tab) = self.tabs.list.get_mut(index) else {
+            return;
+        };
+        let TabKind::Console(c) = &mut tab.kind else {
+            return;
+        };
+        match action {
+            ConsoleAction::Run(kind) => {
+                let Some(conn) = self.sessions.conn(&tab.connection) else {
+                    self.status = Status {
+                        text: format!("{} n'est pas connectée", tab.connection),
+                        kind: StatusKind::Error,
+                    };
+                    return;
+                };
+                let max = Some(console::MAX_ROWS);
+                let run = match kind {
+                    RunKind::Script(text) => self.worker.run_script(tab.id, conn, text, max),
+                    RunKind::AtCursor { text, cursor } => {
+                        self.worker.run_at_cursor(tab.id, conn, text, cursor, max)
+                    }
+                };
+                tab.runs.script = Some(run);
+                c.running_since = Some(std::time::Instant::now());
+                tab.summary = Some("Exécution…".into());
+            }
+            ConsoleAction::Cancel => {
+                self.worker.cancel(tab.id);
+                tab.runs.script = None;
+                c.cancelled();
+                tab.summary = Some("Annulé".into());
+            }
+            ConsoleAction::Rebind(name) => {
+                tab.connection = name;
+                c.completion = Default::default();
+            }
+            ConsoleAction::History(search) => {
+                self.dialog = Some(Dialog::History(HistoryPopup::new(search)));
+            }
         }
     }
 
@@ -546,14 +616,46 @@ impl App {
             });
             ui.separator();
         }
-        let Some(tab) = self.tabs.active_mut() else {
+        let connections: Vec<_> = self
+            .sessions
+            .open
+            .keys()
+            .map(|name| (name.clone(), self.color_of(name)))
+            .collect();
+        let shortcuts = self.dialog.is_none();
+        let index = self.tabs.active;
+        let sessions = &self.sessions;
+        let Some(tab) = self.tabs.list.get_mut(index) else {
             return;
         };
-        let id = tab.id;
-        match &mut tab.kind {
-            TabKind::Console(c) => c.show(ui, id),
-            TabKind::Data(d) => d.show(ui),
-            TabKind::Ddl(d) => d.show(ui),
+        let action = match &mut tab.kind {
+            TabKind::Console(c) => {
+                let name = tab.connection.as_str();
+                let tables = || sessions.tables_of(name);
+                c.show(
+                    ui,
+                    ConsoleContext {
+                        tab: tab.id,
+                        connection: name,
+                        connections: &connections,
+                        connected: sessions.open.contains_key(name),
+                        running: tab.runs.script.is_some(),
+                        shortcuts,
+                        tables: &tables,
+                    },
+                )
+            }
+            TabKind::Data(d) => {
+                d.show(ui);
+                None
+            }
+            TabKind::Ddl(d) => {
+                d.show(ui);
+                None
+            }
+        };
+        if let Some(action) = action {
+            self.console_action(index, action);
         }
     }
 }

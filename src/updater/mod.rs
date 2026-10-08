@@ -13,6 +13,7 @@ mod background;
 pub use background::{UpdateEvent, UpdateState, Updater};
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -91,8 +92,37 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-fn http_get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
-    ureq::get(url)
+/// Connection establishment (incl. TLS handshake).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole manifest request.
+const MANIFEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole asset download.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Waiting for response headers on the asset request. ureq 3 has no
+/// per-read idle timeout (`timeout_recv_body` is a total budget), so a
+/// stalled body is bounded by `DOWNLOAD_TIMEOUT` only.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn manifest_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_global(Some(MANIFEST_TIMEOUT))
+        .build()
+        .new_agent()
+}
+
+fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+        .timeout_global(Some(DOWNLOAD_TIMEOUT))
+        .build()
+        .new_agent()
+}
+
+fn http_get(agent: &ureq::Agent, url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
+    agent
+        .get(url)
         .header("User-Agent", USER_AGENT)
         .call()
         .map_err(|e| format!("request to {url} failed: {e}"))
@@ -100,7 +130,7 @@ fn http_get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
 
 /// Blocking: fetch the manifest and return the update for this build, if any.
 pub fn fetch_latest() -> Result<Option<ReleaseInfo>, String> {
-    let mut resp = http_get(MANIFEST_URL)?;
+    let mut resp = http_get(&manifest_agent(), MANIFEST_URL)?;
     let text = resp
         .body_mut()
         .read_to_string()
@@ -179,7 +209,7 @@ fn kind_for_location(
 /// Blocking: download, verify and install. Returns the staged MSI for MSI
 /// installs, `None` once the binary has been replaced.
 pub fn download_and_apply(info: &ReleaseInfo) -> Result<Option<PathBuf>, String> {
-    let mut resp = http_get(&info.asset.url)?;
+    let mut resp = http_get(&download_agent(), &info.asset.url)?;
     let bytes = resp
         .body_mut()
         .with_config()

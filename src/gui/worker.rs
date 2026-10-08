@@ -77,7 +77,6 @@ pub enum Event {
     Submitted {
         tab: TabId,
         run: RunId,
-        #[allow(dead_code)] // data tab (plan 3b, Task 8)
         outcome: Result<usize, String>,
     },
     Ddl {
@@ -373,8 +372,8 @@ impl Worker {
         run
     }
 
-    #[allow(dead_code)] // data tab (plan 3b, Task 8)
-    /// Apply a data editor's pending changes in one transaction.
+    /// Apply a data editor's or console result's pending changes in one
+    /// transaction.
     #[allow(clippy::too_many_arguments)]
     pub fn submit(
         &mut self,

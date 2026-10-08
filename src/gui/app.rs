@@ -364,6 +364,7 @@ impl App {
                 }
             }
             ev @ Event::Script { .. } => self.on_script(ev),
+            ev @ Event::Submitted { .. } if self.is_console(&ev) => self.on_console_submitted(ev),
             ev @ (Event::Page { .. }
             | Event::Count { .. }
             | Event::Submitted { .. }
@@ -418,6 +419,57 @@ impl App {
         }
     }
 
+    /// Whether the outcome `ev` belongs to an open console tab.
+    fn is_console(&mut self, ev: &Event) -> bool {
+        ev.tab()
+            .and_then(|id| self.tabs.find(id))
+            .is_some_and(|t| matches!(t.kind, TabKind::Console(_)))
+    }
+
+    /// Submit of a console result: on success clear its edits and re-run its
+    /// SQL to refresh it; on failure keep the edits and show the error.
+    fn on_console_submitted(&mut self, ev: Event) {
+        let Some(tab) = ev.tab().and_then(|id| self.tabs.find(id)) else {
+            return;
+        };
+        if !tab.runs.accept(&ev) {
+            return;
+        }
+        let (Event::Submitted { outcome, .. }, TabKind::Console(c)) = (ev, &mut tab.kind) else {
+            return;
+        };
+        let Some(id) = c.submitting.take() else {
+            return;
+        };
+        let Some(r) = c.results.iter_mut().find(|r| r.id == id) else {
+            return;
+        };
+        match outcome {
+            Ok(n) => {
+                r.grid.editing = None;
+                r.grid.edits.clear();
+                r.error = None;
+                let sql = r.sql.clone();
+                let text = format!("{n} modification(s) appliquée(s)");
+                tab.summary = Some(text.clone());
+                // A run in progress keeps going: the result refreshes on the next run.
+                if let (None, Some(conn)) = (tab.runs.script, self.sessions.conn(&tab.connection)) {
+                    let run = self
+                        .worker
+                        .run_script(tab.id, conn, sql, Some(console::MAX_ROWS));
+                    tab.runs.script = Some(run);
+                    c.refreshing = Some(id);
+                    c.running_since = Some(std::time::Instant::now());
+                }
+                self.success(text);
+            }
+            Err(e) => {
+                r.error = Some(e.clone());
+                self.error(format!("Submit annulé (transaction annulée) : {e}"));
+            }
+        }
+    }
+
     /// Outcomes of a console run: result tabs, log, history, summary.
     fn on_script(&mut self, ev: Event) {
         let Some(tab) = ev.tab().and_then(|id| self.tabs.find(id)) else {
@@ -429,6 +481,15 @@ impl App {
         let (Event::Script { outcomes, .. }, TabKind::Console(c)) = (ev, &mut tab.kind) else {
             return;
         };
+        if let Some(id) = c.refreshing.take() {
+            tab.summary = Some(console::apply_refresh(
+                c,
+                id,
+                outcomes,
+                chrono::Local::now(),
+            ));
+            return;
+        }
         let at = history_popup::now_secs();
         for o in outcomes.iter().filter(|o| !o.sql.trim().is_empty()) {
             self.history.push(HistoryEntry {
@@ -467,12 +528,14 @@ impl App {
                     }
                 };
                 tab.runs.script = Some(run);
+                c.refreshing = None;
                 c.running_since = Some(std::time::Instant::now());
                 tab.summary = Some("Exécution…".into());
             }
             ConsoleAction::Cancel => {
                 self.worker.cancel(tab.id);
                 tab.runs.script = None;
+                c.refreshing = None;
                 c.cancelled();
                 tab.summary = Some("Annulé".into());
             }
@@ -482,6 +545,41 @@ impl App {
             }
             ConsoleAction::History(search) => {
                 self.dialog = Some(Dialog::History(HistoryPopup::new(search)));
+            }
+            ConsoleAction::Submit {
+                result_index,
+                table,
+                columns,
+                system_columns,
+                changes,
+            } => {
+                if tab.runs.submit.is_some() {
+                    return;
+                }
+                let Some(session) = self.sessions.get(&tab.connection) else {
+                    self.status = Status {
+                        text: format!("{} n'est pas connectée", tab.connection),
+                        kind: StatusKind::Error,
+                    };
+                    return;
+                };
+                let Some(r) = c.results.get_mut(result_index) else {
+                    return;
+                };
+                r.error = None;
+                c.submitting = Some(r.id);
+                let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
+                let run = self.worker.submit(
+                    tab.id,
+                    conn,
+                    db_type,
+                    table,
+                    columns,
+                    system_columns,
+                    changes,
+                );
+                tab.runs.submit = Some(run);
+                tab.summary = Some("Submit…".into());
             }
         }
     }

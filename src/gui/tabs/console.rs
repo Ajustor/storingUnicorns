@@ -5,14 +5,15 @@ use std::time::Instant;
 
 use chrono::{DateTime, Local};
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText};
-use egui_extras::{Column as TableColumn, TableBuilder};
 use egui_phosphor::regular as icon;
 
-use crate::engine::models::QueryResult;
+use crate::engine::models::{Column, QueryResult};
 use crate::engine::ops::query::StatementOutcome;
+use crate::engine::ops::rows::{detect_system_columns, RowChanges};
 use crate::engine::sql::format::format_sql;
 use crate::engine::sql::statements::extract_table_from_query;
 use crate::gui::editor::{self, completion::Completion, EditorContext};
+use crate::gui::grid::{self, GridAction, GridOptions, GridState};
 use crate::gui::theme::{self, ACCENT, ERROR};
 
 use super::TabId;
@@ -44,11 +45,40 @@ pub const HISTORY: KeyboardShortcut = KeyboardShortcut::new(
 );
 
 pub struct ResultTab {
+    /// Unique in its console (indices shift when tabs close).
+    pub id: u64,
     /// "Résultat 1", or the table name when the query reads one table.
     pub title: String,
     pub sql: String,
     pub result: QueryResult,
     pub pinned: bool,
+    pub grid: GridState,
+    /// Read from one table with a primary key: edits can be submitted.
+    pub editable: bool,
+    /// Last failed Submit (the transaction was rolled back).
+    pub error: Option<String>,
+}
+
+impl ResultTab {
+    pub fn new(id: u64, title: String, sql: String, result: QueryResult) -> Self {
+        let editable = is_editable(&sql, &result);
+        Self {
+            id,
+            title,
+            sql,
+            result,
+            pinned: false,
+            grid: GridState::default(),
+            editable,
+            error: None,
+        }
+    }
+}
+
+/// A console result is editable when it reads a single table and has a
+/// primary key column.
+pub fn is_editable(sql: &str, result: &QueryResult) -> bool {
+    extract_table_from_query(sql).is_some() && result.columns.iter().any(|c| c.is_primary_key)
 }
 
 pub struct LogLine {
@@ -76,6 +106,11 @@ pub struct ConsoleTab {
     pub completion: Completion,
     /// Move the editor cursor to `cursor` on the next frame (restored console).
     restore_cursor: bool,
+    next_result_id: u64,
+    /// Result tab whose Submit is running.
+    pub submitting: Option<u64>,
+    /// Result tab whose SQL is re-run after a Submit (the running script).
+    pub refreshing: Option<u64>,
 }
 
 /// How to run the console's SQL.
@@ -94,6 +129,14 @@ pub enum ConsoleAction {
     Rebind(String),
     /// Open the history popup with this search.
     History(String),
+    /// Apply the pending edits of result tab `result_index`.
+    Submit {
+        result_index: usize,
+        table: String,
+        columns: Vec<Column>,
+        system_columns: Vec<usize>,
+        changes: RowChanges,
+    },
 }
 
 /// What the console needs from the app to draw itself.
@@ -190,12 +233,10 @@ pub fn apply_outcomes(
                 });
                 if !result.columns.is_empty() {
                     let title = result_title(&o.sql, console.results.len() + 1, result.truncated);
-                    console.results.push(ResultTab {
-                        title,
-                        sql: o.sql,
-                        result,
-                        pinned: false,
-                    });
+                    let id = console.next_result_id();
+                    console
+                        .results
+                        .push(ResultTab::new(id, title, o.sql, result));
                 }
             }
             Err(e) => {
@@ -222,6 +263,51 @@ pub fn apply_outcomes(
     }
 }
 
+/// Outcome of the re-run of result tab `id` after a Submit: its rows are
+/// replaced (edits and focus dropped), the run is logged. Returns the
+/// status-bar summary.
+pub fn apply_refresh(
+    console: &mut ConsoleTab,
+    id: u64,
+    outcomes: Vec<StatementOutcome>,
+    now: DateTime<Local>,
+) -> String {
+    console.running_since = None;
+    let mut summary = String::new();
+    for o in outcomes {
+        let message = match &o.result {
+            Ok(result) => ok_message(result, o.elapsed_ms),
+            Err(e) => e.clone(),
+        };
+        summary = if o.result.is_ok() {
+            message.clone()
+        } else {
+            format!("Erreur · {} ms", o.elapsed_ms)
+        };
+        console.log.push(LogLine {
+            at: now,
+            sql: o.sql,
+            message,
+            ok: o.result.is_ok(),
+        });
+        let Some(tab) = console.results.iter_mut().find(|r| r.id == id) else {
+            continue;
+        };
+        match o.result {
+            Ok(result) if !result.columns.is_empty() => {
+                tab.editable = is_editable(&tab.sql, &result);
+                tab.result = result;
+                tab.grid.new_result();
+                tab.error = None;
+            }
+            Ok(_) => {}
+            Err(e) => tab.error = Some(e),
+        }
+    }
+    console.refresh_known_columns();
+    summary
+}
+
 impl ConsoleTab {
     pub fn new(query: String, cursor: usize) -> Self {
         let cursor = cursor.min(query.len());
@@ -237,7 +323,23 @@ impl ConsoleTab {
             known_columns: Vec::new(),
             completion: Completion::default(),
             restore_cursor: true,
+            next_result_id: 1,
+            submitting: None,
+            refreshing: None,
         }
+    }
+
+    fn next_result_id(&mut self) -> u64 {
+        let id = self.next_result_id;
+        self.next_result_id += 1;
+        id
+    }
+
+    /// A cell of the active result is being edited (Escape cancels it first).
+    fn grid_editing(&self) -> bool {
+        self.results
+            .get(self.active_result)
+            .is_some_and(|r| r.grid.editing.is_some())
     }
 
     pub fn editor_id(tab: TabId) -> egui::Id {
@@ -383,6 +485,7 @@ impl ConsoleTab {
         }
         if cx.running {
             if !self.completion.open
+                && !self.grid_editing()
                 && pressed(&KeyboardShortcut::new(Modifiers::NONE, Key::Escape))
             {
                 action = Some(ConsoleAction::Cancel);
@@ -538,11 +641,9 @@ impl ConsoleTab {
             self.refresh_known_columns();
         }
         ui.separator();
-        match self.results.get(self.active_result) {
-            Some(r) => {
-                simple_result_table(ui, id.with(("result", self.active_result)), &r.result);
-                None
-            }
+        let active = self.active_result;
+        match self.results.get_mut(active) {
+            Some(r) => result_view(ui, id, active, r),
             None => self.log_view(ui, id),
         }
     }
@@ -615,64 +716,50 @@ fn connection_selector(ui: &mut egui::Ui, cx: &ConsoleContext) -> Option<String>
     chosen
 }
 
-/// Read-only, virtualised table of a console result (replaced by the data
-/// grid in plan 3b, Task 7).
-pub fn simple_result_table(ui: &mut egui::Ui, id: egui::Id, result: &QueryResult) {
-    let n = result.columns.len();
-    if n == 0 {
-        return;
+/// Grid of result tab `r` (at `index`); its Submit becomes a console action.
+fn result_view(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    index: usize,
+    r: &mut ResultTab,
+) -> Option<ConsoleAction> {
+    if let Some(e) = &r.error {
+        ui.colored_label(
+            ERROR,
+            format!(
+                "{} Submit annulé (transaction annulée) : {e}",
+                icon::WARNING
+            ),
+        );
     }
-    let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-    egui::ScrollArea::horizontal()
-        .id_salt(id.with("h"))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            TableBuilder::new(ui)
-                .id_salt(id)
-                .striped(true)
-                .resizable(true)
-                .auto_shrink([false, false])
-                .column(TableColumn::exact(44.0))
-                .columns(TableColumn::initial(140.0).at_least(40.0).clip(true), n)
-                .header(row_height + 2.0, |mut header| {
-                    header.col(|ui| {
-                        ui.label(RichText::new("#").weak());
-                    });
-                    for c in &result.columns {
-                        header.col(|ui| {
-                            let name = if c.is_primary_key {
-                                format!("{} {}", icon::KEY, c.name)
-                            } else {
-                                c.name.clone()
-                            };
-                            ui.strong(name).on_hover_text(&c.type_name);
-                        });
-                    }
-                })
-                .body(|body| {
-                    body.rows(row_height, result.rows.len(), |mut row| {
-                        let i = row.index();
-                        row.col(|ui| {
-                            ui.label(RichText::new((i + 1).to_string()).weak());
-                        });
-                        for cell in &result.rows[i] {
-                            row.col(|ui| {
-                                if cell == "NULL" {
-                                    ui.label(RichText::new("NULL").weak().italics());
-                                } else {
-                                    ui.label(cell.as_str());
-                                }
-                            });
-                        }
-                    });
-                });
-        });
+    let action = grid::show(
+        ui,
+        id.with(("result", r.id)),
+        &mut r.grid,
+        GridOptions {
+            result: &r.result,
+            editable: r.editable,
+            server_sort: false,
+            sort_indicator: None,
+        },
+    );
+    if action != GridAction::Submit || r.grid.edits.is_empty() {
+        return None;
+    }
+    let table = extract_table_from_query(&r.sql)?;
+    let columns = r.result.columns.clone();
+    Some(ConsoleAction::Submit {
+        result_index: index,
+        table,
+        system_columns: detect_system_columns(&columns),
+        changes: r.grid.edits.to_row_changes(&r.result.rows),
+        columns,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::models::Column;
 
     fn result(columns: &[&str], rows: usize) -> QueryResult {
         QueryResult {
@@ -692,10 +779,13 @@ mod tests {
 
     fn tab(title: &str, pinned: bool) -> ResultTab {
         ResultTab {
-            title: title.into(),
-            sql: format!("SELECT * FROM {title}"),
-            result: result(&["a"], 1),
             pinned,
+            ..ResultTab::new(
+                0,
+                title.into(),
+                format!("SELECT * FROM {title}"),
+                result(&["a"], 1),
+            )
         }
     }
 
@@ -790,6 +880,77 @@ mod tests {
         assert!(c.results.is_empty(), "unpinned results replaced");
         assert_eq!(c.active_result, 0, "Sortie when nothing returned rows");
         assert_eq!(c.log[2].message, "1 ligne affectée en 5 ms");
+    }
+
+    fn with_pk(mut r: QueryResult) -> QueryResult {
+        r.columns[0].is_primary_key = true;
+        r
+    }
+
+    #[test]
+    fn editable_when_one_table_with_a_primary_key() {
+        let keyed = with_pk(result(&["id", "name"], 1));
+        assert!(is_editable("SELECT * FROM users", &keyed));
+        assert!(!is_editable("SELECT 1", &keyed), "no table");
+        assert!(
+            !is_editable("SELECT * FROM users", &result(&["id"], 1)),
+            "no key"
+        );
+        let mut c = ConsoleTab::new(String::new(), 0);
+        apply_outcomes(&mut c, vec![ok("SELECT * FROM users", keyed)], Local::now());
+        assert!(c.results[0].editable);
+    }
+
+    #[test]
+    fn apply_refresh_replaces_only_its_result_and_drops_edits() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        apply_outcomes(
+            &mut c,
+            vec![
+                ok("SELECT * FROM a", with_pk(result(&["id"], 1))),
+                ok("SELECT * FROM b", with_pk(result(&["id"], 2))),
+            ],
+            Local::now(),
+        );
+        let (first, second) = (c.results[0].id, c.results[1].id);
+        assert_ne!(first, second);
+        let b = &mut c.results[1];
+        b.grid.edits.set(
+            &b.result.rows,
+            grid::changes::RowRef::Base(0),
+            0,
+            "z".into(),
+        );
+        b.error = Some("old".into());
+
+        let summary = apply_refresh(
+            &mut c,
+            second,
+            vec![ok("SELECT * FROM b", with_pk(result(&["id"], 5)))],
+            Local::now(),
+        );
+        assert_eq!(summary, "5 lignes en 5 ms");
+        assert_eq!(c.results.len(), 2, "other result tabs kept");
+        assert_eq!(c.results[0].result.rows.len(), 1);
+        let b = &c.results[1];
+        assert_eq!((b.id, b.title.as_str()), (second, "b"));
+        assert_eq!(b.result.rows.len(), 5);
+        assert!(b.grid.edits.is_empty() && b.error.is_none());
+        assert_eq!(c.log.len(), 3);
+
+        let summary = apply_refresh(
+            &mut c,
+            first,
+            vec![StatementOutcome {
+                sql: "SELECT * FROM a".into(),
+                result: Err("gone".into()),
+                elapsed_ms: 2,
+            }],
+            Local::now(),
+        );
+        assert_eq!(summary, "Erreur · 2 ms");
+        assert_eq!(c.results[0].error.as_deref(), Some("gone"));
+        assert!(!c.log[3].ok);
     }
 
     #[test]

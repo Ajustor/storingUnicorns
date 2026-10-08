@@ -64,11 +64,12 @@ impl SortKey {
     }
 }
 
-/// Order `view` (row indices) by column `col`; stable.
-fn sort_view(rows: &[Vec<String>], view: &mut Vec<usize>, col: usize, asc: bool) {
-    let mut keyed: Vec<(SortKey, usize)> = view
+/// Every row index, ordered by column `col` (stable).
+pub fn sorted_view(rows: &[Vec<String>], col: usize, asc: bool) -> Vec<usize> {
+    let mut keyed: Vec<(SortKey, usize)> = rows
         .iter()
-        .map(|&i| (SortKey::of(rows.get(i).and_then(|r| r.get(col))), i))
+        .enumerate()
+        .map(|(i, r)| (SortKey::of(r.get(col)), i))
         .collect();
     keyed.sort_by(|a, b| {
         let o = a.0.order(&b.0);
@@ -78,14 +79,7 @@ fn sort_view(rows: &[Vec<String>], view: &mut Vec<usize>, col: usize, asc: bool)
             o.reverse()
         }
     });
-    *view = keyed.into_iter().map(|(_, i)| i).collect();
-}
-
-/// Every row index, ordered by column `col` (stable).
-pub fn sorted_view(rows: &[Vec<String>], col: usize, asc: bool) -> Vec<usize> {
-    let mut view = (0..rows.len()).collect();
-    sort_view(rows, &mut view, col, asc);
-    view
+    keyed.into_iter().map(|(_, i)| i).collect()
 }
 
 /// Local sort after a click on column `col`: asc → desc → none; another
@@ -234,11 +228,20 @@ impl GridState {
         if !self.view_dirty && self.view_source == source {
             return;
         }
-        let mut view = matching_rows(rows, &self.filter);
-        if let Some((col, asc)) = self.sort {
-            sort_view(rows, &mut view, col, asc);
-        }
-        self.view = view;
+        let filtered = matching_rows(rows, &self.filter);
+        self.view = match self.sort {
+            Some((col, asc)) if filtered.len() == rows.len() => sorted_view(rows, col, asc),
+            Some((col, asc)) => {
+                let mut keep = vec![false; rows.len()];
+                for &i in &filtered {
+                    keep[i] = true;
+                }
+                let mut view = sorted_view(rows, col, asc);
+                view.retain(|&i| keep[i]);
+                view
+            }
+            None => filtered,
+        };
         self.view_dirty = false;
         self.view_source = source;
     }

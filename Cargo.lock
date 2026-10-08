@@ -2951,6 +2951,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tachyonfx",
+ "tempfile",
  "thiserror 1.0.69",
  "tiberius",
  "tokio",

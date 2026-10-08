@@ -2448,109 +2448,59 @@ async fn handle_import<B: ratatui::backend::Backend>(
         }
     };
 
-    // Parse CSV
-    let (columns, rows) = match services::export_import::parse_csv(&content) {
-        Ok(data) => data,
+    let quotes = get_quote_chars(state);
+    state.set_status(format!("Importing into {}...", import_state.target_table));
+
+    // Redraw to show the initial status
+    let temp_registry = ClickableRegistry::new();
+    let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
+
+    // The connection is taken out of the state while importing so the progress
+    // callback can redraw the whole UI (rendering never reads the connection).
+    let conn = state.connection.take().unwrap();
+    let result = ops::transfer::import_csv(
+        &conn,
+        &import_state.target_table,
+        &content,
+        quotes,
+        |done, total| {
+            // Redraw periodically (every 10 rows and on the last row)
+            if done % 10 == 1 || done == total {
+                if let Some(ref mut is) = state.import_state {
+                    is.import_progress = Some((done, total));
+                }
+                let temp_registry = ClickableRegistry::new();
+                let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
+            }
+        },
+    )
+    .await;
+    state.connection = Some(conn);
+
+    let stats = match result {
+        Ok(s) => s,
         Err(e) => {
-            state.set_status(format!("CSV parse error: {}", e));
+            state.set_status(e.to_string());
             state.close_dialog();
             return;
         }
     };
 
-    let (quote_start, quote_end) = get_quote_chars(state);
-    let actions = services::export_import::build_upsert_import_actions(
-        &import_state.target_table,
-        &columns,
-        &rows,
-        quote_start,
-        quote_end,
-    );
-
-    let total = actions.len();
-    let mut success_count = 0;
-    let mut update_count = 0;
-    let mut insert_count = 0;
-    let mut last_error: Option<String> = None;
-
-    // Initialize progress
-    if let Some(ref mut is) = state.import_state {
-        is.import_progress = Some((0, total));
-    }
-    state.set_status(format!("Importing {} rows...", total));
-
-    // Redraw to show initial progress
-    let temp_registry = ClickableRegistry::new();
-    let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
-
-    for (i, action) in actions.iter().enumerate() {
-        let conn = state.connection.as_ref().unwrap();
-        let result = match action {
-            services::export_import::ImportAction::Upsert {
-                update_query,
-                insert_query,
-            } => {
-                // Try UPDATE first
-                match conn.execute_query(update_query).await {
-                    Ok(res) if res.rows_affected > 0 => {
-                        update_count += 1;
-                        Ok(())
-                    }
-                    Ok(_) => {
-                        // No rows affected → element doesn't exist, INSERT without id
-                        match conn.execute_query(insert_query).await {
-                            Ok(_) => {
-                                insert_count += 1;
-                                Ok(())
-                            }
-                            Err(e) => Err(format!("{}", e)),
-                        }
-                    }
-                    Err(e) => Err(format!("{}", e)),
-                }
-            }
-            services::export_import::ImportAction::InsertOnly { query } => {
-                match conn.execute_query(query).await {
-                    Ok(_) => {
-                        insert_count += 1;
-                        Ok(())
-                    }
-                    Err(e) => Err(format!("{}", e)),
-                }
-            }
-        };
-
-        match result {
-            Ok(()) => success_count += 1,
-            Err(e) => {
-                last_error = Some(e);
-            }
-        }
-
-        // Update progress and redraw periodically (every 10 rows or last row)
-        if i % 10 == 0 || i == total - 1 {
-            if let Some(ref mut is) = state.import_state {
-                is.import_progress = Some((i + 1, total));
-            }
-            let temp_registry = ClickableRegistry::new();
-            let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
-        }
-    }
-
-    if success_count == total {
+    let success_count = stats.succeeded();
+    if success_count == stats.total {
         state.set_status(format!(
             "Import complete: {} rows ({} updated, {} inserted) into {}",
-            success_count, update_count, insert_count, import_state.target_table
+            success_count, stats.updated, stats.inserted, import_state.target_table
         ));
-    } else if let Some(err) = last_error {
+    } else if let Some(err) = stats.errors.last() {
         state.set_status(format!(
             "Import partial: {}/{} rows ({} updated, {} inserted). Last error: {}",
-            success_count, total, update_count, insert_count, err
+            success_count, stats.total, stats.updated, stats.inserted, err
         ));
     } else {
         state.set_status(format!(
             "Import: {}/{} rows ({} updated, {} inserted)",
-            success_count, total, update_count, insert_count
+            success_count, stats.total, stats.updated, stats.inserted
         ));
     }
 
@@ -2884,51 +2834,26 @@ async fn handle_batch_export<B: ratatui::backend::Backend>(
     }
 
     let total = selected_tables.len();
-    let (quote_start, quote_end) = get_quote_chars(state);
-    let mut success_count = 0;
-    let mut last_error: Option<String> = None;
+    let quotes = get_quote_chars(state);
 
-    for (i, (schema, table)) in selected_tables.iter().enumerate() {
-        let clean_name = services::export_import::BatchExportState::clean_table_name(table);
-        let full_table_name = format!("{0}{1}{2}.{0}{3}{2}", quote_start, schema, quote_end, table);
-
-        // Update progress
-        if let Some(ref mut bs) = state.batch_export_state {
-            bs.progress = Some((i, total, table.clone()));
-        }
-        let temp_registry = ClickableRegistry::new();
-        let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
-
-        // Execute SELECT * FROM table
-        let query = format!("SELECT * FROM {}", full_table_name);
-        match state
-            .connection
-            .as_ref()
-            .unwrap()
-            .execute_query(&query)
-            .await
-        {
-            Ok(result) => {
-                let file_name = format!("{}.{}", clean_name, batch.format.extension());
-                let file_path = dir.join(&file_name);
-
-                match services::export_import::export_to_file(
-                    &result,
-                    batch.format,
-                    file_path.to_str().unwrap_or(&file_name),
-                    &full_table_name,
-                    quote_start,
-                    quote_end,
-                ) {
-                    Ok(_) => success_count += 1,
-                    Err(e) => last_error = Some(format!("{}: {}", table, e)),
-                }
+    // See handle_import: the connection is taken out so progress can redraw.
+    let conn = state.connection.take().unwrap();
+    let report = ops::transfer::export_tables(
+        &conn,
+        &selected_tables,
+        &dir,
+        batch.format,
+        quotes,
+        |done, total, table| {
+            if let Some(ref mut bs) = state.batch_export_state {
+                bs.progress = Some((done, total, table.to_string()));
             }
-            Err(e) => {
-                last_error = Some(format!("{}: {}", table, e));
-            }
-        }
-    }
+            let temp_registry = ClickableRegistry::new();
+            let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
+        },
+    )
+    .await;
+    state.connection = Some(conn);
 
     // Final progress update
     if let Some(ref mut bs) = state.batch_export_state {
@@ -2937,12 +2862,13 @@ async fn handle_batch_export<B: ratatui::backend::Backend>(
     let temp_registry = ClickableRegistry::new();
     let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
 
+    let success_count = report.succeeded;
     if success_count == total {
         state.set_status(format!(
             "Batch export complete: {} tables exported to {}",
             success_count, batch.directory
         ));
-    } else if let Some(err) = last_error {
+    } else if let Some(err) = report.errors.last() {
         state.set_status(format!(
             "Batch export partial: {}/{} tables. Last error: {}",
             success_count, total, err
@@ -2985,104 +2911,25 @@ async fn handle_batch_import<B: ratatui::backend::Backend>(
     }
 
     let total = selected_tables.len();
-    let (quote_start, quote_end) = get_quote_chars(state);
-    let mut success_count = 0;
-    let mut total_rows = 0usize;
-    let mut total_updates = 0usize;
-    let mut total_inserts = 0usize;
-    let mut last_error: Option<String> = None;
+    let quotes = get_quote_chars(state);
 
-    for (i, (schema, table)) in selected_tables.iter().enumerate() {
-        let clean_name = services::export_import::BatchExportState::clean_table_name(table);
-        let csv_path = std::path::Path::new(&batch.directory).join(format!("{}.csv", clean_name));
-
-        // Update progress
-        if let Some(ref mut bs) = state.batch_import_state {
-            bs.progress = Some((i, total, table.clone()));
-        }
-        let temp_registry = ClickableRegistry::new();
-        let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
-
-        // Read CSV file
-        let content = match std::fs::read_to_string(&csv_path) {
-            Ok(c) => c,
-            Err(e) => {
-                last_error = Some(format!("{}: {}", table, e));
-                continue;
+    // See handle_import: the connection is taken out so progress can redraw.
+    let conn = state.connection.take().unwrap();
+    let report = ops::transfer::import_tables(
+        &conn,
+        &selected_tables,
+        std::path::Path::new(&batch.directory),
+        quotes,
+        |done, total, table| {
+            if let Some(ref mut bs) = state.batch_import_state {
+                bs.progress = Some((done, total, table.to_string()));
             }
-        };
-
-        // Parse CSV
-        let (columns, rows) = match services::export_import::parse_csv(&content) {
-            Ok(data) => data,
-            Err(e) => {
-                last_error = Some(format!("{}: CSV parse error: {}", table, e));
-                continue;
-            }
-        };
-
-        let full_table_name = format!("{0}{1}{2}.{0}{3}{2}", quote_start, schema, quote_end, table);
-
-        let actions = services::export_import::build_upsert_import_actions(
-            &full_table_name,
-            &columns,
-            &rows,
-            quote_start,
-            quote_end,
-        );
-
-        let mut table_success = true;
-        let mut table_updates = 0usize;
-        let mut table_inserts = 0usize;
-        for action in &actions {
-            let conn = state.connection.as_ref().unwrap();
-            let result = match action {
-                services::export_import::ImportAction::Upsert {
-                    update_query,
-                    insert_query,
-                } => match conn.execute_query(update_query).await {
-                    Ok(res) if res.rows_affected > 0 => {
-                        table_updates += 1;
-                        Ok(())
-                    }
-                    Ok(_) => match conn.execute_query(insert_query).await {
-                        Ok(_) => {
-                            table_inserts += 1;
-                            Ok(())
-                        }
-                        Err(e) => Err(format!("{}", e)),
-                    },
-                    Err(e) => Err(format!("{}", e)),
-                },
-                services::export_import::ImportAction::InsertOnly { query } => {
-                    match conn.execute_query(query).await {
-                        Ok(_) => {
-                            table_inserts += 1;
-                            Ok(())
-                        }
-                        Err(e) => Err(format!("{}", e)),
-                    }
-                }
-            };
-
-            match result {
-                Ok(()) => {}
-                Err(e) => {
-                    last_error = Some(format!("{}: {}", table, e));
-                    table_success = false;
-                    break;
-                }
-            }
-        }
-
-        total_rows += table_updates + table_inserts;
-        total_updates += table_updates;
-        total_inserts += table_inserts;
-
-        if table_success {
-            success_count += 1;
-        }
-    }
+            let temp_registry = ClickableRegistry::new();
+            let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
+        },
+    )
+    .await;
+    state.connection = Some(conn);
 
     // Final progress update
     if let Some(ref mut bs) = state.batch_import_state {
@@ -3091,20 +2938,22 @@ async fn handle_batch_import<B: ratatui::backend::Backend>(
     let temp_registry = ClickableRegistry::new();
     let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
 
+    let success_count = report.succeeded;
+    let total_rows = report.rows_affected;
     if success_count == total {
         state.set_status(format!(
-            "Batch import complete: {} tables, {} rows ({} updated, {} inserted) from {}",
-            success_count, total_rows, total_updates, total_inserts, batch.directory
+            "Batch import complete: {} tables, {} rows from {}",
+            success_count, total_rows, batch.directory
         ));
-    } else if let Some(err) = last_error {
+    } else if let Some(err) = report.errors.last() {
         state.set_status(format!(
-            "Batch import partial: {}/{} tables, {} rows ({} updated, {} inserted). Last error: {}",
-            success_count, total, total_rows, total_updates, total_inserts, err
+            "Batch import partial: {}/{} tables, {} rows. Last error: {}",
+            success_count, total, total_rows, err
         ));
     } else {
         state.set_status(format!(
-            "Batch import: {}/{} tables, {} rows ({} updated, {} inserted)",
-            success_count, total, total_rows, total_updates, total_inserts
+            "Batch import: {}/{} tables, {} rows",
+            success_count, total, total_rows
         ));
     }
 

@@ -289,3 +289,72 @@ pub fn build_delete_query(
     let where_clause = build_where_clause(columns, values, quote_start, quote_end);
     format!("DELETE FROM {} WHERE {}", table_name, where_clause)
 }
+
+/// `query` without its leading whitespace and `--` / `/* */` comments.
+pub(crate) fn skip_leading_comments(query: &str) -> &str {
+    let mut rest = query;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+        } else {
+            return rest;
+        }
+    }
+}
+
+/// First keyword of `query` (after whitespace and comments), upper-cased.
+pub(crate) fn leading_keyword(query: &str) -> String {
+    skip_leading_comments(query)
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+/// Whether `query` starts (after whitespace and comments) with a
+/// row-modifying keyword. `WITH ... DELETE/UPDATE` is deliberately not
+/// recognised: a CTE is far more often a SELECT, and an empty SELECT would
+/// otherwise report a stale count.
+pub(crate) fn is_dml(query: &str) -> bool {
+    matches!(
+        leading_keyword(query).as_str(),
+        "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "MERGE"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_dml_skips_leading_comments() {
+        assert!(is_dml("  -- note\n/* c */ delete from t"));
+        assert!(is_dml("INSERT INTO t VALUES (1)"));
+        assert!(is_dml("update t set a = 1"));
+        assert!(is_dml("REPLACE INTO t VALUES (1)"));
+        assert!(!is_dml("SELECT 1"));
+        assert!(!is_dml("COMMIT"));
+        assert!(!is_dml("-- DELETE FROM t\nSELECT 1"));
+        assert!(!is_dml("/* unterminated DELETE"));
+        assert!(!is_dml(""));
+    }
+
+    #[test]
+    fn is_dml_recognises_merge() {
+        assert!(is_dml(
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE;"
+        ));
+        assert!(is_dml(
+            "/* upsert */ merge t using s on 1 = 1 when matched then delete;"
+        ));
+    }
+
+    #[test]
+    fn leading_keyword_is_uppercased() {
+        assert_eq!(leading_keyword("\n -- x\n begin tran"), "BEGIN");
+        assert_eq!(leading_keyword("@x"), "");
+    }
+}

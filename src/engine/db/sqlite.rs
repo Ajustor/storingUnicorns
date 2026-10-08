@@ -3,7 +3,7 @@ use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, SqlitePool, TypeInfo};
 
 use crate::engine::models::{Column, QueryResult, SchemaInfo};
 
-use super::utils::{build_update_clauses, fetch_rows_and_result};
+use super::utils::{build_update_clauses, fetch_rows_and_result, is_dml};
 
 /// Connect to SQLite
 pub async fn connect(conn_str: &str) -> Result<SqlitePool> {
@@ -64,30 +64,6 @@ where
         0
     };
     Ok(rows_to_result(&rows, affected))
-}
-
-/// Whether `query` starts (after whitespace and comments) with a
-/// row-modifying keyword. `WITH ... DELETE/UPDATE` is deliberately not
-/// recognised: a CTE is far more often a SELECT, and an empty SELECT would
-/// otherwise report a stale count.
-fn is_dml(query: &str) -> bool {
-    let mut rest = query;
-    loop {
-        rest = rest.trim_start();
-        if let Some(after) = rest.strip_prefix("--") {
-            rest = after.split_once('\n').map_or("", |(_, tail)| tail);
-        } else if let Some(after) = rest.strip_prefix("/*") {
-            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
-        } else {
-            break;
-        }
-    }
-    let keyword = rest
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .collect::<String>()
-        .to_ascii_uppercase();
-    matches!(keyword.as_str(), "INSERT" | "UPDATE" | "DELETE" | "REPLACE")
 }
 
 /// Execute a query on SQLite
@@ -453,14 +429,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows_affected, 0);
-    }
-
-    #[test]
-    fn is_dml_skips_leading_comments() {
-        assert!(is_dml("  -- note\n/* c */ delete from t"));
-        assert!(is_dml("INSERT INTO t VALUES (1)"));
-        assert!(!is_dml("SELECT 1"));
-        assert!(!is_dml("COMMIT"));
     }
 
     #[tokio::test]

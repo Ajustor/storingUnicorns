@@ -23,6 +23,14 @@ pub fn run() -> anyhow::Result<()> {
         .with_app_id("storingUnicorns")
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([720.0, 480.0]);
+    let icon_png = include_bytes!("../../assets/icon.png");
+    let viewport = match eframe::icon_data::from_png_bytes(icon_png) {
+        Ok(icon) => viewport.with_icon(Arc::new(icon)),
+        Err(e) => {
+            tracing::warn!("window icon: {e}");
+            viewport
+        }
+    };
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()

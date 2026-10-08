@@ -22,6 +22,8 @@ const MANIFEST_URL: &str = "https://ajustor.github.io/storingUnicorns/latest.jso
 const USER_AGENT: &str = concat!("storingUnicorns/", env!("CARGO_PKG_VERSION"));
 /// Hard cap on downloaded asset size, as a guard against a runaway response.
 const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
+/// Name prefix of staging files and directories.
+const STAGING_PREFIX: &str = "storingUnicorns-update";
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const BINARY_ASSET: Option<&str> = Some("storingUnicorns-windows-x64.exe");
@@ -184,34 +186,88 @@ pub fn download_and_apply(info: &ReleaseInfo) -> Result<Option<PathBuf>, String>
         .limit(MAX_ASSET_BYTES)
         .read_to_vec()
         .map_err(|e| format!("downloading {}: {e}", info.asset.name))?;
-    let dir = std::env::temp_dir().join("storingUnicorns-update");
-    stage_and_apply(info, &bytes, &dir)
+    stage_and_apply(info, &bytes, None)
 }
 
+/// Verify `bytes`, then stage and install them. Staging happens in freshly
+/// created, uniquely named files/directories (never a predictable shared
+/// path). `dir` overrides where they are created (tests); `None` uses the
+/// executable's directory (binary) or the system temp dir (MSI).
 fn stage_and_apply(
     info: &ReleaseInfo,
     bytes: &[u8],
-    dir: &Path,
+    dir: Option<&Path>,
 ) -> Result<Option<PathBuf>, String> {
     verify_digest(bytes, &info.asset.sha256)?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let path = dir.join(&info.asset.name);
-    std::fs::write(&path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
     match info.kind {
-        InstallKind::Msi => Ok(Some(path)),
-        InstallKind::ReplaceBinary => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                    .map_err(|e| format!("chmod {}: {e}", path.display()))?;
-            }
-            let res =
-                self_replace::self_replace(&path).map_err(|e| format!("replacing executable: {e}"));
-            let _ = std::fs::remove_file(&path);
-            res.map(|_| None)
-        }
+        InstallKind::Msi => stage_msi(&info.asset.name, bytes, dir).map(Some),
+        InstallKind::ReplaceBinary => replace_binary(bytes, dir).map(|_| None),
     }
+}
+
+/// Create a private (mode 0700 on unix) staging directory.
+fn private_staging_dir(parent: Option<&Path>) -> Result<tempfile::TempDir, String> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(STAGING_PREFIX);
+    match parent {
+        Some(parent) => builder.tempdir_in(parent),
+        None => builder.tempdir(),
+    }
+    .map_err(|e| format!("creating staging directory: {e}"))
+}
+
+/// Write the MSI into a new private directory that outlives this process, so
+/// `msiexec` can read it after exit. Returns the MSI path.
+fn stage_msi(name: &str, bytes: &[u8], parent: Option<&Path>) -> Result<PathBuf, String> {
+    let dir = private_staging_dir(parent)?;
+    let path = dir.path().join(name);
+    std::fs::write(&path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    let _kept = dir.keep();
+    Ok(path)
+}
+
+/// Write the new binary to a unique temp file (next to the running executable
+/// when possible, so the swap stays on one filesystem) and swap it in.
+fn replace_binary(bytes: &[u8], dir: Option<&Path>) -> Result<(), String> {
+    use std::io::Write;
+
+    let near_exe = match dir {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf)),
+    };
+    let new_file = |dir: &Path| {
+        tempfile::Builder::new()
+            .prefix(STAGING_PREFIX)
+            .tempfile_in(dir)
+    };
+    // Keeps the fallback directory alive (and removes it on drop).
+    let mut fallback_dir = None;
+    let mut file = match near_exe.as_deref().map(new_file) {
+        Some(Ok(file)) => file,
+        _ => {
+            let tmp = private_staging_dir(None)?;
+            let file = new_file(tmp.path()).map_err(|e| format!("creating staging file: {e}"))?;
+            fallback_dir = Some(tmp);
+            file
+        }
+    };
+    file.write_all(bytes)
+        .and_then(|_| file.flush())
+        .map_err(|e| format!("writing {}: {e}", file.path().display()))?;
+    // Close the handle; the path is still deleted on drop.
+    let path = file.into_temp_path();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+    let res = self_replace::self_replace(&path).map_err(|e| format!("replacing executable: {e}"));
+    drop(path);
+    drop(fallback_dir);
+    res
 }
 
 fn verify_digest(bytes: &[u8], expected: &str) -> Result<(), String> {
@@ -438,8 +494,8 @@ mod tests {
         .unwrap()
         .unwrap();
         info.asset.sha256 = "00".into();
-        assert!(stage_and_apply(&info, b"payload", dir.path()).is_err());
-        assert!(!dir.path().join(MSI_ASSET).exists());
+        assert!(stage_and_apply(&info, b"payload", Some(dir.path())).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -454,8 +510,40 @@ mod tests {
         .unwrap();
         info.asset.sha256 =
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into();
-        let staged = stage_and_apply(&info, b"abc", dir.path()).unwrap().unwrap();
+        let staged = stage_and_apply(&info, b"abc", Some(dir.path()))
+            .unwrap()
+            .unwrap();
         assert_eq!(std::fs::read(staged).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn stage_msi_uses_a_fresh_private_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut info = select_update(
+            manifest("9.0.0", &[MSI_ASSET]),
+            &v("1.0.0"),
+            InstallKind::Msi,
+        )
+        .unwrap()
+        .unwrap();
+        info.asset.sha256 =
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into();
+        let first = stage_and_apply(&info, b"abc", Some(dir.path()))
+            .unwrap()
+            .unwrap();
+        let second = stage_and_apply(&info, b"abc", Some(dir.path()))
+            .unwrap()
+            .unwrap();
+        let parent = first.parent().unwrap();
+        assert_eq!(parent.parent().unwrap(), dir.path());
+        assert_ne!(parent.file_name().unwrap(), STAGING_PREFIX);
+        assert!(parent
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(STAGING_PREFIX));
+        assert_eq!(first.file_name().unwrap(), MSI_ASSET);
+        assert_ne!(first.parent(), second.parent());
     }
 
     #[test]

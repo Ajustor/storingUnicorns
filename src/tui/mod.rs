@@ -1903,11 +1903,17 @@ async fn handle_schema_action(state: &mut AppState) {
 
             // Execute the SQL
             if let Some(ref conn) = state.connection {
-                match conn.execute_query(&sql).await {
+                match ops::schema::apply_modification(
+                    conn,
+                    &state.table_cache,
+                    &modification,
+                    &db_type,
+                )
+                .await
+                {
                     Ok(_) => {
                         state.set_status(format!("Column '{}' added successfully", column.name));
-                        // Invalidate cache and refresh autocomplete
-                        state.table_cache.invalidate(&table_name).await;
+                        // Cache already invalidated: refresh autocomplete
                         state.current_table_context = None;
                         if let Some(cols) = fetch_table_columns(state, &table_name).await {
                             state.known_columns = cols.iter().map(|c| c.name.clone()).collect();
@@ -1942,14 +1948,20 @@ async fn handle_schema_action(state: &mut AppState) {
             }
 
             if let Some(ref conn) = state.connection {
-                match conn.execute_query(&sql).await {
+                match ops::schema::apply_modification(
+                    conn,
+                    &state.table_cache,
+                    &modification,
+                    &db_type,
+                )
+                .await
+                {
                     Ok(_) => {
                         state.set_status(format!(
                             "Column '{}' modified successfully",
                             original_name
                         ));
-                        // Invalidate cache and refresh autocomplete
-                        state.table_cache.invalidate(&table_name).await;
+                        // Cache already invalidated: refresh autocomplete
                         state.current_table_context = None;
                         if let Some(cols) = fetch_table_columns(state, &table_name).await {
                             state.known_columns = cols.iter().map(|c| c.name.clone()).collect();
@@ -1980,11 +1992,17 @@ async fn handle_schema_action(state: &mut AppState) {
             }
 
             if let Some(ref conn) = state.connection {
-                match conn.execute_query(&sql).await {
+                match ops::schema::apply_modification(
+                    conn,
+                    &state.table_cache,
+                    &modification,
+                    &db_type,
+                )
+                .await
+                {
                     Ok(_) => {
                         state.set_status(format!("Column '{}' dropped successfully", column_name));
-                        // Invalidate cache and refresh autocomplete
-                        state.table_cache.invalidate(&table_name).await;
+                        // Cache already invalidated: refresh autocomplete
                         state.current_table_context = None;
                         if let Some(cols) = fetch_table_columns(state, &table_name).await {
                             state.known_columns = cols.iter().map(|c| c.name.clone()).collect();
@@ -2023,12 +2041,18 @@ async fn handle_schema_action(state: &mut AppState) {
             }
 
             if let Some(ref conn) = state.connection {
-                match conn.execute_query(&sql).await {
+                match ops::schema::apply_modification(
+                    conn,
+                    &state.table_cache,
+                    &modification,
+                    &db_type,
+                )
+                .await
+                {
                     Ok(_) => {
                         state
                             .set_status(format!("Column '{}' renamed to '{}'", old_name, new_name));
-                        // Invalidate cache and refresh autocomplete
-                        state.table_cache.invalidate(&table_name).await;
+                        // Cache already invalidated: refresh autocomplete
                         state.current_table_context = None;
                         if let Some(cols) = fetch_table_columns(state, &table_name).await {
                             state.known_columns = cols.iter().map(|c| c.name.clone()).collect();
@@ -2049,54 +2073,15 @@ pub(crate) async fn fetch_table_columns(
     state: &mut AppState,
     table_name: &str,
 ) -> Option<Vec<ColumnDefinition>> {
-    // Check cache first
-    if let Some(columns) = state.table_cache.get_column_details(table_name).await {
-        return Some(
-            columns
-                .into_iter()
-                .map(|c| ColumnDefinition {
-                    name: c.name,
-                    data_type: c.type_name,
-                    nullable: c.nullable,
-                    is_primary_key: c.is_primary_key,
-                    default_value: None,
-                })
-                .collect(),
-        );
-    }
-
-    // Fetch from database
-    if let Some(ref conn) = state.connection {
-        match conn.get_table_column_details(table_name).await {
-            Ok(columns) => {
-                // Store in cache
-                state
-                    .table_cache
-                    .set(table_name.to_string(), columns.clone())
-                    .await;
-
-                return Some(
-                    columns
-                        .into_iter()
-                        .map(|c| ColumnDefinition {
-                            name: c.name,
-                            data_type: c.type_name,
-                            nullable: c.nullable,
-                            is_primary_key: c.is_primary_key,
-                            default_value: None,
-                        })
-                        .collect(),
-                );
-            }
-            Err(e) => {
-                tracing::error!("Failed to fetch columns for {}: {}", table_name, e);
-                state.set_status(format!("Failed to fetch columns: {}", e));
-                return None;
-            }
+    let conn = state.connection.as_ref()?;
+    match ops::schema::fetch_columns(conn, &state.table_cache, table_name).await {
+        Ok(cols) => Some(cols),
+        Err(e) => {
+            tracing::error!("Failed to fetch columns for {}: {}", table_name, e);
+            state.set_status(format!("Failed to fetch columns: {}", e));
+            None
         }
     }
-
-    None
 }
 
 /// Update completions with cached table columns

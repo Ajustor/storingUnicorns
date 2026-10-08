@@ -29,9 +29,8 @@ use update_notifier::check_version;
 use config::AppConfig;
 use db::DatabaseConnection;
 use services::ColumnDefinition;
-use crate::engine::sql::statements::{
-    extract_table_from_query, get_execution_unit_at_cursor, quote_chars, ExecutionUnit,
-};
+use crate::engine::ops::{self, query::Executed};
+use crate::engine::sql::statements::quote_chars;
 use ui::{
     compute_active_panel_area, compute_modal_area, render_neon_border, render_ui,
     run_splash_screen, ClickableRegistry, ModalAnimation, PanelAnimations,
@@ -1456,7 +1455,7 @@ async fn handle_connect<B: ratatui::backend::Backend>(
 
 pub(crate) async fn handle_refresh_tables(state: &mut AppState) {
     if let Some(ref conn) = state.connection {
-        match conn.get_tables_by_schema().await {
+        match ops::query::refresh_schemas(conn).await {
             Ok(schemas) => {
                 let total_tables: usize = schemas.iter().map(|s| s.tables.len()).sum();
                 state.schemas = schemas;
@@ -1477,213 +1476,79 @@ pub(crate) async fn handle_refresh_tables(state: &mut AppState) {
 }
 
 pub(crate) async fn handle_execute_query(state: &mut AppState) {
-    if state.query_input().trim().is_empty() {
-        state.set_status("Query is empty");
-        return;
-    }
-
     if state.connection.is_none() {
         state.set_status("Not connected. Select a connection and press Enter.");
         return;
     }
-
-    // Clone the query to avoid borrow issues
     let query = state.query_input().to_string();
     state.set_status("Executing query...");
     state.is_loading = true;
-
-    let result = state
-        .connection
-        .as_ref()
-        .unwrap()
-        .execute_query(&query)
-        .await;
-
-    match result {
-        Ok(mut result) => {
-            let row_count = result.rows.len();
-            let time = result.execution_time_ms;
-
-            // Try to get column metadata for the table
-            if let Some(table_name) = extract_table_from_query(&query) {
-                // Get nullability info
-                if let Ok(nullability) = state
-                    .connection
-                    .as_ref()
-                    .unwrap()
-                    .get_column_nullability(&table_name)
-                    .await
-                {
-                    for col in &mut result.columns {
-                        if let Some(&nullable) = nullability.get(&col.name) {
-                            col.nullable = nullable;
-                        }
-                    }
-                }
-
-                // Get primary key info
-                if let Ok(primary_keys) = state
-                    .connection
-                    .as_ref()
-                    .unwrap()
-                    .get_primary_keys(&table_name)
-                    .await
-                {
-                    for col in &mut result.columns {
-                        col.is_primary_key = primary_keys.contains(&col.name);
-                    }
-                }
-            }
-
-            state.query_result = Some(result);
-            state.update_known_columns(); // Update columns for autocompletion
-            state.compute_col_widths(); // Cache column widths once
-            state.selected_row = 0;
-            state.results_scroll_x = 0; // Reset horizontal scroll
-            state.set_status(format!("Query executed: {} rows in {}ms", row_count, time));
-            state.active_panel = ActivePanel::Results;
-        }
-        Err(e) => {
-            state.set_status(format!("Query error: {}", e));
-        }
-    }
-
+    let result = ops::query::run_all(state.connection.as_ref().unwrap(), &query).await;
     state.is_loading = false;
+    match result {
+        Ok(result) => {
+            let msg = format!(
+                "Query executed: {} rows in {}ms",
+                result.rows.len(),
+                result.execution_time_ms
+            );
+            show_result(state, result);
+            state.set_status(msg);
+        }
+        Err(e) => state.set_status(format!("Query error: {e}")),
+    }
 }
 
-/// Execute only the SQL statement at the current cursor position
+/// Execute only the SQL statement (or transaction block) at the cursor.
 pub(crate) async fn handle_execute_current_query(state: &mut AppState) {
-    if state.query_input().trim().is_empty() {
-        state.set_status("Query is empty");
-        return;
-    }
-
     if state.connection.is_none() {
         state.set_status("Not connected. Select a connection and press Enter.");
         return;
     }
-
-    // Find the query at the cursor position
-    let query_text = state.query_input().to_string();
-    let cursor_pos = state.cursor_position();
-    let query = match get_execution_unit_at_cursor(&query_text, cursor_pos) {
-        ExecutionUnit::UnterminatedTransaction => {
-            state.set_status("Transaction not terminated: add COMMIT or ROLLBACK");
-            return;
-        }
-        ExecutionUnit::Transaction(statements) => {
-            state.set_status(format!(
-                "Executing transaction ({} statements)...",
-                statements.len()
-            ));
-            state.is_loading = true;
-
-            let result = state
-                .connection
-                .as_ref()
-                .unwrap()
-                .execute_transaction(&statements)
-                .await;
-
-            match result {
-                Ok(result) => {
-                    let row_count = result.rows.len();
-                    let time = result.execution_time_ms;
-                    let stmt_count = statements.len();
-                    state.query_result = Some(result);
-                    state.update_known_columns();
-                    state.compute_col_widths();
-                    state.selected_row = 0;
-                    state.results_scroll_x = 0;
-                    if row_count > 0 {
-                        state.set_status(format!(
-                            "Transaction committed: {} rows in {}ms",
-                            row_count, time
-                        ));
-                    } else {
-                        state.set_status(format!(
-                            "Transaction committed: {} statements in {}ms",
-                            stmt_count, time
-                        ));
-                    }
-                    state.active_panel = ActivePanel::Results;
-                }
-                Err(e) => {
-                    state.set_status(format!("Transaction rolled back: {}", e));
-                }
-            }
-
-            state.is_loading = false;
-            return;
-        }
-        ExecutionUnit::Single(query) => query,
-    };
-
-    if query.trim().is_empty() {
-        state.set_status("No query at cursor position");
-        return;
-    }
-
+    let text = state.query_input().to_string();
+    let cursor = state.cursor_position();
     state.set_status("Executing query...");
     state.is_loading = true;
-
-    let result = state
-        .connection
-        .as_ref()
-        .unwrap()
-        .execute_query(&query)
-        .await;
-
-    match result {
-        Ok(mut result) => {
-            let row_count = result.rows.len();
-            let time = result.execution_time_ms;
-
-            // Try to get column metadata for the table
-            if let Some(table_name) = extract_table_from_query(&query) {
-                // Get nullability info
-                if let Ok(nullability) = state
-                    .connection
-                    .as_ref()
-                    .unwrap()
-                    .get_column_nullability(&table_name)
-                    .await
-                {
-                    for col in &mut result.columns {
-                        if let Some(&nullable) = nullability.get(&col.name) {
-                            col.nullable = nullable;
-                        }
-                    }
-                }
-
-                // Get primary key info
-                if let Ok(primary_keys) = state
-                    .connection
-                    .as_ref()
-                    .unwrap()
-                    .get_primary_keys(&table_name)
-                    .await
-                {
-                    for col in &mut result.columns {
-                        col.is_primary_key = primary_keys.contains(&col.name);
-                    }
-                }
-            }
-
-            state.query_result = Some(result);
-            state.update_known_columns(); // Update columns for autocompletion
-            state.compute_col_widths(); // Cache column widths once
-            state.selected_row = 0;
-            state.results_scroll_x = 0;
-            state.set_status(format!("Query executed: {} rows in {}ms", row_count, time));
-            state.active_panel = ActivePanel::Results;
-        }
-        Err(e) => {
-            state.set_status(format!("Query error: {}", e));
-        }
-    }
-
+    let outcome =
+        ops::query::run_at_cursor(state.connection.as_ref().unwrap(), &text, cursor).await;
     state.is_loading = false;
+    match outcome {
+        Ok(Executed::Query(result)) => {
+            let msg = format!(
+                "Query executed: {} rows in {}ms",
+                result.rows.len(),
+                result.execution_time_ms
+            );
+            show_result(state, result);
+            state.set_status(msg);
+        }
+        Ok(Executed::Transaction { result, statements }) => {
+            let msg = if result.rows.is_empty() {
+                format!(
+                    "Transaction committed: {statements} statements in {}ms",
+                    result.execution_time_ms
+                )
+            } else {
+                format!(
+                    "Transaction committed: {} rows in {}ms",
+                    result.rows.len(),
+                    result.execution_time_ms
+                )
+            };
+            show_result(state, result);
+            state.set_status(msg);
+        }
+        Err(e) => state.set_status(e.to_string()),
+    }
+}
+
+fn show_result(state: &mut AppState, result: crate::engine::models::QueryResult) {
+    state.query_result = Some(result);
+    state.update_known_columns(); // Update columns for autocompletion
+    state.compute_col_widths(); // Cache column widths once
+    state.selected_row = 0;
+    state.results_scroll_x = 0; // Reset horizontal scroll
+    state.active_panel = ActivePanel::Results;
 }
 
 /// Move cursor up one line in the query editor

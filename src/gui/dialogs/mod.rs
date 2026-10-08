@@ -4,8 +4,10 @@ pub mod connection;
 
 use super::app::App;
 use super::history_popup::{HistoryAction, HistoryPopup};
+use super::table_search::TableSearch;
 use super::tabs::{TabId, TabKind};
 use super::worker::Event;
+use crate::engine::ops::transfer::qualified;
 use connection::{ConnectionForm, FormAction};
 
 pub enum Dialog {
@@ -14,6 +16,8 @@ pub enum Dialog {
     ConfirmDeleteConnection(String),
     /// Query history (Ctrl+Alt+E) of the active console.
     History(HistoryPopup),
+    /// Table search (Ctrl+N) over every open connection.
+    TableSearch(TableSearch),
     /// "Abandonner les modifications ?" before data tab `TabId` changes page.
     DiscardEdits(TabId),
 }
@@ -53,6 +57,17 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         if let TabKind::Console(c) = &mut tab.kind {
                             c.insert(ui.ctx(), tab.id, &sql);
                         }
+                    }
+                    keep = false;
+                }
+            }
+            Dialog::TableSearch(search) => {
+                ui.set_min_width(520.0);
+                let color_of = |name: &str| app.color_of(name);
+                if let Some((connection, schema, table)) = search.ui(ui, &color_of) {
+                    let quotes = app.sessions.get(&connection).map(|s| s.quotes);
+                    if let Some(quotes) = quotes {
+                        app.open_data(&connection, &qualified(&schema, &table, quotes), &table);
                     }
                     keep = false;
                 }

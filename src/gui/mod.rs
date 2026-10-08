@@ -7,6 +7,7 @@ mod history_popup;
 mod grid;
 mod sessions;
 mod status;
+mod table_search;
 mod tabs;
 mod theme;
 mod value_panel;

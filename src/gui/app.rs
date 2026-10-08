@@ -14,16 +14,20 @@ use super::dialogs::{self, connection::same_target, Dialog};
 use super::history_popup::{self, HistoryPopup};
 use super::sessions::{Session, Sessions};
 use super::status::{self, Status, StatusKind};
+use super::table_search::TableSearch;
 use super::tabs::console::{self, ConsoleAction, ConsoleContext, ConsoleTab, RunKind};
 use super::tabs::data::{DataAction, DataContext, DataTab, Nav};
-use super::tabs::{self, ddl::DdlTab, TabId, TabKind, Tabs};
+use super::tabs::ddl::{DdlAction, DdlTab};
+use super::tabs::{self, TabId, TabKind, Tabs};
 use super::theme::{self, ThemeChoice, ERROR};
+use super::value_panel::ValuePanel;
 use super::worker::{Event, Worker};
 
 pub const NEW_CONSOLE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::T);
 pub const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
 pub const SAVE_CONSOLES: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 pub const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
+pub const TABLE_SEARCH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
 
 pub struct App {
     pub config: AppConfig,
@@ -37,6 +41,7 @@ pub struct App {
     pub history: History,
     pub explorer_filter: String,
     pub show_value_panel: bool,
+    pub value_panel: ValuePanel,
     pub status: Status,
     /// Import/export progress `(done, total, label)`.
     pub progress: Option<(usize, usize, String)>,
@@ -95,6 +100,7 @@ impl App {
             history: History::load_from(history_path),
             explorer_filter: String::new(),
             show_value_panel: false,
+            value_panel: ValuePanel::default(),
             status,
             progress: None,
             dialog: None,
@@ -355,6 +361,31 @@ impl App {
         if let Some(tab) = self.tabs.find(id) {
             tab.runs.ddl = Some(run);
         }
+    }
+
+    /// Request the `CREATE TABLE` of DDL tab `id` again.
+    fn reload_ddl(&mut self, id: TabId) {
+        let Some(tab) = self.tabs.find(id) else {
+            return;
+        };
+        let (TabKind::Ddl(d), Some(session)) = (&mut tab.kind, self.sessions.get(&tab.connection))
+        else {
+            return;
+        };
+        let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
+        d.reload();
+        tab.runs.ddl = Some(self.worker.ddl(id, conn, db_type, d.table.clone()));
+    }
+
+    /// Ctrl+N: search a table in every open connection.
+    fn table_search(&mut self) {
+        if self.sessions.open.is_empty() {
+            self.error("Ouvrez d'abord une connexion");
+            return;
+        }
+        self.dialog = Some(Dialog::TableSearch(TableSearch::new(
+            self.sessions.all_tables(),
+        )));
     }
 
     pub fn close_tab(&mut self, index: usize) {
@@ -683,6 +714,9 @@ impl App {
                 Err(e) => self.error(format!("Enregistrement des consoles impossible : {e}")),
             }
         }
+        if pressed(&TABLE_SEARCH) {
+            self.table_search();
+        }
         if pressed(&REFRESH) {
             // A data tab reloads its page, other tabs their connection.
             let active = self.tabs.active_mut().map(|t| match &mut t.kind {
@@ -810,6 +844,7 @@ impl App {
             return;
         };
         let mut data_action = None;
+        let mut ddl_action = None;
         let action = match &mut tab.kind {
             TabKind::Console(c) => {
                 let name = tab.connection.as_str();
@@ -839,7 +874,7 @@ impl App {
                 None
             }
             TabKind::Ddl(d) => {
-                d.show(ui);
+                ddl_action = d.show(ui, sessions.open.contains_key(&tab.connection));
                 None
             }
         };
@@ -849,6 +884,9 @@ impl App {
         }
         if let Some(action) = data_action {
             self.data_action(id, action);
+        }
+        if let Some(DdlAction::Refresh) = ddl_action {
+            self.reload_ddl(id);
         }
     }
 }

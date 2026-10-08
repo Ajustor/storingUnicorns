@@ -54,7 +54,6 @@ impl Sessions {
     }
 
     /// All `(connection, schema, table)` triples, for Ctrl+N and completion.
-    #[allow(dead_code)] // table search (plan 3b, Task 9)
     pub fn all_tables(&self) -> Vec<(String, String, String)> {
         all_tables(
             self.open

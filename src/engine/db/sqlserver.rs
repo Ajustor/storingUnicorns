@@ -1,6 +1,7 @@
 use anyhow::Result;
+use futures_util::TryStreamExt;
 use std::sync::Arc;
-use tiberius::{AuthMethod, Client, Config};
+use tiberius::{AuthMethod, Client, Config, QueryItem, QueryStream};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
@@ -142,9 +143,47 @@ async fn execute_counting(
     })
 }
 
-/// Execute a query on SQL Server. DML that returns no rows goes through
+/// Collect the rows of the first result set of `stream`, keeping at most
+/// `max_rows` of them. Returns the rows and whether more were available.
+///
+/// The stream is always read to the end, extra rows being discarded right
+/// away (only the kept rows use memory). Dropping a partially read
+/// `QueryStream` would leave the rest of the response on the wire: tiberius
+/// then flushes it packet by packet at the start of the next query on this
+/// shared client, logging a warning for every packet, and a later error in the
+/// batch would surface on that unrelated query. Draining here keeps the client
+/// clean and reports errors where they belong.
+async fn first_result_capped(
+    mut stream: QueryStream<'_>,
+    max_rows: Option<usize>,
+) -> Result<(Vec<tiberius::Row>, bool)> {
+    let mut rows = Vec::new();
+    let mut truncated = false;
+    let mut result_sets = 0usize;
+    while let Some(item) = stream.try_next().await? {
+        match item {
+            QueryItem::Metadata(_) => result_sets += 1,
+            QueryItem::Row(row) if result_sets <= 1 => {
+                if max_rows.is_some_and(|max| rows.len() >= max) {
+                    truncated = true;
+                } else {
+                    rows.push(row);
+                }
+            }
+            QueryItem::Row(_) => {}
+        }
+    }
+    Ok((rows, truncated))
+}
+
+/// Execute a query on SQL Server, keeping at most `max_rows` rows of the first
+/// result set (all when `None`). DML that returns no rows goes through
 /// `Client::execute` so that `rows_affected` is the real count.
-pub async fn execute_query(client: &SqlServerClient, query: &str) -> Result<QueryResult> {
+pub async fn execute_query_limited(
+    client: &SqlServerClient,
+    query: &str,
+    max_rows: Option<usize>,
+) -> Result<QueryResult> {
     let statements: Vec<String> = split_statements(query)
         .into_iter()
         .map(|(_, _, stmt)| stmt)
@@ -154,8 +193,11 @@ pub async fn execute_query(client: &SqlServerClient, query: &str) -> Result<Quer
         return execute_counting(&mut client, query).await;
     }
     let stream = client.simple_query(query).await?;
-    let rows = stream.into_first_result().await?;
-    Ok(rows_to_result(&rows))
+    let (rows, truncated) = first_result_capped(stream, max_rows).await?;
+    Ok(QueryResult {
+        truncated,
+        ..rows_to_result(&rows)
+    })
 }
 
 /// Join transaction statements into a single T-SQL batch. Running the whole

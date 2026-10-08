@@ -50,17 +50,29 @@ fn rows_to_result(rows: &[PgRow], affected: u64) -> QueryResult {
 
 /// Execute one statement exactly once, collecting its rows and affected-row
 /// count from the same stream.
-async fn run_statement<'c, E>(executor: E, query: &str) -> Result<QueryResult>
+async fn run_statement<'c, E>(
+    executor: E,
+    query: &str,
+    max_rows: Option<usize>,
+) -> Result<QueryResult>
 where
     E: sqlx::Executor<'c, Database = sqlx::Postgres>,
 {
-    let (rows, done) = fetch_rows_and_result(executor, query).await?;
-    Ok(rows_to_result(&rows, done.rows_affected()))
+    let (rows, done, truncated) = fetch_rows_and_result(executor, query, max_rows).await?;
+    Ok(QueryResult {
+        truncated,
+        ..rows_to_result(&rows, done.rows_affected())
+    })
 }
 
-/// Execute a query on PostgreSQL
-pub async fn execute_query(pool: &PgPool, query: &str) -> Result<QueryResult> {
-    run_statement(pool, query).await
+/// Execute a query on PostgreSQL, keeping at most `max_rows` rows (all when
+/// `None`); `truncated` is set when more rows were available.
+pub async fn execute_query_limited(
+    pool: &PgPool,
+    query: &str,
+    max_rows: Option<usize>,
+) -> Result<QueryResult> {
+    run_statement(pool, query, max_rows).await
 }
 
 /// Execute a sequence of statements as one transaction on a single dedicated
@@ -75,7 +87,7 @@ pub async fn execute_transaction(pool: &PgPool, statements: &[String]) -> Result
     let mut last_changed: Option<QueryResult> = None;
 
     for stmt in statements {
-        match run_statement(&mut *conn, stmt).await {
+        match run_statement(&mut *conn, stmt, None).await {
             Ok(result) => {
                 if !result.rows.is_empty() {
                     last_rows = Some(result);

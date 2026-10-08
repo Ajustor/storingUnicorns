@@ -47,16 +47,34 @@ impl DatabaseConnection {
 
     /// Execute a query and return results
     pub async fn execute_query(&self, query: &str) -> Result<QueryResult> {
+        self.execute_query_limited(query, None).await
+    }
+
+    /// Execute a query, keeping at most `max_rows` rows (all when `None`).
+    /// `QueryResult::truncated` is set when more rows were available.
+    pub async fn execute_query_limited(
+        &self,
+        query: &str,
+        max_rows: Option<usize>,
+    ) -> Result<QueryResult> {
         let start = Instant::now();
 
         let result = match self {
-            DatabaseConnection::Postgres(pool) => postgres::execute_query(pool, query).await?,
-            DatabaseConnection::MySQL(pool) => mysql::execute_query(pool, query).await?,
-            DatabaseConnection::SQLite(pool) => sqlite::execute_query(pool, query).await?,
-            DatabaseConnection::SQLServer(client) => {
-                sqlserver::execute_query(client, query).await?
+            DatabaseConnection::Postgres(pool) => {
+                postgres::execute_query_limited(pool, query, max_rows).await?
             }
-            DatabaseConnection::Azure(client) => azure::execute_query(client, query).await?,
+            DatabaseConnection::MySQL(pool) => {
+                mysql::execute_query_limited(pool, query, max_rows).await?
+            }
+            DatabaseConnection::SQLite(pool) => {
+                sqlite::execute_query_limited(pool, query, max_rows).await?
+            }
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::execute_query_limited(client, query, max_rows).await?
+            }
+            DatabaseConnection::Azure(client) => {
+                azure::execute_query_limited(client, query, max_rows).await?
+            }
         };
 
         Ok(QueryResult {

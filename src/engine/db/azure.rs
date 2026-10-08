@@ -156,9 +156,13 @@ async fn connect_with_aad_token(config: &ConnectionConfig, token: &str) -> Resul
 
 // ========== Delegated Operations (same as SQL Server) ==========
 
-/// Execute a query on Azure SQL Database
-pub async fn execute_query(client: &SqlServerClient, query: &str) -> Result<QueryResult> {
-    super::sqlserver::execute_query(client, query).await
+/// Execute a query on Azure SQL Database, keeping at most `max_rows` rows
+pub async fn execute_query_limited(
+    client: &SqlServerClient,
+    query: &str,
+    max_rows: Option<usize>,
+) -> Result<QueryResult> {
+    super::sqlserver::execute_query_limited(client, query, max_rows).await
 }
 
 /// Get list of tables grouped by schema

@@ -50,11 +50,15 @@ fn rows_to_result(rows: &[SqliteRow], affected: u64) -> QueryResult {
 
 /// Execute one statement exactly once, collecting its rows and affected-row
 /// count from the same stream.
-async fn run_statement<'c, E>(executor: E, query: &str) -> Result<QueryResult>
+async fn run_statement<'c, E>(
+    executor: E,
+    query: &str,
+    max_rows: Option<usize>,
+) -> Result<QueryResult>
 where
     E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
 {
-    let (rows, done) = fetch_rows_and_result(executor, query).await?;
+    let (rows, done, truncated) = fetch_rows_and_result(executor, query, max_rows).await?;
     // SQLite reports `sqlite3_changes()`, which is NOT reset by statements
     // that modify nothing (SELECT, DDL, COMMIT...): it keeps the count of the
     // last INSERT/UPDATE/DELETE on the connection. Only trust it for DML.
@@ -63,12 +67,20 @@ where
     } else {
         0
     };
-    Ok(rows_to_result(&rows, affected))
+    Ok(QueryResult {
+        truncated,
+        ..rows_to_result(&rows, affected)
+    })
 }
 
-/// Execute a query on SQLite
-pub async fn execute_query(pool: &SqlitePool, query: &str) -> Result<QueryResult> {
-    run_statement(pool, query).await
+/// Execute a query on SQLite, keeping at most `max_rows` rows (all when
+/// `None`); `truncated` is set when more rows were available.
+pub async fn execute_query_limited(
+    pool: &SqlitePool,
+    query: &str,
+    max_rows: Option<usize>,
+) -> Result<QueryResult> {
+    run_statement(pool, query, max_rows).await
 }
 
 /// Execute a sequence of statements as one transaction on a single dedicated
@@ -85,7 +97,7 @@ pub async fn execute_transaction(pool: &SqlitePool, statements: &[String]) -> Re
     let mut last_changed: Option<QueryResult> = None;
 
     for stmt in statements {
-        match run_statement(&mut *conn, stmt).await {
+        match run_statement(&mut *conn, stmt, None).await {
             Ok(result) => {
                 if !result.rows.is_empty() {
                     last_rows = Some(result);
@@ -302,6 +314,10 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
+    async fn execute_query(pool: &SqlitePool, query: &str) -> Result<QueryResult> {
+        execute_query_limited(pool, query, None).await
+    }
+
     /// A shared in-memory pool: max_connections(1) ensures every acquisition
     /// reuses the same connection (and therefore the same in-memory database).
     async fn mem_pool() -> SqlitePool {
@@ -444,5 +460,49 @@ mod tests {
         let result = execute_transaction(&pool, &stmts).await.unwrap();
         assert_eq!(result.rows, vec![vec!["7".to_string()]]);
         assert_eq!(result.rows_affected, 1);
+    }
+
+    #[tokio::test]
+    async fn row_cap_truncates_and_flags() {
+        let pool = mem_pool().await;
+        for i in 0..10 {
+            sqlx::query(&format!("INSERT INTO t VALUES ({i})"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let r = execute_query_limited(&pool, "SELECT a FROM t ORDER BY a", Some(3))
+            .await
+            .unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert!(r.truncated);
+        let r = execute_query_limited(&pool, "SELECT a FROM t", Some(10))
+            .await
+            .unwrap();
+        assert_eq!(r.rows.len(), 10);
+        assert!(!r.truncated);
+        let r = execute_query_limited(&pool, "SELECT a FROM t", None)
+            .await
+            .unwrap();
+        assert!(!r.truncated);
+    }
+
+    #[tokio::test]
+    async fn row_cap_still_runs_later_statements_of_the_batch() {
+        let pool = mem_pool().await;
+        // Enough rows that the driver can't have produced them all before the
+        // cap is reached.
+        let sql = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 50000)                    SELECT x FROM n; INSERT INTO t VALUES (99)";
+        let r = execute_query_limited(&pool, sql, Some(1)).await.unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert!(r.truncated);
+        let r = execute_query(&pool, "SELECT a FROM t WHERE a = 99")
+            .await
+            .unwrap();
+        assert_eq!(
+            r.rows.len(),
+            1,
+            "the INSERT after the capped SELECT must run"
+        );
     }
 }

@@ -42,12 +42,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Send `tracing` output to `debug.log` in the config directory
-/// (`~/.config/storing-unicorns/` or the platform equivalent).
+/// (`~/.config/storing-unicorns/` or the platform equivalent, or
+/// `$STORINGUNICORNS_CONFIG_DIR`).
 fn tracing_to_file() {
-    let log_path = dirs::config_dir()
-        .expect("Could not determine config directory")
-        .join("storing-unicorns");
-    std::fs::create_dir_all(&log_path).expect("Could not create config directory");
+    let log_path = engine::config::app_dir().expect("Could not create config directory");
     let file = match std::fs::File::create(log_path.join("debug.log")) {
         Ok(file) => file,
         Err(error) => panic!("Error: {:?}", error),

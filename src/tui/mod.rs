@@ -62,20 +62,7 @@ pub(crate) fn next_char_boundary(s: &str, pos: usize) -> usize {
     idx
 }
 
-pub async fn run() -> Result<()> {
-    // Parse command line arguments
-    let args: Vec<String> = std::env::args().collect();
-    let debug_mode = args.iter().any(|arg| arg == "--debug" || arg == "-d");
-    let no_animations = args
-        .iter()
-        .any(|arg| arg == "--no-animations" || arg == "-na");
-    let version = args.iter().any(|arg| arg == "--version" || arg == "-v");
-
-    if version {
-        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-
+pub async fn run(opts: crate::cli::TuiOptions) -> Result<()> {
     // Setup logging — store log next to config in ~/.config/storing-unicorns/
     let log_path = dirs::config_dir()
         .expect("Could not determine config directory")
@@ -107,9 +94,9 @@ pub async fn run() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app state
-    let mut state = AppState::new(config, debug_mode, no_animations);
+    let mut state = AppState::new(config, opts.debug, opts.no_animations);
 
-    if debug_mode {
+    if opts.debug {
         state.set_status("Debug mode enabled - queries will be shown in editor");
     }
 

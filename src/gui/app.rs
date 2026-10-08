@@ -4,11 +4,12 @@ use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_phosphor::regular as icon;
 
 use crate::engine::config::AppConfig;
+use crate::engine::models::ConnectionConfig;
 use crate::engine::services::history::History;
 use crate::engine::services::query_tabs::{QueryTab, QueryTabsState};
 use crate::updater::{ExitAction, Updater};
 
-use super::dialogs::{self, Dialog};
+use super::dialogs::{self, connection::same_target, Dialog};
 use super::sessions::{Session, Sessions};
 use super::status::{self, Status, StatusKind};
 use super::tabs::{self, console::ConsoleTab, data::DataTab, ddl::DdlTab, TabId, TabKind, Tabs};
@@ -30,7 +31,6 @@ pub struct App {
     pub sessions: Sessions,
     pub tabs: Tabs,
     pub history: History,
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     pub explorer_filter: String,
     pub show_value_panel: bool,
     pub status: Status,
@@ -155,7 +155,61 @@ impl App {
         self.worker.connect(config);
     }
 
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
+    /// Store a new (`original == None`) or edited connection. A rename moves
+    /// its tabs and saved consoles along; a change of target (host, base…)
+    /// drops its open session.
+    pub fn save_connection(&mut self, original: Option<String>, config: ConnectionConfig) {
+        let index = original
+            .as_ref()
+            .and_then(|old| self.config.connections.iter().position(|c| &c.name == old));
+        let (Some(old), Some(index)) = (original, index) else {
+            self.config.connections.push(config);
+            self.save_config();
+            return;
+        };
+        let previous = std::mem::replace(&mut self.config.connections[index], config.clone());
+        let keep_session = same_target(&previous, &config);
+        let new = config.name.clone();
+        if old != new {
+            for tab in self.tabs.list.iter_mut().filter(|t| t.connection == old) {
+                tab.connection = new.clone();
+            }
+            for q in &mut self.pending_consoles {
+                if q.connection.as_deref() == Some(old.as_str()) {
+                    q.connection = Some(new.clone());
+                }
+            }
+            if self.config.last_connection.as_deref() == Some(old.as_str()) {
+                self.config.last_connection = Some(new.clone());
+            }
+            self.sessions.errors.remove(&old);
+            // Metadata caches are keyed by name.
+            self.worker.forget(&old);
+            if let Some(session) = self.sessions.open.remove(&old) {
+                if keep_session {
+                    self.sessions.open.insert(new.clone(), session);
+                }
+            }
+        } else if !keep_session {
+            self.disconnect(&old);
+        }
+        if let Some(session) = self.sessions.get_mut(&new) {
+            session.config = config;
+        }
+        self.save_config();
+    }
+
+    /// Remove a (disconnected) connection from the configuration.
+    pub fn delete_connection(&mut self, name: &str) {
+        self.config.connections.retain(|c| c.name != name);
+        self.sessions.errors.remove(name);
+        if self.config.last_connection.as_deref() == Some(name) {
+            self.config.last_connection = None;
+        }
+        self.save_config();
+        self.info(format!("Connexion « {name} » supprimée"));
+    }
+
     /// Drop the session of `name`; its tabs stay open, marked disconnected.
     pub fn disconnect(&mut self, name: &str) {
         if self.sessions.open.remove(name).is_some() {
@@ -196,7 +250,6 @@ impl App {
         )
     }
 
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     /// Activate the data tab of `table` (qualified), opening it if needed.
     pub fn open_data(&mut self, connection: &str, table: &str, title: &str) {
         match self.tabs.find_data(connection, table) {
@@ -211,7 +264,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     /// Open a DDL tab for `table` (qualified) and request its `CREATE TABLE`.
     pub fn open_ddl(&mut self, connection: &str, table: &str, title: &str) {
         let Some(session) = self.sessions.get(connection) else {
@@ -438,7 +490,11 @@ impl App {
                         if r.clicked() {
                             action = Some(Action::Activate(i));
                         }
-                        if r.middle_clicked() || ui.small_button(icon::X).clicked() {
+                        let close = ui
+                            .small_button(icon::X)
+                            .on_hover_text("Fermer (Ctrl+W)")
+                            .clicked();
+                        if close || r.middle_clicked() {
                             action = Some(Action::Close(i));
                         }
                         ui.spacing_mut().item_spacing.x = spacing;

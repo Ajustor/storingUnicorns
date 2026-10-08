@@ -5,19 +5,18 @@ use crate::gui::worker::Event;
 
 pub struct DdlTab {
     /// Qualified, quoted table name.
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     pub table: String,
     /// `None` while loading.
     pub ddl: Option<Result<String, String>>,
 }
 
 impl DdlTab {
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     pub fn new(table: String) -> Self {
         Self { table, ddl: None }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new(&self.table).strong());
         match &self.ddl {
             None => {
                 ui.spinner();

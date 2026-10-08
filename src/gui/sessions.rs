@@ -10,7 +10,6 @@ use super::worker::Conn;
 pub struct Session {
     pub config: ConnectionConfig,
     pub conn: Conn,
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     pub quotes: (char, char),
     pub schemas: Vec<SchemaInfo>,
     /// table (qualified) → details, filled lazily by the explorer.
@@ -42,7 +41,6 @@ pub struct Sessions {
 }
 
 impl Sessions {
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     pub fn get(&self, name: &str) -> Option<&Session> {
         self.open.get(name)
     }
@@ -51,7 +49,7 @@ impl Sessions {
         self.open.get_mut(name)
     }
 
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
+    #[allow(dead_code)] // console and data tabs (plan 3b, Tasks 6 and 8)
     pub fn conn(&self, name: &str) -> Option<Conn> {
         self.open.get(name).map(|s| s.conn.clone())
     }

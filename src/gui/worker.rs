@@ -44,7 +44,7 @@ pub enum Event {
         name: String,
         error: String,
     },
-    TestFinished(#[allow(dead_code)] /* connection dialog (Task 5) */ Result<(), String>),
+    TestFinished(Result<(), String>),
     Schemas {
         name: String,
         outcome: Result<Vec<SchemaInfo>, String>,
@@ -280,7 +280,6 @@ impl Worker {
         });
     }
 
-    #[allow(dead_code)] // connection dialog (plan 3b, Task 5)
     pub fn test_connection(&self, config: ConnectionConfig) {
         self.spawn(async move {
             let outcome = match DatabaseConnection::connect(&config).await {
@@ -302,7 +301,6 @@ impl Worker {
         });
     }
 
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     /// Columns, indexes and foreign keys of `table` on connection `name`.
     pub fn table_details(&mut self, name: String, conn: Conn, table: String) {
         let cache = self.cache_for(&name);

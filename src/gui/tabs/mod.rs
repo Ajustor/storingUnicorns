@@ -13,9 +13,7 @@ pub type TabId = super::worker::TabId;
 
 pub enum TabKind {
     Console(console::ConsoleTab),
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     Data(data::DataTab),
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     Ddl(ddl::DdlTab),
 }
 
@@ -146,7 +144,6 @@ impl Tabs {
         self.list.get_mut(self.active)
     }
 
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     /// Data tab already open for (connection, table)? → its index.
     pub fn find_data(&self, connection: &str, table: &str) -> Option<usize> {
         self.list.iter().position(|t| {

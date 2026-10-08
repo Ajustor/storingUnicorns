@@ -49,7 +49,6 @@ pub const ACCENT: Color32 = Color32::from_rgb(0xB3, 0x6B, 0xFF);
 pub const SUCCESS: Color32 = Color32::from_rgb(0x4C, 0xC3, 0x8A);
 pub const ERROR: Color32 = Color32::from_rgb(0xE5, 0x5C, 0x6C);
 
-#[allow(dead_code)] // connection dialog (plan 3b, Task 5)
 /// Default palette offered in the connection form (DataGrip-like).
 pub const CONNECTION_COLORS: [[u8; 3]; 7] = [
     [0xE5, 0x5C, 0x6C], // prod red

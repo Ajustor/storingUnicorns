@@ -8,7 +8,6 @@ pub struct DataTab {
 }
 
 impl DataTab {
-    #[allow(dead_code)] // explorer (plan 3b, Task 5)
     pub fn new(table: String) -> Self {
         Self { table }
     }

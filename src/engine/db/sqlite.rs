@@ -604,6 +604,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn several_statements_keep_the_first_row_set() {
+        let pool = mem_pool().await;
+        let r = execute_query(
+            &pool,
+            "INSERT INTO t VALUES (5); SELECT a FROM t; SELECT 2 AS b, 3 AS c",
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.columns.len(), 1);
+        assert_eq!(r.rows, vec![vec!["5".to_string()]]);
+    }
+
+    #[tokio::test]
     async fn row_cap_truncates_and_flags() {
         let pool = mem_pool().await;
         for i in 0..10 {

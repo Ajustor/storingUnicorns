@@ -17,6 +17,8 @@ use crate::engine::sql::statements::split_statements;
 /// When `query` holds several statements, the rest of the stream is still
 /// drained (rows discarded) so that the following statements run: some
 /// drivers (SQLite) execute them lazily, while the stream is being read.
+/// Only the rows of the first statement that returns rows are kept (like
+/// SQL Server's first result set); affected-row counts are summed over all.
 ///
 /// `prepared` selects the prepared-statement protocol; otherwise the text
 /// (simple query) protocol is used, which MySQL needs for statements it does
@@ -42,9 +44,16 @@ where
     let mut done = DB::QueryResult::default();
     let mut truncated = false;
     let mut single_statement: Option<bool> = None;
+    // Set once the first statement that returned rows has finished: rows of
+    // later statements (possibly another shape) are discarded.
+    let mut first_result_done = false;
     while let Some(item) = stream.try_next().await? {
         match item {
-            Either::Left(result) => done.extend(Some(result)),
+            Either::Left(result) => {
+                first_result_done |= !rows.is_empty();
+                done.extend(Some(result));
+            }
+            Either::Right(_) if first_result_done => {}
             Either::Right(row) => {
                 if max_rows.is_some_and(|max| rows.len() >= max) {
                     truncated = true;
@@ -171,6 +180,45 @@ pub fn group_foreign_keys(
     keys
 }
 
+/// SQL literal for `value` in column `col`. For numeric types a number is
+/// left unquoted and an empty value is NULL; anything else is a quoted
+/// string, so a non-numeric value typed in a numeric column is rejected by
+/// the database instead of being run as SQL.
+fn sql_literal(col: &Column, value: &str) -> String {
+    let value = if is_bit_type(&col.type_name) {
+        map_bit_value(value)
+    } else {
+        value.to_string()
+    };
+    if is_numeric_type(&col.type_name) {
+        let number = value.trim();
+        if number.is_empty() {
+            return "NULL".to_string();
+        }
+        let plain = number
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | 'e' | 'E'));
+        if plain && number.parse::<f64>().is_ok() {
+            return number.to_string();
+        }
+    }
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// `"col" = <literal>`, or `"col" IS NULL` for a NULL value.
+fn where_part(col: &Column, value: &str, quote_start: char, quote_end: char) -> String {
+    let literal = if value == "NULL" {
+        "NULL".to_string()
+    } else {
+        sql_literal(col, value)
+    };
+    if literal == "NULL" {
+        format!("{quote_start}{}{quote_end} IS NULL", col.name)
+    } else {
+        format!("{quote_start}{}{quote_end} = {literal}", col.name)
+    }
+}
+
 /// Build UPDATE query SET clause and WHERE clause
 /// WHERE clause uses only primary key columns if available, otherwise falls back to all columns
 pub fn build_update_clauses(
@@ -186,64 +234,19 @@ pub fn build_update_clauses(
         .zip(original_values.iter().zip(new_values.iter()))
         .filter(|(_, (orig, new))| orig != new)
         .map(|(col, (_, new))| {
-            if new == "NULL" {
-                format!("{}{}{} = NULL", quote_start, col.name, quote_end)
+            let literal = if new == "NULL" {
+                "NULL".to_string()
             } else {
-                let escaped_value = new.replace('\'', "''");
-                let escaped_value = if is_bit_type(&col.type_name) {
-                    map_bit_value(&escaped_value)
-                } else {
-                    escaped_value
-                };
-                if is_numeric_type(&col.type_name) {
-                    format!(
-                        "{}{}{} = {}",
-                        quote_start, col.name, quote_end, escaped_value
-                    )
-                } else {
-                    format!(
-                        "{}{}{} = '{}'",
-                        quote_start, col.name, quote_end, escaped_value
-                    )
-                }
-            }
+                sql_literal(col, new)
+            };
+            format!("{quote_start}{}{quote_end} = {literal}", col.name)
         })
         .collect();
 
-    // Check if we have primary key columns
-    let has_primary_keys = columns.iter().any(|c| c.is_primary_key);
-
-    // Build WHERE clause using primary keys only (if available) or all columns as fallback
-    let where_parts: Vec<String> = columns
-        .iter()
-        .zip(original_values.iter())
-        .filter(|(col, _)| !has_primary_keys || col.is_primary_key)
-        .map(|(col, val)| {
-            if val == "NULL" {
-                format!("{}{}{} IS NULL", quote_start, col.name, quote_end)
-            } else {
-                let escaped_value = val.replace('\'', "''");
-                let escaped_value = if is_bit_type(&col.type_name) {
-                    map_bit_value(&escaped_value)
-                } else {
-                    escaped_value
-                };
-                if is_numeric_type(&col.type_name) {
-                    format!(
-                        "{}{}{} = {}",
-                        quote_start, col.name, quote_end, escaped_value
-                    )
-                } else {
-                    format!(
-                        "{}{}{} = '{}'",
-                        quote_start, col.name, quote_end, escaped_value
-                    )
-                }
-            }
-        })
-        .collect();
-
-    (set_parts.join(", "), where_parts.join(" AND "))
+    (
+        set_parts.join(", "),
+        build_where_clause(columns, original_values, quote_start, quote_end),
+    )
 }
 
 /// Check if a SQL type is numeric (should not be quoted)
@@ -303,17 +306,7 @@ pub fn build_insert_parts(
         if val == "NULL" || val.is_empty() {
             val_parts.push("NULL".to_string());
         } else {
-            let escaped_value = val.replace('\'', "''");
-            let escaped_value = if is_bit_type(&col.type_name) {
-                map_bit_value(&escaped_value)
-            } else {
-                escaped_value
-            };
-            if is_numeric_type(&col.type_name) {
-                val_parts.push(escaped_value);
-            } else {
-                val_parts.push(format!("'{}'", escaped_value));
-            }
+            val_parts.push(sql_literal(col, val));
         }
     }
 
@@ -378,29 +371,7 @@ pub fn build_where_clause(
         .iter()
         .zip(values.iter())
         .filter(|(col, _)| !has_primary_keys || col.is_primary_key)
-        .map(|(col, val)| {
-            if val == "NULL" {
-                format!("{}{}{} IS NULL", quote_start, col.name, quote_end)
-            } else {
-                let escaped_value = val.replace('\'', "''");
-                let escaped_value = if is_bit_type(&col.type_name) {
-                    map_bit_value(&escaped_value)
-                } else {
-                    escaped_value
-                };
-                if is_numeric_type(&col.type_name) {
-                    format!(
-                        "{}{}{} = {}",
-                        quote_start, col.name, quote_end, escaped_value
-                    )
-                } else {
-                    format!(
-                        "{}{}{} = '{}'",
-                        quote_start, col.name, quote_end, escaped_value
-                    )
-                }
-            }
-        })
+        .map(|(col, val)| where_part(col, val, quote_start, quote_end))
         .collect();
 
     where_parts.join(" AND ")
@@ -504,6 +475,40 @@ mod tests {
         assert_eq!(split("db.[dbo].t"), (some("dbo"), "t".into()));
         assert_eq!(split("public.\"Mixed\""), (some("public"), "Mixed".into()));
         assert_eq!(split("\"\".t"), (None, "t".into()));
+    }
+
+    #[test]
+    fn literals_per_column_type() {
+        let col = |ty: &str| Column {
+            name: "c".into(),
+            type_name: ty.into(),
+            nullable: true,
+            is_primary_key: true,
+        };
+        assert_eq!(sql_literal(&col("int"), " 42 "), "42");
+        assert_eq!(sql_literal(&col("numeric(10,2)"), "-1.5e3"), "-1.5e3");
+        assert_eq!(sql_literal(&col("int"), ""), "NULL");
+        assert_eq!(
+            sql_literal(&col("int"), "1; DROP TABLE t"),
+            "'1; DROP TABLE t'"
+        );
+        assert_eq!(sql_literal(&col("bit"), "true"), "1");
+        assert_eq!(sql_literal(&col("text"), "it's"), "'it''s'");
+        assert_eq!(sql_literal(&col("text"), ""), "''");
+        let cols = [col("int"), col("text")];
+        let (set, filter) = build_update_clauses(
+            &cols,
+            &["1".into(), "a".into()],
+            &["".into(), "NULL".into()],
+            '"',
+            '"',
+        );
+        assert_eq!(set, "\"c\" = NULL, \"c\" = NULL");
+        assert_eq!(filter, "\"c\" = 1 AND \"c\" = 'a'");
+        assert_eq!(
+            build_where_clause(&cols, &["NULL".into(), "x".into()], '[', ']'),
+            "[c] IS NULL AND [c] = 'x'"
+        );
     }
 
     #[test]

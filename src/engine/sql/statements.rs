@@ -51,6 +51,20 @@ pub fn split_statements(input: &str) -> Vec<(usize, usize, String)> {
                     i += 1;
                 }
             }
+            // Postgres dollar quoting: `$$ … $$` or `$tag$ … $tag$` (a
+            // function body full of `;`). `$1` is a parameter, not a quote.
+            '$' if dollar_tag(&input[pos..]).is_some()
+                && !(i > 0 && is_ident_char(chars[i - 1].1)) =>
+            {
+                let tag = dollar_tag(&input[pos..]).unwrap_or_default();
+                let body = pos + tag.len();
+                let end = input[body..]
+                    .find(tag)
+                    .map_or(input.len(), |at| body + at + tag.len());
+                while i < chars.len() && chars[i].0 < end {
+                    i += 1;
+                }
+            }
             '-' if i + 1 < chars.len() && chars[i + 1].1 == '-' => {
                 while i < chars.len() && chars[i].1 != '\n' {
                     i += 1;
@@ -77,6 +91,21 @@ pub fn split_statements(input: &str) -> Vec<(usize, usize, String)> {
     // Trailing statement without a terminating ';'
     push_stmt(&mut statements, stmt_start, input.len());
     statements
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// The dollar-quote opening `text` (`$$` or `$tag$`, the tag an identifier
+/// not starting with a digit), if any.
+fn dollar_tag(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('$')?;
+    let len = rest.find('$')?;
+    let tag = &rest[..len];
+    let valid = !tag.starts_with(|c: char| c.is_ascii_digit())
+        && tag.chars().all(|c| c.is_alphanumeric() || c == '_');
+    valid.then(|| &text[..len + 2])
 }
 
 /// Classify a statement as a transaction start, returning true for
@@ -292,6 +321,24 @@ mod helper_tests {
         let stmts = split_statements("SELECT 1; -- a;b\nSELECT 2; /* x; */ SELECT 3");
         let texts: Vec<_> = stmts.iter().map(|s| s.2.as_str()).collect();
         assert_eq!(texts, ["SELECT 1", "-- a;b\nSELECT 2", "/* x; */ SELECT 3"]);
+    }
+
+    #[test]
+    fn split_keeps_dollar_quoted_bodies_whole() {
+        let texts = |sql: &str| {
+            split_statements(sql)
+                .into_iter()
+                .map(|s| s.2)
+                .collect::<Vec<_>>()
+        };
+        let body = "CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql";
+        assert_eq!(texts(&format!("{body}; SELECT 1")), [body, "SELECT 1"]);
+        let tagged = "DO $fn$ BEGIN PERFORM 1; END $fn$";
+        assert_eq!(texts(&format!("{tagged};SELECT 2")), [tagged, "SELECT 2"]);
+        // Parameters and identifiers containing `$` are not quotes.
+        assert_eq!(texts("SELECT $1; SELECT a$b$c FROM t; SELECT 3").len(), 3);
+        // An unterminated quote runs to the end.
+        assert_eq!(texts("SELECT $$ a; b").len(), 1);
     }
 
     #[test]

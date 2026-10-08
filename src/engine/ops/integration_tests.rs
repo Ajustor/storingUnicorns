@@ -456,6 +456,19 @@ async fn integration_postgres() {
         ],
     };
     exercise(&conn, &d).await;
+    // A function body full of `;` stays one statement.
+    let out = run_script(
+        &conn,
+        "CREATE FUNCTION su_it.f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql;\n\
+         SELECT su_it.f() AS v",
+        None,
+    )
+    .await;
+    assert_eq!(out.len(), 2);
+    assert_eq!(
+        out[1].result.as_ref().unwrap().rows,
+        vec![vec!["1".to_string()]]
+    );
     check_decoding(
         &conn,
         &[
@@ -518,6 +531,15 @@ async fn integration_mysql() {
     assert_eq!(cols.len(), 4);
     assert_eq!(conn.get_primary_keys("parent").await.unwrap(), ["id"]);
     assert_eq!(conn.get_foreign_keys("child").await.unwrap().len(), 1);
+    // The text protocol accepts several statements; the first row set wins.
+    let r = exec(&conn, "SELECT 1 AS a; SELECT 2 AS b, 3 AS c").await;
+    assert_eq!(r.rows, vec![vec!["1".to_string()]]);
+    let r = exec(
+        &conn,
+        "UPDATE parent SET name = name WHERE a = 1; UPDATE parent SET name = name",
+    )
+    .await;
+    assert_eq!(r.rows_affected, 1 + 6);
     check_decoding(
         &conn,
         &[

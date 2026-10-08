@@ -129,16 +129,23 @@ pub async fn run(opts: crate::cli::TuiOptions) -> Result<()> {
         eprintln!("Error: {err:?}");
     }
 
-    // Check for updates after the TUI exits so the message is visible.
-    let skipped = state.config.skipped_version.clone();
-    let check = tokio::task::spawn_blocking(crate::updater::fetch_latest);
-    if let Ok(Ok(Ok(Some(info)))) = tokio::time::timeout(Duration::from_secs(5), check).await {
-        if skipped.as_deref() != Some(info.version.to_string().as_str()) {
-            println!(
-                "storingUnicorns v{} is available (current v{}). Run `storingUnicorns update` to install it.",
-                info.version,
-                crate::updater::current_version()
-            );
+    // Check for updates after the TUI exits so the message is visible
+    // (at most once a day).
+    let now = crate::updater::unix_now();
+    if crate::updater::should_check(crate::updater::last_check(), now) {
+        let skipped = state.config.skipped_version.clone();
+        let check = tokio::task::spawn_blocking(crate::updater::fetch_latest);
+        if let Ok(Ok(Ok(release))) = tokio::time::timeout(Duration::from_secs(5), check).await {
+            crate::updater::record_check(now);
+            if let Some(info) = release {
+                if !crate::updater::is_skipped(&info, skipped.as_deref()) {
+                    println!(
+                        "storingUnicorns v{} is available (current v{}). Run `storingUnicorns update` to install it.",
+                        info.version,
+                        crate::updater::current_version()
+                    );
+                }
+            }
         }
     }
 

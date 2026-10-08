@@ -128,6 +128,59 @@ fn http_get(agent: &ureq::Agent, url: &str) -> Result<ureq::http::Response<ureq:
         .map_err(|e| format!("request to {url} failed: {e}"))
 }
 
+/// Whether the user chose to skip `info`'s version. `skipped` may carry a
+/// leading `v`; an unparsable value skips nothing.
+pub fn is_skipped(info: &ReleaseInfo, skipped: Option<&str>) -> bool {
+    skipped
+        .and_then(|v| semver::Version::parse(v.trim_start_matches('v')).ok())
+        .is_some_and(|v| v == info.version)
+}
+
+/// Minimum time between automatic (post-exit) update checks.
+const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// Whether an automatic check is due, given the unix time of the last
+/// completed one.
+pub fn should_check(last: Option<u64>, now: u64) -> bool {
+    match last {
+        None => true,
+        // A timestamp in the future (clock changed) must not block checks.
+        Some(last) => last > now || now - last > CHECK_INTERVAL_SECS,
+    }
+}
+
+/// `last_update_check` next to the config file; holds unix seconds.
+fn last_check_path() -> Option<PathBuf> {
+    crate::engine::config::AppConfig::config_path()
+        .ok()
+        .map(|p| p.with_file_name("last_update_check"))
+}
+
+/// Unix time of the last completed automatic check, if recorded.
+pub fn last_check() -> Option<u64> {
+    std::fs::read_to_string(last_check_path()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Remember that an automatic check completed at `now` (best effort).
+pub fn record_check(now: u64) {
+    let Some(path) = last_check_path() else {
+        return;
+    };
+    if let Err(e) = std::fs::write(&path, now.to_string()) {
+        tracing::debug!("writing {}: {e}", path.display());
+    }
+}
+
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Blocking: fetch the manifest and return the update for this build, if any.
 pub fn fetch_latest() -> Result<Option<ReleaseInfo>, String> {
     let mut resp = http_get(&manifest_agent(), MANIFEST_URL)?;
@@ -578,5 +631,32 @@ mod tests {
     fn encode_powershell_command_is_base64_utf16le() {
         // "A" in UTF-16LE is 0x41 0x00 → "QQA="
         assert_eq!(encode_powershell_command("A"), "QQA=");
+    }
+
+    #[test]
+    fn is_skipped_ignores_v_prefix() {
+        let info = select_update(
+            manifest("1.2.0", &[MSI_ASSET]),
+            &v("1.0.0"),
+            InstallKind::Msi,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(is_skipped(&info, Some("1.2.0")));
+        assert!(is_skipped(&info, Some("v1.2.0")));
+        assert!(!is_skipped(&info, Some("1.1.0")));
+        assert!(!is_skipped(&info, Some("garbage")));
+        assert!(!is_skipped(&info, None));
+    }
+
+    #[test]
+    fn should_check_at_most_daily() {
+        let day = 24 * 60 * 60;
+        let now = 1_000_000;
+        assert!(should_check(None, now));
+        assert!(!should_check(Some(now), now));
+        assert!(!should_check(Some(now - day), now));
+        assert!(should_check(Some(now - day - 1), now));
+        assert!(should_check(Some(now + 10), now));
     }
 }

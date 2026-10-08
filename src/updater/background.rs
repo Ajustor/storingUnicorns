@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
-use super::{download_and_apply, fetch_latest, ExitAction, ReleaseInfo};
+use super::{download_and_apply, fetch_latest, is_skipped, ExitAction, ReleaseInfo};
 
 #[derive(Debug, Clone)]
 pub enum UpdateState {
@@ -90,12 +90,12 @@ impl Updater {
         let skipped = if manual {
             None
         } else {
-            skipped_version.and_then(|v| semver::Version::parse(v).ok())
+            skipped_version.map(str::to_owned)
         };
         let tx = self.tx.clone();
         let repaint = self.repaint.clone();
         std::thread::spawn(move || {
-            let res = fetch().map(|r| r.filter(|info| Some(&info.version) != skipped.as_ref()));
+            let res = fetch().map(|r| r.filter(|info| !is_skipped(info, skipped.as_deref())));
             let _ = tx.send(Msg::Checked(res));
             repaint();
         });
@@ -157,11 +157,11 @@ impl Updater {
                 self.manual.then_some(UpdateEvent::Error(e))
             }
             Msg::Installed(res) => {
-                let UpdateState::Downloading(info) =
-                    std::mem::replace(&mut self.state, UpdateState::Idle)
-                else {
+                // A result we're no longer waiting for: leave the state alone.
+                let UpdateState::Downloading(info) = &self.state else {
                     return None;
                 };
+                let info = info.clone();
                 match res {
                     Ok(staged) => {
                         self.staged_msi = staged;
@@ -246,5 +246,22 @@ mod tests {
         u.state = UpdateState::Available(info("99.0.0"));
         u.install_with(|_| Err("disk full".into()));
         assert!(matches!(wait(&mut u), Some(UpdateEvent::Error(e)) if e == "disk full"));
+    }
+
+    #[test]
+    fn stray_install_result_does_not_clobber_state() {
+        let mut u = Updater::new(|| {});
+        u.state = UpdateState::Available(info("99.0.0"));
+        u.tx.send(Msg::Installed(Ok(None))).unwrap();
+        assert!(u.poll().is_none());
+        assert!(matches!(u.state, UpdateState::Available(_)));
+    }
+
+    #[test]
+    fn skipped_version_with_v_prefix_is_skipped() {
+        let mut u = Updater::new(|| {});
+        u.check_with(false, Some("v99.0.0"), || Ok(Some(info("99.0.0"))));
+        assert!(wait(&mut u).is_none());
+        assert!(matches!(u.state, UpdateState::UpToDate));
     }
 }

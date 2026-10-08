@@ -60,6 +60,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Misc
 dirs = "5.0"
 
+# SQL formatting (GUI "Reformat")
+sqlformat = "0.3"
+
 # Terminal effects
 tachyonfx = "0.9"
 

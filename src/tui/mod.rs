@@ -2080,7 +2080,7 @@ pub(crate) async fn fetch_table_columns(
 pub(crate) async fn update_completions_from_context(state: &mut AppState) {
     // Extract table name from current query
     let query = state.query_input().to_string();
-    if let Some(table_name) = crate::tui::ui::sql_highlight::extract_table_from_query(&query) {
+    if let Some(table_name) = crate::tui::ui::sql_highlight::completion_context_table(&query) {
         // Check if we need to fetch columns
         if state.current_table_context.as_ref() != Some(&table_name) {
             state.current_table_context = Some(table_name.clone());

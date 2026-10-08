@@ -589,8 +589,11 @@ pub fn get_completions(
     suggestions
 }
 
-/// Extract table name from a SQL query for context-aware completion
-pub fn extract_table_from_query(query: &str) -> Option<String> {
+/// Table the query works on (after FROM, UPDATE or INTO), with its outer
+/// quotes stripped, for context-aware completion. Not to be confused with
+/// `statements::extract_table_from_query`, which keeps the quotes so the name
+/// can be reused in SQL.
+pub fn completion_context_table(query: &str) -> Option<String> {
     let query_upper = query.to_uppercase();
 
     // Try to find table name after FROM

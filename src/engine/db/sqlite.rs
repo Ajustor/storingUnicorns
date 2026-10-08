@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, SqlitePool, TypeInfo};
+use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, SqlitePool, TypeInfo, ValueRef};
 
 use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
 
@@ -360,7 +360,13 @@ pub async fn close(pool: SqlitePool) {
     pool.close().await;
 }
 
+/// Text of a cell; NULL of any type (an untyped NULL decodes as "" through
+/// `String`) is checked first and shown as `NULL`.
 fn get_value(row: &SqliteRow, index: usize) -> String {
+    match row.try_get_raw(index) {
+        Ok(raw) if !raw.is_null() => {}
+        _ => return "NULL".to_string(),
+    }
     row.try_get::<String, _>(index)
         .or_else(|_| row.try_get::<i32, _>(index).map(|v| v.to_string()))
         .or_else(|_| row.try_get::<i64, _>(index).map(|v| v.to_string()))
@@ -419,6 +425,15 @@ mod tests {
             .await
             .unwrap();
         rows[0].0
+    }
+
+    #[tokio::test]
+    async fn null_of_any_type_is_shown_as_null() {
+        let pool = mem_pool().await;
+        let r = execute_query(&pool, "SELECT NULL AS a, CAST(NULL AS TEXT) AS b, '' AS c")
+            .await
+            .unwrap();
+        assert_eq!(r.rows, vec![vec!["NULL", "NULL", ""]]);
     }
 
     #[tokio::test]

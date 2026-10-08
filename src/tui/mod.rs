@@ -24,8 +24,6 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use update_notifier::check_version;
-
 use config::AppConfig;
 use db::DatabaseConnection;
 use services::ColumnDefinition;
@@ -129,13 +127,18 @@ pub async fn run(opts: crate::cli::TuiOptions) -> Result<()> {
         eprintln!("Error: {err:?}");
     }
 
-    // Check for updates after TUI exits so the message is visible in terminal
-    check_version(
-        &env!("CARGO_PKG_NAME").to_lowercase(),
-        env!("CARGO_PKG_VERSION"),
-        Duration::from_secs(60 * 60 * 24),
-    )
-    .ok();
+    // Check for updates after the TUI exits so the message is visible.
+    let skipped = state.config.skipped_version.clone();
+    let check = tokio::task::spawn_blocking(crate::updater::fetch_latest);
+    if let Ok(Ok(Ok(Some(info)))) = tokio::time::timeout(Duration::from_secs(5), check).await {
+        if skipped.as_deref() != Some(info.version.to_string().as_str()) {
+            println!(
+                "storingUnicorns v{} is available (current v{}). Run `storingUnicorns update` to install it.",
+                info.version,
+                crate::updater::current_version()
+            );
+        }
+    }
 
     Ok(())
 }

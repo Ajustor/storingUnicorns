@@ -9,6 +9,12 @@ use crate::engine::models::ConnectionConfig;
 pub struct AppConfig {
     pub connections: Vec<ConnectionConfig>,
     pub last_connection: Option<String>,
+    /// Release the user chose not to be offered again.
+    #[serde(default)]
+    pub skipped_version: Option<String>,
+    /// GUI theme: "system" (default), "dark" or "light".
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 
 impl AppConfig {
@@ -56,5 +62,16 @@ impl AppConfig {
     #[allow(dead_code)]
     pub fn get_connection(&self, name: &str) -> Option<&ConnectionConfig> {
         self.connections.iter().find(|c| c.name == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_config_without_new_fields_still_parses() {
+        let c: AppConfig = toml::from_str("connections = []").unwrap();
+        assert!(c.skipped_version.is_none() && c.theme.is_none());
     }
 }

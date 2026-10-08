@@ -14,10 +14,7 @@ fn main() -> anyhow::Result<()> {
         // The GUI arrives in plan 3; until then the TUI is the only interface.
         Mode::Gui => run_tui(Default::default()),
         Mode::Tui(opts) => run_tui(opts),
-        Mode::Update => {
-            println!("Self-update is not available yet.");
-            Ok(())
-        }
+        Mode::Update => run_update(),
         Mode::Version => {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -34,5 +31,35 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_tui(opts: cli::TuiOptions) -> anyhow::Result<()> {
-    tokio::runtime::Runtime::new()?.block_on(tui::run(opts))
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(tui::run(opts));
+    // Don't wait for a post-exit update check that outlived its timeout.
+    runtime.shutdown_background();
+    result
+}
+
+/// `storingUnicorns update`: check, download, install, report on stdout.
+fn run_update() -> anyhow::Result<()> {
+    println!("Current version: {}", updater::current_version());
+    println!("Checking for updates…");
+    let info = match updater::fetch_latest() {
+        Ok(Some(info)) => info,
+        Ok(None) => {
+            println!("storingUnicorns is up to date.");
+            return Ok(());
+        }
+        Err(e) => anyhow::bail!("update check failed: {e}"),
+    };
+    println!("Installing v{}…", info.version);
+    match updater::download_and_apply(&info).map_err(|e| anyhow::anyhow!(e))? {
+        None => println!(
+            "Updated to v{}. Restart storingUnicorns to use it.",
+            info.version
+        ),
+        Some(msi) => {
+            println!("Launching the installer…");
+            updater::run_exit_action(&updater::ExitAction::RunMsi(msi), &[]);
+        }
+    }
+    Ok(())
 }

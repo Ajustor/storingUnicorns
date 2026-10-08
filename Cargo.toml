@@ -67,8 +67,6 @@ tachyonfx = "0.9"
 azure_identity = "0.22"
 azure_core = "0.22"
 
-update-notifier = "0.1.9"
-
 # Self-update from GitHub Pages
 ureq = "3"
 semver = "1"

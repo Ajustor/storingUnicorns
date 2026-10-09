@@ -121,6 +121,12 @@ pub fn parse_url(input: &str) -> Result<ParsedUrl, String> {
             _ => {}
         }
     }
+    // libpq: `require` plus a root certificate behaves as `verify-ca`.
+    // sqlx only reads the CA when verifying, so say so explicitly rather
+    // than leave the user believing the server is pinned.
+    if ssl_mode == Some(SslMode::Require) && ssl_ca.is_some() {
+        ssl_mode = Some(SslMode::VerifyCa);
+    }
     let flavor = scheme_flavor.or_else(|| Flavor::from_host(&host));
     Ok(ParsedUrl {
         db_type,
@@ -309,6 +315,22 @@ mod tests {
                 .unwrap();
         assert_eq!(p.ssl_ca, None);
         assert_eq!(p.ssl_mode, Some(SslMode::VerifyFull));
+    }
+
+    #[test]
+    fn require_with_a_root_cert_verifies_it_as_libpq_does() {
+        let p = parse_url("postgresql://h/d?sslmode=require&sslrootcert=ca.pem").unwrap();
+        assert_eq!(p.ssl_mode, Some(SslMode::VerifyCa));
+        // Order of the parameters doesn't matter; MySQL spelling too.
+        let p = parse_url("mysql://h/d?ssl-ca=ca.pem&ssl-mode=REQUIRED").unwrap();
+        assert_eq!(p.ssl_mode, Some(SslMode::VerifyCa));
+        // `system` pins nothing; other modes are left alone.
+        let p = parse_url("postgresql://h/d?sslmode=require&sslrootcert=system").unwrap();
+        assert_eq!(p.ssl_mode, Some(SslMode::Require));
+        let p = parse_url("postgresql://h/d?sslmode=verify-full&sslrootcert=ca.pem").unwrap();
+        assert_eq!(p.ssl_mode, Some(SslMode::VerifyFull));
+        let p = parse_url("postgresql://h/d?sslmode=prefer&sslrootcert=ca.pem").unwrap();
+        assert_eq!(p.ssl_mode, Some(SslMode::Prefer));
     }
 
     #[test]

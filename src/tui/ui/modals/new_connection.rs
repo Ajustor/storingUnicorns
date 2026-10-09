@@ -239,19 +239,9 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
         ConnectionField::Host,
         false,
     );
-    // Like the GUI's placeholder: the preset's host hint, dimmed, while
-    // the field is empty (the cursor cell keeps its reversed style).
+    // Like the GUI's placeholder: the preset's host hint while empty.
     if let (true, Some(f)) = (nc.host.is_empty(), nc.flavor) {
-        let area = chunks[idx];
-        let x = area.x + "Host: ".len() as u16;
-        let width = (area.x + area.width).saturating_sub(x) as usize;
-        frame.buffer_mut().set_stringn(
-            x,
-            area.y,
-            presets::preset(f).host_hint,
-            width,
-            Style::default().fg(Color::DarkGray),
-        );
+        render_placeholder(frame, chunks[idx], "Host", presets::preset(f).host_hint);
     }
     idx += 1;
 
@@ -307,7 +297,26 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
             ConnectionField::SslCa,
             false,
         );
+        // The CA is only read when verifying (VerifyCa / VerifyFull).
+        if nc.ssl_ca.is_empty() {
+            render_placeholder(
+                frame,
+                chunks[idx],
+                "Certificat CA",
+                "utilisé en mode Vérifier",
+            );
+        }
     }
+}
+
+/// Dimmed text in place of an empty field's value, after `label: `; the
+/// cursor cell keeps its reversed style.
+fn render_placeholder(frame: &mut Frame, area: Rect, label: &str, text: &str) {
+    let x = area.x + label.chars().count() as u16 + 2;
+    let width = (area.x + area.width).saturating_sub(x) as usize;
+    frame
+        .buffer_mut()
+        .set_stringn(x, area.y, text, width, Style::default().fg(Color::DarkGray));
 }
 
 #[cfg(test)]
@@ -375,5 +384,20 @@ mod tests {
         state.new_connection.host = "mine".into();
         let all = screen(&state).join("\n");
         assert!(!all.contains("supabase.co"), "{all}");
+    }
+
+    #[test]
+    fn an_empty_ca_says_when_it_is_used() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.open_new_connection_dialog();
+        let all = screen(&state).join("\n");
+        assert!(
+            all.contains("Certificat CA: utilisé en mode Vérifier"),
+            "{all}"
+        );
+        state.new_connection.ssl_ca = "ca.pem".into();
+        let all = screen(&state).join("\n");
+        assert!(all.contains("Certificat CA: ca.pem "), "{all}");
+        assert!(!all.contains("utilisé en mode"), "{all}");
     }
 }

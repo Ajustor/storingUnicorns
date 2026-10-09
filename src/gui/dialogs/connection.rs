@@ -410,7 +410,8 @@ impl ConnectionForm {
         ui.end_row();
         ui.label("Certificat CA");
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.ssl_ca).hint_text("racines du système"));
+            ui.add(egui::TextEdit::singleline(&mut self.ssl_ca).hint_text("racines du système"))
+                .on_hover_text("utilisé en mode Vérifier");
             if ui.button(egui_phosphor::regular::FOLDER_OPEN).clicked() {
                 if let Some(p) = rfd::FileDialog::new()
                     .add_filter("Certificat", &["pem", "crt", "cer"])
@@ -418,6 +419,16 @@ impl ConnectionForm {
                 {
                     self.ssl_ca = p.display().to_string();
                 }
+            }
+            // The CA is only read when verifying (VerifyCa / VerifyFull).
+            if !matches!(self.ssl_mode, SslMode::VerifyCa | SslMode::VerifyFull)
+                && !self.ssl_ca.trim().is_empty()
+            {
+                ui.label(
+                    egui::RichText::new("utilisé en mode Vérifier")
+                        .weak()
+                        .small(),
+                );
             }
         });
         ui.end_row();

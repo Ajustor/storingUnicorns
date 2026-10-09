@@ -105,7 +105,10 @@ pub fn parse_url(input: &str) -> Result<ParsedUrl, String> {
         return Err("URL sans hôte".into());
     }
     let username = Some(decode(url.username())).filter(|u| !u.is_empty());
-    let password = url.password().map(decode);
+    let password = url
+        .password()
+        .map(decode)
+        .or_else(|| has_empty_password(input.trim()).then(String::new));
     let database = Some(decode(url.path().trim_start_matches('/'))).filter(|d| !d.is_empty());
     let mut ssl_mode = None;
     let mut ssl_ca = None;
@@ -130,6 +133,16 @@ pub fn parse_url(input: &str) -> Result<ParsedUrl, String> {
         ssl_ca,
         flavor,
     })
+}
+
+/// Whether the userinfo of `input` ends with `:` (`user:@host`): an
+/// explicitly empty password, which `url` reports as no password.
+fn has_empty_password(input: &str) -> bool {
+    let rest = input.split_once("://").map_or("", |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| userinfo.ends_with(':'))
 }
 
 fn decode(s: &str) -> String {
@@ -267,6 +280,25 @@ mod tests {
             parse_url("postgres://h/d?sslmode=bogus").unwrap().ssl_mode,
             None
         );
+    }
+
+    #[test]
+    fn explicitly_empty_password() {
+        let p = parse_url("postgres://u:@localhost/d").unwrap();
+        assert_eq!(p.username.as_deref(), Some("u"));
+        assert_eq!(p.password, Some(String::new()));
+        let p = parse_url("mysql://u:@h:3306/d?x=a:@b").unwrap();
+        assert_eq!(p.password, Some(String::new()));
+        // No colon: no password at all; `:@` after the host is not userinfo.
+        assert_eq!(
+            parse_url("postgres://u@localhost/d").unwrap().password,
+            None
+        );
+        assert_eq!(
+            parse_url("postgres://localhost/a:@b").unwrap().password,
+            None
+        );
+        assert_eq!(parse_url("postgres://h/d?q=x:@y").unwrap().password, None);
     }
 
     #[test]

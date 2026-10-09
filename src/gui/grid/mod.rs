@@ -14,12 +14,17 @@ use crate::gui::theme::{ACCENT, ERROR, SUCCESS};
 
 use changes::{PendingEdits, RowRef};
 
-/// Indices of `rows` with a cell containing `filter` (case-insensitive).
-pub fn matching_rows(rows: &[Vec<String>], filter: &str) -> Vec<usize> {
+/// Indices of `rows` with a cell containing `filter` (case-insensitive),
+/// matched against the values shown: pending edits applied, NULL as "NULL".
+pub fn matching_rows(rows: &[Vec<String>], edits: &PendingEdits, filter: &str) -> Vec<usize> {
     let needle = filter.to_lowercase();
     (0..rows.len())
         .filter(|&i| {
-            needle.is_empty() || rows[i].iter().any(|c| c.to_lowercase().contains(&needle))
+            needle.is_empty()
+                || (0..rows[i].len()).any(|c| {
+                    let shown = display_cell(edits.value(rows, RowRef::Base(i), c));
+                    shown.to_lowercase().contains(&needle)
+                })
         })
         .collect()
 }
@@ -259,7 +264,7 @@ impl GridState {
         if !self.view_dirty && self.view_source == source {
             return;
         }
-        let filtered = matching_rows(rows, &self.filter);
+        let filtered = matching_rows(rows, &self.edits, &self.filter);
         self.view = match self.sort {
             Some((col, asc)) if filtered.len() == rows.len() => sorted_view(rows, col, asc),
             Some((col, asc)) => {
@@ -372,6 +377,26 @@ impl GridState {
         self.start_edit(ctx, &result.rows, r, first_input_column(&result.columns));
     }
 
+    /// Mark or unmark row `r` deleted; a new row is removed, and the later
+    /// new rows shift up: the focus and an open cell editor follow their row
+    /// (they are dropped when on the removed row).
+    fn toggle_delete(&mut self, r: RowRef) {
+        self.edits.toggle_delete(r);
+        let RowRef::New(removed) = r else {
+            return;
+        };
+        let follow = |row: RowRef| match row {
+            RowRef::New(j) if j == removed => None,
+            RowRef::New(j) if j > removed => Some(RowRef::New(j - 1)),
+            other => Some(other),
+        };
+        self.selected = self.selected.and_then(|(row, c)| Some((follow(row)?, c)));
+        self.editing = self
+            .editing
+            .take()
+            .and_then(|(row, c, text)| Some((follow(row)?, c, text)));
+    }
+
     fn revert(&mut self) {
         self.editing = None;
         self.edits.clear();
@@ -462,7 +487,7 @@ impl GridState {
             if key(Modifiers::NONE, Key::F2) || key(Modifiers::NONE, Key::Enter) {
                 self.start_edit(ctx, &result.rows, r, c);
             } else if key(Modifiers::COMMAND, Key::Delete) {
-                self.edits.toggle_delete(r);
+                self.toggle_delete(r);
             }
         }
         if key(Modifiers::COMMAND, Key::Enter) && !self.edits.is_empty() {
@@ -780,7 +805,7 @@ pub fn show(
         Some(CellAction::AddRow) => state.add_row(&ctx, result),
         Some(CellAction::ToggleDelete(r)) => {
             state.commit_edit(rows);
-            state.edits.toggle_delete(r);
+            state.toggle_delete(r);
             focus_grid();
         }
         None => {}
@@ -954,10 +979,61 @@ mod tests {
 
     #[test]
     fn filter_matches_any_cell_case_insensitively() {
-        assert_eq!(matching_rows(&rows(), "B"), vec![1]);
-        assert_eq!(matching_rows(&rows(), "3"), vec![2]);
-        assert_eq!(matching_rows(&rows(), ""), vec![0, 1, 2]);
-        assert!(matching_rows(&rows(), "zzz").is_empty());
+        let none = PendingEdits::default();
+        assert_eq!(matching_rows(&rows(), &none, "B"), vec![1]);
+        assert_eq!(matching_rows(&rows(), &none, "3"), vec![2]);
+        assert_eq!(matching_rows(&rows(), &none, ""), vec![0, 1, 2]);
+        assert!(matching_rows(&rows(), &none, "zzz").is_empty());
+    }
+
+    #[test]
+    fn filter_matches_the_values_shown() {
+        let r = rows();
+        let mut edits = PendingEdits::default();
+        edits.set(&r, RowRef::Base(0), 1, "Zoe".into());
+        assert_eq!(matching_rows(&r, &edits, "zoe"), vec![0], "edited value");
+        assert!(
+            matching_rows(&r, &edits, "alice").is_empty(),
+            "replaced value"
+        );
+        let nulls = col(&[NULL_CELL, "x"]);
+        let none = PendingEdits::default();
+        assert_eq!(
+            matching_rows(&nulls, &none, "null"),
+            vec![0],
+            "shown as NULL"
+        );
+        assert!(
+            matching_rows(&nulls, &none, "\u{E000}").is_empty(),
+            "no sentinel"
+        );
+    }
+
+    #[test]
+    fn removing_a_new_row_keeps_focus_and_editor_on_their_rows() {
+        let mut g = GridState::default();
+        for _ in 0..3 {
+            g.edits.add_row(2);
+        }
+        g.selected = Some((RowRef::New(2), 1));
+        g.editing = Some((RowRef::New(1), 0, "typed".into()));
+        g.toggle_delete(RowRef::New(0));
+        assert_eq!(g.edits.new_rows(), 2);
+        assert_eq!(g.selected, Some((RowRef::New(1), 1)), "followed its row");
+        assert_eq!(
+            g.editing.as_ref().map(|e| (e.0, e.1, e.2.as_str())),
+            Some((RowRef::New(0), 0, "typed"))
+        );
+        // The focused row itself is removed: no focus on another row.
+        g.toggle_delete(RowRef::New(1));
+        assert_eq!(g.selected, None);
+        assert_eq!(g.editing.as_ref().map(|e| e.0), Some(RowRef::New(0)));
+        g.toggle_delete(RowRef::New(0));
+        assert!(g.editing.is_none());
+        // Base rows don't shift.
+        g.selected = Some((RowRef::Base(1), 0));
+        g.toggle_delete(RowRef::Base(0));
+        assert_eq!(g.selected, Some((RowRef::Base(1), 0)));
     }
 
     #[test]

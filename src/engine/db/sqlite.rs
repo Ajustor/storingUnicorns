@@ -3,9 +3,7 @@ use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, SqlitePool, TypeInfo, V
 
 use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
 
-use super::utils::{
-    build_update_clauses, fetch_rows_and_result, is_dml, split_qualified, TxConnection,
-};
+use super::utils::{fetch_rows_and_result, is_dml, split_qualified, TxConnection};
 
 /// Connect to SQLite
 pub async fn connect(conn_str: &str) -> Result<SqlitePool> {
@@ -148,31 +146,6 @@ pub async fn get_tables_by_schema(pool: &SqlitePool) -> Result<Vec<SchemaInfo>> 
         tables: rows.into_iter().map(|r| r.0).collect(),
         expanded: false,
     }])
-}
-
-/// Update a row in SQLite
-pub async fn update_row(
-    pool: &SqlitePool,
-    table_name: &str,
-    columns: &[Column],
-    original_values: &[String],
-    new_values: &[String],
-) -> Result<u64> {
-    let (set_clause, where_clause) =
-        build_update_clauses(columns, original_values, new_values, '"', '"');
-
-    if set_clause.is_empty() {
-        return Ok(0); // No changes
-    }
-
-    let query = format!(
-        "UPDATE {} SET {} WHERE {}",
-        table_name, set_clause, where_clause
-    );
-
-    tracing::debug!("SQLite UPDATE query: {}", query);
-    let result = sqlx::query(&query).execute(pool).await?;
-    Ok(result.rows_affected())
 }
 
 /// Insert a new row into a SQLite table

@@ -3,10 +3,7 @@ use sqlx::{postgres::PgRow, Column as SqlxColumn, PgPool, Row, TypeInfo};
 
 use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
 
-use super::utils::{
-    build_update_clauses, fetch_rows_and_result, group_tables_by_schema, split_qualified,
-    TxConnection,
-};
+use super::utils::{fetch_rows_and_result, group_tables_by_schema, split_qualified, TxConnection};
 
 /// Connect to PostgreSQL
 pub async fn connect(conn_str: &str) -> Result<PgPool> {
@@ -125,31 +122,6 @@ pub async fn get_tables_by_schema(pool: &PgPool) -> Result<Vec<SchemaInfo>> {
     .fetch_all(pool)
     .await?;
     Ok(group_tables_by_schema(rows))
-}
-
-/// Update a row in PostgreSQL
-pub async fn update_row(
-    pool: &PgPool,
-    table_name: &str,
-    columns: &[Column],
-    original_values: &[String],
-    new_values: &[String],
-) -> Result<u64> {
-    let (set_clause, where_clause) =
-        build_update_clauses(columns, original_values, new_values, '"', '"');
-
-    if set_clause.is_empty() {
-        return Ok(0); // No changes
-    }
-
-    let query = format!(
-        "UPDATE {} SET {} WHERE {}",
-        table_name, set_clause, where_clause
-    );
-
-    tracing::info!("PostgreSQL UPDATE query: {}", query);
-    let result = sqlx::query(&query).execute(pool).await?;
-    Ok(result.rows_affected())
 }
 
 /// Insert a new row into a PostgreSQL table

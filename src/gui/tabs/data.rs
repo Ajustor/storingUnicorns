@@ -7,7 +7,8 @@ use egui::{Galley, Key, RichText};
 use egui_phosphor::regular as icon;
 
 use crate::engine::models::QueryResult;
-use crate::engine::ops::rows::detect_system_columns;
+use crate::engine::ops::query::has_full_key;
+use crate::engine::ops::rows::{detect_system_columns, NO_PRIMARY_KEY};
 use crate::engine::sql::paging::{toggle_order, DataQuery};
 use crate::gui::editor::highlight_job;
 use crate::gui::grid::changes::PendingEdits;
@@ -261,6 +262,16 @@ impl DataTab {
         }
     }
 
+    /// Rows can be edited: the table has a primary key, all of it shown.
+    pub fn editable(&self) -> bool {
+        self.result.as_ref().is_some_and(has_full_key)
+    }
+
+    /// Why a loaded page is read-only.
+    pub fn read_only_hint(&self) -> Option<&'static str> {
+        (self.result.is_some() && !self.editable()).then_some(NO_PRIMARY_KEY)
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, cx: DataContext) -> Option<DataAction> {
         if self.needs_load && cx.connected && !self.loading {
             return Some(DataAction::Load { count: true });
@@ -279,6 +290,10 @@ impl DataTab {
                 });
         }
         ui.separator();
+        if let Some(hint) = self.read_only_hint() {
+            ui.label(RichText::new(format!("{} {hint}", icon::LOCK)).weak());
+        }
+        let editable = self.editable();
         let Some(result) = &self.result else {
             if self.loading {
                 ui.spinner();
@@ -291,7 +306,7 @@ impl DataTab {
             &mut self.grid,
             GridOptions {
                 result,
-                editable: true,
+                editable,
                 server_sort: true,
                 sort_indicator: self.sort,
             },
@@ -443,6 +458,26 @@ mod tests {
             truncated: false,
             primary_key: vec!["id".into()],
         }
+    }
+
+    #[test]
+    fn table_without_primary_key_is_read_only() {
+        let mut t = DataTab::new("\"main\".\"t\"".into(), ('"', '"'));
+        assert!(!t.editable(), "nothing loaded");
+        t.on_event(page_event(Ok(page(2))));
+        assert!(t.editable());
+        assert_eq!(t.read_only_hint(), None);
+        let mut unkeyed = page(2);
+        unkeyed.primary_key.clear();
+        for c in &mut unkeyed.columns {
+            c.is_primary_key = false;
+        }
+        t.on_event(page_event(Ok(unkeyed)));
+        assert!(!t.editable());
+        assert_eq!(
+            t.read_only_hint(),
+            Some("Lecture seule : pas de clé primaire")
+        );
     }
 
     fn page_event(outcome: Result<QueryResult, String>) -> Event {

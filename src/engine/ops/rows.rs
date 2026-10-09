@@ -7,8 +7,12 @@ use crate::engine::db::DatabaseConnection;
 use crate::engine::models::{Column, DatabaseType};
 use crate::engine::sql::statements::quote_chars;
 
+#[cfg(test)] // integration tests
+pub use crate::engine::db::utils::transaction_bounds;
+
 /// Update one row identified by its original values. Returns 0 without
-/// touching the database when nothing changed.
+/// touching the database when nothing changed; fails (and changes nothing)
+/// unless exactly one row matches.
 pub async fn update_row(
     conn: &DatabaseConnection,
     table: &str,
@@ -16,10 +20,11 @@ pub async fn update_row(
     original: &[String],
     new: &[String],
 ) -> Result<u64> {
-    if original == new {
+    let (qs, qe) = quote_chars(&conn.db_type());
+    let Some(sql) = build_update_query(table, columns, original, new, qs, qe) else {
         return Ok(0);
-    }
-    conn.update_row(table, columns, original, new).await
+    };
+    conn.execute_checked_batch(&[sql], &[Some(1)]).await
 }
 
 /// Insert a row, skipping the auto-generated `system_columns` indices.
@@ -35,6 +40,7 @@ pub async fn insert_row(
 }
 
 /// Delete the row matching `values`, quoting identifiers with `quotes`.
+/// Fails (and deletes nothing) unless exactly one row matches.
 pub async fn delete_row(
     conn: &DatabaseConnection,
     table: &str,
@@ -43,7 +49,7 @@ pub async fn delete_row(
     quotes: (char, char),
 ) -> Result<u64> {
     let sql = build_delete_query(table, columns, values, quotes.0, quotes.1);
-    Ok(conn.execute_query(&sql).await?.rows_affected)
+    conn.execute_checked_batch(&[sql], &[Some(1)]).await
 }
 
 /// Pending edits of a data grid, applied together by `submit_changes`.
@@ -68,19 +74,16 @@ impl RowChanges {
     }
 }
 
-/// `(begin, commit)` statements for the dialect.
-pub fn transaction_bounds(db: &DatabaseType) -> (&'static str, &'static str) {
-    match db {
-        DatabaseType::Postgres | DatabaseType::SQLite => ("BEGIN", "COMMIT"),
-        DatabaseType::MySQL => ("START TRANSACTION", "COMMIT"),
-        DatabaseType::SQLServer | DatabaseType::Azure => ("BEGIN TRANSACTION", "COMMIT"),
-    }
-}
+/// Message of a submit refused because rows can't be identified.
+pub const NO_PRIMARY_KEY: &str = "Lecture seule : pas de clé primaire";
 
-/// Build the statements for `changes` (deletes, then updates, then inserts),
-/// wrap them in the dialect's BEGIN/COMMIT and run them with
-/// `execute_transaction` (rolled back on any error). Returns the number of
-/// statements applied (unchanged updates are skipped).
+/// Build the statements for `changes` (deletes, then updates, then inserts)
+/// and run them in one transaction with `execute_checked_batch`: every
+/// UPDATE and DELETE must affect exactly one row (its row may have been
+/// deleted or changed since it was loaded, or the key may not be unique),
+/// otherwise everything is rolled back. Rows are identified by the primary
+/// key: without one (`columns` has no key column) the submit is refused.
+/// Returns the number of statements applied (unchanged updates are skipped).
 pub async fn submit_changes(
     conn: &DatabaseConnection,
     db: &DatabaseType,
@@ -89,32 +92,30 @@ pub async fn submit_changes(
     system_columns: &[usize],
     changes: &RowChanges,
 ) -> Result<usize> {
+    if changes.is_empty() {
+        return Ok(0);
+    }
+    if !columns.iter().any(|c| c.is_primary_key) {
+        anyhow::bail!("{NO_PRIMARY_KEY}");
+    }
     let (qs, qe) = quote_chars(db);
     let deletes = changes
         .deletes
         .iter()
-        .map(|values| build_delete_query(table, columns, values, qs, qe));
-    let updates = changes
-        .updates
-        .iter()
-        .filter_map(|(original, new)| build_update_query(table, columns, original, new, qs, qe));
-    let inserts = changes
-        .inserts
-        .iter()
-        .filter_map(|values| build_insert_query(table, columns, values, system_columns, qs, qe));
-    let statements: Vec<String> = deletes.chain(updates).chain(inserts).collect();
+        .map(|values| (build_delete_query(table, columns, values, qs, qe), Some(1)));
+    let updates = changes.updates.iter().filter_map(|(original, new)| {
+        build_update_query(table, columns, original, new, qs, qe).map(|sql| (sql, Some(1)))
+    });
+    let inserts = changes.inserts.iter().filter_map(|values| {
+        build_insert_query(table, columns, values, system_columns, qs, qe).map(|sql| (sql, None))
+    });
+    let (statements, expected): (Vec<String>, Vec<Option<u64>>) =
+        deletes.chain(updates).chain(inserts).unzip();
     if statements.is_empty() {
         return Ok(0);
     }
-
-    let applied = statements.len();
-    let (begin, commit) = transaction_bounds(db);
-    let mut block = Vec::with_capacity(applied + 2);
-    block.push(begin.to_string());
-    block.extend(statements);
-    block.push(commit.to_string());
-    conn.execute_transaction(&block).await?;
-    Ok(applied)
+    conn.execute_checked_batch(&statements, &expected).await?;
+    Ok(statements.len())
 }
 
 /// Result of an operation applied to several tables.
@@ -302,6 +303,125 @@ mod tests {
         );
         let r = conn.execute_query("SELECT name FROM t").await.unwrap();
         assert_eq!(r.rows[0][0], "a", "update must be rolled back");
+    }
+
+    /// Names of `t`, ordered.
+    async fn names(conn: &DatabaseConnection) -> Vec<String> {
+        let r = conn
+            .execute_query("SELECT name FROM t ORDER BY id")
+            .await
+            .unwrap();
+        r.rows.into_iter().map(|r| r[0].clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn submit_rolls_back_when_a_row_is_no_longer_there() {
+        let conn = sqlite_mem(SETUP).await;
+        let changes = RowChanges {
+            updates: vec![
+                (row("1", "a"), row("1", "A")),
+                // Deleted (or its key changed) since it was loaded.
+                (row("7", "x"), row("7", "y")),
+            ],
+            inserts: vec![row("", "c")],
+            deletes: vec![row("2", "b")],
+        };
+        let err = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[0], &changes)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("La ligne n'a pas été trouvée ou n'est pas unique (0 ligne)"),
+            "{err}"
+        );
+        assert!(err.contains("modifications annulées"), "{err}");
+        assert_eq!(names(&conn).await, ["a", "b"], "everything rolled back");
+        // The connection is usable (no transaction left open).
+        update_row(&conn, "t", &cols(), &row("1", "a"), &row("1", "z"))
+            .await
+            .unwrap();
+        assert_eq!(names(&conn).await, ["z", "b"]);
+    }
+
+    #[tokio::test]
+    async fn submit_rolls_back_when_a_key_matches_several_rows() {
+        // `k` is presented as the key but the table does not enforce it.
+        let conn = sqlite_mem(&[
+            "CREATE TABLE d (k INTEGER, v TEXT)",
+            "INSERT INTO d VALUES (1, 'a'), (1, 'a'), (2, 'b')",
+        ])
+        .await;
+        let columns: Vec<Column> = ["k", "v"]
+            .iter()
+            .map(|n| Column {
+                name: n.to_string(),
+                type_name: "TEXT".into(),
+                nullable: true,
+                is_primary_key: *n == "k",
+            })
+            .collect();
+        for changes in [
+            RowChanges {
+                updates: vec![(row("1", "a"), row("1", "z"))],
+                ..Default::default()
+            },
+            RowChanges {
+                deletes: vec![row("2", "b"), row("1", "a")],
+                ..Default::default()
+            },
+        ] {
+            let err = submit_changes(&conn, &DatabaseType::SQLite, "d", &columns, &[], &changes)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("n'est pas unique (2 lignes)"), "{err}");
+            let r = conn
+                .execute_query("SELECT k, v FROM d ORDER BY k, v")
+                .await
+                .unwrap();
+            assert_eq!(r.rows.len(), 3, "nothing deleted");
+            assert!(r.rows.iter().all(|r| r[1] != "z"), "nothing updated");
+        }
+        // Single-row helpers are checked too.
+        assert!(
+            update_row(&conn, "d", &columns, &row("1", "a"), &row("1", "z"))
+                .await
+                .is_err()
+        );
+        assert!(delete_row(&conn, "d", &columns, &row("1", "a"), ('"', '"'))
+            .await
+            .is_err());
+        assert_eq!(count(&conn, "d").await, "3");
+    }
+
+    #[tokio::test]
+    async fn submit_refuses_a_table_without_primary_key() {
+        let conn = sqlite_mem(&[
+            "CREATE TABLE n (a TEXT, b TEXT)",
+            "INSERT INTO n VALUES ('x', 'y')",
+        ])
+        .await;
+        let columns: Vec<Column> = ["a", "b"]
+            .iter()
+            .map(|n| Column {
+                name: n.to_string(),
+                type_name: "TEXT".into(),
+                nullable: true,
+                is_primary_key: false,
+            })
+            .collect();
+        let changes = RowChanges {
+            updates: vec![(row("x", "y"), row("x", "z"))],
+            inserts: vec![row("p", "q")],
+            deletes: vec![],
+        };
+        let err = submit_changes(&conn, &DatabaseType::SQLite, "n", &columns, &[], &changes)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pas de clé primaire"), "{err}");
+        let r = conn.execute_query("SELECT a, b FROM n").await.unwrap();
+        assert_eq!(r.rows, vec![vec!["x".to_string(), "y".to_string()]]);
     }
 
     #[tokio::test]

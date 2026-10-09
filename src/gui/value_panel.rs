@@ -189,7 +189,10 @@ fn focus(tabs: &mut super::tabs::Tabs) -> Option<Focus<'_>> {
     let tab = tabs.active_mut()?;
     let id = tab.id;
     let (result_id, result, grid, editable) = match &mut tab.kind {
-        TabKind::Data(d) => (0, d.result.as_ref()?, &mut d.grid, true),
+        TabKind::Data(d) => {
+            let editable = d.editable();
+            (0, d.result.as_ref()?, &mut d.grid, editable)
+        }
         TabKind::Console(c) => {
             let r = c.results.get_mut(c.active_result)?;
             (r.id, &r.result, &mut r.grid, r.editable)

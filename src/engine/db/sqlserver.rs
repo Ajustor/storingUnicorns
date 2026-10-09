@@ -13,8 +13,8 @@ use crate::engine::models::{
 use crate::engine::sql::statements::split_statements;
 
 use super::utils::{
-    build_update_clauses, group_foreign_keys, group_indexes, group_tables_by_schema, is_dml,
-    leading_keyword, skip_leading_comments, split_qualified,
+    group_foreign_keys, group_indexes, group_tables_by_schema, is_dml, leading_keyword,
+    skip_leading_comments, split_qualified,
 };
 
 /// A tiberius client over TCP.
@@ -376,6 +376,64 @@ pub async fn execute_transaction(
     outcome
 }
 
+/// Run `sql` as one batch and read its whole response.
+async fn run_batch(client: &mut TdsClient, sql: &str) -> Result<Vec<Vec<tiberius::Row>>> {
+    Ok(client.simple_query(sql).await?.into_results().await?)
+}
+
+/// Run one statement and return the number of rows it affected
+/// (`@@ROWCOUNT`, which does not count the rows changed by triggers).
+async fn rows_affected_by(client: &mut TdsClient, stmt: &str) -> Result<u64> {
+    let results = run_batch(client, &format!("{stmt};\nSELECT @@ROWCOUNT")).await?;
+    let count: Option<i32> = results
+        .last()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get(0));
+    Ok(count.unwrap_or(0).max(0) as u64)
+}
+
+/// Run `statements` one by one in a transaction on the shared client.
+/// Statement `i` must affect exactly `expected[i]` rows when that is
+/// `Some`; on a different count or any error the transaction is rolled back
+/// and the error returned. Returns the total number of affected rows.
+pub async fn execute_checked_batch(
+    client: &SqlServerClient,
+    statements: &[String],
+    expected: &[Option<u64>],
+) -> Result<u64> {
+    let mut client = client.lock().await?;
+    let outcome = async {
+        run_batch(&mut client, "BEGIN TRANSACTION").await?;
+        let mut total = 0;
+        for (i, stmt) in statements.iter().enumerate() {
+            let affected = rows_affected_by(&mut client, stmt).await?;
+            if let Some(want) = expected.get(i).copied().flatten() {
+                if affected != want {
+                    return Err(super::utils::row_count_error(affected));
+                }
+            }
+            total += affected;
+        }
+        run_batch(&mut client, "COMMIT").await?;
+        Ok(total)
+    }
+    .await;
+    let in_step = match &outcome {
+        Ok(_) => true,
+        // A count mismatch or a server error: the response was read.
+        Err(e) => e.downcast_ref::<tiberius::error::Error>().is_none() || is_server_error(e),
+    };
+    if outcome.is_err() && in_step {
+        let cleanup = run_batch(&mut client, "IF @@TRANCOUNT > 0 ROLLBACK").await;
+        client.settle(&cleanup);
+    } else {
+        // Other errors may leave the response unread: the client is
+        // replaced (and the server rolls the transaction back).
+        client.settle(&outcome);
+    }
+    outcome
+}
+
 /// Get tables grouped by schema
 pub async fn get_tables_by_schema(client: &SqlServerClient) -> Result<Vec<SchemaInfo>> {
     let mut client = client.lock().await?;
@@ -401,30 +459,6 @@ pub async fn get_tables_by_schema(client: &SqlServerClient) -> Result<Vec<Schema
         })
         .collect();
     Ok(group_tables_by_schema(tuples))
-}
-
-/// Update a row in SQL Server
-pub async fn update_row(
-    client: &SqlServerClient,
-    table_name: &str,
-    columns: &[Column],
-    original_values: &[String],
-    new_values: &[String],
-) -> Result<u64> {
-    let (set_clause, where_clause) =
-        build_update_clauses(columns, original_values, new_values, '[', ']');
-
-    if set_clause.is_empty() {
-        return Ok(0); // No changes
-    }
-
-    let query = format!(
-        "UPDATE {} SET {} WHERE {}",
-        table_name, set_clause, where_clause
-    );
-
-    tracing::debug!("SQL Server UPDATE query: {}", query);
-    execute_counted(client, &query).await
 }
 
 /// Insert a new row into a SQL Server table

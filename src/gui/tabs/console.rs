@@ -9,9 +9,9 @@ use egui_phosphor::regular as icon;
 
 use crate::engine::models::{Column, QueryResult};
 use crate::engine::ops::query::{editable_table, StatementOutcome};
-use crate::engine::ops::rows::{detect_system_columns, RowChanges};
+use crate::engine::ops::rows::{detect_system_columns, RowChanges, NO_PRIMARY_KEY};
 use crate::engine::sql::format::format_sql;
-use crate::engine::sql::statements::extract_table_from_query;
+use crate::engine::sql::statements::{extract_table_from_query, single_table_source};
 use crate::gui::editor::{self, completion::Completion, EditorContext};
 use crate::gui::grid::{self, GridAction, GridOptions, GridState};
 use crate::gui::theme::{self, ACCENT, ERROR};
@@ -79,6 +79,13 @@ impl ResultTab {
 /// whole primary key is shown (`ops::query::editable_table`).
 pub fn is_editable(sql: &str, result: &QueryResult) -> bool {
     editable_table(sql, result).is_some()
+}
+
+/// Why a result that reads a single table is read-only: that table has no
+/// primary key (its rows can't be told apart).
+pub fn read_only_hint(sql: &str, result: &QueryResult) -> Option<&'static str> {
+    let unkeyed = single_table_source(sql).is_some() && result.primary_key.is_empty();
+    (unkeyed && !is_editable(sql, result)).then_some(NO_PRIMARY_KEY)
 }
 
 pub struct LogLine {
@@ -737,6 +744,9 @@ fn result_view(
             ),
         );
     }
+    if let Some(hint) = read_only_hint(&r.sql, &r.result) {
+        ui.label(RichText::new(format!("{} {hint}", icon::LOCK)).weak());
+    }
     let action = grid::show(
         ui,
         id.with(("result", r.id)),
@@ -928,6 +938,20 @@ mod tests {
         let mut c = ConsoleTab::new(String::new(), 0);
         apply_outcomes(&mut c, vec![ok("SELECT * FROM users", keyed)], Local::now());
         assert!(c.results[0].editable);
+    }
+
+    #[test]
+    fn read_only_hint_only_for_a_single_table_without_key() {
+        let keyed = with_pk(result(&["id", "name"], 1));
+        assert_eq!(read_only_hint("SELECT * FROM users", &keyed), None);
+        let unkeyed = result(&["a", "b"], 1);
+        assert_eq!(
+            read_only_hint("SELECT * FROM logs", &unkeyed),
+            Some("Lecture seule : pas de clé primaire")
+        );
+        assert!(!is_editable("SELECT * FROM logs", &unkeyed));
+        // Not a single table: read-only without that hint.
+        assert_eq!(read_only_hint("SELECT 1 AS one", &unkeyed), None);
     }
 
     #[test]

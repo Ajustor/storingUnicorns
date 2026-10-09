@@ -7,7 +7,7 @@ use crate::engine::models::{
 };
 
 pub use super::sqlserver::SqlServerClient;
-use super::{azure, mysql, postgres, sqlite, sqlserver};
+use super::{azure, mysql, postgres, sqlite, sqlserver, utils};
 
 /// Unified database connection handle
 pub enum DatabaseConnection {
@@ -113,6 +113,44 @@ impl DatabaseConnection {
         })
     }
 
+    /// The database type of this connection.
+    pub fn db_type(&self) -> DatabaseType {
+        match self {
+            DatabaseConnection::Postgres(_) => DatabaseType::Postgres,
+            DatabaseConnection::MySQL(_) => DatabaseType::MySQL,
+            DatabaseConnection::SQLite(_) => DatabaseType::SQLite,
+            DatabaseConnection::SQLServer(_) => DatabaseType::SQLServer,
+            DatabaseConnection::Azure(_) => DatabaseType::Azure,
+        }
+    }
+
+    /// Run `statements` one by one in a transaction (the dialect's BEGIN and
+    /// COMMIT) on a dedicated connection. Statement `i` must affect exactly
+    /// `expected[i]` rows when that is `Some`: on a different count, or any
+    /// error, everything is rolled back and an error returned. Returns the
+    /// total number of affected rows.
+    pub async fn execute_checked_batch(
+        &self,
+        statements: &[String],
+        expected: &[Option<u64>],
+    ) -> Result<u64> {
+        let (begin, _) = utils::transaction_bounds(&self.db_type());
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                utils::execute_checked(pool, begin, statements, expected).await
+            }
+            DatabaseConnection::MySQL(pool) => {
+                utils::execute_checked(pool, begin, statements, expected).await
+            }
+            DatabaseConnection::SQLite(pool) => {
+                utils::execute_checked(pool, begin, statements, expected).await
+            }
+            DatabaseConnection::SQLServer(client) | DatabaseConnection::Azure(client) => {
+                sqlserver::execute_checked_batch(client, statements, expected).await
+            }
+        }
+    }
+
     /// Test the connection
     pub async fn test(&self) -> Result<()> {
         match self {
@@ -150,36 +188,6 @@ impl DatabaseConnection {
             DatabaseConnection::SQLite(pool) => sqlite::get_tables_by_schema(pool).await,
             DatabaseConnection::SQLServer(client) => sqlserver::get_tables_by_schema(client).await,
             DatabaseConnection::Azure(client) => azure::get_tables_by_schema(client).await,
-        }
-    }
-
-    /// Update a row in the database
-    /// Uses the original values to build a WHERE clause and the new values for the SET clause
-    pub async fn update_row(
-        &self,
-        table_name: &str,
-        columns: &[Column],
-        original_values: &[String],
-        new_values: &[String],
-    ) -> Result<u64> {
-        match self {
-            DatabaseConnection::Postgres(pool) => {
-                postgres::update_row(pool, table_name, columns, original_values, new_values).await
-            }
-            DatabaseConnection::MySQL(pool) => {
-                mysql::update_row(pool, table_name, columns, original_values, new_values).await
-            }
-            DatabaseConnection::SQLite(pool) => {
-                sqlite::update_row(pool, table_name, columns, original_values, new_values).await
-            }
-            DatabaseConnection::SQLServer(client) => {
-                sqlserver::update_row(client, table_name, columns, original_values, new_values)
-                    .await
-            }
-            DatabaseConnection::Azure(client) => {
-                sqlserver::update_row(client, table_name, columns, original_values, new_values)
-                    .await
-            }
         }
     }
 

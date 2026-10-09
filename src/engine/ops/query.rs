@@ -112,9 +112,13 @@ async fn enrich(conn: &DatabaseConnection, sql: &str, result: &mut QueryResult) 
 /// the displayed row.
 pub fn editable_table(sql: &str, result: &QueryResult) -> Option<String> {
     let table = single_table_source(sql)?;
-    if result.primary_key.is_empty() {
-        return None;
-    }
+    has_full_key(result).then_some(table)
+}
+
+/// Whether the rows of `result` (read from a single table) can be told
+/// apart: the table has a primary key, every key column is in the result
+/// and no column name is repeated.
+pub fn has_full_key(result: &QueryResult) -> bool {
     let names = &result.columns;
     let unique = names
         .iter()
@@ -124,7 +128,7 @@ pub fn editable_table(sql: &str, result: &QueryResult) -> Option<String> {
         .primary_key
         .iter()
         .all(|pk| names.iter().any(|c| c.name == *pk));
-    (unique && keyed).then_some(table)
+    !result.primary_key.is_empty() && unique && keyed
 }
 
 /// Run one execution unit. Single statements are capped at `max_rows` and

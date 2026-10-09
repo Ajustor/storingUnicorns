@@ -373,6 +373,71 @@ async fn exercise(conn: &DatabaseConnection, d: &Dialect) {
     let after = parent_rows(conn, d).await;
     assert_eq!(after.len(), 5, "delete rolled back");
     assert_eq!(after[2], ("3".into(), "p3".into()), "update rolled back");
+    // A row deleted since it was loaded: the submit fails and nothing of it
+    // is applied, the connection stays usable.
+    let rows = exec(
+        conn,
+        &format!("SELECT id, a, b, name FROM {parent} ORDER BY a"),
+    )
+    .await
+    .rows;
+    let mut ghost = rows[0].clone();
+    ghost[0] = "987654".into();
+    let mut ghost_edit = ghost.clone();
+    ghost_edit[3] = "ghost".into();
+    let mut edited = rows[1].clone();
+    edited[3] = "changed".into();
+    let changes = RowChanges {
+        updates: vec![(rows[1].clone(), edited), (ghost, ghost_edit)],
+        inserts: vec![vec!["".into(), "6".into(), "60".into(), "p6".into()]],
+        deletes: vec![rows[2].clone()],
+    };
+    let err = submit_changes(conn, &d.db, &parent, &columns, &system, &changes)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("(0 ligne)"), "{err}");
+    assert_eq!(parent_rows(conn, d).await, after, "nothing applied");
+    // A key that is not unique for the database ((b, name) presented as the
+    // key).
+    let by_a: Vec<_> = columns
+        .iter()
+        .map(|c| crate::engine::models::Column {
+            is_primary_key: c.name == "b" || c.name == "name",
+            ..c.clone()
+        })
+        .collect();
+    exec(
+        conn,
+        &format!("INSERT INTO {parent} (a, b, name) VALUES (70, 30, 'p3')"),
+    )
+    .await;
+    let rows = exec(
+        conn,
+        &format!("SELECT id, a, b, name FROM {parent} WHERE b = 30 ORDER BY a"),
+    )
+    .await
+    .rows;
+    let mut edited = rows[0].clone();
+    edited[3] = "both".into();
+    let changes = RowChanges {
+        updates: vec![(rows[0].clone(), edited)],
+        ..Default::default()
+    };
+    let err = submit_changes(conn, &d.db, &parent, &by_a, &system, &changes)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("(2 lignes)"), "{err}");
+    assert_eq!(
+        scalar(
+            conn,
+            &format!("SELECT COUNT(*) FROM {parent} WHERE name = 'both'")
+        )
+        .await,
+        "0"
+    );
+    exec(conn, &format!("DELETE FROM {parent} WHERE a = 70")).await;
 
     // --- CSV import (upsert): update by id, insert unknown id ---
     let id1 = scalar(conn, &format!("SELECT id FROM {parent} WHERE a = 1")).await;

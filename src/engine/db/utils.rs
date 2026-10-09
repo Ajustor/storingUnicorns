@@ -4,7 +4,7 @@ use futures_util::TryStreamExt;
 use sqlx::pool::PoolConnection;
 use sqlx::{Database, Either, Executor, IntoArguments};
 
-use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, SchemaInfo};
+use crate::engine::models::{Column, DatabaseType, ForeignKeyInfo, IndexInfo, SchemaInfo};
 use crate::engine::sql::statements::split_statements;
 
 /// Execute `query` exactly once and collect both its rows and its
@@ -121,6 +121,95 @@ impl<DB: Database> Drop for TxConnection<DB> {
         if let Some(mut conn) = self.conn.take() {
             // Closed (in a spawned task) instead of returned to the pool.
             conn.close_on_drop();
+        }
+    }
+}
+
+/// `(begin, commit)` statements for the dialect.
+pub fn transaction_bounds(db: &DatabaseType) -> (&'static str, &'static str) {
+    match db {
+        DatabaseType::Postgres | DatabaseType::SQLite => ("BEGIN", "COMMIT"),
+        DatabaseType::MySQL => ("START TRANSACTION", "COMMIT"),
+        DatabaseType::SQLServer | DatabaseType::Azure => ("BEGIN TRANSACTION", "COMMIT"),
+    }
+}
+
+/// Rows changed by a statement, for every sqlx backend.
+pub trait RowsAffected {
+    fn rows(&self) -> u64;
+}
+
+impl RowsAffected for sqlx::postgres::PgQueryResult {
+    fn rows(&self) -> u64 {
+        self.rows_affected()
+    }
+}
+
+impl RowsAffected for sqlx::mysql::MySqlQueryResult {
+    fn rows(&self) -> u64 {
+        self.rows_affected()
+    }
+}
+
+impl RowsAffected for sqlx::sqlite::SqliteQueryResult {
+    fn rows(&self) -> u64 {
+        self.rows_affected()
+    }
+}
+
+/// The error of a checked statement that did not affect exactly one row.
+pub fn row_count_error(affected: u64) -> anyhow::Error {
+    let unit = if affected <= 1 { "ligne" } else { "lignes" };
+    anyhow::anyhow!(
+        "La ligne n'a pas été trouvée ou n'est pas unique ({affected} {unit}) —          modifications annulées"
+    )
+}
+
+/// Run `statements` one by one between `begin` and `COMMIT` on a dedicated
+/// connection of `pool`. Statement `i` must affect exactly `expected[i]`
+/// rows when that is `Some`; on a different count or any error the
+/// transaction is rolled back and the error returned. Returns the total
+/// number of affected rows. Statements go through the text protocol (MySQL
+/// rejects `START TRANSACTION` as a prepared statement).
+pub async fn execute_checked<DB>(
+    pool: &sqlx::Pool<DB>,
+    begin: &str,
+    statements: &[String],
+    expected: &[Option<u64>],
+) -> anyhow::Result<u64>
+where
+    DB: Database,
+    DB::QueryResult: RowsAffected,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+{
+    // Closed instead of pooled if the batch does not run to completion.
+    let mut conn = TxConnection::new(pool.acquire().await?);
+    (&mut *conn).execute(begin).await?;
+    let outcome = async {
+        let mut total = 0;
+        for (i, stmt) in statements.iter().enumerate() {
+            let affected = (&mut *conn).execute(stmt.as_str()).await?.rows();
+            if let Some(want) = expected.get(i).copied().flatten() {
+                if affected != want {
+                    return Err(row_count_error(affected));
+                }
+            }
+            total += affected;
+        }
+        Ok(total)
+    }
+    .await;
+    match outcome {
+        Ok(total) => {
+            (&mut *conn).execute("COMMIT").await?;
+            conn.release();
+            Ok(total)
+        }
+        Err(e) => {
+            if (&mut *conn).execute("ROLLBACK").await.is_ok() {
+                conn.release();
+            }
+            Err(e)
         }
     }
 }

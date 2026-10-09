@@ -609,6 +609,13 @@ mod tests {
 
     #[test]
     fn without_a_password_pgpass_is_read() {
+        // `set_var` races with whatever reads the environment in the other
+        // test threads, so the check runs in a child process of this test
+        // binary, started with PGPASSFILE set.
+        const CHILD: &str = "STORINGUNICORNS_PGPASS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return pgpass_is_read_from_env();
+        }
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("pgpass.conf");
         std::fs::write(&file, "pgpass-test.invalid:5499:shop:bob:fr0m-pgpass\n").unwrap();
@@ -617,8 +624,25 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        // Only this test sets PGPASSFILE, and only its host matches the file.
-        std::env::set_var("PGPASSFILE", &file);
+        let name = concat!(module_path!(), "::without_a_password_pgpass_is_read");
+        let name = name.split_once("::").map_or(name, |(_, rest)| rest);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("PGPASSFILE", &file)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran no test: {stdout}"
+        );
+    }
+
+    /// Run in the child process of `without_a_password_pgpass_is_read`.
+    fn pgpass_is_read_from_env() {
         let c = ConnectionConfig {
             host: Some("pgpass-test.invalid".into()),
             port: Some(5499),
@@ -635,7 +659,6 @@ mod tests {
                 ..c
             })
         );
-        std::env::remove_var("PGPASSFILE");
         assert!(
             without.contains(r#"password: Some("fr0m-pgpass")"#),
             "{without}"

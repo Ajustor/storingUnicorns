@@ -159,7 +159,6 @@ pub struct ConnectionConfig {
 }
 
 impl ConnectionConfig {
-    #[allow(dead_code)] // TODO(tls-presets): drop once the dialogs use it.
     pub fn effective_ssl_mode(&self) -> SslMode {
         self.ssl_mode.unwrap_or_default()
     }

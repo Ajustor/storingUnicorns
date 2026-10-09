@@ -4763,6 +4763,8 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "rust_decimal",
+ "rustls 0.23.45",
+ "rustls-native-certs 0.8.4",
  "serde",
  "serde_json",
  "sha2",

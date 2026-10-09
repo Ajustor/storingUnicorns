@@ -1,16 +1,41 @@
 use anyhow::Result;
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{postgres::PgRow, Column as SqlxColumn, PgPool, Row, TypeInfo};
 
 use crate::engine::models::{
-    Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, NULL_CELL,
+    Column, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, SslMode,
+    NULL_CELL,
 };
 
 use super::utils::{fetch_rows_and_result, group_tables_by_schema, split_qualified, TxConnection};
 
+/// Options built field by field: no URL, so any character works in the
+/// password. (Like a URL, unset fields still fall back to the PG* variables.)
+pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
+    let mut o = PgConnectOptions::new_without_pgpass()
+        .host(config.host.as_deref().unwrap_or("localhost"))
+        .port(config.port.unwrap_or(5432))
+        .username(config.username.as_deref().unwrap_or("postgres"))
+        .database(&config.database)
+        .ssl_mode(match config.effective_ssl_mode() {
+            SslMode::Disable => PgSslMode::Disable,
+            SslMode::Prefer => PgSslMode::Prefer,
+            SslMode::Require => PgSslMode::Require,
+            SslMode::VerifyCa => PgSslMode::VerifyCa,
+            SslMode::VerifyFull => PgSslMode::VerifyFull,
+        });
+    if let Some(p) = &config.password {
+        o = o.password(p);
+    }
+    if let Some(ca) = &config.ssl_ca {
+        o = o.ssl_root_cert(ca);
+    }
+    o
+}
+
 /// Connect to PostgreSQL
-pub async fn connect(conn_str: &str) -> Result<PgPool> {
-    let pool = PgPool::connect(conn_str).await?;
-    Ok(pool)
+pub async fn connect(config: &ConnectionConfig) -> Result<PgPool> {
+    Ok(PgPool::connect_with(connect_options(config)).await?)
 }
 
 /// Convert fetched rows into a `QueryResult`.
@@ -444,7 +469,9 @@ fn get_value(row: &PgRow, index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::models::{ConnectionConfig, SslMode};
     use sqlx::postgres::types::PgInterval;
+    use sqlx::postgres::PgSslMode;
 
     #[test]
     fn interval_text_matches_postgres_style() {
@@ -466,5 +493,62 @@ mod tests {
     fn array_text_renders_nulls() {
         assert_eq!(array_text(vec![Some(1), None]), "{1,NULL}");
         assert_eq!(array_text::<i32>(vec![]), "{}");
+    }
+
+    #[test]
+    fn options_come_from_the_fields() {
+        let c = ConnectionConfig {
+            host: Some("db.example.com".into()),
+            port: Some(6543),
+            username: Some("alice".into()),
+            password: Some("a@b:c/d#e?f%g".into()),
+            database: "app".into(),
+            ssl_mode: Some(SslMode::VerifyFull),
+            ssl_ca: Some("C:/certs/ca.pem".into()),
+            ..Default::default()
+        };
+        let o = connect_options(&c);
+        assert_eq!(o.get_host(), "db.example.com");
+        assert_eq!(o.get_port(), 6543);
+        assert_eq!(o.get_username(), "alice");
+        assert_eq!(o.get_database(), Some("app"));
+        assert!(matches!(o.get_ssl_mode(), PgSslMode::VerifyFull));
+        // No getter for the password or the CA: check the Debug output.
+        let debug = format!("{o:?}");
+        assert!(
+            debug.contains(r#"password: Some("a@b:c/d#e?f%g")"#),
+            "{debug}"
+        );
+        assert!(debug.contains("C:/certs/ca.pem"), "{debug}");
+    }
+
+    #[test]
+    fn defaults_and_ssl_mapping() {
+        let o = connect_options(&ConnectionConfig {
+            host: None,
+            port: None,
+            username: None,
+            ..Default::default()
+        });
+        assert_eq!(o.get_host(), "localhost");
+        assert_eq!(o.get_port(), 5432);
+        assert_eq!(o.get_username(), "postgres");
+        assert!(matches!(o.get_ssl_mode(), PgSslMode::Prefer));
+        for (mode, want) in [
+            (SslMode::Disable, PgSslMode::Disable),
+            (SslMode::Prefer, PgSslMode::Prefer),
+            (SslMode::Require, PgSslMode::Require),
+            (SslMode::VerifyCa, PgSslMode::VerifyCa),
+            (SslMode::VerifyFull, PgSslMode::VerifyFull),
+        ] {
+            let c = ConnectionConfig {
+                ssl_mode: Some(mode),
+                ..Default::default()
+            };
+            assert_eq!(
+                std::mem::discriminant(&connect_options(&c).get_ssl_mode()),
+                std::mem::discriminant(&want)
+            );
+        }
     }
 }

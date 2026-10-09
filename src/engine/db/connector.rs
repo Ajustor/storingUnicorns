@@ -21,19 +21,17 @@ pub enum DatabaseConnection {
 impl DatabaseConnection {
     /// Connect to a database using the provided configuration
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
-        let conn_str = config.to_connection_string();
-
         match config.db_type {
             DatabaseType::Postgres => {
-                let pool = postgres::connect(&conn_str).await?;
+                let pool = postgres::connect(config).await?;
                 Ok(DatabaseConnection::Postgres(pool))
             }
             DatabaseType::MySQL => {
-                let pool = mysql::connect(&conn_str).await?;
+                let pool = mysql::connect(config).await?;
                 Ok(DatabaseConnection::MySQL(pool))
             }
             DatabaseType::SQLite => {
-                let pool = sqlite::connect(&conn_str).await?;
+                let pool = sqlite::connect(&config.to_connection_string()).await?;
                 Ok(DatabaseConnection::SQLite(pool))
             }
             DatabaseType::SQLServer => {

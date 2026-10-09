@@ -64,6 +64,9 @@ pub struct Sessions {
     pub connecting: BTreeSet<String>,
     /// Last connection failure per connection name (cleared on retry).
     pub errors: HashMap<String, String>,
+    /// Bumped by every mutable access to a session (schemas, details):
+    /// views caching what they derive from the sessions compare it.
+    generation: u64,
 }
 
 impl Sessions {
@@ -72,7 +75,12 @@ impl Sessions {
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Session> {
+        self.generation += 1;
         self.open.get_mut(name)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn conn(&self, name: &str) -> Option<Conn> {

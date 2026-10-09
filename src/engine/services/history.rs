@@ -27,6 +27,8 @@ pub struct HistoryEntry {
 pub struct History {
     entries: Vec<HistoryEntry>,
     path: PathBuf,
+    /// Bumped by every change (views caching a search compare it).
+    generation: u64,
 }
 
 impl History {
@@ -44,13 +46,18 @@ impl History {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
-        Self { entries, path }
+        Self {
+            entries,
+            path,
+            generation: 0,
+        }
     }
 
     /// Newest last. Skips an entry identical (same sql + connection) to the
     /// newest one (updates its `at`/`duration_ms`/`ok` instead). Keeps the
     /// last `MAX`.
     pub fn push(&mut self, entry: HistoryEntry) {
+        self.generation += 1;
         match self.entries.last_mut() {
             Some(last) if last.sql == entry.sql && last.connection == entry.connection => {
                 last.at = entry.at;
@@ -74,14 +81,32 @@ impl History {
         write_atomic(&self.path, json.as_bytes())
     }
 
-    /// Newest first, case-insensitive substring match on `sql`; empty query → all.
+    /// The entries [`History::search_indices`] finds.
+    #[cfg(test)]
     pub fn search(&self, query: &str) -> Vec<&HistoryEntry> {
-        let needle = query.to_lowercase();
-        self.entries
-            .iter()
-            .rev()
-            .filter(|e| needle.is_empty() || e.sql.to_lowercase().contains(&needle))
+        self.search_indices(query)
+            .into_iter()
+            .map(|i| &self.entries[i])
             .collect()
+    }
+
+    /// Indexes (for [`History::get`]) of the entries whose `sql` contains
+    /// `query` (case-insensitive; empty query → all), newest first.
+    pub fn search_indices(&self, query: &str) -> Vec<usize> {
+        let needle = query.to_lowercase();
+        (0..self.entries.len())
+            .rev()
+            .filter(|&i| needle.is_empty() || self.entries[i].sql.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&HistoryEntry> {
+        self.entries.get(index)
+    }
+
+    /// Changes at each [`History::push`].
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 

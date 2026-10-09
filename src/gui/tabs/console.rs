@@ -1,6 +1,7 @@
 //! SQL console tab: editor, one result tab per row-returning statement, and
 //! the "Sortie" log of every execution.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use chrono::{DateTime, Local};
@@ -14,6 +15,7 @@ use crate::engine::sql::format::format_sql;
 use crate::engine::sql::statements::{extract_table_from_query, single_table_source};
 use crate::gui::editor::{self, completion::Completion, EditorContext};
 use crate::gui::grid::{self, GridAction, GridOptions, GridState};
+use crate::gui::rows::fixed_row;
 use crate::gui::theme::{self, ACCENT, ERROR};
 
 use super::TabId;
@@ -108,11 +110,29 @@ pub fn read_only_hint(sql: &str, result: &QueryResult) -> Option<&'static str> {
     (unkeyed && !is_editable(sql, result)).then_some(NO_PRIMARY_KEY)
 }
 
+/// Lines kept in the "Sortie" log (the oldest are dropped).
+pub const MAX_LOG_LINES: usize = 2000;
+
 pub struct LogLine {
-    pub at: DateTime<Local>,
     pub sql: String,
     pub message: String,
     pub ok: bool,
+    /// `HH:MM:SS` of the run.
+    time: String,
+    /// First line of `sql`, shortened (drawn every frame).
+    preview: String,
+}
+
+impl LogLine {
+    pub fn new(at: DateTime<Local>, sql: String, message: String, ok: bool) -> Self {
+        Self {
+            time: at.format("%H:%M:%S").to_string(),
+            preview: crate::gui::history_popup::preview(&sql, 120),
+            sql,
+            message,
+            ok,
+        }
+    }
 }
 
 pub struct ConsoleTab {
@@ -124,7 +144,8 @@ pub struct ConsoleTab {
     pub results: Vec<ResultTab>,
     /// `== results.len()` means the "Sortie" log tab.
     pub active_result: usize,
-    pub log: Vec<LogLine>,
+    /// The "Sortie" log, oldest first, at most `MAX_LOG_LINES`.
+    pub log: VecDeque<LogLine>,
     pub running_since: Option<Instant>,
     /// Splitter between the editor and the results.
     pub editor_height: f32,
@@ -275,12 +296,12 @@ pub fn apply_outcomes(
         total_ms += o.elapsed_ms;
         match o.result {
             Ok(result) => {
-                console.log.push(LogLine {
-                    at: now,
-                    sql: o.sql.clone(),
-                    message: ok_message(&result, o.elapsed_ms),
-                    ok: true,
-                });
+                console.push_log(LogLine::new(
+                    now,
+                    o.sql.clone(),
+                    ok_message(&result, o.elapsed_ms),
+                    true,
+                ));
                 last_rows = Some(if result.columns.is_empty() {
                     plural(
                         result.rows_affected as usize,
@@ -306,12 +327,7 @@ pub fn apply_outcomes(
             }
             Err(e) => {
                 failed = true;
-                console.log.push(LogLine {
-                    at: now,
-                    sql: o.sql,
-                    message: e,
-                    ok: false,
-                });
+                console.push_log(LogLine::new(now, o.sql, e, false));
             }
         }
     }
@@ -386,12 +402,7 @@ pub fn apply_refresh(
         } else {
             format!("Erreur · {} ms", o.elapsed_ms)
         };
-        console.log.push(LogLine {
-            at: now,
-            sql: o.sql,
-            message,
-            ok: o.result.is_ok(),
-        });
+        console.push_log(LogLine::new(now, o.sql, message, o.result.is_ok()));
         let Some(tab) = console.results.iter_mut().find(|r| r.id == id) else {
             continue;
         };
@@ -411,6 +422,15 @@ pub fn apply_refresh(
 }
 
 impl ConsoleTab {
+    /// Append to the "Sortie" log, dropping the oldest lines past
+    /// `MAX_LOG_LINES`.
+    pub fn push_log(&mut self, line: LogLine) {
+        self.log.push_back(line);
+        while self.log.len() > MAX_LOG_LINES {
+            self.log.pop_front();
+        }
+    }
+
     pub fn new(query: String, cursor: usize) -> Self {
         let cursor = cursor.min(query.len());
         Self {
@@ -419,7 +439,7 @@ impl ConsoleTab {
             selection: None,
             results: Vec::new(),
             active_result: 0,
-            log: Vec::new(),
+            log: VecDeque::new(),
             running_since: None,
             editor_height: 220.0,
             known_columns: Vec::new(),
@@ -496,12 +516,12 @@ impl ConsoleTab {
     /// Log a cancelled run.
     pub fn cancelled(&mut self) {
         self.running_since = None;
-        self.log.push(LogLine {
-            at: Local::now(),
-            sql: String::new(),
-            message: "Annulé".into(),
-            ok: false,
-        });
+        self.push_log(LogLine::new(
+            Local::now(),
+            String::new(),
+            "Annulé".into(),
+            false,
+        ));
         self.active_result = self.results.len();
     }
 
@@ -814,23 +834,27 @@ impl ConsoleTab {
             return None;
         }
         let mut action = None;
+        // Only the visible lines are laid out.
+        let row_height = ui.spacing().interact_size.y;
         egui::ScrollArea::vertical()
             .id_salt(id.with("log"))
             .auto_shrink([false, false])
             .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &self.log {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(line.at.format("%H:%M:%S").to_string()).weak());
+            .show_rows(ui, row_height, self.log.len(), |ui, range| {
+                for i in range {
+                    let line = &self.log[i];
+                    fixed_row(ui, row_height, i, |ui, _| {
+                        ui.label(RichText::new(&line.time).weak());
                         let msg = RichText::new(&line.message);
                         ui.label(if line.ok { msg } else { msg.color(ERROR) });
                         if !line.sql.is_empty() {
-                            let sql = crate::gui::history_popup::preview(&line.sql, 120);
                             let r = ui
                                 .add(
-                                    egui::Label::new(RichText::new(sql).monospace().weak())
-                                        .truncate()
-                                        .sense(egui::Sense::click()),
+                                    egui::Label::new(
+                                        RichText::new(&line.preview).monospace().weak(),
+                                    )
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
                                 )
                                 .on_hover_text("Chercher dans l'historique");
                             if r.clicked() {
@@ -1013,6 +1037,23 @@ mod tests {
             result_title("SELECT * FROM [dbo].[t]", 1, true),
             "t (1000+)"
         );
+    }
+
+    #[test]
+    fn log_keeps_the_newest_lines() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        for i in 0..MAX_LOG_LINES + 5 {
+            c.push_log(LogLine::new(
+                Local::now(),
+                format!("SELECT {i}\nFROM t"),
+                String::new(),
+                true,
+            ));
+        }
+        assert_eq!(c.log.len(), MAX_LOG_LINES);
+        assert_eq!(c.log[0].sql, "SELECT 5\nFROM t");
+        assert_eq!(c.log[0].preview, "SELECT 5…");
+        assert_eq!(c.log.back().map(|l| l.time.len()), Some(8));
     }
 
     #[test]
@@ -1346,5 +1387,49 @@ mod tests {
         let empty = ConsoleTab::new("  \n".into(), 0);
         assert!(empty.run_current().is_none());
         assert!(empty.run_all().is_none());
+    }
+
+    /// "Sortie" with 2 000 lines, idle frames.
+    /// `cargo test --release -- --ignored bench_console_log --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_console_log() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        for i in 0..2000 {
+            c.push_log(LogLine::new(
+                Local::now(),
+                format!("SELECT * FROM t WHERE id = {i}"),
+                "1 ligne en 3 ms".into(),
+                true,
+            ));
+        }
+        let ctx = egui::Context::default();
+        let frame = || {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    std::hint::black_box(c.log_view(ui, egui::Id::new("bench")));
+                });
+            });
+            std::hint::black_box(ctx.tessellate(out.shapes, out.pixels_per_point));
+        };
+        for _ in 0..3 {
+            frame();
+        }
+        let n = 30;
+        let t = Instant::now();
+        for _ in 0..n {
+            frame();
+        }
+        eprintln!(
+            "console log, 2 000 lines: {:.2} ms/frame",
+            t.elapsed().as_secs_f64() * 1000.0 / n as f64
+        );
     }
 }

@@ -12,6 +12,31 @@ pub struct HistoryPopup {
     pub search: String,
     pub selected: usize,
     focus_search: bool,
+    results: SearchCache,
+}
+
+/// Matches of the last search, kept until the query or the history change
+/// (the popup is drawn every frame).
+#[derive(Default)]
+struct SearchCache {
+    key: Option<(String, u64)>,
+    /// `(entry index, preview of its SQL)`, newest first.
+    matches: Vec<(usize, String)>,
+}
+
+impl SearchCache {
+    fn get(&mut self, history: &History, query: &str) -> &[(usize, String)] {
+        let fresh = matches!(&self.key, Some((q, g)) if q == query && *g == history.generation());
+        if !fresh {
+            self.matches = history
+                .search_indices(query)
+                .into_iter()
+                .filter_map(|i| Some((i, preview(&history.get(i)?.sql, 90))))
+                .collect();
+            self.key = Some((query.to_string(), history.generation()));
+        }
+        &self.matches
+    }
 }
 
 pub enum HistoryAction {
@@ -54,6 +79,7 @@ impl HistoryPopup {
             search,
             selected: 0,
             focus_search: true,
+            results: SearchCache::default(),
         }
     }
 
@@ -71,7 +97,7 @@ impl HistoryPopup {
         if search.changed() {
             self.selected = 0;
         }
-        let entries = history.search(&self.search);
+        let entries = self.results.get(history, &self.search);
         if entries.is_empty() {
             ui.label(RichText::new("Aucune requête").weak());
             return HistoryAction::None;
@@ -91,8 +117,8 @@ impl HistoryPopup {
             self.selected = self.selected.saturating_sub(1);
         }
         let mut action = HistoryAction::None;
-        if enter {
-            action = HistoryAction::Insert(entries[self.selected].sql.clone());
+        if let Some(e) = history.get(entries[self.selected].0).filter(|_| enter) {
+            action = HistoryAction::Insert(e.sql.clone());
         }
         let now = now_secs();
         ui.separator();
@@ -100,8 +126,11 @@ impl HistoryPopup {
             .max_height(420.0)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                for (i, e) in entries.iter().enumerate() {
-                    let text = RichText::new(preview(&e.sql, 90)).monospace();
+                for (i, (index, sql)) in entries.iter().enumerate() {
+                    let Some(e) = history.get(*index) else {
+                        continue;
+                    };
+                    let text = RichText::new(sql).monospace();
                     let text = if e.ok { text } else { text.color(ERROR) };
                     let r = ui
                         .selectable_label(i == self.selected, text)
@@ -142,6 +171,42 @@ mod tests {
         assert_eq!(relative_time(400, 100), "il y a 5 min");
         assert_eq!(relative_time(3 * 3_600 + 10, 0), "il y a 3 h");
         assert_eq!(relative_time(2 * 86_400, 0), "il y a 2 j");
+    }
+
+    #[test]
+    fn search_is_cached_until_the_query_or_the_history_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = History::load_from(dir.path().join("h.json"));
+        let entry = |sql: &str| crate::engine::services::history::HistoryEntry {
+            sql: sql.into(),
+            connection: "c".into(),
+            at: 0,
+            duration_ms: 1,
+            ok: true,
+        };
+        history.push(entry("SELECT 1"));
+        history.push(entry("select 2\nFROM t"));
+        let mut cache = SearchCache::default();
+        let found = |cache: &mut SearchCache, history: &History, q: &str| {
+            cache
+                .get(history, q)
+                .iter()
+                .map(|(_, p)| p.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            found(&mut cache, &history, "SELECT"),
+            ["select 2…", "SELECT 1"]
+        );
+        let key = cache.key.clone();
+        assert_eq!(
+            found(&mut cache, &history, "SELECT"),
+            ["select 2…", "SELECT 1"]
+        );
+        assert_eq!(cache.key, key, "nothing changed");
+        assert_eq!(found(&mut cache, &history, "1"), ["SELECT 1"]);
+        history.push(entry("SELECT 11"));
+        assert_eq!(found(&mut cache, &history, "1"), ["SELECT 11", "SELECT 1"]);
     }
 
     #[test]

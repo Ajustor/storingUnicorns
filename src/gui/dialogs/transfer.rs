@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
-use crate::engine::db::utils::display_qualified;
+use crate::engine::db::utils::{display_qualified, display_table_name};
 use crate::engine::models::{QueryResult, SchemaInfo};
 use crate::engine::ops::transfer::qualified;
-use crate::engine::services::export_import::{find_batch_csv, BatchExportState, ExportFormat};
+use crate::engine::services::export_import::{find_batch_csv, safe_file_stem, ExportFormat};
 
 use super::super::app::App;
 use super::super::theme::ERROR;
@@ -80,14 +80,12 @@ pub fn format_for(path: &Path) -> ExportFormat {
     }
 }
 
-/// Last segment of a possibly qualified, quoted table name, for file names.
+/// File name stem for an export of `table` (possibly qualified and quoted):
+/// its table part, made safe.
 fn file_stem(table: &str) -> String {
-    let last = table.rsplit('.').next().unwrap_or(table);
-    let stem = BatchExportState::clean_table_name(last);
-    if stem.is_empty() {
-        "export".into()
-    } else {
-        stem
+    match display_table_name(table) {
+        name if name.is_empty() => "export".into(),
+        name => safe_file_stem(&name),
     }
 }
 
@@ -377,6 +375,13 @@ mod tests {
         // Files of older exports (`<table>.csv`) still count.
         b.select_matching_files(|p| p == Path::new("dump").join("a.csv"));
         assert_eq!(b.selected(), vec![pair("main", "a")]);
+    }
+
+    #[test]
+    fn export_file_stem_is_the_safe_table_name() {
+        assert_eq!(file_stem("\"main\".\"users\""), "users");
+        assert_eq!(file_stem("[dbo].[a/b]"), "a_b");
+        assert_eq!(file_stem(""), "export");
     }
 
     #[test]

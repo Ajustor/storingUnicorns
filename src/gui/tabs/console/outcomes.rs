@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, Local};
 
+use crate::engine::db::utils::display_table_name;
 use crate::engine::models::QueryResult;
 use crate::engine::ops::query::{editable_table, StatementOutcome};
 use crate::engine::ops::rows::NO_PRIMARY_KEY;
@@ -104,12 +105,7 @@ impl LogLine {
 /// Title of the `index`-th (1-based) result tab of `sql`.
 pub fn result_title(sql: &str, index: usize, truncated: bool) -> String {
     let table = extract_table_from_query(sql)
-        .and_then(|t| {
-            t.rsplit('.').next().map(|t| {
-                t.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'))
-                    .to_string()
-            })
-        })
+        .map(|t| display_table_name(&t))
         .filter(|t| !t.is_empty());
     let title = table.unwrap_or_else(|| format!("Résultat {index}"));
     if truncated {

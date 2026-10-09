@@ -4,6 +4,7 @@
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
+use crate::engine::db::utils::display_table_name;
 use crate::engine::models::{Column, DatabaseType};
 use crate::engine::services::{ColumnDefinition, SchemaModification};
 
@@ -105,7 +106,10 @@ pub fn on_applied(app: &mut App, name: String, table: String, outcome: Result<St
     }
     match outcome {
         Ok(_) => {
-            app.success(format!("Structure de {} modifiée", display_name(&table)));
+            app.success(format!(
+                "Structure de {} modifiée",
+                display_table_name(&table)
+            ));
             if let Some(s) = app.sessions.get_mut(&name) {
                 s.details.remove(&table);
                 // Supersedes a request still running (it predates the change).
@@ -115,18 +119,12 @@ pub fn on_applied(app: &mut App, name: String, table: String, outcome: Result<St
         }
         Err(e) => app.error(format!(
             "{} : modification de structure impossible : {e}",
-            display_name(&table)
+            display_table_name(&table)
         )),
     }
 }
 
 /// `"main"."users"` → `users`.
-fn display_name(table: &str) -> String {
-    let last = table.rsplit('.').next().unwrap_or(table);
-    last.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'))
-        .to_string()
-}
-
 fn definition(c: &Column) -> ColumnDefinition {
     ColumnDefinition {
         name: c.name.clone(),
@@ -372,13 +370,6 @@ mod tests {
             SchemaModification::ModifyColumn { ref table_name, ref column }
                 if table_name == "\"main\".\"t\"" && column.data_type == "INT"
         ));
-    }
-
-    #[test]
-    fn display_name_drops_schema_and_quotes() {
-        assert_eq!(display_name("\"main\".\"users\""), "users");
-        assert_eq!(display_name("[dbo].[t]"), "t");
-        assert_eq!(display_name("t"), "t");
     }
 
     #[test]

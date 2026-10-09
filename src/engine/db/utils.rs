@@ -225,6 +225,12 @@ pub fn display_qualified(name: &str) -> String {
     }
 }
 
+/// The table part of a possibly quoted, qualified name, unquoted, for titles
+/// and file names: `"main"."users"` → `users`, `[dbo].[a.b]` → `a.b`.
+pub fn display_table_name(name: &str) -> String {
+    split_qualified(name).1
+}
+
 /// Split a table name, bare (`t`), qualified (`s.t`, `db.s.t`) and/or quoted
 /// with any dialect's quotes (`"s"."t"`, `` `s`.`t` ``, `[s].[t]`), into
 /// `(schema, table)`, both unquoted. Doubled quotes inside a quoted part are
@@ -593,6 +599,16 @@ mod tests {
         assert_eq!(fks[0].columns, ["x", "y"]);
         assert_eq!(fks[0].ref_columns, ["px", "py"]);
         assert_eq!(fks[1].ref_table, "q");
+    }
+
+    #[test]
+    fn display_table_name_drops_schema_and_quotes() {
+        assert_eq!(display_table_name("\"main\".\"users\""), "users");
+        assert_eq!(display_table_name("[dbo].[t]"), "t");
+        assert_eq!(display_table_name("`db`.`t`"), "t");
+        assert_eq!(display_table_name("t"), "t");
+        assert_eq!(display_table_name("\"a.b\""), "a.b", "dot inside quotes");
+        assert_eq!(display_table_name(""), "");
     }
 
     #[test]

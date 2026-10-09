@@ -223,11 +223,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BASE_URL: ${{ steps.pages.outputs.base_url }}
         run: bash scripts/build-site.sh "$GITHUB_REF_NAME" "$BASE_URL" artifacts
+      # One artifact name per attempt: a re-run would otherwise find the
+      # previous attempt's "github-pages" too, and deploy-pages refuses two.
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site
+          name: github-pages-${{ github.run_attempt }}
       - id: deploy
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-${{ github.run_attempt }}
 
   crates:
     name: Publish to crates.io

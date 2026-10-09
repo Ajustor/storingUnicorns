@@ -1,0 +1,322 @@
+use anyhow::Result;
+use sqlx::{MySqlPool, PgPool, SqlitePool};
+use std::time::Instant;
+
+use crate::engine::models::{
+    ConnectionConfig, DatabaseType, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
+};
+
+pub use super::sqlserver::SqlServerClient;
+use super::{azure, mysql, postgres, sqlite, sqlserver, utils};
+
+/// Unified database connection handle
+pub enum DatabaseConnection {
+    Postgres(PgPool),
+    MySQL(MySqlPool),
+    SQLite(SqlitePool),
+    SQLServer(SqlServerClient),
+    Azure(SqlServerClient),
+}
+
+impl DatabaseConnection {
+    /// Connect to a database using the provided configuration
+    pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
+        let conn_str = config.to_connection_string();
+
+        match config.db_type {
+            DatabaseType::Postgres => {
+                let pool = postgres::connect(&conn_str).await?;
+                Ok(DatabaseConnection::Postgres(pool))
+            }
+            DatabaseType::MySQL => {
+                let pool = mysql::connect(&conn_str).await?;
+                Ok(DatabaseConnection::MySQL(pool))
+            }
+            DatabaseType::SQLite => {
+                let pool = sqlite::connect(&conn_str).await?;
+                Ok(DatabaseConnection::SQLite(pool))
+            }
+            DatabaseType::SQLServer => {
+                let client = sqlserver::connect(config).await?;
+                Ok(DatabaseConnection::SQLServer(client))
+            }
+            DatabaseType::Azure => {
+                let client = azure::connect(config).await?;
+                Ok(DatabaseConnection::Azure(client))
+            }
+        }
+    }
+
+    /// Execute a query and return results
+    pub async fn execute_query(&self, query: &str) -> Result<QueryResult> {
+        self.execute_query_limited(query, None).await
+    }
+
+    /// Execute a query, keeping at most `max_rows` rows (all when `None`).
+    /// `QueryResult::truncated` is set when more rows were available.
+    pub async fn execute_query_limited(
+        &self,
+        query: &str,
+        max_rows: Option<usize>,
+    ) -> Result<QueryResult> {
+        let start = Instant::now();
+
+        let result = match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::execute_query_limited(pool, query, max_rows).await?
+            }
+            DatabaseConnection::MySQL(pool) => {
+                mysql::execute_query_limited(pool, query, max_rows).await?
+            }
+            DatabaseConnection::SQLite(pool) => {
+                sqlite::execute_query_limited(pool, query, max_rows).await?
+            }
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::execute_query_limited(client, query, max_rows).await?
+            }
+            DatabaseConnection::Azure(client) => {
+                azure::execute_query_limited(client, query, max_rows).await?
+            }
+        };
+
+        Ok(QueryResult {
+            execution_time_ms: start.elapsed().as_millis(),
+            ..result
+        })
+    }
+
+    /// Execute a transaction block (the statements between `BEGIN` and
+    /// `COMMIT`/`ROLLBACK`, inclusive) atomically on a single dedicated
+    /// connection. On any error the transaction is rolled back.
+    pub async fn execute_transaction(&self, statements: &[String]) -> Result<QueryResult> {
+        let start = Instant::now();
+
+        let result = match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::execute_transaction(pool, statements).await?
+            }
+            DatabaseConnection::MySQL(pool) => mysql::execute_transaction(pool, statements).await?,
+            DatabaseConnection::SQLite(pool) => {
+                sqlite::execute_transaction(pool, statements).await?
+            }
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::execute_transaction(client, statements).await?
+            }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::execute_transaction(client, statements).await?
+            }
+        };
+
+        Ok(QueryResult {
+            execution_time_ms: start.elapsed().as_millis(),
+            ..result
+        })
+    }
+
+    /// The database type of this connection.
+    pub fn db_type(&self) -> DatabaseType {
+        match self {
+            DatabaseConnection::Postgres(_) => DatabaseType::Postgres,
+            DatabaseConnection::MySQL(_) => DatabaseType::MySQL,
+            DatabaseConnection::SQLite(_) => DatabaseType::SQLite,
+            DatabaseConnection::SQLServer(_) => DatabaseType::SQLServer,
+            DatabaseConnection::Azure(_) => DatabaseType::Azure,
+        }
+    }
+
+    /// Run `statements` one by one in a transaction (the dialect's BEGIN and
+    /// COMMIT) on a dedicated connection. Statement `i` must affect exactly
+    /// `expected[i]` rows when that is `Some`: on a different count, or any
+    /// error, everything is rolled back and an error returned. Returns the
+    /// total number of affected rows.
+    pub async fn execute_checked_batch(
+        &self,
+        statements: &[String],
+        expected: &[Option<u64>],
+    ) -> Result<u64> {
+        let (begin, _) = utils::transaction_bounds(&self.db_type());
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                utils::execute_checked(pool, begin, statements, expected).await
+            }
+            DatabaseConnection::MySQL(pool) => {
+                utils::execute_checked(pool, begin, statements, expected).await
+            }
+            DatabaseConnection::SQLite(pool) => {
+                utils::execute_checked(pool, begin, statements, expected).await
+            }
+            DatabaseConnection::SQLServer(client) | DatabaseConnection::Azure(client) => {
+                sqlserver::execute_checked_batch(client, statements, expected).await
+            }
+        }
+    }
+
+    /// Test the connection
+    pub async fn test(&self) -> Result<()> {
+        match self {
+            DatabaseConnection::Postgres(pool) => postgres::test(pool).await,
+            DatabaseConnection::MySQL(pool) => mysql::test(pool).await,
+            DatabaseConnection::SQLite(pool) => sqlite::test(pool).await,
+            DatabaseConnection::SQLServer(client) => sqlserver::test(client).await,
+            DatabaseConnection::Azure(client) => azure::test(client).await,
+        }
+    }
+
+    /// Get list of tables/schemas (legacy - returns flat list)
+    #[allow(dead_code)]
+    pub async fn get_tables(&self) -> Result<Vec<String>> {
+        let schemas = self.get_tables_by_schema().await?;
+        Ok(schemas
+            .into_iter()
+            .flat_map(|s| {
+                s.tables.into_iter().map(move |t| {
+                    if s.name.is_empty() {
+                        t
+                    } else {
+                        format!("{}.{}", s.name, t)
+                    }
+                })
+            })
+            .collect())
+    }
+
+    /// Get list of tables grouped by schema
+    pub async fn get_tables_by_schema(&self) -> Result<Vec<SchemaInfo>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => postgres::get_tables_by_schema(pool).await,
+            DatabaseConnection::MySQL(pool) => mysql::get_tables_by_schema(pool).await,
+            DatabaseConnection::SQLite(pool) => sqlite::get_tables_by_schema(pool).await,
+            DatabaseConnection::SQLServer(client) => sqlserver::get_tables_by_schema(client).await,
+            DatabaseConnection::Azure(client) => azure::get_tables_by_schema(client).await,
+        }
+    }
+
+    /// Get column metadata (name, type, nullable) for a table
+    /// Returns a map of column_name -> nullable
+    pub async fn get_column_nullability(
+        &self,
+        table_name: &str,
+    ) -> Result<std::collections::HashMap<String, bool>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::get_column_nullability(pool, table_name).await
+            }
+            DatabaseConnection::MySQL(pool) => {
+                mysql::get_column_nullability(pool, table_name).await
+            }
+            DatabaseConnection::SQLite(pool) => {
+                sqlite::get_column_nullability(pool, table_name).await
+            }
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_column_nullability(client, table_name).await
+            }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::get_column_nullability(client, table_name).await
+            }
+        }
+    }
+
+    /// Get primary key columns for a table
+    pub async fn get_primary_keys(&self, table_name: &str) -> Result<Vec<String>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::get_primary_keys(pool, table_name).await
+            }
+            DatabaseConnection::MySQL(pool) => mysql::get_primary_keys(pool, table_name).await,
+            DatabaseConnection::SQLite(pool) => sqlite::get_primary_keys(pool, table_name).await,
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_primary_keys(client, table_name).await
+            }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::get_primary_keys(client, table_name).await
+            }
+        }
+    }
+
+    /// Get column names for a specific table (for autocompletion)
+    #[allow(dead_code)]
+    pub async fn get_table_columns(&self, table_name: &str) -> Result<Vec<String>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::get_table_columns(pool, table_name).await
+            }
+            DatabaseConnection::MySQL(pool) => mysql::get_table_columns(pool, table_name).await,
+            DatabaseConnection::SQLite(pool) => sqlite::get_table_columns(pool, table_name).await,
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_table_columns(client, table_name).await
+            }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::get_table_columns(client, table_name).await
+            }
+        }
+    }
+
+    /// Get full column metadata for a table (for schema modification)
+    pub async fn get_table_column_details(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<crate::engine::models::Column>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::get_table_column_details(pool, table_name).await
+            }
+            DatabaseConnection::MySQL(pool) => {
+                mysql::get_table_column_details(pool, table_name).await
+            }
+            DatabaseConnection::SQLite(pool) => {
+                sqlite::get_table_column_details(pool, table_name).await
+            }
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_table_column_details(client, table_name).await
+            }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::get_table_column_details(client, table_name).await
+            }
+        }
+    }
+
+    /// Indexes of a table (including the one backing the primary key).
+    pub async fn get_indexes(&self, table_name: &str) -> Result<Vec<IndexInfo>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => postgres::get_indexes(pool, table_name).await,
+            DatabaseConnection::MySQL(pool) => mysql::get_indexes(pool, table_name).await,
+            DatabaseConnection::SQLite(pool) => sqlite::get_indexes(pool, table_name).await,
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_indexes(client, table_name).await
+            }
+            DatabaseConnection::Azure(client) => sqlserver::get_indexes(client, table_name).await,
+        }
+    }
+
+    /// Foreign keys declared on a table.
+    pub async fn get_foreign_keys(&self, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::get_foreign_keys(pool, table_name).await
+            }
+            DatabaseConnection::MySQL(pool) => mysql::get_foreign_keys(pool, table_name).await,
+            DatabaseConnection::SQLite(pool) => sqlite::get_foreign_keys(pool, table_name).await,
+            DatabaseConnection::SQLServer(client) => {
+                sqlserver::get_foreign_keys(client, table_name).await
+            }
+            DatabaseConnection::Azure(client) => {
+                sqlserver::get_foreign_keys(client, table_name).await
+            }
+        }
+    }
+
+    /// Close the connection
+    pub async fn close(self) {
+        match self {
+            DatabaseConnection::Postgres(pool) => postgres::close(pool).await,
+            DatabaseConnection::MySQL(pool) => mysql::close(pool).await,
+            DatabaseConnection::SQLite(pool) => sqlite::close(pool).await,
+            DatabaseConnection::SQLServer(_) => {
+                // Tiberius client is dropped automatically
+            }
+            DatabaseConnection::Azure(_) => {
+                // Azure client is dropped automatically
+            }
+        }
+    }
+}

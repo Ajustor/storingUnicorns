@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>storingUnicorns {{version}}</title>
+  <meta name="description" content="storingUnicorns — un client de bases de données léger, en Rust : interface graphique rapide et interface terminal. PostgreSQL, MySQL, SQLite, SQL Server, Azure SQL.">
+  <link rel="icon" href="./icon.png" type="image/png">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fcfaff">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0d0b14">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="storingUnicorns">
+  <meta property="og:description" content="Un client de bases de données léger, en Rust.">
+  <script>
+    // Appliqué avant le premier rendu : sinon la page clignote dans le mauvais thème.
+    try {
+      var choix = localStorage.getItem('theme');
+      if (choix === 'clair' || choix === 'sombre') document.documentElement.dataset.theme = choix;
+    } catch (e) {}
+  </script>
+  <style>
+    :root {
+      color-scheme: light dark;
+
+      --marque: #8b5cf6;
+      --marque-douce: #ede9fe;
+      --marque-forte: #6d28d9;
+      --sur-marque: #ffffff;
+
+      --fond: #fcfaff;
+      --fond-doux: #f4f1fa;
+      --bordure: #e6e1f0;
+      --bordure-forte: #d4cde3;
+      --texte: #16141d;
+      --texte-doux: #5f5b6b;
+
+      --lueur: rgb(139 92 246 / 18%);
+      --arc-en-ciel: linear-gradient(90deg, #f43f5e, #f59e0b, #eab308, #22c55e, #3b82f6, #8b5cf6);
+
+      --rayon: 0.75rem;
+      --ombre: 0 1px 2px rgb(40 20 70 / 5%), 0 16px 40px rgb(40 20 70 / 8%);
+      --largeur: 62rem;
+    }
+
+    /* Le sombre, deux fois : quand le système le demande sans choix contraire,
+       et quand le visiteur l'a choisi. Les deux blocs changent ensemble. */
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme='clair']) {
+        --marque-douce: rgb(139 92 246 / 16%);
+        --marque-forte: #c4b5fd;
+        --sur-marque: #160d2b;
+        --fond: #0d0b14;
+        --fond-doux: #15121f;
+        --bordure: #262133;
+        --bordure-forte: #352f45;
+        --texte: #ece9f3;
+        --texte-doux: #9d98aa;
+        --lueur: rgb(139 92 246 / 24%);
+        --ombre: 0 1px 2px rgb(0 0 0 / 45%), 0 16px 40px rgb(0 0 0 / 35%);
+      }
+    }
+
+    :root[data-theme='sombre'] {
+      color-scheme: dark;
+      --marque-douce: rgb(139 92 246 / 16%);
+      --marque-forte: #c4b5fd;
+      --sur-marque: #160d2b;
+      --fond: #0d0b14;
+      --fond-doux: #15121f;
+      --bordure: #262133;
+      --bordure-forte: #352f45;
+      --texte: #ece9f3;
+      --texte-doux: #9d98aa;
+      --lueur: rgb(139 92 246 / 24%);
+      --ombre: 0 1px 2px rgb(0 0 0 / 45%), 0 16px 40px rgb(0 0 0 / 35%);
+    }
+
+    :root[data-theme='clair'] { color-scheme: light; }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      line-height: 1.65;
+      color: var(--texte);
+      background: var(--fond);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    h1, h2, h3 { margin: 0; line-height: 1.15; text-wrap: balance; }
+    p { margin: 0; }
+    a { color: inherit; }
+    code, pre, .mono { font-family: ui-monospace, 'SFMono-Regular', 'Cascadia Code', Consolas, monospace; }
+
+    :focus-visible {
+      outline: 2px solid var(--marque);
+      outline-offset: 3px;
+      border-radius: 0.25rem;
+    }
+
+    .page {
+      display: flex;
+      flex-direction: column;
+      min-height: 100dvh;
+    }
+
+    .borne {
+      width: 100%;
+      max-width: var(--largeur);
+      margin-inline: auto;
+      padding-inline: 1.25rem;
+    }
+
+    main { flex: 1; }
+
+    /* --- En-tête ---------------------------------------------------------- */
+
+    .saut {
+      position: absolute;
+      top: 0.5rem;
+      left: 0.5rem;
+      padding: 0.5rem 0.875rem;
+      background: var(--fond);
+      border: 1px solid var(--marque);
+      border-radius: var(--rayon);
+      transform: translateY(-200%);
+      z-index: 2;
+    }
+    .saut:focus-visible { transform: translateY(0); }
+
+    header.borne {
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+      padding-block: 1rem;
+    }
+
+    .marque {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-weight: 650;
+      letter-spacing: -0.01em;
+      text-decoration: none;
+    }
+    .marque img { width: 1.75rem; height: 1.75rem; border-radius: 0.4rem; }
+
+    nav {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-left: auto;
+    }
+    nav a { color: var(--texte-doux); text-decoration: none; }
+    nav a:hover { color: var(--texte); }
+
+    .theme {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 2rem;
+      height: 2rem;
+      padding: 0;
+      font: inherit;
+      font-size: 0.9375rem;
+      line-height: 1;
+      color: var(--texte);
+      background: var(--fond-doux);
+      border: 1px solid var(--bordure);
+      border-radius: 999px;
+      cursor: pointer;
+    }
+    .theme:hover { border-color: var(--marque); }
+
+    /* Le glyphe montre ce vers quoi le clic mène. */
+    .theme .vers-clair { display: none; }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme='clair']) .theme .vers-clair { display: inline; }
+      :root:not([data-theme='clair']) .theme .vers-sombre { display: none; }
+    }
+    :root[data-theme='sombre'] .theme .vers-clair { display: inline; }
+    :root[data-theme='sombre'] .theme .vers-sombre { display: none; }
+
+    @media (max-width: 40rem) {
+      nav a.secondaire-nav { display: none; }
+    }
+
+    /* --- Héros ------------------------------------------------------------ */
+
+    .hero {
+      display: grid;
+      justify-items: center;
+      gap: 1.25rem;
+      padding: 4rem 0 3.5rem;
+      text-align: center;
+    }
+
+    .etat {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.3125rem 0.75rem;
+      font-size: 0.75rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--texte-doux);
+      background: var(--fond-doux);
+      border: 1px solid var(--bordure);
+      border-radius: 999px;
+    }
+
+    .point {
+      width: 0.5rem;
+      height: 0.5rem;
+      background: #22c55e;
+      border-radius: 50%;
+      animation: clignote 2.4s ease-in-out infinite;
+    }
+    @keyframes clignote { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+    .logo {
+      position: relative;
+      display: grid;
+      place-items: center;
+      width: 7rem;
+      height: 7rem;
+    }
+    .logo::before {
+      content: '';
+      position: absolute;
+      inset: -70%;
+      background: radial-gradient(circle, var(--lueur), transparent 68%);
+      animation: respire 5s ease-in-out infinite;
+    }
+    .logo img {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      border-radius: 1.5rem;
+      box-shadow: var(--ombre);
+    }
+    @keyframes respire {
+      0%, 100% { opacity: 0.55; transform: scale(0.92); }
+      50% { opacity: 1; transform: scale(1.06); }
+    }
+
+    h1 {
+      font-size: clamp(2.5rem, 8.5vw, 4.25rem);
+      font-weight: 700;
+      letter-spacing: -0.035em;
+    }
+    .suffixe { color: var(--texte-doux); font-weight: 400; }
+
+    .accroche {
+      position: relative;
+      padding-bottom: 0.75rem;
+      font-size: clamp(1.2rem, 3.5vw, 1.625rem);
+      font-weight: 600;
+      color: var(--marque-forte);
+    }
+    /* La crinière : un filet arc-en-ciel qui passe sans fin. */
+    .accroche::after {
+      content: '';
+      position: absolute;
+      inset-inline: 0;
+      bottom: 0;
+      height: 2px;
+      background: var(--arc-en-ciel);
+      border-radius: 2px;
+      transform-origin: left;
+      animation: charge 3.2s ease-in-out infinite;
+    }
+    @keyframes charge {
+      0% { transform: scaleX(0); opacity: 0; }
+      35% { opacity: 1; }
+      100% { transform: scaleX(1); opacity: 0; }
+    }
+
+    .lead {
+      max-width: 42rem;
+      font-size: 1.0625rem;
+      color: var(--texte-doux);
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 0.75rem;
+      margin-top: 0.5rem;
+    }
+
+    .bouton {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      min-height: 2.75rem;
+      padding: 0.5rem 1.25rem;
+      border-radius: var(--rayon);
+      font-weight: 600;
+      text-decoration: none;
+    }
+    .principal {
+      color: var(--sur-marque);
+      background: var(--marque-forte);
+      box-shadow: var(--ombre);
+    }
+    .principal:hover { background: var(--marque); }
+    .secondaire {
+      color: var(--texte);
+      border: 1px solid var(--bordure-forte);
+    }
+    .secondaire:hover { border-color: var(--marque); }
+
+    .petit { font-size: 0.8125rem; color: var(--texte-doux); }
+
+    /* --- Chiffres --------------------------------------------------------- */
+
+    .chiffres {
+      display: grid;
+      gap: 1rem;
+      padding: 2.5rem 0;
+      border-top: 1px solid var(--bordure);
+      border-bottom: 1px solid var(--bordure);
+    }
+
+    .surtitre {
+      font-family: ui-monospace, 'SFMono-Regular', 'Cascadia Code', monospace;
+      font-size: 0.75rem;
+      font-weight: 500;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      color: var(--texte-doux);
+    }
+
+    .chiffres ul {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+      gap: 1.5rem 2rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .chiffres li { display: grid; gap: 0.125rem; }
+    .chiffres b {
+      font-size: clamp(1.75rem, 4.5vw, 2.25rem);
+      font-weight: 650;
+      letter-spacing: -0.03em;
+      font-variant-numeric: tabular-nums;
+    }
+    .chiffres span { color: var(--texte-doux); font-size: 0.9375rem; line-height: 1.4; }
+
+    /* --- Sections --------------------------------------------------------- */
+
+    section.bloc {
+      display: grid;
+      gap: 1.5rem;
+      padding: 3.5rem 0;
+      scroll-margin-top: 1rem;
+    }
+    section.bloc + section.bloc { border-top: 1px solid var(--bordure); }
+
+    h2 {
+      font-size: clamp(1.5rem, 3.5vw, 1.875rem);
+      letter-spacing: -0.02em;
+    }
+
+    .intro { max-width: 44rem; color: var(--texte-doux); }
+
+    /* --- Téléchargements -------------------------------------------------- */
+
+    .telechargements {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+      gap: 1rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .carte {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      padding: 1.25rem;
+      background: var(--fond-doux);
+      border: 1px solid var(--bordure);
+      border-radius: var(--rayon);
+      transition: border-color 0.15s;
+    }
+    .carte:hover { border-color: var(--bordure-forte); }
+
+    /* La carte du système du visiteur, repérée par le script. */
+    .carte.votre-os {
+      border-color: var(--marque);
+      box-shadow: var(--ombre);
+    }
+    .carte .pastille {
+      display: none;
+      position: absolute;
+      top: -0.6rem;
+      right: 1rem;
+      padding: 0 0.5rem;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--sur-marque);
+      background: var(--marque-forte);
+      border-radius: 999px;
+    }
+    .carte.votre-os .pastille { display: block; }
+
+    .carte .os { display: flex; align-items: center; gap: 0.5rem; font-weight: 650; font-size: 1.0625rem; }
+    .carte .os svg { width: 1.25rem; height: 1.25rem; fill: currentColor; flex: none; }
+    /* Le détail prend la place libre : les boutons s'alignent d'une carte à l'autre. */
+    .carte .detail { flex: 1; color: var(--texte-doux); font-size: 0.875rem; }
+    .carte .bouton { justify-content: center; margin-top: 0.25rem; }
+    .carte .fichier { font-size: 0.75rem; color: var(--texte-doux); word-break: break-all; }
+
+    .carte details { font-size: 0.75rem; color: var(--texte-doux); }
+    .carte summary { cursor: pointer; width: fit-content; }
+    .carte summary:hover { color: var(--texte); }
+    .carte details code { display: block; margin-top: 0.25rem; word-break: break-all; }
+
+    .astuce {
+      padding: 0.875rem 1rem;
+      font-size: 0.9375rem;
+      color: var(--texte-doux);
+      background: var(--marque-douce);
+      border-radius: var(--rayon);
+    }
+    .astuce code, .prose code {
+      font-variant-ligatures: none;
+      padding: 0.1em 0.35em;
+      background: var(--fond-doux);
+      border: 1px solid var(--bordure);
+      border-radius: 0.25rem;
+      font-size: 0.875em;
+    }
+
+    /* --- Fonctionnalités -------------------------------------------------- */
+
+    .piliers {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+      gap: 2rem 2.5rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .piliers > li {
+      display: grid;
+      align-content: start;
+      gap: 0.5rem;
+      padding-left: 1rem;
+      border-left: 2px solid var(--bordure);
+      transition: border-color 0.15s;
+    }
+    .piliers > li:hover { border-left-color: var(--marque); }
+    .piliers h3 { font-size: 1.0625rem; font-weight: 600; }
+    .piliers ul {
+      display: grid;
+      gap: 0.25rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      color: var(--texte-doux);
+      font-size: 0.9375rem;
+    }
+    kbd {
+      font-family: ui-monospace, 'SFMono-Regular', 'Cascadia Code', monospace;
+      font-size: 0.75em;
+      padding: 0.05em 0.35em;
+      border: 1px solid var(--bordure-forte);
+      border-bottom-width: 2px;
+      border-radius: 0.25rem;
+      color: var(--texte);
+      white-space: nowrap;
+    }
+
+    /* --- Extensions ------------------------------------------------------- */
+
+    .etapes {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+      gap: 1rem 2rem;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: etape;
+    }
+    .etapes li {
+      counter-increment: etape;
+      display: grid;
+      gap: 0.25rem;
+      color: var(--texte-doux);
+      font-size: 0.9375rem;
+    }
+    .etapes li::before {
+      content: counter(etape);
+      display: grid;
+      place-items: center;
+      width: 1.75rem;
+      height: 1.75rem;
+      margin-bottom: 0.25rem;
+      font-weight: 650;
+      color: var(--marque-forte);
+      background: var(--marque-douce);
+      border-radius: 50%;
+    }
+    .etapes b { color: var(--texte); }
+
+    /* --- Notes de version ------------------------------------------------- */
+
+    .prose { max-width: 68ch; }
+    .prose > * + * { margin-top: 0.875rem; }
+    .prose h3, .prose h4 { margin-top: 1.5rem; font-size: 1.0625rem; }
+    .prose ul { padding-left: 1.375rem; margin: 0; }
+    .prose li + li { margin-top: 0.25rem; }
+    .prose a { color: var(--marque-forte); text-underline-offset: 0.15em; }
+
+    .prose h4 { margin-top: 1rem; font-size: 0.9375rem; }
+
+    .historique { display: grid; gap: 0.5rem; margin-top: 1rem; }
+    .historique:not(:has(details)) { display: none; }
+    .historique .surtitre { margin-bottom: 0.25rem; }
+    .version {
+      padding: 0.625rem 1rem;
+      background: var(--fond-doux);
+      border: 1px solid var(--bordure);
+      border-radius: var(--rayon);
+    }
+    .version[open] { padding-bottom: 1rem; }
+    .version summary {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      cursor: pointer;
+    }
+    .version summary:hover b { color: var(--marque-forte); }
+    .version .date { font-size: 0.8125rem; color: var(--texte-doux); font-variant-numeric: tabular-nums; }
+    .version .prose { margin-top: 0.75rem; font-size: 0.9375rem; }
+
+    /* --- Pied ------------------------------------------------------------- */
+
+    footer.borne {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 0.5rem 1.5rem;
+      padding-block: 1.5rem 2.5rem;
+      border-top: 1px solid var(--bordure);
+      color: var(--texte-doux);
+      font-size: 0.875rem;
+    }
+    footer a { color: var(--texte-doux); }
+    footer a:hover { color: var(--texte); }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
+    pre.commande {
+      margin: 0.5rem 0 1rem;
+      padding: 0.75rem 1rem;
+      border-radius: 10px;
+      background: var(--marque-douce);
+      overflow-x: auto;
+      font-size: 0.95rem;
+    }
+    [data-theme="sombre"] pre.commande { background: rgba(139, 92, 246, 0.15); }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="clair"]) pre.commande { background: rgba(139, 92, 246, 0.15); }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+  <a class="saut" href="#contenu">Aller au contenu</a>
+
+  <header class="borne">
+    <a class="marque" href="./">
+      <img src="./icon.png" alt="" width="28" height="28">
+      <span>storingUnicorns</span>
+    </a>
+    <nav aria-label="Navigation principale">
+      <a class="secondaire-nav" href="#fonctionnalites">Fonctionnalités</a>
+      <a class="secondaire-nav" href="#installer">Installer</a>
+      <a href="#telecharger">Télécharger</a>
+      <button type="button" class="theme" id="theme" aria-label="Changer de thème" title="Changer de thème"><span class="vers-clair" aria-hidden="true">☀</span><span class="vers-sombre" aria-hidden="true">☾</span></button>
+    </nav>
+  </header>
+
+  <main id="contenu" class="borne">
+    <section class="hero">
+      <p class="etat mono">
+        <span class="point" aria-hidden="true"></span>
+        v{{version}} · dernière version stable
+      </p>
+
+      <div class="logo"><img src="./icon.png" alt="" width="112" height="112"></div>
+
+      <h1>storing<span class="suffixe">Unicorns</span></h1>
+
+      <p class="accroche">Un client de bases de données léger, construit en Rust.</p>
+
+      <p class="lead">
+        Une interface graphique rapide, inspirée de DataGrip, pour parcourir vos tables,
+        écrire du SQL et modifier vos données — et la même chose dans le terminal, pour ceux qui n'en
+        sortent jamais.
+      </p>
+
+      <div class="actions">
+        <a class="bouton principal" id="cta" href="#telecharger">Télécharger v{{version}}</a>
+        <a class="bouton secondaire" href="#installer">Installer en une ligne</a>
+      </div>
+      <p class="petit">Windows · Linux · macOS (Apple Silicon) — mises à jour automatiques</p>
+    </section>
+
+    <section class="chiffres" aria-labelledby="chiffres-titre">
+      <h2 id="chiffres-titre" class="surtitre">En quelques chiffres</h2>
+      <ul>
+        <li><b>5</b><span>moteurs : PostgreSQL, MySQL, SQLite, SQL Server, Azure SQL</span></li>
+        <li><b>2</b><span>interfaces : graphique et terminal, dans un seul binaire</span></li>
+        <li><b>1</b><span>fichier à télécharger, qui se met à jour tout seul</span></li>
+        <li><b>3</b><span>plateformes : Windows, Linux et macOS</span></li>
+      </ul>
+    </section>
+
+    <section class="bloc" id="installer" aria-labelledby="installer-titre">
+      <h2 id="installer-titre">Installer en une ligne</h2>
+      <p class="intro">Le script télécharge le binaire de votre système, vérifie son empreinte SHA-256 et l'ajoute à votre <code>PATH</code>.</p>
+      <h3>Linux / macOS</h3>
+      <pre class="commande mono">curl -fsSL https://ajustor.github.io/storingUnicorns/install.sh | sh</pre>
+      <h3>Windows (PowerShell)</h3>
+      <pre class="commande mono">irm https://ajustor.github.io/storingUnicorns/install.ps1 | iex</pre>
+      <p class="astuce">
+        Ensuite : <code>storingUnicorns</code> ouvre l'interface graphique,
+        <code>storingUnicorns tui</code> l'interface terminal,
+        <code>storingUnicorns update</code> met à jour.
+      </p>
+    </section>
+
+    <section class="bloc" id="telecharger" aria-labelledby="telecharger-titre">
+      <h2 id="telecharger-titre">Télécharger la v{{version}}</h2>
+      <p class="intro">
+        Choisissez le fichier de votre système. Une fois installé, storingUnicorns se
+        met à jour tout seul : il vérifie au démarrage si une nouvelle version existe
+        et contrôle chaque téléchargement par son empreinte SHA-256.
+      </p>
+      <ul class="telechargements">
+{{downloads}}
+      </ul>
+      <p class="astuce">
+        <strong>Linux / macOS :</strong> rendez le binaire exécutable avec
+        <code>chmod +x storingUnicorns-*</code> puis lancez-le.
+        <strong>Windows :</strong> l'installateur <code>.msi</code> installe pour tous les
+        utilisateurs ; le <code>.exe</code> est une version portable, sans installation.
+      </p>
+    </section>
+
+    <section class="bloc" id="fonctionnalites" aria-labelledby="fonctionnalites-titre">
+      <h2 id="fonctionnalites-titre">Tout ce qu'il faut, rien de plus</h2>
+      <ul class="piliers">
+        <li>
+          <h3>🔌 Connexions</h3>
+          <ul>
+            <li>PostgreSQL, MySQL, SQLite, SQL Server</li>
+            <li>Azure SQL : identifiants, Azure AD ou identité managée</li>
+            <li>Plusieurs connexions ouvertes à la fois, chacune avec sa couleur</li>
+            <li>Explorateur : schémas, tables, colonnes, clés et index</li>
+          </ul>
+        </li>
+        <li>
+          <h3>✏️ Consoles SQL</h3>
+          <ul>
+            <li>Instruction ou bloc <code>BEGIN … COMMIT</code> au curseur <kbd>Ctrl+Entrée</kbd></li>
+            <li>Un onglet de résultat par instruction, journal « Sortie »</li>
+            <li>Formatage <kbd>Ctrl+Alt+L</kbd>, historique <kbd>Ctrl+Alt+E</kbd></li>
+            <li>Autocomplétion des tables et colonnes, annulation <kbd>Échap</kbd></li>
+          </ul>
+        </li>
+        <li>
+          <h3>📊 Éditeur de données</h3>
+          <ul>
+            <li>Pagination, filtre <code>WHERE</code> et tri <code>ORDER BY</code></li>
+            <li>Tri par clic sur l'en-tête de colonne</li>
+            <li>Modifier, ajouter et supprimer des lignes directement dans la grille</li>
+            <li><b>Submit</b> en une seule transaction, ou <b>Revert</b></li>
+          </ul>
+        </li>
+        <li>
+          <h3>🔍 Inspection</h3>
+          <ul>
+            <li>Panneau de valeur, JSON mis en forme</li>
+            <li>DDL de la table, recherche de table <kbd>Ctrl+N</kbd></li>
+            <li>Structure : ajouter, renommer, modifier, supprimer une colonne</li>
+          </ul>
+        </li>
+        <li>
+          <h3>📦 Import / export</h3>
+          <ul>
+            <li>Export CSV ou SQL INSERT</li>
+            <li>Import CSV avec mise à jour par identifiant et progression</li>
+            <li>Export, import et vidage de plusieurs tables d'un coup</li>
+          </ul>
+        </li>
+        <li>
+          <h3>🖥️ Terminal</h3>
+          <ul>
+            <li>Toute l'application au clavier : <code>storingUnicorns tui</code></li>
+            <li>Mêmes connexions que l'interface graphique</li>
+          </ul>
+        </li>
+      </ul>
+    </section>
+
+    <section class="bloc" id="nouveautes" aria-labelledby="nouveautes-titre">
+      <h2 id="nouveautes-titre">Nouveautés de la v{{version}}</h2>
+      <div class="prose">
+{{notes}}
+      </div>
+      <div class="historique">
+        <h3 class="surtitre">Historique des versions</h3>
+{{history}}
+      </div>
+    </section>
+  </main>
+
+  <footer class="borne">
+    <p>🦄 storingUnicorns v{{version}} · Licence MIT · Construit en Rust avec egui et ratatui</p>
+    <span><a href="#nouveautes">Nouveautés</a> · <a href="https://github.com/Ajustor/storingUnicorns">Code source</a> · <a href="./latest.json">latest.json</a></span>
+  </footer>
+</div>
+
+<script>
+  // Thème : le choix du visiteur l'emporte sur celui du système, et se souvient.
+  document.getElementById('theme').addEventListener('click', function () {
+    var racine = document.documentElement;
+    var sombre = racine.dataset.theme
+      ? racine.dataset.theme === 'sombre'
+      : matchMedia('(prefers-color-scheme: dark)').matches;
+    racine.dataset.theme = sombre ? 'clair' : 'sombre';
+    try { localStorage.setItem('theme', racine.dataset.theme); } catch (e) {}
+  });
+
+  // Système du visiteur : met sa carte en avant et pointe le bouton principal dessus.
+  (function () {
+    var p = ((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent).toLowerCase();
+    var os = p.indexOf('win') >= 0 ? 'windows' : p.indexOf('mac') >= 0 ? 'macos' : p.indexOf('linux') >= 0 ? 'linux' : null;
+    if (!os) return;
+    var carte = document.querySelector('.carte[data-os="' + os + '"]');
+    if (!carte) return;
+    carte.classList.add('votre-os');
+    var lien = carte.querySelector('a.bouton');
+    var cta = document.getElementById('cta');
+    cta.href = lien.href;
+    cta.textContent = 'Télécharger pour ' + carte.dataset.label;
+  })();
+</script>
+</body>
+</html>

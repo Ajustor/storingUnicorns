@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX v3 installer for storingUnicorns.
+
+  Build (from the project root, after a release build: cargo build -r):
+    candle.exe -arch x64 -dProductVersion=0.9.0 -out wix\main.wixobj wix\main.wxs
+    light.exe  -ext WixUIExtension -out storingUnicorns-setup.msi wix\main.wixobj
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="storingUnicorns"
+           Language="1036"
+           Version="$(var.ProductVersion)"
+           Manufacturer="Ajustor"
+           UpgradeCode="{6F1D2C8A-3B7E-4E52-9A41-0C5B8D7E2F19}">
+
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             Description="storingUnicorns — client de bases de données" />
+
+    <MajorUpgrade DowngradeErrorMessage="Une version plus récente de storingUnicorns est déjà installée." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="assets\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPHELPLINK" Value="https://ajustor.github.io/storingUnicorns/" />
+
+    <UIRef Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="wix\License.rtf" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="storingUnicorns" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+    </Directory>
+
+    <Feature Id="ProductFeature" Title="storingUnicorns" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="*">
+        <File Id="MainExecutable" Name="storingUnicorns.exe"
+              Source="target\release\storingUnicorns.exe" KeyPath="yes" />
+        <!-- `storingUnicorns tui` / `update` from any terminal -->
+        <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no"
+                     Part="last" Action="set" System="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="*">
+        <Shortcut Id="StartMenuLink" Name="storingUnicorns"
+                  Description="Client de bases de données"
+                  Target="[INSTALLFOLDER]storingUnicorns.exe"
+                  WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
+        <RegistryValue Root="HKCU" Key="Software\storingUnicorns" Name="StartMenu"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Product>
+</Wix>

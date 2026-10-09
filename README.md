@@ -241,6 +241,20 @@ src/
 
 ## Installer
 
+Depuis la [page de téléchargement](https://ajustor.github.io/storingUnicorns/) :
+
+- macOS (Apple Silicon) : ouvrez `storingUnicorns-macos-arm64.dmg` et glissez **storingUnicorns**
+  dans **Applications**. L'app est signée ad hoc, sans notarisation Apple : au premier lancement,
+  clic droit → **Ouvrir** (ou Réglages Système → Confidentialité et sécurité → **Ouvrir quand même**).
+- Linux (x86_64) : `chmod +x storingUnicorns-linux-x64.AppImage` puis lancez-la (FUSE requis :
+  paquet `libfuse2` ou `fuse`) ; `./storingUnicorns-linux-x64.AppImage tui` ouvre l'interface terminal.
+
+Ces paquets se mettent à jour d'eux-mêmes (l'exécutable de l'app, ou le fichier `.AppImage`, est
+remplacé). Ils sont produits par `scripts/build-macos-app.sh` (à lancer sur macOS) et
+`scripts/build-appimage.sh`, à partir du binaire release et des fichiers de `packaging/`.
+
+En ligne de commande (binaire seul) :
+
 - Linux / macOS : `curl -fsSL https://ajustor.github.io/storingUnicorns/install.sh | sh`
 - Windows : `irm https://ajustor.github.io/storingUnicorns/install.ps1 | iex`, ou l'installateur `.msi`
   sur la [page de téléchargement](https://ajustor.github.io/storingUnicorns/)
@@ -250,5 +264,5 @@ src/
 
 1. Mettre à jour `version` dans `Cargo.toml` et ajouter la section `## [X.Y.Z] - AAAA-MM-JJ` dans `CHANGELOG.md`.
 2. Commit, puis `git tag vX.Y.Z && git push origin master vX.Y.Z`.
-3. Le workflow Release construit les binaires et le MSI, crée la release GitHub,
+3. Le workflow Release construit les binaires, le MSI, l'AppImage et le `.dmg`, crée la release GitHub,
    publie la page de téléchargement + `latest.json` sur GitHub Pages, puis publie sur crates.io.

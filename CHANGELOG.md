@@ -11,6 +11,12 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
 
 ### Nouveautés
 
+- **macOS : une vraie application.** `storingUnicorns-macos-arm64.dmg` contient
+  **storingUnicorns.app**, à glisser dans Applications. Lancée depuis le Finder
+  ou le Dock, elle reprend le `PATH` de votre shell de connexion : Azure CLI
+  (`az`) est trouvé pour l'authentification Azure AD.
+- **Linux : une AppImage.** `storingUnicorns-linux-x64.AppImage`, avec son icône
+  et son entrée de menu, se met à jour sur place.
 - **Azure SQL : identité managée affectée par l'utilisateur.** Le champ
   « ID client de l'identité » choisit l'identité à utiliser (vide = identité
   système). Sur App Service, Functions et Container Apps, seule l'identité

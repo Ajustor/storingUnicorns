@@ -2,6 +2,7 @@ mod cli;
 mod console;
 mod engine;
 mod gui;
+mod login_path;
 mod tui;
 mod updater;
 
@@ -22,6 +23,8 @@ fn main() -> anyhow::Result<()> {
             }
             // Panics in a detached GUI have no console: keep a trace next to the config.
             tracing_to_file();
+            // Before the GUI starts any thread: it sets PATH.
+            login_path::import();
             gui::run()
         }
         Mode::Tui(opts) => run_tui(opts),

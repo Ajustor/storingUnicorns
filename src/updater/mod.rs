@@ -272,7 +272,7 @@ fn install_kind() -> InstallKind {
 }
 
 /// The `.AppImage` file this process runs from, if any.
-fn running_appimage() -> Option<PathBuf> {
+pub(crate) fn running_appimage() -> Option<PathBuf> {
     appimage_of(
         std::env::current_exe().ok()?,
         std::env::var_os("APPIMAGE")?,

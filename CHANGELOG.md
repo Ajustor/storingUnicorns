@@ -17,6 +17,10 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
   (`az`) est trouvé pour l'authentification Azure AD.
 - **Linux : une AppImage.** `storingUnicorns-linux-x64.AppImage`, avec son icône
   et son entrée de menu, se met à jour sur place.
+- **Commande `storingUnicorns` dans le `PATH`.** L'app macOS et l'AppImage
+  créent au lancement un lien dans `/usr/local/bin` ou `~/.local/bin` (ajouté si
+  besoin au fichier de démarrage du shell) : `storingUnicorns tui` marche depuis
+  un nouveau terminal.
 - **Azure SQL : identité managée affectée par l'utilisateur.** Le champ
   « ID client de l'identité » choisit l'identité à utiliser (vide = identité
   système). Sur App Service, Functions et Container Apps, seule l'identité

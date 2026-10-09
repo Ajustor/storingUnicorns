@@ -249,6 +249,11 @@ Depuis la [page de téléchargement](https://ajustor.github.io/storingUnicorns/)
 - Linux (x86_64) : `chmod +x storingUnicorns-linux-x64.AppImage` puis lancez-la (FUSE requis :
   paquet `libfuse2` ou `fuse`) ; `./storingUnicorns-linux-x64.AppImage tui` ouvre l'interface terminal.
 
+Au lancement, l'app et l'AppImage ajoutent la commande `storingUnicorns` au `PATH` : un lien dans
+`/usr/local/bin` (macOS, s'il est accessible en écriture) ou `~/.local/bin`, ajouté si besoin au
+fichier de démarrage du shell (`~/.zshrc`, `~/.bashrc` — `~/.bash_profile` sur macOS —, ou
+`~/.config/fish/conf.d/`). Un `storingUnicorns` déjà installé par `install.sh` n'est pas remplacé.
+
 Ces paquets se mettent à jour d'eux-mêmes (l'exécutable de l'app, ou le fichier `.AppImage`, est
 remplacé). Ils sont produits par `scripts/build-macos-app.sh` (à lancer sur macOS) et
 `scripts/build-appimage.sh`, à partir du binaire release et des fichiers de `packaging/`.

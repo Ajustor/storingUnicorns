@@ -1,4 +1,5 @@
 mod cli;
+mod cli_link;
 mod console;
 mod engine;
 mod gui;
@@ -25,6 +26,8 @@ fn main() -> anyhow::Result<()> {
             tracing_to_file();
             // Before the GUI starts any thread: it sets PATH.
             login_path::import();
+            // The .app / AppImage puts `storingUnicorns` on the PATH.
+            cli_link::install_in_background();
             gui::run()
         }
         Mode::Tui(opts) => run_tui(opts),

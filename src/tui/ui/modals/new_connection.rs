@@ -6,6 +6,7 @@ use ratatui::{
 };
 
 use super::centered_rect;
+use crate::engine::db::azure::AzureCloud;
 use crate::engine::models::{AzureAuthMethod, DatabaseType};
 use crate::engine::presets;
 use crate::tui::{uses_tls, AppState, ConnectionField, DialogMode};
@@ -13,8 +14,8 @@ use crate::tui::ui::widgets::draw_cursor;
 
 /// Rows per field: the value line and its bottom rule.
 const FIELD_HEIGHT: u16 = 2;
-/// The most fields shown at once (PostgreSQL / MySQL with SSL, or Azure
-/// interactive), so the dialog never resizes while cycling the type.
+/// The most fields shown at once (PostgreSQL / MySQL with SSL), so the
+/// dialog never resizes while cycling the type.
 const MAX_FIELDS: u16 = 11;
 
 /// Where the connection dialog is drawn: 60 % wide, tall enough for every
@@ -65,11 +66,19 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     let nc = &state.new_connection;
     let is_azure = nc.db_type == DatabaseType::Azure;
     let show_tenant = is_azure && nc.azure_auth_method == AzureAuthMethod::Interactive;
+    let managed_identity = is_azure && nc.azure_auth_method == AzureAuthMethod::ManagedIdentity;
+    let show_username = !show_tenant;
+    let show_password = !is_azure || nc.azure_auth_method == AzureAuthMethod::Credentials;
     let show_ssl = uses_tls(&nc.db_type);
 
-    // Name, URL, Modèle, Type, Host, Port, Username, Password, Database,
-    // plus the engine-specific fields.
-    let fields = 9 + u16::from(is_azure) + u16::from(show_tenant) + 2 * u16::from(show_ssl);
+    // Name, URL, Modèle, Type, Host, Port, Database, plus the engine- and
+    // authentication-specific fields.
+    let fields = 7
+        + u16::from(is_azure)
+        + u16::from(show_tenant)
+        + u16::from(show_username)
+        + u16::from(show_password)
+        + 2 * u16::from(show_ssl);
     let mut constraints = vec![Constraint::Length(FIELD_HEIGHT); fields as usize];
     constraints.push(Constraint::Min(0)); // Spacer
 
@@ -109,7 +118,8 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
 
         // Show cursor for the active field (cycle fields use render_cycle)
         if is_active {
-            let cursor_x = area.x + label.len() as u16 + 2 + nc.cursor_position as u16;
+            let label_width = label.chars().count() as u16;
+            let cursor_x = area.x + label_width + 2 + nc.cursor_position as u16;
             let cursor_y = area.y;
             draw_cursor(frame, cursor_x.min(area.x + area.width - 1), cursor_y);
         }
@@ -243,6 +253,22 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     if let (true, Some(f)) = (nc.host.is_empty(), nc.flavor) {
         render_placeholder(frame, chunks[idx], "Host", presets::preset(f).host_hint);
     }
+    // Where the tokens come from, deduced from the host: on the row's rule,
+    // right-aligned, where the host value can't hide it.
+    if is_azure {
+        let cloud = format!(" {} ", AzureCloud::from_host(&nc.host));
+        let area = chunks[idx];
+        let len = cloud.chars().count() as u16;
+        if area.height > 1 && len < area.width {
+            frame.buffer_mut().set_stringn(
+                area.x + area.width - len - 1,
+                area.y + 1,
+                &cloud,
+                len as usize,
+                Style::default().fg(Color::DarkGray),
+            );
+        }
+    }
     idx += 1;
 
     render_field(
@@ -255,25 +281,44 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     );
     idx += 1;
 
-    render_field(
-        frame,
-        chunks[idx],
-        "Username",
-        &nc.username,
-        ConnectionField::Username,
-        false,
-    );
-    idx += 1;
+    if managed_identity {
+        // The user-assigned identity's client ID, kept in the username.
+        const LABEL: &str = "ID client";
+        render_field(
+            frame,
+            chunks[idx],
+            LABEL,
+            &nc.username,
+            ConnectionField::Username,
+            false,
+        );
+        if nc.username.is_empty() {
+            render_placeholder(frame, chunks[idx], LABEL, "vide = identité système");
+        }
+        idx += 1;
+    } else if show_username {
+        render_field(
+            frame,
+            chunks[idx],
+            "Username",
+            &nc.username,
+            ConnectionField::Username,
+            false,
+        );
+        idx += 1;
+    }
 
-    render_field(
-        frame,
-        chunks[idx],
-        "Password",
-        &nc.password,
-        ConnectionField::Password,
-        true,
-    );
-    idx += 1;
+    if show_password {
+        render_field(
+            frame,
+            chunks[idx],
+            "Password",
+            &nc.password,
+            ConnectionField::Password,
+            true,
+        );
+        idx += 1;
+    }
 
     render_field(
         frame,
@@ -371,6 +416,39 @@ mod tests {
         let all = screen(&state).join("\n");
         assert!(!all.contains("SSL:"), "{all}");
         assert!(all.contains("Database:"), "{all}");
+    }
+
+    #[test]
+    fn managed_identity_asks_for_a_client_id_and_shows_the_cloud() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.open_new_connection_dialog();
+        let nc = &mut state.new_connection;
+        nc.set_db_type(DatabaseType::Azure);
+        nc.host = "srv.database.usgovcloudapi.net".into();
+        nc.username.clear();
+        nc.azure_auth_method = AzureAuthMethod::ManagedIdentity;
+        let all = screen(&state).join("\n");
+        assert!(all.contains("ID client: vide = identité système"), "{all}");
+        assert!(all.contains(" Azure Government "), "{all}");
+        assert!(!all.contains("Password:"), "{all}");
+        assert!(!all.contains("Tenant ID:"), "{all}");
+
+        state.new_connection.azure_auth_method = AzureAuthMethod::Interactive;
+        let all = screen(&state).join("\n");
+        assert!(all.contains("Tenant ID:"), "{all}");
+        assert!(
+            !all.contains("Username:") && !all.contains("ID client"),
+            "{all}"
+        );
+
+        state.new_connection.azure_auth_method = AzureAuthMethod::Credentials;
+        state.new_connection.host = "srv.database.windows.net".into();
+        let all = screen(&state).join("\n");
+        assert!(
+            all.contains("Username:") && all.contains("Password:"),
+            "{all}"
+        );
+        assert!(all.contains(" Azure (cloud public) "), "{all}");
     }
 
     #[test]

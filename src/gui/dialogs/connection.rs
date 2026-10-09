@@ -2,6 +2,7 @@
 
 use egui::{Sense, Stroke, StrokeKind};
 
+use crate::engine::db::azure::{self, AzureCloud};
 use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType, Flavor, SslMode};
 use crate::engine::presets;
 use crate::gui::theme::{self, CONNECTION_COLORS, ERROR, SUCCESS};
@@ -19,6 +20,9 @@ const AZURE_METHODS: [AzureAuthMethod; 3] = [
     AzureAuthMethod::Interactive,
     AzureAuthMethod::ManagedIdentity,
 ];
+
+/// The username field of an Azure managed identity connection.
+const MANAGED_IDENTITY_LABEL: &str = "ID client de l'identité (vide = identité système)";
 
 fn default_port(t: &DatabaseType) -> &'static str {
     match t {
@@ -211,6 +215,9 @@ impl ConnectionForm {
         };
         let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
         let azure = self.db_type == DatabaseType::Azure;
+        if azure && self.azure_auth == AzureAuthMethod::ManagedIdentity {
+            azure::managed_identity_client_id(Some(&self.username)).map_err(|e| e.to_string())?;
+        }
         Ok(ConnectionConfig {
             name: name.to_string(),
             db_type: self.db_type.clone(),
@@ -360,12 +367,20 @@ impl ConnectionForm {
     fn server_fields(&mut self, ui: &mut egui::Ui) {
         ui.label("Hôte");
         let hint = self.flavor.map_or("", |f| presets::preset(f).host_hint);
-        ui.add(egui::TextEdit::singleline(&mut self.host).hint_text(hint));
+        let azure = self.db_type == DatabaseType::Azure;
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.host).hint_text(hint));
+            // Where the tokens come from, deduced from the host.
+            if azure {
+                ui.weak(AzureCloud::from_host(&self.host).to_string())
+                    .on_hover_text("Cloud Azure déduit de l'hôte");
+            }
+        });
         ui.end_row();
         ui.label("Port");
         ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(80.0));
         ui.end_row();
-        if self.db_type == DatabaseType::Azure {
+        if azure {
             ui.label("Authentification");
             egui::ComboBox::from_id_salt("azure_auth")
                 .selected_text(self.azure_auth.to_string())
@@ -376,12 +391,24 @@ impl ConnectionForm {
                     }
                 });
             ui.end_row();
-            ui.label("Tenant ID");
-            ui.text_edit_singleline(&mut self.tenant_id);
-            ui.end_row();
+            match self.azure_auth {
+                AzureAuthMethod::Interactive => {
+                    ui.label("Tenant ID");
+                    ui.text_edit_singleline(&mut self.tenant_id);
+                    ui.end_row();
+                }
+                AzureAuthMethod::ManagedIdentity => {
+                    ui.label(MANAGED_IDENTITY_LABEL);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.username)
+                            .hint_text("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"),
+                    );
+                    ui.end_row();
+                }
+                AzureAuthMethod::Credentials => {}
+            }
         }
-        let needs_credentials =
-            self.db_type != DatabaseType::Azure || self.azure_auth == AzureAuthMethod::Credentials;
+        let needs_credentials = !azure || self.azure_auth == AzureAuthMethod::Credentials;
         if needs_credentials {
             ui.label("Utilisateur");
             ui.text_edit_singleline(&mut self.username);
@@ -531,6 +558,32 @@ mod tests {
         };
         let f = ConnectionForm::new(Some(edited));
         assert_eq!(f.validate(&existing()).unwrap().color, Some([1, 2, 3]));
+    }
+
+    #[test]
+    fn managed_identity_client_id_round_trips_and_is_validated() {
+        let id = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
+        let saved = ConnectionConfig {
+            name: "Az".into(),
+            db_type: DatabaseType::Azure,
+            host: Some("srv.database.usgovcloudapi.net".into()),
+            username: Some(id.into()),
+            azure_auth_method: Some(AzureAuthMethod::ManagedIdentity),
+            database: "app".into(),
+            ..Default::default()
+        };
+        let mut f = ConnectionForm::new(Some(saved.clone()));
+        let c = f.validate(&[saved]).unwrap();
+        assert_eq!(c.username.as_deref(), Some(id));
+        assert_eq!(c.azure_auth_method, Some(AzureAuthMethod::ManagedIdentity));
+
+        f.username = "sa".into();
+        assert!(f
+            .validate(&[])
+            .unwrap_err()
+            .contains("n'est pas un ID client"));
+        f.username.clear(); // system-assigned identity
+        assert_eq!(f.validate(&[]).unwrap().username, None);
     }
 
     #[test]

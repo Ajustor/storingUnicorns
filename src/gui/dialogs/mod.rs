@@ -174,6 +174,27 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 ui.label(format!(
                     "Supprimer « {name} » ? Cette action est définitive."
                 ));
+                let tabs = app
+                    .tabs
+                    .list
+                    .iter()
+                    .filter(|t| &t.connection == name)
+                    .count();
+                if tabs > 0 {
+                    ui.label(format!(
+                        "Ses {tabs} onglet(s) seront fermés et ses consoles oubliées."
+                    ));
+                }
+                let pending = app.tabs.with_pending_edits(Some(name));
+                if pending > 0 {
+                    ui.colored_label(
+                        super::theme::ERROR,
+                        format!(
+                            "{pending} onglet(s) ont des modifications non envoyées : \
+                             elles seront perdues."
+                        ),
+                    );
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Supprimer").clicked() {

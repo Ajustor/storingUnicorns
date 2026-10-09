@@ -243,8 +243,14 @@ impl App {
         self.save_config();
     }
 
-    /// Remove a (disconnected) connection from the configuration.
+    /// Remove a connection from the configuration, with its session, its
+    /// tabs and its saved consoles.
     pub fn delete_connection(&mut self, name: &str) {
+        self.disconnect(name);
+        for tab in tabs::remove_connection(&mut self.tabs, &mut self.pending_consoles, name) {
+            self.worker.cancel(tab.id);
+        }
+        self.consoles_changed();
         self.config.connections.retain(|c| c.name != name);
         self.sessions.errors.remove(name);
         if self.config.last_connection.as_deref() == Some(name) {
@@ -1124,7 +1130,7 @@ impl eframe::App for App {
             let pending = if self.quit_confirmed {
                 0
             } else {
-                self.tabs.with_pending_edits()
+                self.tabs.with_pending_edits(None)
             };
             if pending > 0 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

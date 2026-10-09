@@ -207,10 +207,12 @@ impl Tabs {
         })
     }
 
-    /// Number of tabs with pending edits (open cell editors committed first).
-    pub fn with_pending_edits(&mut self) -> usize {
+    /// Number of tabs (of `connection` only, when given) with pending edits
+    /// (open cell editors committed first).
+    pub fn with_pending_edits(&mut self, connection: Option<&str>) -> usize {
         self.list
             .iter_mut()
+            .filter(|t| connection.is_none_or(|c| t.connection == c))
             .filter_map(|t| {
                 t.commit_editors();
                 t.has_pending_edits().then_some(())
@@ -239,6 +241,21 @@ pub fn take_consoles(pending: &mut Vec<QueryTab>, name: &str, with_unbound: bool
         });
     *pending = kept;
     taken
+}
+
+/// Close every tab of `connection` and forget its consoles not restored yet
+/// (the connection is deleted); returns the closed tabs.
+pub fn remove_connection(
+    tabs: &mut Tabs,
+    pending: &mut Vec<QueryTab>,
+    connection: &str,
+) -> Vec<Tab> {
+    pending.retain(|q| q.connection.as_deref() != Some(connection));
+    let mut closed = Vec::new();
+    while let Some(i) = tabs.list.iter().position(|t| t.connection == connection) {
+        closed.extend(tabs.close(i));
+    }
+    closed
 }
 
 /// Consoles to write to `queries.toml`: the open ones, then those not
@@ -374,14 +391,16 @@ mod tests {
             }
         );
         assert_eq!(tabs.list[2].close_risk(), CloseRisk::None);
-        assert_eq!(tabs.with_pending_edits(), 0);
+        assert_eq!(tabs.with_pending_edits(None), 0);
 
         // A cell being edited (not committed yet) is pending work too.
         let TabKind::Data(d) = &mut tabs.list[2].kind else {
             unreachable!()
         };
         d.grid.editing = Some((RowRef::Base(0), 0, "2".into()));
-        assert_eq!(tabs.with_pending_edits(), 1);
+        assert_eq!(tabs.with_pending_edits(None), 1);
+        assert_eq!(tabs.with_pending_edits(Some("c")), 1);
+        assert_eq!(tabs.with_pending_edits(Some("other")), 0);
         assert_eq!(tabs.list[2].close_risk(), CloseRisk::DataEdits);
 
         // Pending edits in a console result.
@@ -406,7 +425,29 @@ mod tests {
                 edits: true
             }
         );
-        assert_eq!(tabs.with_pending_edits(), 2);
+        assert_eq!(tabs.with_pending_edits(None), 2);
+    }
+
+    #[test]
+    fn removing_a_connection_closes_its_tabs_and_saved_consoles() {
+        let mut tabs = Tabs::default();
+        tabs.add("prod".into(), "A".into(), console());
+        tabs.add("dev".into(), "B".into(), console());
+        tabs.add("prod".into(), "users".into(), data("users"));
+        tabs.add("dev".into(), "C".into(), console());
+        tabs.active = 3;
+        let mut pending = vec![
+            saved("p", Some("prod")),
+            saved("d", Some("dev")),
+            saved("u", None),
+        ];
+        let closed = remove_connection(&mut tabs, &mut pending, "prod");
+        let titles = |v: &[Tab]| v.iter().map(|t| t.title.clone()).collect::<Vec<_>>();
+        assert_eq!(titles(&closed), ["A", "users"]);
+        assert_eq!(titles(&tabs.list), ["B", "C"]);
+        assert_eq!(tabs.active().unwrap().title, "C", "the active tab stays");
+        let names: Vec<_> = pending.iter().map(|q| q.name.as_str()).collect();
+        assert_eq!(names, ["d", "u"]);
     }
 
     fn saved(name: &str, connection: Option<&str>) -> QueryTab {

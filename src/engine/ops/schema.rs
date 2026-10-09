@@ -7,7 +7,7 @@ use crate::engine::ops::transfer::qualified;
 use crate::engine::services::{
     table_cache::TableCache, ColumnDefinition, SchemaModification, SchemaService,
 };
-use crate::engine::sql::statements::quote_chars;
+use crate::engine::sql::statements::{quote_chars, quote_ident};
 
 /// Columns of `table`, served from `cache` when fresh (filled otherwise).
 async fn cached_columns(
@@ -65,10 +65,10 @@ pub async fn table_details(
 
 /// `table` (optionally `schema.table`, possibly already quoted) quoted with
 /// `quotes`, each part separately.
-fn quote_table(table: &str, (q0, q1): (char, char)) -> String {
+fn quote_table(table: &str, quotes: (char, char)) -> String {
     match split_qualified(table) {
-        (Some(schema), name) => qualified(&schema, &name, (q0, q1)),
-        (None, name) => format!("{q0}{}{q1}", name.replace(q1, &format!("{q1}{q1}"))),
+        (Some(schema), name) => qualified(&schema, &name, quotes),
+        (None, name) => quote_ident(&name, quotes),
     }
 }
 
@@ -139,8 +139,7 @@ pub async fn table_ddl(
 /// given (already quoted/qualified). Statements are separated by `;\n\n`;
 /// the primary-key index is part of the table body, not a `CREATE INDEX`.
 pub fn generate_ddl(table: &str, details: &TableDetails, quotes: (char, char)) -> String {
-    let (q0, q1) = quotes;
-    let quote = |name: &str| format!("{q0}{}{q1}", name.replace(q1, &format!("{q1}{q1}")));
+    let quote = |name: &str| quote_ident(name, quotes);
     let quote_list = |names: &[String]| {
         names
             .iter()

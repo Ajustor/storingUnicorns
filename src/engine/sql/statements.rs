@@ -463,6 +463,22 @@ pub fn single_table_source(sql: &str) -> Option<String> {
     (depth == 0).then_some(table)
 }
 
+/// `name` between identifier quotes `(open, close)`, a closing quote inside
+/// it doubled (`a"b` → `"a""b"`, `a]b` → `[a]]b]`). The one way identifiers
+/// are quoted in generated SQL.
+pub fn quote_ident(name: &str, (q0, q1): (char, char)) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    out.push(q0);
+    for c in name.chars() {
+        out.push(c);
+        if c == q1 {
+            out.push(q1);
+        }
+    }
+    out.push(q1);
+    out
+}
+
 /// Identifier quote characters `(open, close)` for a database type.
 pub fn quote_chars(db_type: &DatabaseType) -> (char, char) {
     match db_type {
@@ -729,6 +745,15 @@ SELECT a FROM \"main\".\"t\" u"
         ] {
             assert_eq!(single_table_source(sql), None, "{sql}");
         }
+    }
+
+    #[test]
+    fn quote_ident_doubles_the_closing_quote() {
+        assert_eq!(quote_ident("a", ('"', '"')), "\"a\"");
+        assert_eq!(quote_ident("a\"b", ('"', '"')), "\"a\"\"b\"");
+        assert_eq!(quote_ident("a]b[c", ('[', ']')), "[a]]b[c]");
+        assert_eq!(quote_ident("a`b", ('`', '`')), "`a``b`");
+        assert_eq!(quote_ident("", ('"', '"')), "\"\"");
     }
 
     #[test]

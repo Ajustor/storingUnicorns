@@ -10,6 +10,7 @@ use crate::engine::models::QueryResult;
 use crate::engine::ops::query::has_full_key;
 use crate::engine::ops::rows::NO_PRIMARY_KEY;
 use crate::engine::sql::paging::{toggle_order, DataQuery};
+use crate::engine::sql::statements::quote_ident;
 use crate::gui::editor::highlight_job;
 use crate::gui::grid::changes::PendingEdits;
 use crate::gui::grid::{self, GridAction, GridOptions, GridState};
@@ -41,11 +42,6 @@ pub fn busy_hint(submitting: bool, loading: bool) -> Option<&'static str> {
 /// Whether the page can be replaced without losing pending edits.
 pub fn can_leave(edits: &PendingEdits) -> bool {
     edits.is_empty()
-}
-
-/// `name` between the database's identifier quotes (closing quote doubled).
-pub fn quote_ident(name: &str, (q0, q1): (char, char)) -> String {
-    format!("{q0}{}{q1}", name.replace(q1, &format!("{q1}{q1}")))
 }
 
 /// Sort arrow for an ORDER BY built by header clicks (`col ASC` / `col
@@ -564,13 +560,6 @@ mod tests {
         assert!(can_leave(&edits));
         edits.add_row(2);
         assert!(!can_leave(&edits));
-    }
-
-    #[test]
-    fn quote_ident_doubles_the_closing_quote() {
-        assert_eq!(quote_ident("a", ('"', '"')), "\"a\"");
-        assert_eq!(quote_ident("a]b", ('[', ']')), "[a]]b]");
-        assert_eq!(quote_ident("a`b", ('`', '`')), "`a``b`");
     }
 
     #[test]

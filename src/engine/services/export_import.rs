@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::engine::models::{is_null, QueryResult};
+use crate::engine::sql::statements::quote_ident;
 
 /// State for filesystem path autocompletion
 #[derive(Debug, Clone)]
@@ -530,7 +531,7 @@ pub fn export_to_sql_insert(
     let col_names: Vec<String> = result
         .columns
         .iter()
-        .map(|c| format!("{}{}{}", quote_start, c.name, quote_end))
+        .map(|c| quote_ident(&c.name, (quote_start, quote_end)))
         .collect();
     let columns_str = col_names.join(", ");
 
@@ -720,7 +721,7 @@ pub fn build_upsert_import_actions(
                 .map(|row| {
                     let col_names: Vec<String> = columns
                         .iter()
-                        .map(|c| format!("{}{}{}", quote_start, c, quote_end))
+                        .map(|c| quote_ident(c, (quote_start, quote_end)))
                         .collect();
                     let values: Vec<String> = row.iter().map(|v| escape_sql_value(v)).collect();
                     ImportAction::InsertOnly {
@@ -736,21 +737,21 @@ pub fn build_upsert_import_actions(
         }
     };
 
-    let id_col_name = format!("{}{}{}", quote_start, columns[id_col_idx], quote_end);
+    let id_col_name = quote_ident(&columns[id_col_idx], (quote_start, quote_end));
 
     // Columns without the id column (for INSERT without id)
     let non_id_columns: Vec<String> = columns
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != id_col_idx)
-        .map(|(_, c)| format!("{}{}{}", quote_start, c, quote_end))
+        .map(|(_, c)| quote_ident(c, (quote_start, quote_end)))
         .collect();
     let non_id_columns_str = non_id_columns.join(", ");
 
     // All columns (for UPDATE SET)
     let all_col_names: Vec<String> = columns
         .iter()
-        .map(|c| format!("{}{}{}", quote_start, c, quote_end))
+        .map(|c| quote_ident(c, (quote_start, quote_end)))
         .collect();
 
     rows.iter()
@@ -872,7 +873,7 @@ impl BatchTruncateState {
             .iter()
             .filter(|(_, _, selected)| *selected)
             .map(|(schema, table, _)| {
-                format!("{1}{0}{2}.{1}{3}{2}", schema, quote_start, quote_end, table)
+                crate::engine::ops::transfer::qualified(schema, table, (quote_start, quote_end))
             })
             .collect()
     }

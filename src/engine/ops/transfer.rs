@@ -8,6 +8,7 @@ use crate::engine::services::export_import::{
     build_upsert_import_actions, export_to_file, parse_csv, BatchExportState, ExportFormat,
     ImportAction,
 };
+use crate::engine::sql::statements::quote_ident;
 
 /// Outcome of a single-table CSV import.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -74,9 +75,12 @@ pub async fn import_csv(
 
 /// `"schema"."table"` with the database's identifier quotes (a closing
 /// quote inside a name is doubled).
-pub fn qualified(schema: &str, table: &str, (q0, q1): (char, char)) -> String {
-    let esc = |name: &str| name.replace(q1, &format!("{q1}{q1}"));
-    format!("{q0}{}{q1}.{q0}{}{q1}", esc(schema), esc(table))
+pub fn qualified(schema: &str, table: &str, quotes: (char, char)) -> String {
+    format!(
+        "{}.{}",
+        quote_ident(schema, quotes),
+        quote_ident(table, quotes)
+    )
 }
 
 /// Export each `(schema, table)` to `<dir>/<table>.<ext>`. `dir` must exist:

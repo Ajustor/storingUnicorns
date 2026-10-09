@@ -7,7 +7,7 @@ use sqlx::{Database, Either, Executor, IntoArguments};
 #[cfg(test)]
 use crate::engine::models::NULL_CELL;
 use crate::engine::models::{is_null, Column, DatabaseType, ForeignKeyInfo, IndexInfo, SchemaInfo};
-use crate::engine::sql::statements::{quote_chars, split_statements};
+use crate::engine::sql::statements::{quote_chars, quote_ident, split_statements};
 
 /// Execute `query` exactly once and collect both its rows and its
 /// `DB::QueryResult` (affected-row counts summed via `Extend`) from the same
@@ -366,10 +366,11 @@ fn sql_literal(col: &Column, value: &str) -> String {
 /// `"col" = <literal>`, or `"col" IS NULL` for a NULL value.
 fn where_part(col: &Column, value: &str, quote_start: char, quote_end: char) -> String {
     let literal = sql_literal(col, value);
+    let name = quote_ident(&col.name, (quote_start, quote_end));
     if literal == "NULL" {
-        format!("{quote_start}{}{quote_end} IS NULL", col.name)
+        format!("{name} IS NULL")
     } else {
-        format!("{quote_start}{}{quote_end} = {literal}", col.name)
+        format!("{name} = {literal}")
     }
 }
 
@@ -389,8 +390,8 @@ pub fn build_update_clauses(
         .filter(|(_, (orig, new))| orig != new)
         .map(|(col, (_, new))| {
             format!(
-                "{quote_start}{}{quote_end} = {}",
-                col.name,
+                "{} = {}",
+                quote_ident(&col.name, (quote_start, quote_end)),
                 sql_literal(col, new)
             )
         })
@@ -452,7 +453,7 @@ pub fn build_insert_parts(
         let Some(val) = val else {
             continue;
         };
-        col_parts.push(format!("{}{}{}", quote_start, col.name, quote_end));
+        col_parts.push(quote_ident(&col.name, (quote_start, quote_end)));
         val_parts.push(sql_literal(col, val));
     }
 
@@ -785,6 +786,33 @@ mod tests {
         assert!(is_dml(
             "/* upsert */ merge t using s on 1 = 1 when matched then delete;"
         ));
+    }
+
+    #[test]
+    fn column_names_are_escaped_in_generated_dml() {
+        let cols = vec![Column {
+            name: "a\"b".into(),
+            type_name: "TEXT".into(),
+            nullable: true,
+            is_primary_key: true,
+        }];
+        let (x, y) = (vec!["x".to_string()], vec!["y".to_string()]);
+        assert_eq!(
+            build_delete_query("t", &cols, &x, '"', '"'),
+            "DELETE FROM t WHERE \"a\"\"b\" = 'x'"
+        );
+        assert_eq!(
+            build_update_query("t", &cols, &x, &y, '"', '"').unwrap(),
+            "UPDATE t SET \"a\"\"b\" = 'y' WHERE \"a\"\"b\" = 'x'"
+        );
+        let cols = vec![Column {
+            name: "x]y".into(),
+            ..cols[0].clone()
+        }];
+        assert_eq!(
+            build_insert_query("t", &cols, &[Some("v".into())], &DatabaseType::SQLServer),
+            "INSERT INTO t ([x]]y]) VALUES ('v')"
+        );
     }
 
     #[test]

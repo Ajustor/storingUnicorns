@@ -183,7 +183,9 @@ pub fn render_connections_panel(
 
             ListItem::new(format!(
                 "{}{} ({})",
-                connected_marker, conn.name, conn.db_type
+                connected_marker,
+                conn.name,
+                conn.display_type()
             ))
             .style(style)
         })
@@ -1194,7 +1196,7 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     let connection_info = if state.is_connecting {
         String::from("⏳ Connecting... | ")
     } else if let Some(ref config) = state.current_connection_config {
-        format!("Connected: {} ({}) | ", config.name, config.db_type)
+        format!("Connected: {} ({}) | ", config.name, config.display_type())
     } else {
         String::from("Disconnected | ")
     };
@@ -1207,4 +1209,42 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     let paragraph = Paragraph::new(status).style(Style::default().bg(Color::DarkGray));
 
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::config::AppConfig;
+    use crate::engine::models::{ConnectionConfig, Flavor};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn screen(draw: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal.draw(draw).unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn connections_show_their_flavor() {
+        let config = ConnectionConfig {
+            name: "prod".into(),
+            flavor: Some(Flavor::Supabase),
+            ..Default::default()
+        };
+        let mut state = AppState::new(
+            AppConfig {
+                connections: vec![config.clone()],
+                ..Default::default()
+            },
+            false,
+            true,
+        );
+        state.current_connection_config = Some(config);
+        let registry = ClickableRegistry::new();
+        let list = screen(|f| render_connections_panel(f, f.area(), &state, &registry));
+        assert!(list.contains("prod (Supabase)"), "{list}");
+        let bar = screen(|f| render_status_bar(f, f.area(), &state));
+        assert!(bar.contains("Connected: prod (Supabase)"), "{bar}");
+    }
 }

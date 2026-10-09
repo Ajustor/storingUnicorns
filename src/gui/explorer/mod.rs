@@ -426,7 +426,7 @@ fn connection_row(
     let toggled = toggle(ui, open).clicked();
     theme::dot(ui, theme::connection_color(config.color));
     let label = clickable(ui, RichText::new(name).strong());
-    ui.label(RichText::new(config.db_type.to_string()).weak().small());
+    ui.label(RichText::new(config.display_type()).weak().small());
     if connecting {
         ui.spinner();
     }

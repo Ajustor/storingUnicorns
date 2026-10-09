@@ -108,7 +108,6 @@ impl Flavor {
     ];
 
     /// The driver this product speaks.
-    #[allow(dead_code)] // TODO(tls-presets): drop once the dialogs use it.
     pub fn driver(self) -> DatabaseType {
         match self {
             Flavor::MariaDb | Flavor::PlanetScale => DatabaseType::MySQL,
@@ -164,7 +163,6 @@ impl ConnectionConfig {
     }
 
     /// The flavor when it matches the driver, else the engine name.
-    #[allow(dead_code)] // TODO(tls-presets): drop once the dialogs use it.
     pub fn display_type(&self) -> String {
         match self.flavor {
             Some(f) if f.driver() == self.db_type => f.to_string(),

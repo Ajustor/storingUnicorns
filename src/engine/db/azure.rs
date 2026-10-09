@@ -1,13 +1,12 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-use std::sync::Arc;
 use tiberius::{AuthMethod, Client, Config};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::engine::models::{AzureAuthMethod, ConnectionConfig, QueryResult, SchemaInfo};
 
+use super::sqlserver::TdsClient;
 use super::SqlServerClient;
 
 /// Azure SQL Database resource for token acquisition
@@ -15,8 +14,14 @@ const AZURE_SQL_RESOURCE: &str = "https://database.windows.net";
 
 // ========== Connect Function ==========
 
-/// Connect to Azure SQL Database
+/// Connect to Azure SQL Database. The shared client reconnects through
+/// `open` (acquiring a fresh token) when an operation was interrupted.
 pub async fn connect(config: &ConnectionConfig) -> Result<SqlServerClient> {
+    Ok(SqlServerClient::new(config.clone(), open(config).await?))
+}
+
+/// Open a client with the configured Azure authentication method.
+pub async fn open(config: &ConnectionConfig) -> Result<TdsClient> {
     let auth_method = config
         .azure_auth_method
         .as_ref()
@@ -31,12 +36,12 @@ pub async fn connect(config: &ConnectionConfig) -> Result<SqlServerClient> {
 }
 
 /// Connect using SQL Server authentication (username/password)
-async fn connect_with_credentials(config: &ConnectionConfig) -> Result<SqlServerClient> {
-    super::sqlserver::connect(config).await
+async fn connect_with_credentials(config: &ConnectionConfig) -> Result<TdsClient> {
+    super::sqlserver::open(config).await
 }
 
 /// Connect using Azure CLI (`az account get-access-token`), with optional tenant_id
-async fn connect_with_azure_cli(config: &ConnectionConfig) -> Result<SqlServerClient> {
+async fn connect_with_azure_cli(config: &ConnectionConfig) -> Result<TdsClient> {
     let tenant_id = config.tenant_id.as_deref();
     let token = get_azure_cli_token(tenant_id).await?;
     connect_with_aad_token(config, &token).await
@@ -108,7 +113,7 @@ async fn get_azure_cli_token(tenant_id: Option<&str>) -> Result<String> {
 // ========== Managed Identity ==========
 
 /// Connect using Managed Identity (via DefaultAzureCredential)
-async fn connect_with_managed_identity(config: &ConnectionConfig) -> Result<SqlServerClient> {
+async fn connect_with_managed_identity(config: &ConnectionConfig) -> Result<TdsClient> {
     use azure_core::credentials::TokenCredential;
     use azure_identity::DefaultAzureCredential;
 
@@ -135,7 +140,7 @@ async fn connect_with_managed_identity(config: &ConnectionConfig) -> Result<SqlS
 
 // ========== AAD Token Connection ==========
 
-async fn connect_with_aad_token(config: &ConnectionConfig, token: &str) -> Result<SqlServerClient> {
+async fn connect_with_aad_token(config: &ConnectionConfig, token: &str) -> Result<TdsClient> {
     let mut tib_config = Config::new();
     tib_config.host(
         config
@@ -150,8 +155,7 @@ async fn connect_with_aad_token(config: &ConnectionConfig, token: &str) -> Resul
 
     let tcp = TcpStream::connect(tib_config.get_addr()).await?;
     tcp.set_nodelay(true)?;
-    let client = Client::connect(tib_config, tcp.compat_write()).await?;
-    Ok(Arc::new(Mutex::new(client)))
+    Ok(Client::connect(tib_config, tcp.compat_write()).await?)
 }
 
 // ========== Delegated Operations (same as SQL Server) ==========

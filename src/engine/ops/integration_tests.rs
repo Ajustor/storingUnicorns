@@ -406,12 +406,15 @@ async fn exercise(conn: &DatabaseConnection, d: &Dialect) {
 /// A transaction block interrupted while it runs (the GUI's cancel drops
 /// the future) must leave nothing open: the next statement on `conn` is
 /// committed on its own and the block's INSERT is rolled back, as seen from
-/// the `other`, independent connection. `slow` runs for several seconds.
+/// the `other`, independent connection. `slow` runs for several seconds;
+/// `no_open_tx` is a query returning `expected` when the session that runs
+/// it has no open transaction.
 async fn cancelled_transaction_leaves_nothing_open(
     conn: &DatabaseConnection,
     other: &DatabaseConnection,
     d: &Dialect,
     slow: &str,
+    (no_open_tx, expected): (&str, &str),
 ) {
     let parent = d.q("parent");
     let (begin, commit) = transaction_bounds(&d.db);
@@ -427,6 +430,16 @@ async fn cancelled_transaction_leaves_nothing_open(
     )
     .await;
     assert!(run.is_err(), "the block must be interrupted while running");
+    let start = std::time::Instant::now();
+    assert_eq!(
+        scalar(conn, no_open_tx).await,
+        expected,
+        "no transaction open after the interruption"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "the next query must not wait for the interrupted one"
+    );
 
     exec(
         conn,
@@ -519,7 +532,14 @@ async fn integration_postgres() {
         ],
     };
     exercise(&conn, &d).await;
-    cancelled_transaction_leaves_nothing_open(&single, &conn, &d, "SELECT pg_sleep(5)").await;
+    cancelled_transaction_leaves_nothing_open(
+        &single,
+        &conn,
+        &d,
+        "SELECT pg_sleep(5)",
+        ("SELECT txid_current_if_assigned() IS NULL", "true"),
+    )
+    .await;
     // A function body full of `;` stays one statement.
     let out = run_script(
         &conn,
@@ -598,7 +618,17 @@ async fn integration_mysql() {
         ],
     };
     exercise(&conn, &d).await;
-    cancelled_transaction_leaves_nothing_open(&single, &conn, &d, "SELECT SLEEP(5)").await;
+    cancelled_transaction_leaves_nothing_open(
+        &single,
+        &conn,
+        &d,
+        "SELECT SLEEP(5)",
+        (
+            "SELECT COUNT(*) FROM information_schema.innodb_trx              WHERE trx_mysql_thread_id = CONNECTION_ID()",
+            "0",
+        ),
+    )
+    .await;
     // Bare names resolve in the current database.
     let cols = conn.get_table_column_details("parent").await.unwrap();
     assert_eq!(cols.len(), 4);
@@ -699,6 +729,43 @@ async fn integration_mssql() {
         ],
     };
     exercise(&conn, &d).await;
+    // The single shared client must survive an interrupted batch: reconnected,
+    // nothing left open, the abandoned batch not committed.
+    let other = DatabaseConnection::connect(&mssql_config(&spec))
+        .await
+        .unwrap();
+    cancelled_transaction_leaves_nothing_open(
+        &conn,
+        &other,
+        &d,
+        "WAITFOR DELAY '00:00:05'",
+        ("SELECT @@TRANCOUNT", "0"),
+    )
+    .await;
+    // Same for a plain long query interrupted mid-way.
+    let slow = conn.execute_query("WAITFOR DELAY '00:00:10'; SELECT 1 AS one");
+    let run = tokio::time::timeout(std::time::Duration::from_millis(500), slow).await;
+    assert!(run.is_err(), "the query must be interrupted while running");
+    let start = std::time::Instant::now();
+    assert_eq!(scalar(&conn, "SELECT 42").await, "42");
+    assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    assert_eq!(scalar(&conn, "SELECT @@TRANCOUNT").await, "0");
+    // A server error is not an interruption: the session (and its temporary
+    // tables) is kept.
+    exec(&conn, "CREATE TABLE #su_tmp (x INT)").await;
+    assert!(conn
+        .execute_query("SELECT * FROM su_it_missing")
+        .await
+        .is_err());
+    let block = [
+        "BEGIN TRANSACTION".to_string(),
+        "INSERT INTO #su_tmp VALUES (1)".to_string(),
+        "INSERT INTO #su_tmp VALUES ('x')".to_string(),
+        "COMMIT".to_string(),
+    ];
+    assert!(conn.execute_transaction(&block).await.is_err());
+    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM #su_tmp").await, "0");
+    assert_eq!(scalar(&conn, "SELECT @@TRANCOUNT").await, "0");
     let ddl = table_ddl(&conn, &TableCache::default(), &d.db, &d.q("parent"))
         .await
         .unwrap();

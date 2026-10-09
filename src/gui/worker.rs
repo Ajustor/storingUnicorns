@@ -185,7 +185,8 @@ impl Worker {
     /// cancelled. An interrupted transaction block is rolled back because
     /// `execute_transaction` closes its dedicated connection when dropped
     /// before the end (sqlx would otherwise return it to the pool with the
-    /// transaction still open).
+    /// transaction still open). On SQL Server the shared client is marked
+    /// dirty and reconnected before its next use.
     pub fn cancel(&mut self, tab: TabId) -> bool {
         match self.running.remove(&tab) {
             Some(h) if !h.is_finished() => {

@@ -3,11 +3,11 @@ use futures_util::TryStreamExt;
 use std::sync::Arc;
 use tiberius::{AuthMethod, Client, Config, QueryItem, QueryStream};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::engine::models::{
-    Column, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
+    Column, ConnectionConfig, DatabaseType, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
 };
 
 use crate::engine::sql::statements::split_statements;
@@ -17,11 +17,113 @@ use super::utils::{
     leading_keyword, skip_leading_comments, split_qualified,
 };
 
-/// SQL Server client type alias
-pub type SqlServerClient = Arc<Mutex<Client<Compat<TcpStream>>>>;
+/// A tiberius client over TCP.
+pub type TdsClient = Client<Compat<TcpStream>>;
 
-/// Connect to SQL Server
-pub async fn connect(config: &ConnectionConfig) -> Result<SqlServerClient> {
+/// The connection's single tiberius client, shared by every operation and
+/// used by one at a time.
+///
+/// An operation interrupted between sending its batch and reading the whole
+/// response (task aborted by a GUI cancel, timeout…) leaves the client out of
+/// step with the server: the next query would first wait for the abandoned
+/// batch to finish (and a transaction it opened would then commit or stay
+/// open). `lock` therefore marks the client dirty until the operation calls
+/// `settle`; a client still dirty at the next `lock` is dropped (the server
+/// rolls back the session's transaction) and replaced by a new connection
+/// made from the saved configuration (Azure included, token re-acquired).
+#[derive(Clone)]
+pub struct SqlServerClient(Arc<Shared>);
+
+struct Shared {
+    config: ConnectionConfig,
+    slot: Mutex<Slot>,
+}
+
+struct Slot {
+    /// `None` after a failed reconnection.
+    client: Option<TdsClient>,
+    dirty: bool,
+}
+
+/// Exclusive use of the client, from `SqlServerClient::lock`.
+pub struct ClientGuard<'a> {
+    slot: MutexGuard<'a, Slot>,
+}
+
+impl SqlServerClient {
+    pub fn new(config: ConnectionConfig, client: TdsClient) -> Self {
+        Self(Arc::new(Shared {
+            config,
+            slot: Mutex::new(Slot {
+                client: Some(client),
+                dirty: false,
+            }),
+        }))
+    }
+
+    /// Wait for the client, reconnecting first if the previous operation was
+    /// interrupted. The client is marked dirty until `ClientGuard::settle`.
+    pub async fn lock(&self) -> Result<ClientGuard<'_>> {
+        let mut slot = self.0.slot.lock().await;
+        if slot.dirty || slot.client.is_none() {
+            if slot.dirty {
+                tracing::warn!("SQL Server: previous operation interrupted, reconnecting");
+            }
+            // Closing the old connection makes the server roll back its work.
+            slot.client = None;
+            slot.client = Some(reopen(&self.0.config).await?);
+        }
+        slot.dirty = true;
+        Ok(ClientGuard { slot })
+    }
+}
+
+/// A new client for `config`, with the authentication of its database type.
+async fn reopen(config: &ConnectionConfig) -> Result<TdsClient> {
+    match config.db_type {
+        DatabaseType::Azure => super::azure::open(config).await,
+        _ => open(config).await,
+    }
+}
+
+impl ClientGuard<'_> {
+    /// The operation is over: unless it failed with an I/O or protocol error
+    /// (the response may be partly unread), the client is in step again.
+    /// A server error (bad SQL, constraint…) is reported after the request
+    /// was answered, so the client stays usable.
+    pub fn settle<T>(mut self, outcome: &Result<T>) {
+        self.slot.dirty = match outcome {
+            Ok(_) => false,
+            Err(e) => !is_server_error(e),
+        };
+    }
+}
+
+impl std::ops::Deref for ClientGuard<'_> {
+    type Target = TdsClient;
+
+    fn deref(&self) -> &TdsClient {
+        self.slot.client.as_ref().expect("connected by lock")
+    }
+}
+
+impl std::ops::DerefMut for ClientGuard<'_> {
+    fn deref_mut(&mut self) -> &mut TdsClient {
+        self.slot.client.as_mut().expect("connected by lock")
+    }
+}
+
+/// Whether `e` is an error reported by the server (as opposed to I/O,
+/// protocol or decoding errors).
+fn is_server_error(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<tiberius::error::Error>(),
+        Some(tiberius::error::Error::Server(_))
+    )
+}
+
+/// Open a client with SQL Server authentication.
+pub async fn open(config: &ConnectionConfig) -> Result<TdsClient> {
     let mut tib_config = Config::new();
     tib_config.host(config.host.as_deref().unwrap_or("localhost"));
     tib_config.port(config.port.unwrap_or(1433));
@@ -34,8 +136,12 @@ pub async fn connect(config: &ConnectionConfig) -> Result<SqlServerClient> {
 
     let tcp = TcpStream::connect(tib_config.get_addr()).await?;
     tcp.set_nodelay(true)?;
-    let client = Client::connect(tib_config, tcp.compat_write()).await?;
-    Ok(Arc::new(Mutex::new(client)))
+    Ok(Client::connect(tib_config, tcp.compat_write()).await?)
+}
+
+/// Connect to SQL Server
+pub async fn connect(config: &ConnectionConfig) -> Result<SqlServerClient> {
+    Ok(SqlServerClient::new(config.clone(), open(config).await?))
 }
 
 /// Convert fetched rows into a `QueryResult`.
@@ -135,10 +241,7 @@ fn counts_only<S: AsRef<str>>(statements: &[S]) -> bool {
 /// Run `batch` with `Client::execute` and sum the affected-row counts. It goes
 /// through `sp_executesql`: the whole text is still one batch, so variables
 /// declared in it stay visible across its statements.
-async fn execute_counting(
-    client: &mut Client<Compat<TcpStream>>,
-    batch: &str,
-) -> Result<QueryResult> {
+async fn execute_counting(client: &mut TdsClient, batch: &str) -> Result<QueryResult> {
     let affected = client.execute(batch, &[]).await?.total();
     Ok(QueryResult {
         rows_affected: affected,
@@ -191,16 +294,21 @@ pub async fn execute_query_limited(
         .into_iter()
         .map(|(_, _, stmt)| stmt)
         .collect();
-    let mut client = client.lock().await;
-    if counts_only(&statements) {
-        return execute_counting(&mut client, query).await;
+    let mut client = client.lock().await?;
+    let outcome = async {
+        if counts_only(&statements) {
+            return execute_counting(&mut client, query).await;
+        }
+        let stream = client.simple_query(query).await?;
+        let (rows, truncated) = first_result_capped(stream, max_rows).await?;
+        Ok(QueryResult {
+            truncated,
+            ..rows_to_result(&rows)
+        })
     }
-    let stream = client.simple_query(query).await?;
-    let (rows, truncated) = first_result_capped(stream, max_rows).await?;
-    Ok(QueryResult {
-        truncated,
-        ..rows_to_result(&rows)
-    })
+    .await;
+    client.settle(&outcome);
+    outcome
 }
 
 /// Join transaction statements into a single T-SQL batch. Running the whole
@@ -228,7 +336,7 @@ pub async fn execute_transaction(
     statements: &[String],
 ) -> Result<QueryResult> {
     let batch = build_tsql_batch(statements);
-    let mut client = client.lock().await;
+    let mut client = client.lock().await?;
 
     let outcome = async {
         if counts_only(statements) {
@@ -247,30 +355,43 @@ pub async fn execute_transaction(
     }
     .await;
 
-    match outcome {
-        Ok(result) => Ok(result),
-        Err(e) => {
-            // The failed batch may have left a transaction open on the shared
-            // client; roll it back so later queries aren't poisoned.
-            let _ = client
+    if outcome.is_err() && is_server_error(outcome.as_ref().unwrap_err()) {
+        // The failed batch may have left a transaction open on the shared
+        // client; roll it back so later queries aren't poisoned. If that
+        // fails too, the client is left dirty and replaced on next use.
+        let cleanup = async {
+            client
                 .simple_query("IF @@TRANCOUNT > 0 ROLLBACK; SET XACT_ABORT OFF")
-                .await;
-            Err(e)
+                .await?
+                .into_results()
+                .await?;
+            Ok(())
         }
+        .await;
+        client.settle(&cleanup);
+    } else {
+        // Other errors may leave the response unread: reconnect.
+        client.settle(&outcome);
     }
+    outcome
 }
 
 /// Get tables grouped by schema
 pub async fn get_tables_by_schema(client: &SqlServerClient) -> Result<Vec<SchemaInfo>> {
-    let mut client = client.lock().await;
-    let stream = client
-        .simple_query(
-            "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES 
-             WHERE TABLE_TYPE = 'BASE TABLE' 
-             ORDER BY TABLE_SCHEMA, TABLE_NAME",
-        )
-        .await?;
-    let rows = stream.into_first_result().await?;
+    let mut client = client.lock().await?;
+    let rows = async {
+        let stream = client
+            .simple_query(
+                "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES 
+                 WHERE TABLE_TYPE = 'BASE TABLE' 
+                 ORDER BY TABLE_SCHEMA, TABLE_NAME",
+            )
+            .await?;
+        Ok(stream.into_first_result().await?)
+    }
+    .await;
+    client.settle(&rows);
+    let rows = rows?;
     let tuples: Vec<(String, String)> = rows
         .iter()
         .filter_map(|row| {
@@ -303,9 +424,7 @@ pub async fn update_row(
     );
 
     tracing::debug!("SQL Server UPDATE query: {}", query);
-    let mut client = client.lock().await;
-    let result = client.execute(&query, &[]).await?;
-    Ok(result.total())
+    execute_counted(client, &query).await
 }
 
 /// Insert a new row into a SQL Server table
@@ -329,9 +448,36 @@ pub async fn insert_row(
     );
 
     tracing::debug!("SQL Server INSERT query: {}", query);
-    let mut client = client.lock().await;
-    let result = client.execute(&query, &[]).await?;
-    Ok(result.total())
+    execute_counted(client, &query).await
+}
+
+/// Run a DML statement and return its affected-row count.
+async fn execute_counted(client: &SqlServerClient, query: &str) -> Result<u64> {
+    let mut client = client.lock().await?;
+    let outcome = async { Ok(client.execute(query, &[]).await?.total()) }.await;
+    client.settle(&outcome);
+    outcome
+}
+
+/// Rows of a metadata `query` taking the schema (`@P1`, NULL for the
+/// default one) and the table name (`@P2`).
+async fn query_rows(
+    client: &SqlServerClient,
+    query: &str,
+    schema: &Option<String>,
+    table: &str,
+) -> Result<Vec<tiberius::Row>> {
+    let mut client = client.lock().await?;
+    let outcome = async {
+        Ok(client
+            .query(query, &[&schema.as_deref(), &table])
+            .await?
+            .into_first_result()
+            .await?)
+    }
+    .await;
+    client.settle(&outcome);
+    outcome
 }
 
 /// `(schema, table)` of a possibly qualified/bracketed name. `None` schema:
@@ -372,12 +518,7 @@ async fn column_rows(
          WHERE c.TABLE_SCHEMA = COALESCE(@P1, SCHEMA_NAME()) AND c.TABLE_NAME = @P2
          ORDER BY c.ORDINAL_POSITION";
 
-    let mut client = client.lock().await;
-    let rows = client
-        .query(query, &[&schema.as_deref(), &table.as_str()])
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = query_rows(client, query, &schema, &table).await?;
 
     let mut columns = Vec::with_capacity(rows.len());
     for row in rows {
@@ -419,12 +560,7 @@ pub async fn get_primary_keys(client: &SqlServerClient, table_name: &str) -> Res
            AND ku.TABLE_SCHEMA = COALESCE(@P1, SCHEMA_NAME()) AND ku.TABLE_NAME = @P2
          ORDER BY ku.ORDINAL_POSITION";
 
-    let mut client = client.lock().await;
-    let rows = client
-        .query(query, &[&schema.as_deref(), &table.as_str()])
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = query_rows(client, query, &schema, &table).await?;
 
     let mut primary_keys = Vec::new();
     for row in rows {
@@ -478,12 +614,7 @@ pub async fn get_indexes(client: &SqlServerClient, table_name: &str) -> Result<V
            AND i.name IS NOT NULL AND ic.is_included_column = 0
          ORDER BY i.is_primary_key DESC, i.name, ic.key_ordinal";
 
-    let mut client = client.lock().await;
-    let rows = client
-        .query(query, &[&schema.as_deref(), &table.as_str()])
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = query_rows(client, query, &schema, &table).await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -518,12 +649,7 @@ pub async fn get_foreign_keys(
          WHERE s.name = COALESCE(@P1, SCHEMA_NAME()) AND t.name = @P2
          ORDER BY fk.name, fkc.constraint_column_id";
 
-    let mut client = client.lock().await;
-    let rows = client
-        .query(query, &[&schema.as_deref(), &table.as_str()])
-        .await?
-        .into_first_result()
-        .await?;
+    let rows = query_rows(client, query, &schema, &table).await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -550,9 +676,18 @@ pub async fn get_foreign_keys(
 
 /// Test the connection
 pub async fn test(client: &SqlServerClient) -> Result<()> {
-    let mut client = client.lock().await;
-    client.simple_query("SELECT 1").await?;
-    Ok(())
+    let mut client = client.lock().await?;
+    let outcome = async {
+        client
+            .simple_query("SELECT 1")
+            .await?
+            .into_results()
+            .await?;
+        Ok(())
+    }
+    .await;
+    client.settle(&outcome);
+    outcome
 }
 
 /// Text of a cell, decoded from its TDS type (so that tinyint, smallint,

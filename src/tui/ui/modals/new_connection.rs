@@ -7,6 +7,7 @@ use ratatui::{
 
 use super::centered_rect;
 use crate::engine::models::{AzureAuthMethod, DatabaseType};
+use crate::engine::presets;
 use crate::tui::{uses_tls, AppState, ConnectionField, DialogMode};
 use crate::tui::ui::widgets::draw_cursor;
 
@@ -238,6 +239,20 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
         ConnectionField::Host,
         false,
     );
+    // Like the GUI's placeholder: the preset's host hint, dimmed, while
+    // the field is empty (the cursor cell keeps its reversed style).
+    if let (true, Some(f)) = (nc.host.is_empty(), nc.flavor) {
+        let area = chunks[idx];
+        let x = area.x + "Host: ".len() as u16;
+        let width = (area.x + area.width).saturating_sub(x) as usize;
+        frame.buffer_mut().set_stringn(
+            x,
+            area.y,
+            presets::preset(f).host_hint,
+            width,
+            Style::default().fg(Color::DarkGray),
+        );
+    }
     idx += 1;
 
     render_field(
@@ -347,5 +362,18 @@ mod tests {
         let all = screen(&state).join("\n");
         assert!(!all.contains("SSL:"), "{all}");
         assert!(all.contains("Database:"), "{all}");
+    }
+
+    #[test]
+    fn an_empty_host_shows_the_preset_hint() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.open_new_connection_dialog();
+        state.new_connection.flavor = Some(crate::engine::models::Flavor::Supabase);
+        state.new_connection.host.clear();
+        let all = screen(&state).join("\n");
+        assert!(all.contains("Host: db.<projet>.supabase.co"), "{all}");
+        state.new_connection.host = "mine".into();
+        let all = screen(&state).join("\n");
+        assert!(!all.contains("supabase.co"), "{all}");
     }
 }

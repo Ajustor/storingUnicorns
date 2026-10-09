@@ -699,10 +699,16 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
         KeyCode::Right if nc.active_field == ConnectionField::AzureAuth => {
             nc.cycle_azure_auth_method();
         }
-        KeyCode::Left | KeyCode::Right if nc.active_field == ConnectionField::Flavor => {
+        KeyCode::Left if nc.active_field == ConnectionField::Flavor => {
+            nc.cycle_flavor_back();
+        }
+        KeyCode::Right if nc.active_field == ConnectionField::Flavor => {
             nc.cycle_flavor();
         }
-        KeyCode::Left | KeyCode::Right if nc.active_field == ConnectionField::SslMode => {
+        KeyCode::Left if nc.active_field == ConnectionField::SslMode => {
+            nc.cycle_ssl_mode_back();
+        }
+        KeyCode::Right if nc.active_field == ConnectionField::SslMode => {
             nc.cycle_ssl_mode();
         }
         KeyCode::Enter if nc.active_field == ConnectionField::Url && !nc.url.trim().is_empty() => {
@@ -739,10 +745,11 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
                 return;
             }
             let pos = nc.cursor_position;
+            // Cycle fields have no text: typing there does nothing.
             if let Some(field) = nc.get_active_field_mut() {
                 field.insert(pos, c);
+                nc.cursor_position += c.len_utf8();
             }
-            nc.cursor_position += c.len_utf8();
         }
         KeyCode::Backspace => {
             if nc.cursor_position > 0 {
@@ -3416,5 +3423,37 @@ mod tests {
         assert_eq!(saved.ssl_mode, Some(SslMode::Require));
         assert_eq!(saved.color, Some([9, 9, 9]));
         assert_eq!(saved.host.as_deref(), Some("db.abc.supabase.co"));
+    }
+
+    #[test]
+    fn cycle_fields_go_both_ways_and_ignore_typing() {
+        use crate::engine::models::{Flavor, SslMode};
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        let key = |state: &mut AppState, k: KeyCode| {
+            handle_dialog_input(state, k, KeyModifiers::NONE);
+        };
+        state.open_new_connection_dialog();
+        key(&mut state, KeyCode::Tab); // URL
+        key(&mut state, KeyCode::Tab); // Modèle
+        assert_eq!(state.new_connection.active_field, ConnectionField::Flavor);
+        key(&mut state, KeyCode::Char('x'));
+        assert_eq!(state.new_connection.cursor_position, 0);
+        key(&mut state, KeyCode::Left); // Aucun -> last
+        assert_eq!(state.new_connection.flavor, Flavor::ALL.last().copied());
+        key(&mut state, KeyCode::Right); // back to Aucun
+        assert_eq!(state.new_connection.flavor, None);
+        key(&mut state, KeyCode::Right);
+        assert_eq!(state.new_connection.flavor, Some(Flavor::ALL[0]));
+
+        while state.new_connection.active_field != ConnectionField::SslMode {
+            key(&mut state, KeyCode::Tab);
+        }
+        state.new_connection.ssl_mode = SslMode::Prefer;
+        key(&mut state, KeyCode::Left);
+        assert_eq!(state.new_connection.ssl_mode, SslMode::Disable);
+        key(&mut state, KeyCode::Left); // wraps
+        assert_eq!(state.new_connection.ssl_mode, SslMode::VerifyFull);
+        key(&mut state, KeyCode::Right);
+        assert_eq!(state.new_connection.ssl_mode, SslMode::Disable);
     }
 }

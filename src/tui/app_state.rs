@@ -358,13 +358,27 @@ impl NewConnectionState {
     /// when it is empty or a driver default. A typed host is never
     /// overwritten; a default one follows the driver like `cycle_db_type`.
     pub fn cycle_flavor(&mut self) {
-        let next = match self.flavor {
-            None => Some(Flavor::ALL[0]),
-            Some(f) => Flavor::ALL
-                .iter()
-                .position(|x| *x == f)
-                .and_then(|i| Flavor::ALL.get(i + 1).copied()),
+        self.step_flavor(true);
+    }
+
+    /// `cycle_flavor` backwards: None, last product, …, first, None.
+    pub fn cycle_flavor_back(&mut self) {
+        self.step_flavor(false);
+    }
+
+    fn step_flavor(&mut self, forward: bool) {
+        // Position in [None, ALL[0], …, ALL[n-1]], moved one step with wrap.
+        let len = Flavor::ALL.len() + 1;
+        let pos = self
+            .flavor
+            .and_then(|f| Flavor::ALL.iter().position(|x| *x == f))
+            .map_or(0, |i| i + 1);
+        let pos = if forward {
+            (pos + 1) % len
+        } else {
+            (pos + len - 1) % len
         };
+        let next = pos.checked_sub(1).map(|i| Flavor::ALL[i]);
         let Some(f) = next else {
             self.flavor = None;
             return;
@@ -387,11 +401,19 @@ impl NewConnectionState {
     }
 
     pub fn cycle_ssl_mode(&mut self) {
+        self.step_ssl_mode(1);
+    }
+
+    pub fn cycle_ssl_mode_back(&mut self) {
+        self.step_ssl_mode(SslMode::ALL.len() - 1);
+    }
+
+    fn step_ssl_mode(&mut self, step: usize) {
         let i = SslMode::ALL
             .iter()
             .position(|m| *m == self.ssl_mode)
             .unwrap_or(0);
-        self.ssl_mode = SslMode::ALL[(i + 1) % SslMode::ALL.len()];
+        self.ssl_mode = SslMode::ALL[(i + step) % SslMode::ALL.len()];
     }
 
     /// Fill the form from `self.url` (see the SSL / password rules below);

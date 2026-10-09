@@ -30,7 +30,8 @@ fn default_port(t: &DatabaseType) -> &'static str {
 }
 
 /// Whether two configs reach the same database the same way (everything but
-/// the name and the colour is equal): an open session stays valid.
+/// the name, the colour and the flavor is equal): an open session stays
+/// valid.
 pub fn same_target(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
     a.db_type == b.db_type
         && a.host == b.host

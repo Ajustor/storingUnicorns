@@ -630,6 +630,7 @@ mod tests {
             .args([name, "--exact", "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
             .env("PGPASSFILE", &file)
+            .env_remove("PGPASSWORD")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);

@@ -20,6 +20,7 @@ pub struct AppConfig {
 
 /// Environment variable overriding the directory holding every file the app
 /// writes (config, consoles, history, update check, debug log).
+#[cfg_attr(test, allow(dead_code))]
 pub const CONFIG_DIR_ENV: &str = "STORINGUNICORNS_CONFIG_DIR";
 
 /// Pick the app directory: a non-empty override wins, otherwise
@@ -37,14 +38,68 @@ fn resolve_app_dir(
 /// Directory holding the app's files, created if missing. Unit tests always
 /// get a private temporary directory so they never touch the user's files.
 pub fn app_dir() -> Result<PathBuf> {
-    let dir = if cfg!(test) {
-        Some(std::env::temp_dir().join(format!("storing-unicorns-test-{}", std::process::id())))
-    } else {
-        resolve_app_dir(std::env::var_os(CONFIG_DIR_ENV), dirs::config_dir())
-    }
-    .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
+    let dir =
+        app_dir_path().ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
     fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+#[cfg(not(test))]
+fn app_dir_path() -> Option<PathBuf> {
+    resolve_app_dir(std::env::var_os(CONFIG_DIR_ENV), dirs::config_dir())
+}
+
+/// `%TEMP%/storing-unicorns-tests/<pid>`: one directory per test process,
+/// under one parent whose leftovers older than a day are removed on first
+/// use (a test run can't clean up after itself, the process just exits).
+#[cfg(test)]
+fn app_dir_path() -> Option<PathBuf> {
+    static CLEANED: std::sync::Once = std::sync::Once::new();
+    let parent = std::env::temp_dir().join("storing-unicorns-tests");
+    let own = std::process::id().to_string();
+    CLEANED.call_once(|| {
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let now = std::time::SystemTime::now();
+        remove_stale_dirs(&parent, "", day, now, &own);
+        // Directories of the former layout, one per process directly in %TEMP%.
+        remove_stale_dirs(
+            &std::env::temp_dir(),
+            "storing-unicorns-test-",
+            day,
+            now,
+            "",
+        );
+    });
+    Some(parent.join(own))
+}
+
+/// Remove the subdirectories of `parent` named `prefix…` (but `keep`) not
+/// modified for `max_age` at `now`. Best effort: errors are ignored.
+#[cfg(test)]
+fn remove_stale_dirs(
+    parent: &Path,
+    prefix: &str,
+    max_age: std::time::Duration,
+    now: std::time::SystemTime,
+    keep: &str,
+) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > max_age));
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        let name = entry.file_name();
+        let named = name
+            .to_str()
+            .is_some_and(|n| n.starts_with(prefix) && n != keep);
+        if is_dir && stale && named {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Replace `path` with `contents` through a uniquely named temporary file
@@ -162,9 +217,33 @@ mod tests {
     }
 
     #[test]
+    fn stale_test_dirs_are_removed() {
+        let parent = tempfile::tempdir().unwrap();
+        for d in ["old", "mine", "other-old"] {
+            fs::create_dir(parent.path().join(d)).unwrap();
+        }
+        fs::write(parent.path().join("file"), "x").unwrap();
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let now = std::time::SystemTime::now();
+        remove_stale_dirs(parent.path(), "", day, now, "mine");
+        assert!(parent.path().join("old").exists(), "recent: kept");
+        remove_stale_dirs(parent.path(), "other-", day, now + 2 * day, "mine");
+        assert!(
+            !parent.path().join("other-old").exists(),
+            "prefixed and old"
+        );
+        assert!(parent.path().join("old").exists(), "not prefixed");
+        remove_stale_dirs(parent.path(), "", day, now + 2 * day, "mine");
+        assert!(!parent.path().join("old").exists(), "older than a day");
+        assert!(parent.path().join("mine").exists(), "this process's own");
+        assert!(parent.path().join("file").exists(), "only directories");
+        remove_stale_dirs(&parent.path().join("missing"), "", day, now, "mine");
+    }
+
+    #[test]
     fn tests_never_use_the_real_config_dir() {
         let dir = app_dir().unwrap();
-        assert!(dir.starts_with(std::env::temp_dir()));
+        assert!(dir.starts_with(std::env::temp_dir().join("storing-unicorns-tests")));
         if let Some(real) = dirs::config_dir() {
             assert!(!dir.starts_with(real.join("storing-unicorns")));
         }

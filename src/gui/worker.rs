@@ -194,12 +194,14 @@ impl Worker {
         self.rx.try_iter().collect()
     }
 
-    #[allow(dead_code)] // console and data tabs (plan 3b, Tasks 6 and 8)
+    /// Whether cancellable work of `tab` is still running (tests: tabs track
+    /// their runs in `Runs`).
+    #[cfg(test)]
     pub fn is_running(&self, tab: TabId) -> bool {
         self.running.get(&tab).is_some_and(|h| !h.is_finished())
     }
 
-    #[allow(dead_code)] // console and data tabs (plan 3b, Tasks 6 and 8)
+    #[cfg(test)]
     pub fn any_running(&self) -> bool {
         self.running.values().any(|h| !h.is_finished())
     }

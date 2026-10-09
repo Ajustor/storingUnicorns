@@ -157,6 +157,14 @@ impl ConnectionField {
             Self::TenantId => {
                 *db_type != DatabaseType::Azure || *auth_method != AzureAuthMethod::Interactive
             }
+            // Azure AD (CLI) needs neither; a managed identity only its
+            // client ID, kept in the username.
+            Self::Username => {
+                *db_type == DatabaseType::Azure && *auth_method == AzureAuthMethod::Interactive
+            }
+            Self::Password => {
+                *db_type == DatabaseType::Azure && *auth_method != AzureAuthMethod::Credentials
+            }
             Self::SslMode | Self::SslCa => !uses_tls(db_type),
             _ => false,
         }
@@ -222,6 +230,17 @@ impl Default for NewConnectionState {
 }
 
 impl NewConnectionState {
+    /// Whether the form can be saved, else a French message.
+    pub fn check(&self) -> Result<(), String> {
+        if self.db_type == DatabaseType::Azure
+            && self.azure_auth_method == AzureAuthMethod::ManagedIdentity
+        {
+            crate::engine::db::azure::managed_identity_client_id(Some(&self.username))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn to_config(&self) -> ConnectionConfig {
         ConnectionConfig {
             name: self.name.clone(),
@@ -1476,6 +1495,62 @@ mod tests {
             ConnectionField::Database.next_for(&DatabaseType::Postgres, &a),
             ConnectionField::SslMode
         );
+    }
+
+    #[test]
+    fn azure_fields_follow_the_auth_method() {
+        let t = DatabaseType::Azure;
+        let next = |f: ConnectionField, a| f.next_for(&t, &a);
+        // Managed identity: client ID (username), no password.
+        let mi = AzureAuthMethod::ManagedIdentity;
+        assert_eq!(
+            next(ConnectionField::Port, mi.clone()),
+            ConnectionField::Username
+        );
+        assert_eq!(
+            next(ConnectionField::Username, mi),
+            ConnectionField::Database
+        );
+        // Azure AD (CLI): neither.
+        let cli = AzureAuthMethod::Interactive;
+        assert_eq!(next(ConnectionField::Port, cli), ConnectionField::Database);
+        // SQL auth: both.
+        let sql = AzureAuthMethod::Credentials;
+        assert_eq!(
+            next(ConnectionField::Username, sql),
+            ConnectionField::Password
+        );
+        // Other engines are untouched.
+        assert_eq!(
+            ConnectionField::Port.next_for(&DatabaseType::SQLServer, &AzureAuthMethod::Interactive),
+            ConnectionField::Username
+        );
+    }
+
+    #[test]
+    fn managed_identity_client_id_round_trips_and_is_checked() {
+        let id = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
+        let conn = ConnectionConfig {
+            db_type: DatabaseType::Azure,
+            host: Some("srv.database.chinacloudapi.cn".into()),
+            username: Some(id.into()),
+            azure_auth_method: Some(AzureAuthMethod::ManagedIdentity),
+            ..Default::default()
+        };
+        let mut nc = NewConnectionState::from_config(&conn);
+        assert!(nc.check().is_ok());
+        let c = nc.to_config();
+        assert_eq!(c.username.as_deref(), Some(id));
+        assert_eq!(c.azure_auth_method, Some(AzureAuthMethod::ManagedIdentity));
+        assert_eq!(c.host, conn.host);
+
+        nc.username = "sa".into();
+        assert!(nc.check().unwrap_err().contains("n'est pas un ID client"));
+        nc.username.clear();
+        assert!(nc.check().is_ok());
+        nc.username = "sa".into();
+        nc.azure_auth_method = AzureAuthMethod::Credentials;
+        assert!(nc.check().is_ok());
     }
 
     #[test]

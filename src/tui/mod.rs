@@ -723,6 +723,10 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
         }
         KeyCode::Enter => {
             // Save the connection
+            if let Err(e) = nc.check() {
+                state.set_status(e);
+                return;
+            }
             let config = nc.to_config();
             let name = config.name.clone();
 

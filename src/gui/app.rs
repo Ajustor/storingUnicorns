@@ -182,8 +182,15 @@ impl App {
         let keep_session = same_target(&previous, &config);
         let new = config.name.clone();
         if old != new {
-            for tab in self.tabs.list.iter_mut().filter(|t| t.connection == old) {
-                tab.connection = new.clone();
+            for tab in &mut self.tabs.list {
+                if tab.connection == old {
+                    tab.connection = new.clone();
+                }
+                if let TabKind::Console(c) = &mut tab.kind {
+                    for r in c.results.iter_mut().filter(|r| r.connection == old) {
+                        r.connection = new.clone();
+                    }
+                }
             }
             for q in &mut self.pending_consoles {
                 if q.connection.as_deref() == Some(old.as_str()) {
@@ -603,7 +610,7 @@ impl App {
                 let text = format!("{n} modification(s) appliquée(s)");
                 tab.summary = Some(text.clone());
                 // A run in progress keeps going: the result refreshes on the next run.
-                if let (None, Some(conn)) = (tab.runs.script, self.sessions.conn(&tab.connection)) {
+                if let (None, Some(conn)) = (tab.runs.script, self.sessions.conn(&r.connection)) {
                     let run = self
                         .worker
                         .run_script(tab.id, conn, sql, Some(console::MAX_ROWS));
@@ -650,7 +657,12 @@ impl App {
                 ok: o.result.is_ok(),
             });
         }
-        tab.summary = Some(console::apply_outcomes(c, outcomes, chrono::Local::now()));
+        tab.summary = Some(console::apply_outcomes(
+            c,
+            &tab.connection,
+            outcomes,
+            chrono::Local::now(),
+        ));
     }
 
     /// Apply what the console at `index` asked for.
@@ -696,10 +708,11 @@ impl App {
             ConsoleAction::History(search) => {
                 self.dialog = Some(Dialog::History(HistoryPopup::new(search)));
             }
-            ConsoleAction::Export { result, table } => {
-                let connection = tab.connection.clone();
-                transfer::export_result(self, &connection, result, table);
-            }
+            ConsoleAction::Export {
+                result,
+                table,
+                connection,
+            } => transfer::export_result(self, &connection, result, table),
             ConsoleAction::Submit {
                 result_index,
                 table,
@@ -709,15 +722,21 @@ impl App {
                 if tab.runs.submit.is_some() {
                     return;
                 }
-                let Some(session) = self.sessions.get(&tab.connection) else {
-                    self.status = Status {
-                        text: format!("{} n'est pas connectée", tab.connection),
-                        kind: StatusKind::Error,
-                    };
-                    return;
-                };
                 let Some(r) = c.results.get_mut(result_index) else {
                     return;
+                };
+                // The connection the rows were read from, not the console's
+                // current one (it may have been rebound since).
+                let open = |name: &str| self.sessions.open.contains_key(name);
+                let session = match console::result_connection(r, open) {
+                    Ok(name) => &self.sessions.open[name],
+                    Err(e) => {
+                        self.status = Status {
+                            text: e,
+                            kind: StatusKind::Error,
+                        };
+                        return;
+                    }
                 };
                 r.error = None;
                 c.submitting = Some(r.id);
@@ -879,6 +898,16 @@ impl App {
         let shortcuts = self.dialog.is_none();
         let index = self.tabs.active;
         let sessions = &self.sessions;
+        let config = &self.config;
+        let color_of = |name: &str| {
+            theme::connection_color(
+                config
+                    .connections
+                    .iter()
+                    .find(|c| c.name == name)
+                    .and_then(|c| c.color),
+            )
+        };
         let Some(tab) = self.tabs.list.get_mut(index) else {
             return;
         };
@@ -894,6 +923,7 @@ impl App {
                         tab: tab.id,
                         connection: name,
                         connections: &connections,
+                        color_of: &color_of,
                         connected: sessions.open.contains_key(name),
                         running: tab.runs.script.is_some(),
                         shortcuts,

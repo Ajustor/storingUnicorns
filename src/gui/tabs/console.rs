@@ -51,6 +51,9 @@ pub struct ResultTab {
     pub title: String,
     pub sql: String,
     pub result: QueryResult,
+    /// Connection the rows were read from: a Submit or a refresh goes there
+    /// even after the console was bound to another connection.
+    pub connection: String,
     pub pinned: bool,
     pub grid: GridState,
     /// Read from one table with a primary key: edits can be submitted.
@@ -60,18 +63,35 @@ pub struct ResultTab {
 }
 
 impl ResultTab {
-    pub fn new(id: u64, title: String, sql: String, result: QueryResult) -> Self {
+    pub fn new(
+        id: u64,
+        title: String,
+        sql: String,
+        result: QueryResult,
+        connection: String,
+    ) -> Self {
         let editable = is_editable(&sql, &result);
         Self {
             id,
             title,
             sql,
             result,
+            connection,
             pinned: false,
             grid: GridState::default(),
             editable,
             error: None,
         }
+    }
+}
+
+/// Connection result tab `r` must be submitted to / refreshed from, when it
+/// is open (`open`); else the error to report.
+pub fn result_connection(r: &ResultTab, open: impl Fn(&str) -> bool) -> Result<&str, String> {
+    if open(&r.connection) {
+        Ok(&r.connection)
+    } else {
+        Err(format!("Connexion {} fermée", r.connection))
     }
 }
 
@@ -136,10 +156,12 @@ pub enum ConsoleAction {
     Rebind(String),
     /// Open the history popup with this search.
     History(String),
-    /// Export a result's rows; `table` is the INSERT target.
+    /// Export a result's rows; `table` is the INSERT target, `connection`
+    /// the one the rows come from (identifier quotes).
     Export {
         result: QueryResult,
         table: String,
+        connection: String,
     },
     /// Apply the pending edits of result tab `result_index`.
     Submit {
@@ -156,6 +178,8 @@ pub struct ConsoleContext<'a> {
     pub connection: &'a str,
     /// Open connections and their colour (selector).
     pub connections: &'a [(String, Color32)],
+    /// Colour of any configured connection (result badges).
+    pub color_of: &'a dyn Fn(&str) -> Color32,
     pub connected: bool,
     pub running: bool,
     /// False while a modal is open: no shortcut fires.
@@ -206,12 +230,13 @@ fn ok_message(result: &QueryResult, elapsed_ms: u128) -> String {
     }
 }
 
-/// Apply a run's outcomes: unpinned result tabs are replaced by one tab per
-/// row-returning outcome, each outcome is logged, and the first new result
-/// (or "Sortie" on error / no rows) is activated. Returns the status-bar
-/// summary.
+/// Apply a run's outcomes (run on `connection`): unpinned result tabs are
+/// replaced by one tab per row-returning outcome, each outcome is logged,
+/// and the first new result (or "Sortie" on error / no rows) is activated.
+/// Returns the status-bar summary.
 pub fn apply_outcomes(
     console: &mut ConsoleTab,
+    connection: &str,
     outcomes: Vec<StatementOutcome>,
     now: DateTime<Local>,
 ) -> String {
@@ -245,9 +270,13 @@ pub fn apply_outcomes(
                 if !result.columns.is_empty() {
                     let title = result_title(&o.sql, console.results.len() + 1, result.truncated);
                     let id = console.next_result_id();
-                    console
-                        .results
-                        .push(ResultTab::new(id, title, o.sql, result));
+                    console.results.push(ResultTab::new(
+                        id,
+                        title,
+                        o.sql,
+                        result,
+                        connection.into(),
+                    ));
                 }
             }
             Err(e) => {
@@ -483,7 +512,7 @@ impl ConsoleTab {
         self.selection = out.selection;
         self.splitter(ui);
 
-        if let Some(a) = self.results_area(ui, id, cx.running) {
+        if let Some(a) = self.results_area(ui, id, &cx) {
             action = Some(a);
         }
         action
@@ -616,13 +645,24 @@ impl ConsoleTab {
         &mut self,
         ui: &mut egui::Ui,
         id: egui::Id,
-        running: bool,
+        cx: &ConsoleContext,
     ) -> Option<ConsoleAction> {
         let mut close = None;
         ui.horizontal_wrapped(|ui| {
             for (i, r) in self.results.iter_mut().enumerate() {
                 let spacing = ui.spacing().item_spacing.x;
                 ui.spacing_mut().item_spacing.x = 2.0;
+                if r.connection != cx.connection {
+                    // Read on the connection the console was bound to before.
+                    let color = (cx.color_of)(&r.connection);
+                    ui.label(
+                        RichText::new(&r.connection)
+                            .small()
+                            .color(Color32::BLACK)
+                            .background_color(color),
+                    )
+                    .on_hover_text("Connexion de ce résultat");
+                }
                 let label = format!("{} {}", icon::TABLE, r.title);
                 if ui
                     .selectable_label(i == self.active_result, label)
@@ -675,7 +715,7 @@ impl ConsoleTab {
         }
         ui.separator();
         let active = self.active_result;
-        let lock = self.result_lock(active, running);
+        let lock = self.result_lock(active, cx.running);
         match self.results.get_mut(active) {
             Some(r) => result_view(ui, id, active, r, lock),
             None => self.log_view(ui, id),
@@ -786,6 +826,7 @@ fn result_view(
     );
     if action == GridAction::Export {
         return Some(ConsoleAction::Export {
+            connection: r.connection.clone(),
             result: r.result.clone(),
             table: extract_table_from_query(&r.sql).unwrap_or_else(|| "table".into()),
         });
@@ -831,6 +872,7 @@ mod tests {
                 title.into(),
                 format!("SELECT * FROM {title}"),
                 result(&["a"], 1),
+                "c".into(),
             )
         }
     }
@@ -872,6 +914,7 @@ mod tests {
         big.truncated = true;
         let summary = apply_outcomes(
             &mut c,
+            "c",
             vec![
                 ok("UPDATE t SET a = 1", affected),
                 ok("SELECT id, name FROM users", big),
@@ -903,6 +946,7 @@ mod tests {
         c.results = vec![tab("old", false)];
         let summary = apply_outcomes(
             &mut c,
+            "c",
             vec![
                 ok("SELECT * FROM t", result(&["a"], 2)),
                 StatementOutcome {
@@ -924,7 +968,12 @@ mod tests {
             rows_affected: 1,
             ..QueryResult::default()
         };
-        apply_outcomes(&mut c, vec![ok("DELETE FROM t", affected)], Local::now());
+        apply_outcomes(
+            &mut c,
+            "c",
+            vec![ok("DELETE FROM t", affected)],
+            Local::now(),
+        );
         assert!(c.results.is_empty(), "unpinned results replaced");
         assert_eq!(c.active_result, 0, "Sortie when nothing returned rows");
         assert_eq!(c.log[2].message, "1 ligne affectée en 5 ms");
@@ -961,7 +1010,12 @@ mod tests {
             "a key column is missing"
         );
         let mut c = ConsoleTab::new(String::new(), 0);
-        apply_outcomes(&mut c, vec![ok("SELECT * FROM users", keyed)], Local::now());
+        apply_outcomes(
+            &mut c,
+            "c",
+            vec![ok("SELECT * FROM users", keyed)],
+            Local::now(),
+        );
         assert!(c.results[0].editable);
     }
 
@@ -984,6 +1038,7 @@ mod tests {
         let mut c = ConsoleTab::new(String::new(), 0);
         apply_outcomes(
             &mut c,
+            "c",
             vec![
                 ok("SELECT * FROM a", with_pk(result(&["id"], 1))),
                 ok("SELECT * FROM b", with_pk(result(&["id"], 2))),
@@ -1032,10 +1087,33 @@ mod tests {
     }
 
     #[test]
+    fn results_are_submitted_to_the_connection_they_were_read_from() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        apply_outcomes(
+            &mut c,
+            "prod",
+            vec![ok("SELECT * FROM a", with_pk(result(&["id"], 1)))],
+            Local::now(),
+        );
+        // The console is rebound to "dev" afterwards: the result stays on prod.
+        let r = &c.results[0];
+        assert_eq!(r.connection, "prod");
+        assert_eq!(
+            result_connection(r, |n| n == "prod" || n == "dev"),
+            Ok("prod")
+        );
+        assert_eq!(
+            result_connection(r, |n| n == "dev"),
+            Err("Connexion prod fermée".to_string())
+        );
+    }
+
+    #[test]
     fn results_are_read_only_while_submitted_or_replaced() {
         let mut c = ConsoleTab::new(String::new(), 0);
         apply_outcomes(
             &mut c,
+            "c",
             vec![
                 ok("SELECT * FROM a", with_pk(result(&["id"], 1))),
                 ok("SELECT * FROM b", with_pk(result(&["id"], 1))),

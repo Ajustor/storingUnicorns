@@ -115,7 +115,7 @@ pub fn export_result(app: &mut App, connection: &str, result: QueryResult, table
 /// "Importer un CSV…" on `table` (qualified) of `connection`.
 pub fn open_import(app: &mut App, connection: &str, table: &str) {
     let Some(session) = app.sessions.get(connection) else {
-        app.error(format!("{connection} n'est pas connectée"));
+        app.not_connected(connection);
         return;
     };
     let (conn, quotes) = (session.conn.clone(), session.quotes);
@@ -189,7 +189,7 @@ pub fn confirm_truncate_ui(
                             .truncate_tables(connection.to_string(), conn, tables.to_vec());
                     app.progress.update(op, 0, tables.len(), "tables");
                 }
-                None => app.error(format!("{connection} n'est pas connectée")),
+                None => app.not_connected(connection),
             }
             keep = false;
         }
@@ -296,7 +296,7 @@ pub fn batch_ui(app: &mut App, ui: &mut egui::Ui, b: &mut BatchDialog) -> bool {
 /// confirmation first).
 fn start_batch(app: &mut App, b: &BatchDialog, selected: Vec<(String, String)>) {
     let Some(session) = app.sessions.get(&b.connection) else {
-        app.error(format!("{} n'est pas connectée", b.connection));
+        app.not_connected(&b.connection);
         return;
     };
     let (conn, quotes) = (session.conn.clone(), session.quotes);

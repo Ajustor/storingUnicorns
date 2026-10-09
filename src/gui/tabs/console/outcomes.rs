@@ -8,6 +8,7 @@ use crate::engine::ops::query::{editable_table, StatementOutcome};
 use crate::engine::ops::rows::NO_PRIMARY_KEY;
 use crate::engine::sql::statements::{extract_table_from_query, single_table_source};
 use crate::gui::grid::GridState;
+use crate::gui::status::not_connected;
 
 use super::{ConsoleTab, MAX_ROWS};
 
@@ -58,7 +59,7 @@ pub fn result_connection(r: &ResultTab, open: impl Fn(&str) -> bool) -> Result<&
     if open(&r.connection) {
         Ok(&r.connection)
     } else {
-        Err(format!("Connexion {} fermée", r.connection))
+        Err(not_connected(&r.connection))
     }
 }
 
@@ -552,7 +553,7 @@ mod tests {
         );
         assert_eq!(
             result_connection(r, |n| n == "dev"),
-            Err("Connexion prod fermée".to_string())
+            Err("prod n'est pas connectée".to_string())
         );
     }
 

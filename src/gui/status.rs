@@ -9,6 +9,11 @@ use super::app::App;
 use super::theme::{self, ERROR, SUCCESS};
 use super::worker::OpId;
 
+/// The error shown when connection `name` is needed but not open.
+pub fn not_connected(name: &str) -> String {
+    format!("{name} n'est pas connectée")
+}
+
 /// First non-blank line of `text`, with " …" when lines were dropped:
 /// multi-line errors must not grow the status bar or a panel.
 pub fn one_line(text: &str) -> std::borrow::Cow<'_, str> {

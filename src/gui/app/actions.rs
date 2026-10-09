@@ -50,8 +50,8 @@ impl App {
                 let Some(session) = self.sessions.get(&tab.connection) else {
                     d.after_submit = None;
                     d.close_after_submit = false;
-                    let text = format!("{} n'est pas connectée", tab.connection);
-                    self.error(text);
+                    let connection = tab.connection.clone();
+                    self.not_connected(&connection);
                     return;
                 };
                 let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
@@ -180,10 +180,8 @@ impl App {
             return;
         };
         let Some(conn) = self.sessions.conn(&tab.connection) else {
-            self.status = Status {
-                text: format!("{} n'est pas connectée", tab.connection),
-                kind: StatusKind::Error,
-            };
+            let connection = tab.connection.clone();
+            self.not_connected(&connection);
             return;
         };
         let max = Some(console::MAX_ROWS);

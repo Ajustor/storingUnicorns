@@ -152,6 +152,11 @@ impl App {
         self.set_status(text, StatusKind::Error);
     }
 
+    /// Report that `connection` must be connected first.
+    pub fn not_connected(&mut self, connection: &str) {
+        self.error(status::not_connected(connection));
+    }
+
     fn set_status(&mut self, text: impl Into<String>, kind: StatusKind) {
         self.status = Status {
             text: text.into(),

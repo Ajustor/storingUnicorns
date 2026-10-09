@@ -8,6 +8,7 @@ use crate::engine::models::{Column, DatabaseType};
 use crate::engine::services::{ColumnDefinition, SchemaModification};
 
 use super::super::app::App;
+use super::super::status;
 use super::super::theme::{ACCENT, ERROR};
 use super::Dialog;
 
@@ -175,7 +176,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui, d: &mut StructureDialog) -> bool {
     let sqlite = session.is_some_and(|s| s.config.db_type == DatabaseType::SQLite);
     match session.map(|s| (s.details.get(&d.table), s.loading.contains_key(&d.table))) {
         None => {
-            ui.colored_label(ERROR, format!("{} n'est pas connectée", d.connection));
+            ui.colored_label(ERROR, status::not_connected(&d.connection));
         }
         Some((None, _)) | Some((_, true)) => {
             ui.spinner();

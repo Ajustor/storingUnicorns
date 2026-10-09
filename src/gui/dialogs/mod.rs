@@ -7,7 +7,8 @@ pub mod transfer;
 use super::app::App;
 use super::history_popup::{HistoryAction, HistoryPopup};
 use super::table_search::TableSearch;
-use super::tabs::{TabId, TabKind};
+use super::tabs::console::RunKind;
+use super::tabs::{CloseRisk, TabId, TabKind};
 use super::worker::Event;
 use crate::engine::ops::transfer::qualified;
 use connection::{ConnectionForm, FormAction};
@@ -24,6 +25,19 @@ pub enum Dialog {
     TableSearch(TableSearch),
     /// "Abandonner les modifications ?" before data tab `TabId` changes page.
     DiscardEdits(TabId),
+    /// Close tab `id`, which would lose `risk`.
+    CloseTab {
+        id: TabId,
+        risk: CloseRisk,
+    },
+    /// Run console `id` again although its unpinned results (replaced by
+    /// the run) have pending edits.
+    ConfirmRerun {
+        id: TabId,
+        kind: RunKind,
+    },
+    /// Quit although this many tabs have pending edits.
+    ConfirmQuit(usize),
     /// Columns of one table of one connection.
     Structure(StructureDialog),
     /// Empty these (qualified) tables of `connection`.
@@ -107,6 +121,49 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     answer_discard(app, id, answer);
                 }
             }
+            Dialog::CloseTab { id, risk } => {
+                let id = *id;
+                if let Some(answer) = close_tab_ui(ui, *risk) {
+                    keep = false;
+                    match answer {
+                        Discard::Submit => app.submit_and_close(id),
+                        Discard::Drop => app.close_tab_id(id),
+                        Discard::Cancel => {}
+                    }
+                }
+            }
+            Dialog::ConfirmRerun { id, kind } => {
+                ui.heading("Abandonner les modifications ?");
+                ui.label(
+                    "L'exécution remplace les résultats non épinglés : \
+                     leurs modifications en attente seront perdues.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Abandonner").clicked() {
+                        app.run_console(*id, kind.clone());
+                        keep = false;
+                    }
+                    if ui.button("Annuler").clicked() {
+                        keep = false;
+                    }
+                });
+            }
+            Dialog::ConfirmQuit(n) => {
+                ui.heading("Quitter ?");
+                ui.label(format!("{n} onglet(s) ont des modifications non envoyées."));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Fermer quand même").clicked() {
+                        app.quit_confirmed = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        keep = false;
+                    }
+                    if ui.button("Annuler").clicked() {
+                        keep = false;
+                    }
+                });
+            }
             Dialog::Structure(d) => keep = structure::ui(app, ui, d),
             Dialog::ConfirmTruncate { connection, tables } => {
                 keep = transfer::confirm_truncate_ui(app, ui, connection, tables)
@@ -141,6 +198,54 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     if keep && app.dialog.is_none() {
         app.dialog = Some(dialog);
     }
+}
+
+/// Confirmation of the closing of a tab that would lose `risk`.
+fn close_tab_ui(ui: &mut egui::Ui, risk: CloseRisk) -> Option<Discard> {
+    let mut answer = None;
+    match risk {
+        CloseRisk::Console { text, edits } => {
+            ui.heading("Fermer la console ?");
+            if text {
+                ui.label("Son contenu sera perdu.");
+            }
+            if edits {
+                ui.label(
+                    "Des résultats ont des modifications non envoyées : elles seront perdues.",
+                );
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Fermer").clicked() {
+                    answer = Some(Discard::Drop);
+                }
+                if ui.button("Annuler").clicked() {
+                    answer = Some(Discard::Cancel);
+                }
+            });
+        }
+        CloseRisk::DataEdits | CloseRisk::None => {
+            ui.heading("Abandonner les modifications ?");
+            ui.label("Les modifications en attente de cet onglet seront perdues.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Submit")
+                    .on_hover_text("Appliquer, puis fermer si tout a réussi")
+                    .clicked()
+                {
+                    answer = Some(Discard::Submit);
+                }
+                if ui.button("Abandonner").clicked() {
+                    answer = Some(Discard::Drop);
+                }
+                if ui.button("Annuler").clicked() {
+                    answer = Some(Discard::Cancel);
+                }
+            });
+        }
+    }
+    answer
 }
 
 /// Answers to "Abandonner les modifications ?".

@@ -19,7 +19,8 @@ use super::table_search::TableSearch;
 use super::tabs::console::{self, ConsoleAction, ConsoleContext, ConsoleTab, RunKind};
 use super::tabs::data::{DataAction, DataContext, DataTab, Nav};
 use super::tabs::ddl::{DdlAction, DdlTab};
-use super::tabs::{self, TabId, TabKind, Tabs};
+use super::tabs::{self, CloseRisk, TabId, TabKind, Tabs};
+
 use super::theme::{self, ThemeChoice, ERROR};
 use super::value_panel::ValuePanel;
 use super::worker::{Event, Worker};
@@ -53,6 +54,9 @@ pub struct App {
     /// connection opened; set once that happened.
     unbound_restored: bool,
     closed: bool,
+    /// "Fermer quand même" was answered: the next close request quits even
+    /// with pending edits.
+    pub quit_confirmed: bool,
 }
 
 impl App {
@@ -108,6 +112,7 @@ impl App {
             pending_consoles,
             unbound_restored: false,
             closed: false,
+            quit_confirmed: false,
         }
     }
 
@@ -316,6 +321,7 @@ impl App {
             DataAction::Submit => {
                 if tab.runs.submit.is_some() || d.grid.edits.is_empty() {
                     d.after_submit = None;
+                    d.close_after_submit = false;
                     return;
                 }
                 let Some(result) = &d.result else {
@@ -323,6 +329,7 @@ impl App {
                 };
                 let Some(session) = self.sessions.get(&tab.connection) else {
                     d.after_submit = None;
+                    d.close_after_submit = false;
                     let text = format!("{} n'est pas connectée", tab.connection);
                     self.error(text);
                     return;
@@ -347,8 +354,13 @@ impl App {
                 self.open_ddl(&connection, &table, &title);
             }
             DataAction::Applied(n) => {
+                let close = std::mem::take(&mut d.close_after_submit);
                 self.success(format!("{n} modification(s) appliquée(s)"));
-                self.data_action(id, DataAction::Load { count: true });
+                if close {
+                    self.close_tab_id(id);
+                } else {
+                    self.data_action(id, DataAction::Load { count: true });
+                }
             }
             DataAction::SubmitFailed(e) => {
                 self.error(format!("Submit annulé (transaction annulée) : {e}"))
@@ -425,9 +437,40 @@ impl App {
         )));
     }
 
+    /// Close the tab at `index`, after a confirmation when that would lose
+    /// pending edits or a console's text.
+    pub fn request_close(&mut self, index: usize) {
+        let Some(tab) = self.tabs.list.get_mut(index) else {
+            return;
+        };
+        match tab.close_risk() {
+            CloseRisk::None => self.close_tab(index),
+            risk => self.dialog = Some(Dialog::CloseTab { id: tab.id, risk }),
+        }
+    }
+
+    /// Close the tab at `index` right away.
     pub fn close_tab(&mut self, index: usize) {
         if let Some(tab) = self.tabs.close(index) {
             self.worker.cancel(tab.id);
+        }
+    }
+
+    /// Close tab `id` right away (no-op when already closed).
+    pub fn close_tab_id(&mut self, id: TabId) {
+        if let Some(index) = self.tabs.list.iter().position(|t| t.id == id) {
+            self.close_tab(index);
+        }
+    }
+
+    /// "Submit" when closing data tab `id`: submit, close on success.
+    pub fn submit_and_close(&mut self, id: TabId) {
+        let Some(tab) = self.tabs.find(id) else {
+            return;
+        };
+        if let TabKind::Data(d) = &mut tab.kind {
+            d.close_after_submit = true;
+            self.data_action(id, DataAction::Submit);
         }
     }
 
@@ -675,24 +718,14 @@ impl App {
         };
         match action {
             ConsoleAction::Run(kind) => {
-                let Some(conn) = self.sessions.conn(&tab.connection) else {
-                    self.status = Status {
-                        text: format!("{} n'est pas connectée", tab.connection),
-                        kind: StatusKind::Error,
-                    };
+                // The run replaces the unpinned results: ask before
+                // dropping their pending edits.
+                if c.rerun_loses_edits() {
+                    self.dialog = Some(Dialog::ConfirmRerun { id: tab.id, kind });
                     return;
-                };
-                let max = Some(console::MAX_ROWS);
-                let run = match kind {
-                    RunKind::Script(text) => self.worker.run_script(tab.id, conn, text, max),
-                    RunKind::AtCursor { text, cursor } => {
-                        self.worker.run_at_cursor(tab.id, conn, text, cursor, max)
-                    }
-                };
-                tab.runs.script = Some(run);
-                c.refreshing = None;
-                c.running_since = Some(std::time::Instant::now());
-                tab.summary = Some("Exécution…".into());
+                }
+                let id = tab.id;
+                self.run_console(id, kind);
             }
             ConsoleAction::Cancel => {
                 self.worker.cancel(tab.id);
@@ -750,6 +783,34 @@ impl App {
         }
     }
 
+    /// Run `kind` in console `id` (without asking about pending edits).
+    pub fn run_console(&mut self, id: TabId, kind: RunKind) {
+        let Some(tab) = self.tabs.find(id) else {
+            return;
+        };
+        let TabKind::Console(c) = &mut tab.kind else {
+            return;
+        };
+        let Some(conn) = self.sessions.conn(&tab.connection) else {
+            self.status = Status {
+                text: format!("{} n'est pas connectée", tab.connection),
+                kind: StatusKind::Error,
+            };
+            return;
+        };
+        let max = Some(console::MAX_ROWS);
+        let run = match kind {
+            RunKind::Script(text) => self.worker.run_script(tab.id, conn, text, max),
+            RunKind::AtCursor { text, cursor } => {
+                self.worker.run_at_cursor(tab.id, conn, text, cursor, max)
+            }
+        };
+        tab.runs.script = Some(run);
+        c.refreshing = None;
+        c.running_since = Some(std::time::Instant::now());
+        tab.summary = Some("Exécution…".into());
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if self.dialog.is_some() {
             return;
@@ -764,7 +825,7 @@ impl App {
             }
         }
         if pressed(&CLOSE_TAB) {
-            self.close_tab(self.tabs.active);
+            self.request_close(self.tabs.active);
         }
         if pressed(&SAVE_CONSOLES) {
             match self.save_consoles() {
@@ -854,7 +915,7 @@ impl App {
             });
         match action {
             Some(Action::Activate(i)) => self.tabs.active = i,
-            Some(Action::Close(i)) => self.close_tab(i),
+            Some(Action::Close(i)) => self.request_close(i),
             Some(Action::NewConsole) => match self.current_connection() {
                 Some(c) => {
                     self.new_console(&c, String::new());
@@ -987,7 +1048,17 @@ impl eframe::App for App {
         dialogs::show(self, ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.on_close();
+            let pending = if self.quit_confirmed {
+                0
+            } else {
+                self.tabs.with_pending_edits()
+            };
+            if pending > 0 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.dialog = Some(Dialog::ConfirmQuit(pending));
+            } else {
+                self.on_close();
+            }
         }
     }
 }

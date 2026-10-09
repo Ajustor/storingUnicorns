@@ -60,6 +60,18 @@ impl Runs {
     }
 }
 
+/// What closing a tab would lose, hence which confirmation to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseRisk {
+    /// Nothing: close right away.
+    None,
+    /// A data tab with pending edits (they can be submitted first).
+    DataEdits,
+    /// A console: its text (not kept once closed) and/or pending edits in
+    /// its result tabs.
+    Console { text: bool, edits: bool },
+}
+
 pub struct Tab {
     pub id: TabId,
     pub title: String,
@@ -72,6 +84,39 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// Write the text of open cell editors into their pending edits, so that
+    /// it counts before deciding whether something would be lost.
+    pub fn commit_editors(&mut self) {
+        match &mut self.kind {
+            TabKind::Console(c) => c.commit_editors(),
+            TabKind::Data(d) => d.commit_editor(),
+            TabKind::Ddl(_) => {}
+        }
+    }
+
+    /// Pending (unsubmitted) edits in this tab's grids.
+    pub fn has_pending_edits(&self) -> bool {
+        match &self.kind {
+            TabKind::Console(c) => c.results.iter().any(|r| !r.grid.edits.is_empty()),
+            TabKind::Data(d) => !d.grid.edits.is_empty(),
+            TabKind::Ddl(_) => false,
+        }
+    }
+
+    /// What closing this tab would lose (open cell editors committed first).
+    pub fn close_risk(&mut self) -> CloseRisk {
+        self.commit_editors();
+        let edits = self.has_pending_edits();
+        match &self.kind {
+            TabKind::Console(c) if edits || !c.query.trim().is_empty() => CloseRisk::Console {
+                text: !c.query.trim().is_empty(),
+                edits,
+            },
+            TabKind::Data(_) if edits => CloseRisk::DataEdits,
+            _ => CloseRisk::None,
+        }
+    }
+
     /// Hand an outcome of this tab to its body. Stale runs are dropped.
     /// Returns what a data tab asks the app to do next.
     pub fn on_event(&mut self, ev: Event) -> Option<data::DataAction> {
@@ -160,6 +205,17 @@ impl Tabs {
         self.list.iter().position(|t| {
             t.connection == connection && matches!(&t.kind, TabKind::Data(d) if d.table == table)
         })
+    }
+
+    /// Number of tabs with pending edits (open cell editors committed first).
+    pub fn with_pending_edits(&mut self) -> usize {
+        self.list
+            .iter_mut()
+            .filter_map(|t| {
+                t.commit_editors();
+                t.has_pending_edits().then_some(())
+            })
+            .count()
     }
 
     /// Number of console tabs (for default titles).
@@ -278,6 +334,79 @@ mod tests {
         assert_eq!(runs.page, None);
         assert_eq!(runs.count, Some(3));
         assert!(!runs.accept(&Event::TestFinished(Ok(()))));
+    }
+
+    fn table_page() -> crate::engine::models::QueryResult {
+        use crate::engine::models::{Column, QueryResult};
+        QueryResult {
+            columns: vec![Column {
+                name: "id".into(),
+                type_name: "INTEGER".into(),
+                nullable: false,
+                is_primary_key: true,
+            }],
+            rows: vec![vec!["1".into()]],
+            primary_key: vec!["id".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn close_risk_counts_open_editors_and_console_text() {
+        use crate::gui::grid::changes::RowRef;
+        let mut tabs = Tabs::default();
+        tabs.add("c".into(), "empty".into(), console());
+        tabs.add(
+            "c".into(),
+            "text".into(),
+            TabKind::Console(console::ConsoleTab::new("SELECT 1".into(), 0)),
+        );
+        let mut d = data::DataTab::new("t".into(), ('"', '"'));
+        d.result = Some(table_page());
+        tabs.add("c".into(), "t".into(), TabKind::Data(Box::new(d)));
+
+        assert_eq!(tabs.list[0].close_risk(), CloseRisk::None);
+        assert_eq!(
+            tabs.list[1].close_risk(),
+            CloseRisk::Console {
+                text: true,
+                edits: false
+            }
+        );
+        assert_eq!(tabs.list[2].close_risk(), CloseRisk::None);
+        assert_eq!(tabs.with_pending_edits(), 0);
+
+        // A cell being edited (not committed yet) is pending work too.
+        let TabKind::Data(d) = &mut tabs.list[2].kind else {
+            unreachable!()
+        };
+        d.grid.editing = Some((RowRef::Base(0), 0, "2".into()));
+        assert_eq!(tabs.with_pending_edits(), 1);
+        assert_eq!(tabs.list[2].close_risk(), CloseRisk::DataEdits);
+
+        // Pending edits in a console result.
+        let TabKind::Console(c) = &mut tabs.list[0].kind else {
+            unreachable!()
+        };
+        console::apply_outcomes(
+            c,
+            "c",
+            vec![crate::engine::ops::query::StatementOutcome {
+                sql: "SELECT * FROM t".into(),
+                result: Ok(table_page()),
+                elapsed_ms: 1,
+            }],
+            chrono::Local::now(),
+        );
+        c.results[0].grid.editing = Some((RowRef::Base(0), 0, "3".into()));
+        assert_eq!(
+            tabs.list[0].close_risk(),
+            CloseRisk::Console {
+                text: false,
+                edits: true
+            }
+        );
+        assert_eq!(tabs.with_pending_edits(), 2);
     }
 
     fn saved(name: &str, connection: Option<&str>) -> QueryTab {

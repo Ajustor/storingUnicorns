@@ -115,6 +115,9 @@ pub struct DataTab {
     pub confirm: Option<Nav>,
     /// Navigation to apply once the running submit succeeds.
     pub after_submit: Option<Nav>,
+    /// Close the tab once the running submit succeeds ("Submit" in the
+    /// confirmation of its closing).
+    pub close_after_submit: bool,
     /// No page requested yet (opened while disconnected…).
     pub needs_load: bool,
     /// Column names of the result (highlighting of the filter bar).
@@ -153,6 +156,7 @@ impl DataTab {
             quotes,
             confirm: None,
             after_submit: None,
+            close_after_submit: false,
             needs_load: true,
             columns: Vec::new(),
             sort: None,
@@ -179,8 +183,17 @@ impl DataTab {
         ))
     }
 
-    /// Request `nav`, or ask for confirmation first when edits are pending.
+    /// Write the open cell editor's text into the pending edits.
+    pub fn commit_editor(&mut self) {
+        if let Some(r) = &self.result {
+            self.grid.commit_editing(&r.rows);
+        }
+    }
+
+    /// Request `nav`, or ask for confirmation first when edits are pending
+    /// (the text of an open cell editor included).
     pub fn navigate(&mut self, nav: Nav) -> DataAction {
+        self.commit_editor();
         if can_leave(&self.grid.edits) {
             self.apply(nav)
         } else {
@@ -265,6 +278,7 @@ impl DataTab {
                 }
                 Err(e) => {
                     self.after_submit = None;
+                    self.close_after_submit = false;
                     self.error = Some(format!("Submit annulé (transaction annulée) : {e}"));
                     Some(DataAction::SubmitFailed(e))
                 }
@@ -602,6 +616,29 @@ mod tests {
         assert_eq!(t.query.page, 1);
         assert!(t.grid.edits.is_empty());
         assert_eq!(t.discard_and_continue(), None, "answered once");
+    }
+
+    #[test]
+    fn an_open_cell_editor_counts_as_pending_edits() {
+        let mut t = tab_with_page();
+        t.grid.editing = Some((RowRef::Base(0), 1, "typed".into()));
+        assert_eq!(t.navigate(Nav::Refresh), DataAction::Confirm);
+        assert!(t.grid.editing.is_none());
+        let rows = &t.result.as_ref().unwrap().rows;
+        assert_eq!(t.grid.edits.value(rows, RowRef::Base(0), 1), "typed");
+    }
+
+    #[test]
+    fn failed_submit_cancels_the_close_it_was_for() {
+        let mut t = tab_with_page();
+        edit(&mut t);
+        t.close_after_submit = true;
+        t.on_event(Event::Submitted {
+            tab: 1,
+            run: 2,
+            outcome: Err("x".into()),
+        });
+        assert!(!t.close_after_submit);
     }
 
     #[test]

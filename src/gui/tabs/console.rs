@@ -141,6 +141,7 @@ pub struct ConsoleTab {
 }
 
 /// How to run the console's SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunKind {
     /// Every statement of the text (F5, or the selection).
     Script(String),
@@ -390,6 +391,22 @@ impl ConsoleTab {
         } else {
             None
         }
+    }
+
+    /// Write the text of the result tabs' open cell editors into their edits.
+    pub fn commit_editors(&mut self) {
+        for r in &mut self.results {
+            r.grid.commit_editing(&r.result.rows);
+        }
+    }
+
+    /// Whether a new run would drop pending edits: it replaces the unpinned
+    /// result tabs (open cell editors committed first).
+    pub fn rerun_loses_edits(&mut self) -> bool {
+        self.commit_editors();
+        self.results
+            .iter()
+            .any(|r| !r.pinned && !r.grid.edits.is_empty())
     }
 
     /// A cell of the active result is being edited (Escape cancels it first).
@@ -1106,6 +1123,35 @@ mod tests {
             result_connection(r, |n| n == "dev"),
             Err("Connexion prod fermée".to_string())
         );
+    }
+
+    #[test]
+    fn rerun_asks_only_for_edits_in_unpinned_results() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        apply_outcomes(
+            &mut c,
+            "c",
+            vec![
+                ok("SELECT * FROM a", with_pk(result(&["id"], 1))),
+                ok("SELECT * FROM b", with_pk(result(&["id"], 1))),
+            ],
+            Local::now(),
+        );
+        assert!(!c.rerun_loses_edits());
+        c.results[0].pinned = true;
+        let a = &mut c.results[0];
+        a.grid.edits.set(
+            &a.result.rows,
+            grid::changes::RowRef::Base(0),
+            0,
+            "z".into(),
+        );
+        assert!(!c.rerun_loses_edits(), "pinned results are kept");
+        // An open editor counts, once committed.
+        c.results[1].grid.editing = Some((grid::changes::RowRef::Base(0), 0, "y".into()));
+        assert!(c.rerun_loses_edits());
+        assert!(c.results[1].grid.editing.is_none());
+        assert!(!c.results[1].grid.edits.is_empty());
     }
 
     #[test]

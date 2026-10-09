@@ -148,6 +148,10 @@ impl ConnectionForm {
             azure_auth_method: azure.then(|| self.azure_auth.clone()),
             tenant_id: if azure { opt(&self.tenant_id) } else { None },
             color: self.color,
+            // Filled by the SSL / preset fields of the dialog (later task).
+            ssl_mode: None,
+            ssl_ca: None,
+            flavor: None,
         })
     }
 

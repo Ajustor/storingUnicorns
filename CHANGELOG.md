@@ -7,6 +7,28 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.9.1] - 2026-10-09
+
+Première version publiée de la 0.9 : la publication de la 0.9.0 avait échoué
+sous Linux et macOS.
+
+### Corrections
+
+- **Mise à jour automatique derrière un proxy d'entreprise ou un antivirus** :
+  elle fait confiance aux certificats du système (trousseau macOS, magasin
+  Windows, certificats du système sous Linux) au lieu des seuls certificats
+  intégrés au binaire.
+- **Linux** : OpenSSL est intégré au binaire, qui ne dépend plus de la version
+  installée sur la distribution.
+- Les tests passent sous Linux et macOS (un test de l'installeur Windows
+  utilisait des chemins Windows).
+
+### Interne
+
+- Les tests et le build tournent sur Linux, macOS et Windows à chaque pull
+  request, avec une vérification que le binaire ne dépend d'aucune bibliothèque
+  absente d'un système nu (Homebrew sous macOS, OpenSSL sous Linux).
+
 ## [0.9.0] - 2026-10-08
 
 ### Nouveautés

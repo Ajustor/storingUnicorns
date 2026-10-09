@@ -105,8 +105,18 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// stalled body is bounded by `DOWNLOAD_TIMEOUT` only.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Trust the system's certificate store (Keychain, Windows store, system CA
+/// bundle) rather than the roots bundled in the binary, so a corporate proxy
+/// or an antivirus inspecting HTTPS doesn't fail with "UnknownIssuer".
+fn tls_config() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build()
+}
+
 fn manifest_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
+        .tls_config(tls_config())
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(MANIFEST_TIMEOUT))
         .build()
@@ -115,6 +125,7 @@ fn manifest_agent() -> ureq::Agent {
 
 fn download_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
+        .tls_config(tls_config())
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_recv_response(Some(RESPONSE_TIMEOUT))
         .timeout_global(Some(DOWNLOAD_TIMEOUT))

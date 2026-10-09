@@ -168,6 +168,12 @@ pub fn uses_tls(db_type: &DatabaseType) -> bool {
     matches!(db_type, DatabaseType::Postgres | DatabaseType::MySQL)
 }
 
+/// Empty, or a host `set_db_type` fills in: replaceable by another default.
+fn is_default_host(host: &str) -> bool {
+    let h = host.trim();
+    h.is_empty() || h == "localhost" || h == "servername.database.windows.net"
+}
+
 /// State for new connection dialog
 #[derive(Debug, Clone)]
 pub struct NewConnectionState {
@@ -349,8 +355,8 @@ impl NewConnectionState {
 
     /// Next product (None = bare engine, then `Flavor::ALL`, then None
     /// again), applying its preset: driver, port, SSL mode, and the user
-    /// when it is empty or a driver default. A typed host is kept unless the
-    /// driver changes (which resets it like `cycle_db_type`).
+    /// when it is empty or a driver default. A typed host is never
+    /// overwritten; a default one follows the driver like `cycle_db_type`.
     pub fn cycle_flavor(&mut self) {
         let next = match self.flavor {
             None => Some(Flavor::ALL[0]),
@@ -365,7 +371,11 @@ impl NewConnectionState {
         };
         let p = presets::preset(f);
         if p.db_type != self.db_type {
+            let host = std::mem::take(&mut self.host);
             self.set_db_type(p.db_type);
+            if !is_default_host(&host) {
+                self.host = host;
+            }
         }
         self.flavor = next;
         self.port = p.port.to_string();
@@ -1379,6 +1389,23 @@ mod tests {
         assert_eq!(nc.flavor, Flavor::ALL.last().copied());
         nc.cycle_flavor();
         assert_eq!(nc.flavor, None);
+    }
+
+    #[test]
+    fn cycling_presets_keeps_a_typed_host() {
+        let mut nc = NewConnectionState {
+            host: "db.mine.example".into(),
+            ..Default::default()
+        };
+        for _ in 0..=Flavor::ALL.len() {
+            nc.cycle_flavor();
+            assert_eq!(nc.host, "db.mine.example", "{:?}", nc.flavor);
+        }
+        // A default host still follows the driver.
+        let mut nc = NewConnectionState::default();
+        nc.set_db_type(DatabaseType::SQLite);
+        nc.cycle_flavor(); // MariaDB
+        assert_eq!(nc.host, "localhost");
     }
 
     #[test]

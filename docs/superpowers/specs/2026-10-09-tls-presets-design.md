@@ -118,9 +118,8 @@ Fonction pure `engine::presets::parse_url(&str) -> Result<ParsedUrl, String>` :
   champs, y compris le mot de passe.
 - Section « SSL » (PG/MySQL seulement) : liste du mode, chemin du certificat CA
   avec bouton « Parcourir » (rfd).
-- La variante s'affiche à la place du moteur dans l'explorateur (« Supabase »),
-  dans l'info-bulle de la connexion et dans la barre d'état (« Supabase ·
-  PostgreSQL 16.4 » quand la version du serveur est connue).
+- La variante s'affiche à la place du moteur partout où le type de la connexion
+  est affiché (explorateur, barre d'état et liste des connexions du TUI).
 
 ### TUI (`tui/ui/modals/new_connection.rs`)
 

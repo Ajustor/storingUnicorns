@@ -215,7 +215,14 @@ pub fn generate_ddl(table: &str, details: &TableDetails, quotes: (char, char)) -
     ];
     for (what, error) in notes {
         if let Some(e) = error {
-            let e = e.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+            // Any control character (lone \r included) could end the
+            // comment and turn the rest of the message into SQL.
+            let e = e
+                .split(|c: char| c.is_control())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
             ddl.push_str(&format!("\n-- {what} non disponibles sur ce serveur : {e}"));
         }
     }
@@ -376,7 +383,8 @@ mod tests {
                 is_primary_key: true,
             }],
             indexes_error: Some("relation pg_index\ndoes not exist".into()),
-            foreign_keys_error: Some("no\r\nfk".into()),
+            // A lone \r must not end the comment line either.
+            foreign_keys_error: Some("no\r\nfk\rDROP TABLE t".into()),
             ..TableDetails::default()
         };
         let ddl = generate_ddl("\"b\"", &d, ('"', '"'));
@@ -385,7 +393,7 @@ mod tests {
             ddl.ends_with(
                 ");\n\
                  -- Index non disponibles sur ce serveur : relation pg_index does not exist\n\
-                 -- Clés étrangères non disponibles sur ce serveur : no fk"
+                 -- Clés étrangères non disponibles sur ce serveur : no fk DROP TABLE t"
             ),
             "{ddl}"
         );

@@ -11,7 +11,7 @@ use crate::engine::ops::query::has_full_key;
 use crate::engine::ops::rows::NO_PRIMARY_KEY;
 use crate::engine::sql::paging::{toggle_order, DataQuery};
 use crate::engine::sql::statements::quote_ident;
-use crate::gui::editor::highlight_job;
+use crate::gui::editor::HighlightCache;
 use crate::gui::grid::changes::PendingEdits;
 use crate::gui::grid::{self, GridAction, GridOptions, GridState};
 use crate::gui::status::one_line_label;
@@ -437,11 +437,21 @@ impl DataTab {
 
     /// `WHERE [ … ]  ORDER BY [ … ]`; Entrée applies both.
     fn filter_bar(&mut self, ui: &mut egui::Ui, cx: &DataContext) -> Option<DataAction> {
-        let dark = ui.visuals().dark_mode;
-        let size = egui::TextStyle::Monospace.resolve(ui.style()).size;
         let columns = &self.columns;
-        let mut layouter = |ui: &egui::Ui, text: &str, _wrap: f32| -> Arc<Galley> {
-            ui.fonts(|f| f.layout_job(highlight_job(text, columns, dark, size)))
+        let ids = [
+            egui::Id::new(("data_where", cx.tab)),
+            egui::Id::new(("data_order", cx.tab)),
+        ];
+        let cache_ids = ids.map(|id| id.with("highlight"));
+        let [mut where_cache, mut order_cache] = cache_ids.map(|id| {
+            ui.data(|d| d.get_temp::<HighlightCache>(id))
+                .unwrap_or_default()
+        });
+        let mut where_layouter = |ui: &egui::Ui, text: &str, _wrap: f32| -> Arc<Galley> {
+            where_cache.layout(ui, text, columns, f32::INFINITY)
+        };
+        let mut order_layouter = |ui: &egui::Ui, text: &str, _wrap: f32| -> Arc<Galley> {
+            order_cache.layout(ui, text, columns, f32::INFINITY)
         };
         let mut apply = false;
         ui.horizontal(|ui| {
@@ -449,24 +459,27 @@ impl DataTab {
             ui.label(RichText::new("WHERE").monospace().strong());
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.filter_input)
-                    .id(egui::Id::new(("data_where", cx.tab)))
+                    .id(ids[0])
                     .code_editor()
                     .desired_width(width)
                     .hint_text("id > 100")
-                    .layouter(&mut layouter),
+                    .layouter(&mut where_layouter),
             );
             apply |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             ui.label(RichText::new("ORDER BY").monospace().strong());
             let r = ui.add(
                 egui::TextEdit::singleline(&mut self.order_input)
-                    .id(egui::Id::new(("data_order", cx.tab)))
+                    .id(ids[1])
                     .code_editor()
                     .desired_width(width)
                     .hint_text("id DESC")
-                    .layouter(&mut layouter),
+                    .layouter(&mut order_layouter),
             );
             apply |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         });
+        for (id, cache) in cache_ids.into_iter().zip([where_cache, order_cache]) {
+            ui.data_mut(|d| d.insert_temp(id, cache));
+        }
         (apply && cx.connected && !cx.submitting).then(|| self.navigate(Nav::Apply))
     }
 }

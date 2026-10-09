@@ -1,5 +1,10 @@
 //! SQL tokenizer and context-aware completions (UI-agnostic).
 
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::ops::Range;
+use std::sync::OnceLock;
+
 /// SQL Keywords for syntax highlighting
 const SQL_KEYWORDS: &[&str] = &[
     "SELECT",
@@ -151,132 +156,211 @@ pub enum SqlToken {
     Whitespace(String),
 }
 
+/// Kind of a token, without its text (see [`tokenize_spans`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TokenKind {
+    Keyword,
+    Function,
+    String,
+    Number,
+    Operator,
+    Comment,
+    Identifier,
+    Column,
+    Punctuation,
+    Whitespace,
+}
+
+impl TokenKind {
+    fn with_text(self, text: String) -> SqlToken {
+        match self {
+            TokenKind::Keyword => SqlToken::Keyword(text),
+            TokenKind::Function => SqlToken::Function(text),
+            TokenKind::String => SqlToken::String(text),
+            TokenKind::Number => SqlToken::Number(text),
+            TokenKind::Operator => SqlToken::Operator(text),
+            TokenKind::Comment => SqlToken::Comment(text),
+            TokenKind::Identifier => SqlToken::Identifier(text),
+            TokenKind::Column => SqlToken::Column(text),
+            TokenKind::Punctuation => SqlToken::Punctuation(text),
+            TokenKind::Whitespace => SqlToken::Whitespace(text),
+        }
+    }
+}
+
+impl SqlToken {
+    pub fn text(&self) -> &str {
+        match self {
+            SqlToken::Keyword(s)
+            | SqlToken::Function(s)
+            | SqlToken::String(s)
+            | SqlToken::Number(s)
+            | SqlToken::Operator(s)
+            | SqlToken::Comment(s)
+            | SqlToken::Identifier(s)
+            | SqlToken::Column(s)
+            | SqlToken::Punctuation(s)
+            | SqlToken::Whitespace(s) => s,
+        }
+    }
+}
+
 /// Tokenize SQL query for syntax highlighting
 pub fn tokenize_sql(query: &str, known_columns: &[String]) -> Vec<SqlToken> {
+    tokenize_spans(query, known_columns)
+        .into_iter()
+        .map(|(kind, range)| kind.with_text(query[range].to_string()))
+        .collect()
+}
+
+fn is_operator(b: u8) -> bool {
+    SQL_OPERATORS.contains(&(b as char))
+}
+
+/// Byte offset of the first character at or after `i` failing `keep`.
+fn scan_while(text: &str, i: usize, keep: impl Fn(char) -> bool) -> usize {
+    text[i..]
+        .char_indices()
+        .find(|&(_, c)| !keep(c))
+        .map_or(text.len(), |(p, _)| i + p)
+}
+
+type WordSet = HashSet<&'static str>;
+
+/// Lookup sets of the keywords and functions (upper case).
+fn word_sets() -> &'static (WordSet, WordSet) {
+    static SETS: OnceLock<(WordSet, WordSet)> = OnceLock::new();
+    SETS.get_or_init(|| {
+        (
+            SQL_KEYWORDS.iter().copied().collect(),
+            SQL_FUNCTIONS.iter().copied().collect(),
+        )
+    })
+}
+
+/// Known columns, compared ignoring ASCII case.
+enum Columns<'a> {
+    /// A few: a linear scan allocates nothing.
+    Few(&'a [String]),
+    /// Many, in ASCII lower case.
+    Many(HashSet<String>),
+}
+
+impl<'a> Columns<'a> {
+    fn new(columns: &'a [String]) -> Self {
+        if columns.len() <= 16 {
+            Columns::Few(columns)
+        } else {
+            Columns::Many(columns.iter().map(|c| c.to_ascii_lowercase()).collect())
+        }
+    }
+
+    fn contains(&self, word: &str) -> bool {
+        match self {
+            Columns::Few(cols) => cols.iter().any(|c| c.eq_ignore_ascii_case(word)),
+            Columns::Many(set) => set.contains(word.to_ascii_lowercase().as_str()),
+        }
+    }
+}
+
+/// Kind of `word`: keyword, function, known column or plain identifier.
+fn classify_word(word: &str, columns: &Columns) -> TokenKind {
+    let (keywords, functions) = word_sets();
+    // Keywords are short ASCII words: upper-case into a stack buffer.
+    let mut buf = [0u8; 32];
+    let upper: Cow<str> = if word.is_ascii() && word.len() <= buf.len() {
+        let buf = &mut buf[..word.len()];
+        buf.copy_from_slice(word.as_bytes());
+        buf.make_ascii_uppercase();
+        Cow::Borrowed(std::str::from_utf8(buf).unwrap_or_default())
+    } else {
+        Cow::Owned(word.to_uppercase())
+    };
+    if keywords.contains(upper.as_ref()) {
+        TokenKind::Keyword
+    } else if functions.contains(upper.as_ref()) {
+        TokenKind::Function
+    } else if columns.contains(word) {
+        TokenKind::Column
+    } else {
+        TokenKind::Identifier
+    }
+}
+
+/// Tokens of `query` as (kind, byte range), contiguous and covering the
+/// whole text, without allocating a string per token.
+pub fn tokenize_spans(query: &str, known_columns: &[String]) -> Vec<(TokenKind, Range<usize>)> {
+    let columns = Columns::new(known_columns);
+    let b = query.as_bytes();
+    let n = b.len();
     let mut tokens = Vec::new();
-    let chars: Vec<char> = query.chars().collect();
     let mut i = 0;
 
-    while i < chars.len() {
-        let c = chars[i];
-
-        // Whitespace
-        if c.is_whitespace() {
-            let start = i;
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            tokens.push(SqlToken::Whitespace(chars[start..i].iter().collect()));
-            continue;
-        }
-
-        // Single-line comment (-- ...)
-        if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
-            let start = i;
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            tokens.push(SqlToken::Comment(chars[start..i].iter().collect()));
-            continue;
-        }
-
-        // Block comment (/* ... */)
-        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            let start = i;
-            i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            if i + 1 < chars.len() {
-                i += 2; // Skip */
-            }
-            tokens.push(SqlToken::Comment(chars[start..i].iter().collect()));
-            continue;
-        }
-
-        // String literals ('...' or "...")
-        if c == '\'' || c == '"' {
-            let quote = c;
-            let start = i;
+    while i < n {
+        let start = i;
+        let c = query[i..].chars().next().unwrap_or_default();
+        let next = b.get(i + 1).copied();
+        let kind = if c.is_whitespace() {
+            i = scan_while(query, i, char::is_whitespace);
+            TokenKind::Whitespace
+        } else if c == '-' && next == Some(b'-') {
+            // Single-line comment, up to (not including) the newline.
+            i = query[i..].find('\n').map_or(n, |p| i + p);
+            TokenKind::Comment
+        } else if c == '/' && next == Some(b'*') {
+            // Block comment; an unterminated one runs to the end.
+            i = query[i + 2..].find("*/").map_or(n, |p| i + 2 + p + 2);
+            TokenKind::Comment
+        } else if c == '\'' || c == '"' {
+            // String literal; a doubled quote is an escaped one.
+            let quote = b[i];
             i += 1;
-            while i < chars.len() {
-                if chars[i] == quote {
-                    // Check for escaped quote
-                    if i + 1 < chars.len() && chars[i + 1] == quote {
-                        i += 2;
-                        continue;
+            loop {
+                match b[i..].iter().position(|&x| x == quote) {
+                    None => {
+                        i = n;
+                        break;
                     }
-                    i += 1;
-                    break;
+                    Some(p) => {
+                        i += p + 1;
+                        if b.get(i) == Some(&quote) {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
                 }
+            }
+            TokenKind::String
+        } else if c.is_ascii_digit() || (c == '.' && next.is_some_and(|x| x.is_ascii_digit())) {
+            while i < n && (b[i].is_ascii_digit() || b[i] == b'.') {
                 i += 1;
             }
-            tokens.push(SqlToken::String(chars[start..i].iter().collect()));
-            continue;
-        }
-
-        // Numbers
-        if c.is_ascii_digit() || (c == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit())
-        {
-            let start = i;
-            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+            TokenKind::Number
+        } else if c.is_ascii() && is_operator(b[i]) {
+            while i < n && is_operator(b[i]) {
                 i += 1;
             }
-            tokens.push(SqlToken::Number(chars[start..i].iter().collect()));
-            continue;
-        }
-
-        // Operators
-        if SQL_OPERATORS.contains(&c) {
-            let start = i;
-            while i < chars.len() && SQL_OPERATORS.contains(&chars[i]) {
-                i += 1;
-            }
-            tokens.push(SqlToken::Operator(chars[start..i].iter().collect()));
-            continue;
-        }
-
-        // Punctuation
-        if c == '(' || c == ')' || c == ',' || c == ';' || c == '.' || c == '[' || c == ']' {
-            tokens.push(SqlToken::Punctuation(c.to_string()));
+            TokenKind::Operator
+        } else if matches!(c, '(' | ')' | ',' | ';' | '.' | '[' | ']') {
             i += 1;
-            continue;
-        }
-
-        // Identifiers and keywords
-        if c.is_alphabetic() || c == '_' || c == '@' || c == '#' {
-            let start = i;
+            TokenKind::Punctuation
+        } else if c.is_alphabetic() || c == '_' || c == '@' || c == '#' {
             // Always consume the first char (handles '@', '#' prefixes like
             // SQL Server variables/temp tables, which aren't alphanumeric).
-            i += 1;
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            let upper = word.to_uppercase();
-
-            if SQL_KEYWORDS.contains(&upper.as_str()) {
-                tokens.push(SqlToken::Keyword(word));
-            } else if SQL_FUNCTIONS.contains(&upper.as_str()) {
-                tokens.push(SqlToken::Function(word));
-            } else if known_columns
-                .iter()
-                .any(|col| col.eq_ignore_ascii_case(&word))
-            {
-                tokens.push(SqlToken::Column(word));
-            } else {
-                tokens.push(SqlToken::Identifier(word));
-            }
-            continue;
-        }
-
-        // Unknown character
-        tokens.push(SqlToken::Punctuation(c.to_string()));
-        i += 1;
+            i = scan_while(query, i + c.len_utf8(), |c| c.is_alphanumeric() || c == '_');
+            classify_word(&query[start..i], &columns)
+        } else {
+            // Unknown character
+            i += c.len_utf8();
+            TokenKind::Punctuation
+        };
+        tokens.push((kind, start..i));
     }
 
     tokens
 }
+
 /// Find the last whole-word occurrence of `kw` (uppercase) in `text` (uppercase).
 /// Returns the byte position just after the keyword, or None.
 fn last_keyword_pos(text: &str, kw: &str) -> Option<usize> {
@@ -583,7 +667,7 @@ pub fn get_completions(
     }
 
     // Remove duplicates while preserving order
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     suggestions.retain(|s| seen.insert(s.clone()));
     suggestions.truncate(10);
     suggestions
@@ -702,5 +786,57 @@ mod tests {
         let tokens = tokenize_sql("SELECT @ FROM t", &[]);
         assert!(tokens.contains(&SqlToken::Identifier("@".into())));
         assert!(tokens.contains(&SqlToken::Keyword("SELECT".into())));
+    }
+
+    #[test]
+    fn spans_cover_text_and_match_tokens() {
+        let text =
+            "SELECT é_col, \"Nom\" FROM t -- c\n/* b */ WHERE x >= 1.5 AND y = 'it''s' ;@v #t ¤";
+        let cols = vec!["X".to_string(), "é_col".to_string()];
+        // Many columns take the hashed lookup: same tokens.
+        let many: Vec<String> = (0..40)
+            .map(|i| format!("c{i}"))
+            .chain(cols.clone())
+            .collect();
+        assert_eq!(tokenize_sql(text, &many), tokenize_sql(text, &cols));
+        let spans = tokenize_spans(text, &cols);
+        let mut end = 0;
+        for (_, r) in &spans {
+            assert_eq!(r.start, end, "contiguous");
+            end = r.end;
+        }
+        assert_eq!(end, text.len());
+        let tokens = tokenize_sql(text, &cols);
+        assert_eq!(tokens.len(), spans.len());
+        for (t, (k, r)) in tokens.iter().zip(&spans) {
+            assert_eq!(*t, k.with_text(text[r.clone()].to_string()));
+        }
+        assert!(tokens.contains(&SqlToken::Column("x".into())));
+        assert!(tokens.contains(&SqlToken::Column("é_col".into())));
+        assert!(tokens.contains(&SqlToken::String("'it''s'".into())));
+        assert!(tokens.contains(&SqlToken::Comment("/* b */".into())));
+        assert!(tokens.contains(&SqlToken::Comment("-- c".into())));
+        assert!(tokens.contains(&SqlToken::Number("1.5".into())));
+        assert!(tokens.contains(&SqlToken::Operator(">=".into())));
+        assert!(tokens.contains(&SqlToken::Punctuation("¤".into())));
+    }
+
+    #[test]
+    fn keywords_and_functions_ignore_case() {
+        let tokens = tokenize_sql("select Count(x) from t", &[]);
+        assert_eq!(tokens[0], SqlToken::Keyword("select".into()));
+        assert_eq!(tokens[2], SqlToken::Function("Count".into()));
+    }
+
+    #[test]
+    fn unterminated_comment_and_string_run_to_the_end() {
+        assert_eq!(
+            tokenize_sql("a /* open", &[]).last(),
+            Some(&SqlToken::Comment("/* open".into()))
+        );
+        assert_eq!(
+            tokenize_sql("a 'open", &[]).last(),
+            Some(&SqlToken::String("'open".into()))
+        );
     }
 }

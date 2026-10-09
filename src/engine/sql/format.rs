@@ -43,18 +43,7 @@ fn uppercase_keywords(text: &str) -> String {
                 .find(|t| !matches!(t, SqlToken::Whitespace(_)))
                 .is_some_and(|t| matches!(t, SqlToken::Punctuation(p) if p == "("))
         };
-        let text = match token {
-            SqlToken::Keyword(w)
-            | SqlToken::Function(w)
-            | SqlToken::Identifier(w)
-            | SqlToken::Column(w)
-            | SqlToken::String(w)
-            | SqlToken::Number(w)
-            | SqlToken::Operator(w)
-            | SqlToken::Comment(w)
-            | SqlToken::Punctuation(w)
-            | SqlToken::Whitespace(w) => w.as_str(),
-        };
+        let text = token.text();
         let upper = quoted.is_none()
             && !prev_dot
             && match token {

@@ -1,6 +1,6 @@
 use egui::{Color32, ThemePreference};
 
-use crate::engine::sql::lexer::SqlToken;
+use crate::engine::sql::lexer::TokenKind;
 
 /// Persisted as `AppConfig::theme`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,38 +98,38 @@ pub fn fonts() -> egui::FontDefinitions {
     fonts
 }
 
-/// Colour of a SQL token for the current background.
-pub fn token_color(token: &SqlToken, dark: bool) -> Color32 {
-    let (d, l) = match token {
-        SqlToken::Keyword(_) => (
+/// Colour of a SQL token kind for the current background.
+pub fn kind_color(kind: TokenKind, dark: bool) -> Color32 {
+    let (d, l) = match kind {
+        TokenKind::Keyword => (
             Color32::from_rgb(0xC6, 0x8B, 0xFF),
             Color32::from_rgb(0x7A, 0x2E, 0xC9),
         ),
-        SqlToken::Function(_) => (
+        TokenKind::Function => (
             Color32::from_rgb(0xF2, 0xC9, 0x4C),
             Color32::from_rgb(0x9A, 0x6A, 0x00),
         ),
-        SqlToken::String(_) => (
+        TokenKind::String => (
             Color32::from_rgb(0x8C, 0xD3, 0x8C),
             Color32::from_rgb(0x1E, 0x7B, 0x34),
         ),
-        SqlToken::Number(_) => (
+        TokenKind::Number => (
             Color32::from_rgb(0x6C, 0xC7, 0xE8),
             Color32::from_rgb(0x00, 0x6E, 0x96),
         ),
-        SqlToken::Operator(_) => (
+        TokenKind::Operator => (
             Color32::from_rgb(0xF0, 0x7C, 0x7C),
             Color32::from_rgb(0xB0, 0x2A, 0x2A),
         ),
-        SqlToken::Comment(_) => (Color32::from_gray(0x80), Color32::from_gray(0x80)),
-        SqlToken::Column(_) => (
+        TokenKind::Comment => (Color32::from_gray(0x80), Color32::from_gray(0x80)),
+        TokenKind::Column => (
             Color32::from_rgb(0x7F, 0xD8, 0xC8),
             Color32::from_rgb(0x00, 0x7A, 0x66),
         ),
-        SqlToken::Identifier(_) | SqlToken::Whitespace(_) => {
+        TokenKind::Identifier | TokenKind::Whitespace => {
             (Color32::from_gray(0xE0), Color32::from_gray(0x20))
         }
-        SqlToken::Punctuation(_) => (Color32::from_gray(0xA0), Color32::from_gray(0x60)),
+        TokenKind::Punctuation => (Color32::from_gray(0xA0), Color32::from_gray(0x60)),
     };
     if dark {
         d
@@ -155,8 +155,8 @@ mod tests {
 
     #[test]
     fn keywords_and_identifiers_differ() {
-        let kw = token_color(&SqlToken::Keyword("SELECT".into()), true);
-        let id = token_color(&SqlToken::Identifier("x".into()), true);
+        let kw = kind_color(TokenKind::Keyword, true);
+        let id = kind_color(TokenKind::Identifier, true);
         assert_ne!(kw, id);
     }
 

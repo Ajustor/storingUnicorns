@@ -2,12 +2,11 @@
 
 use std::sync::Arc;
 
-use egui::text::LayoutJob;
 use egui::{Galley, RichText};
 use egui_phosphor::regular as icon;
 
 use crate::engine::db::utils::display_qualified;
-use crate::gui::editor::highlight_job;
+use crate::gui::editor::HighlightCache;
 use crate::gui::theme::ERROR;
 use crate::gui::worker::Event;
 
@@ -16,8 +15,8 @@ pub struct DdlTab {
     pub table: String,
     /// `None` while loading.
     pub ddl: Option<Result<String, String>>,
-    /// Highlighted layout of the DDL for (dark mode, font size).
-    job: Option<(bool, f32, LayoutJob)>,
+    /// Highlighted layout of the DDL.
+    highlight: HighlightCache,
 }
 
 /// What the tab asks the app to do.
@@ -30,7 +29,7 @@ impl DdlTab {
         Self {
             table,
             ddl: None,
-            job: None,
+            highlight: HighlightCache::default(),
         }
     }
 
@@ -64,19 +63,9 @@ impl DdlTab {
                 ui.colored_label(ERROR, e);
             }
             Some(Ok(sql)) => {
-                let dark = ui.visuals().dark_mode;
-                let size = egui::TextStyle::Monospace.resolve(ui.style()).size;
-                if !matches!(&self.job, Some((d, s, _)) if *d == dark && *s == size) {
-                    self.job = Some((dark, size, highlight_job(sql, &[], dark, size)));
-                }
-                let job = self.job.as_ref().map(|(_, _, j)| j);
+                let highlight = &mut self.highlight;
                 let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| -> Arc<Galley> {
-                    let mut job = match job {
-                        Some(j) if j.text == text => j.clone(),
-                        _ => highlight_job(text, &[], dark, size),
-                    };
-                    job.wrap.max_width = wrap_width;
-                    ui.fonts(|f| f.layout_job(job))
+                    highlight.layout(ui, text, &[], wrap_width)
                 };
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
@@ -96,13 +85,13 @@ impl DdlTab {
     /// Forget the DDL before reloading it.
     pub fn reload(&mut self) {
         self.ddl = None;
-        self.job = None;
+        self.highlight = HighlightCache::default();
     }
 
     pub fn on_event(&mut self, ev: Event) {
         if let Event::Ddl { outcome, .. } = ev {
             self.ddl = Some(outcome);
-            self.job = None;
+            self.highlight = HighlightCache::default();
         }
     }
 }

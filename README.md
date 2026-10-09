@@ -6,6 +6,13 @@ desktop GUI (egui) and a terminal UI (ratatui) sharing the same engine.
 ## Features
 
 - PostgreSQL, MySQL, SQLite, SQL Server and Azure SQL
+  - compatible products with a ready-made template (port, SSL mode): MariaDB,
+    PlanetScale, CockroachDB, TimescaleDB, Supabase, Neon and Redshift
+  - encrypted PostgreSQL / MySQL connections: SSL mode (disabled, preferred,
+    required, verify CA, verify full) and an optional CA certificate; the
+    system's certificates are trusted
+  - paste a connection URL (`postgresql://user:pass@host/db?sslmode=require`)
+    to fill in the connection form
 - **GUI** (default) with DataGrip ergonomics:
   - several connections open at once, each with its own colour (dot on its tabs)
   - database explorer: connection → schemas → tables → columns / keys / indexes,
@@ -159,6 +166,18 @@ username = "postgres"
 password = "secret"
 database = "mydb"
 color = [229, 83, 75]   # optional, GUI tab dot
+
+[[connections]]
+name = "Supabase"
+db_type = "Postgres"
+host = "db.abcd.supabase.co"
+port = 5432
+username = "postgres"
+password = "p@ss:word"  # stored as typed, any character allowed
+database = "postgres"
+flavor = "Supabase"     # optional: MariaDb, PlanetScale, CockroachDb, TimescaleDb, Supabase, Neon, Redshift
+ssl_mode = "VerifyFull" # Postgres / MySQL: Disable, Prefer (default), Require, VerifyCa, VerifyFull
+ssl_ca = "C:/certs/ca.pem"  # optional extra trusted CA (PEM)
 
 [[connections]]
 name = "SQLite DB"

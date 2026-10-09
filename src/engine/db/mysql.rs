@@ -1,8 +1,10 @@
 use anyhow::Result;
+use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
 use sqlx::{mysql::MySqlRow, Column as SqlxColumn, MySqlPool, Row, TypeInfo};
 
 use crate::engine::models::{
-    Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, NULL_CELL,
+    Column, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, SslMode,
+    NULL_CELL,
 };
 
 use super::utils::{
@@ -10,10 +12,51 @@ use super::utils::{
     split_qualified, TxConnection,
 };
 
-/// Connect to MySQL
-pub async fn connect(conn_str: &str) -> Result<MySqlPool> {
-    let pool = MySqlPool::connect(conn_str).await?;
-    Ok(pool)
+/// Options built field by field: no URL, so any character works in the
+/// password.
+pub fn connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
+    // NOTE: `VerifyCa` still checks the host name. sqlx 0.8.6's
+    // `NoHostnameTlsVerifier` (sqlx-core/src/net/tls/tls_rustls.rs) only
+    // ignores `CertificateError::NotValidForName`, while rustls 0.23 reports
+    // a mismatch as `NotValidForNameContext`. Not patched here: `tls::explain`
+    // says so and points to `Require` instead.
+    let mut o = MySqlConnectOptions::new()
+        .host(config.host.as_deref().unwrap_or("localhost"))
+        .port(config.port.unwrap_or(3306))
+        .username(config.username.as_deref().unwrap_or("root"))
+        .ssl_mode(match config.effective_ssl_mode() {
+            SslMode::Disable => MySqlSslMode::Disabled,
+            SslMode::Prefer => MySqlSslMode::Preferred,
+            SslMode::Require => MySqlSslMode::Required,
+            SslMode::VerifyCa => MySqlSslMode::VerifyCa,
+            SslMode::VerifyFull => MySqlSslMode::VerifyIdentity,
+        });
+    // Unset rather than empty, as the URL path used to: no default database.
+    if !config.database.is_empty() {
+        o = o.database(&config.database);
+    }
+    if let Some(p) = &config.password {
+        o = o.password(p);
+    }
+    if let Some(ca) = &config.ssl_ca {
+        o = o.ssl_ca(ca);
+    }
+    o
+}
+
+/// Connect to MySQL. In `Prefer` mode, a failed TLS handshake is retried
+/// without TLS (see `tls::should_retry_plain`).
+pub async fn connect(config: &ConnectionConfig) -> Result<MySqlPool> {
+    let options = connect_options(config);
+    match MySqlPool::connect_with(options.clone()).await {
+        Err(e) if super::tls::should_retry_plain(config.effective_ssl_mode(), &e) => {
+            tracing::debug!("TLS failed in Prefer mode ({e}); retrying without TLS");
+            MySqlPool::connect_with(options.ssl_mode(MySqlSslMode::Disabled))
+                .await
+                .map_err(|plain| anyhow::anyhow!("TLS : {e} ; sans chiffrement : {plain}"))
+        }
+        result => Ok(result?),
+    }
 }
 
 /// Convert fetched rows into a `QueryResult`.
@@ -307,4 +350,84 @@ fn get_value(row: &MySqlRow, index: usize) -> String {
     row.try_get_unchecked::<&[u8], _>(index)
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
         .unwrap_or_else(|_| NULL_CELL.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::models::{ConnectionConfig, DatabaseType, SslMode};
+    use sqlx::mysql::MySqlSslMode;
+
+    fn mysql(c: ConnectionConfig) -> ConnectionConfig {
+        ConnectionConfig {
+            db_type: DatabaseType::MySQL,
+            ..c
+        }
+    }
+
+    #[test]
+    fn an_empty_database_is_not_sent() {
+        let o = connect_options(&mysql(ConnectionConfig {
+            database: String::new(),
+            ..Default::default()
+        }));
+        assert_eq!(o.get_database(), None);
+    }
+
+    #[test]
+    fn options_come_from_the_fields() {
+        let c = mysql(ConnectionConfig {
+            host: Some("db.example.com".into()),
+            port: Some(3307),
+            username: Some("alice".into()),
+            password: Some("a@b:c/d#e?f%g".into()),
+            database: "app".into(),
+            ssl_mode: Some(SslMode::VerifyFull),
+            ssl_ca: Some("C:/certs/ca.pem".into()),
+            ..Default::default()
+        });
+        let o = connect_options(&c);
+        assert_eq!(o.get_host(), "db.example.com");
+        assert_eq!(o.get_port(), 3307);
+        assert_eq!(o.get_username(), "alice");
+        assert_eq!(o.get_database(), Some("app"));
+        assert!(matches!(o.get_ssl_mode(), MySqlSslMode::VerifyIdentity));
+        // No getter for the password or the CA: check the Debug output.
+        let debug = format!("{o:?}");
+        assert!(
+            debug.contains(r#"password: Some("a@b:c/d#e?f%g")"#),
+            "{debug}"
+        );
+        assert!(debug.contains("C:/certs/ca.pem"), "{debug}");
+    }
+
+    #[test]
+    fn defaults_and_ssl_mapping() {
+        let o = connect_options(&mysql(ConnectionConfig {
+            host: None,
+            port: None,
+            username: None,
+            ..Default::default()
+        }));
+        assert_eq!(o.get_host(), "localhost");
+        assert_eq!(o.get_port(), 3306);
+        assert_eq!(o.get_username(), "root");
+        assert!(matches!(o.get_ssl_mode(), MySqlSslMode::Preferred));
+        for (mode, want) in [
+            (SslMode::Disable, MySqlSslMode::Disabled),
+            (SslMode::Prefer, MySqlSslMode::Preferred),
+            (SslMode::Require, MySqlSslMode::Required),
+            (SslMode::VerifyCa, MySqlSslMode::VerifyCa),
+            (SslMode::VerifyFull, MySqlSslMode::VerifyIdentity),
+        ] {
+            let c = mysql(ConnectionConfig {
+                ssl_mode: Some(mode),
+                ..Default::default()
+            });
+            assert_eq!(
+                std::mem::discriminant(&connect_options(&c).get_ssl_mode()),
+                std::mem::discriminant(&want)
+            );
+        }
+    }
 }

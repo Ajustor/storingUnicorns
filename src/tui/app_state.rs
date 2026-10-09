@@ -7,7 +7,10 @@ use crate::engine::services::query_tabs::QueryTabsState;
 use crate::engine::services::table_cache::{FetchQueue, TableCache};
 use crate::engine::config::AppConfig;
 use crate::engine::db::DatabaseConnection;
-use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType, QueryResult, SchemaInfo};
+use crate::engine::models::{
+    AzureAuthMethod, ConnectionConfig, DatabaseType, Flavor, QueryResult, SchemaInfo, SslMode,
+};
+use crate::engine::presets;
 use crate::engine::models::{display_cell, NULL_CELL};
 use crate::engine::sql::statements::single_table_source;
 use crate::tui::ui::modals::SchemaAction;
@@ -75,6 +78,9 @@ pub enum DialogMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionField {
     Name,
+    /// Pasted connection URL; Enter fills the other fields from it.
+    Url,
+    Flavor,
     DbType,
     AzureAuth,
     TenantId,
@@ -83,13 +89,17 @@ pub enum ConnectionField {
     Username,
     Password,
     Database,
+    SslMode,
+    SslCa,
 }
 
 impl ConnectionField {
     /// Get the next field in the full chain (Azure-aware cycling handled separately)
     pub fn next(self) -> Self {
         match self {
-            Self::Name => Self::DbType,
+            Self::Name => Self::Url,
+            Self::Url => Self::Flavor,
+            Self::Flavor => Self::DbType,
             Self::DbType => Self::AzureAuth,
             Self::AzureAuth => Self::TenantId,
             Self::TenantId => Self::Host,
@@ -97,14 +107,18 @@ impl ConnectionField {
             Self::Port => Self::Username,
             Self::Username => Self::Password,
             Self::Password => Self::Database,
-            Self::Database => Self::Name,
+            Self::Database => Self::SslMode,
+            Self::SslMode => Self::SslCa,
+            Self::SslCa => Self::Name,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::Name => Self::Database,
-            Self::DbType => Self::Name,
+            Self::Name => Self::SslCa,
+            Self::Url => Self::Name,
+            Self::Flavor => Self::Url,
+            Self::DbType => Self::Flavor,
             Self::AzureAuth => Self::DbType,
             Self::TenantId => Self::AzureAuth,
             Self::Host => Self::TenantId,
@@ -112,6 +126,8 @@ impl ConnectionField {
             Self::Username => Self::Port,
             Self::Password => Self::Username,
             Self::Database => Self::Password,
+            Self::SslMode => Self::Database,
+            Self::SslCa => Self::SslMode,
         }
     }
 
@@ -141,9 +157,21 @@ impl ConnectionField {
             Self::TenantId => {
                 *db_type != DatabaseType::Azure || *auth_method != AzureAuthMethod::Interactive
             }
+            Self::SslMode | Self::SslCa => !uses_tls(db_type),
             _ => false,
         }
     }
+}
+
+/// Whether the driver honours the SSL settings (PostgreSQL / MySQL).
+pub fn uses_tls(db_type: &DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::Postgres | DatabaseType::MySQL)
+}
+
+/// Empty, or a host `set_db_type` fills in: replaceable by another default.
+fn is_default_host(host: &str) -> bool {
+    let h = host.trim();
+    h.is_empty() || h == "localhost" || h == "servername.database.windows.net"
 }
 
 /// State for new connection dialog
@@ -160,6 +188,14 @@ pub struct NewConnectionState {
     pub cursor_position: usize,
     pub azure_auth_method: AzureAuthMethod,
     pub tenant_id: String,
+    pub url: String,
+    /// Compatible product; `None` = the bare engine.
+    pub flavor: Option<Flavor>,
+    pub ssl_mode: SslMode,
+    /// CA certificate path; empty = system roots only.
+    pub ssl_ca: String,
+    /// Kept so that editing a connection doesn't drop its GUI colour.
+    pub color: Option<[u8; 3]>,
 }
 
 impl Default for NewConnectionState {
@@ -176,6 +212,11 @@ impl Default for NewConnectionState {
             cursor_position: 14, // length of "New Connection"
             azure_auth_method: AzureAuthMethod::default(),
             tenant_id: String::from("common"),
+            url: String::new(),
+            flavor: None,
+            ssl_mode: SslMode::default(),
+            ssl_ca: String::new(),
+            color: None,
         }
     }
 }
@@ -215,13 +256,56 @@ impl NewConnectionState {
             } else {
                 None
             },
-            ..Default::default()
+            color: self.color,
+            ssl_mode: uses_tls(&self.db_type).then_some(self.ssl_mode),
+            ssl_ca: if uses_tls(&self.db_type) && !self.ssl_ca.trim().is_empty() {
+                Some(self.ssl_ca.trim().into())
+            } else {
+                None
+            },
+            flavor: self.flavor.filter(|f| f.driver() == self.db_type),
+        }
+    }
+
+    /// Edit form for an existing connection.
+    pub fn from_config(conn: &ConnectionConfig) -> Self {
+        Self {
+            name: conn.name.clone(),
+            db_type: conn.db_type.clone(),
+            host: conn.host.clone().unwrap_or_default(),
+            port: conn.port.map(|p| p.to_string()).unwrap_or_default(),
+            username: conn.username.clone().unwrap_or_default(),
+            password: conn.password.clone().unwrap_or_default(),
+            database: conn.database.clone(),
+            azure_auth_method: conn
+                .azure_auth_method
+                .clone()
+                .unwrap_or(AzureAuthMethod::Credentials),
+            tenant_id: conn
+                .tenant_id
+                .clone()
+                .unwrap_or_else(|| "common".to_string()),
+            active_field: ConnectionField::Name,
+            cursor_position: conn.name.len(),
+            url: String::new(),
+            flavor: conn.flavor,
+            ssl_mode: conn.ssl_mode.unwrap_or_default(),
+            ssl_ca: conn
+                .ssl_ca
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            color: conn.color,
         }
     }
 
     pub fn get_active_field_value(&self) -> &str {
         match self.active_field {
             ConnectionField::Name => &self.name,
+            ConnectionField::Url => &self.url,
+            ConnectionField::SslCa => &self.ssl_ca,
+            // Cycled with ←/→, like the type.
+            ConnectionField::Flavor | ConnectionField::SslMode => "",
             ConnectionField::DbType => "",    // handled separately
             ConnectionField::AzureAuth => "", // handled separately (cycle)
             ConnectionField::TenantId => &self.tenant_id,
@@ -236,6 +320,10 @@ impl NewConnectionState {
     pub fn get_active_field_mut(&mut self) -> Option<&mut String> {
         match self.active_field {
             ConnectionField::Name => Some(&mut self.name),
+            ConnectionField::Url => Some(&mut self.url),
+            ConnectionField::SslCa => Some(&mut self.ssl_ca),
+            // Cycled with ←/→, like the type.
+            ConnectionField::Flavor | ConnectionField::SslMode => None,
             ConnectionField::DbType => None,    // handled separately
             ConnectionField::AzureAuth => None, // handled separately (cycle)
             ConnectionField::TenantId => Some(&mut self.tenant_id),
@@ -256,14 +344,118 @@ impl NewConnectionState {
     }
 
     pub fn cycle_db_type(&mut self) {
-        self.db_type = match self.db_type {
+        self.set_db_type(match self.db_type {
             DatabaseType::Postgres => DatabaseType::MySQL,
             DatabaseType::MySQL => DatabaseType::SQLite,
             DatabaseType::SQLite => DatabaseType::SQLServer,
             DatabaseType::SQLServer => DatabaseType::Azure,
             DatabaseType::Azure => DatabaseType::Postgres,
+        });
+    }
+
+    /// Next product (None = bare engine, then `Flavor::ALL`, then None
+    /// again), applying its preset: driver, port, SSL mode, and the user
+    /// when it is empty or a driver default. A typed host is never
+    /// overwritten; a default one follows the driver like `cycle_db_type`.
+    pub fn cycle_flavor(&mut self) {
+        self.step_flavor(true);
+    }
+
+    /// `cycle_flavor` backwards: None, last product, …, first, None.
+    pub fn cycle_flavor_back(&mut self) {
+        self.step_flavor(false);
+    }
+
+    fn step_flavor(&mut self, forward: bool) {
+        // Position in [None, ALL[0], …, ALL[n-1]], moved one step with wrap.
+        let len = Flavor::ALL.len() + 1;
+        let pos = self
+            .flavor
+            .and_then(|f| Flavor::ALL.iter().position(|x| *x == f))
+            .map_or(0, |i| i + 1);
+        let pos = if forward {
+            (pos + 1) % len
+        } else {
+            (pos + len - 1) % len
         };
-        // Update default port and host
+        let next = pos.checked_sub(1).map(|i| Flavor::ALL[i]);
+        let Some(f) = next else {
+            self.flavor = None;
+            return;
+        };
+        let p = presets::preset(f);
+        if p.db_type != self.db_type {
+            let host = std::mem::take(&mut self.host);
+            self.set_db_type(p.db_type);
+            if !is_default_host(&host) {
+                self.host = host;
+            }
+        }
+        self.flavor = next;
+        self.port = p.port.to_string();
+        self.ssl_mode = p.ssl_mode;
+        let u = self.username.trim();
+        if u.is_empty() || u == "postgres" || u == "root" || u == "sa" {
+            self.username = p.username.to_string();
+        }
+    }
+
+    pub fn cycle_ssl_mode(&mut self) {
+        self.step_ssl_mode(1);
+    }
+
+    pub fn cycle_ssl_mode_back(&mut self) {
+        self.step_ssl_mode(SslMode::ALL.len() - 1);
+    }
+
+    fn step_ssl_mode(&mut self, step: usize) {
+        let i = SslMode::ALL
+            .iter()
+            .position(|m| *m == self.ssl_mode)
+            .unwrap_or(0);
+        self.ssl_mode = SslMode::ALL[(i + step) % SslMode::ALL.len()];
+    }
+
+    /// Fill the form from `self.url` (see the SSL / password rules below);
+    /// on error nothing changes.
+    pub fn apply_url(&mut self) -> Result<(), String> {
+        let p = presets::parse_url(&self.url)?;
+        self.set_db_type(p.db_type);
+        self.flavor = p.flavor;
+        if let Some(h) = p.host {
+            self.host = h;
+        }
+        if let Some(n) = p.port {
+            self.port = n.to_string();
+        }
+        if let Some(u) = p.username {
+            self.username = u;
+        }
+        if let Some(pw) = p.password {
+            self.password = pw;
+        }
+        if let Some(d) = p.database {
+            self.database = d;
+        }
+        // The URL describes the whole connection: SSL settings it doesn't
+        // mention go back to their defaults. A missing password keeps the
+        // typed one (URLs are often shared without it).
+        self.ssl_mode = p.ssl_mode.unwrap_or_default();
+        self.ssl_ca = p
+            .ssl_ca
+            .map(|ca| ca.display().to_string())
+            .unwrap_or_default();
+        self.url.clear();
+        Ok(())
+    }
+
+    /// Switch the driver and apply its default port / host (and user for
+    /// SQL Server); a product of another driver is dropped.
+    pub fn set_db_type(&mut self, db_type: DatabaseType) {
+        if self.flavor.is_some_and(|f| f.driver() != db_type) {
+            self.flavor = None;
+        }
+        self.db_type = db_type;
         match self.db_type {
             DatabaseType::Postgres => {
                 self.port = String::from("5432");
@@ -471,25 +663,7 @@ impl AppState {
 
     pub fn open_edit_connection_dialog(&mut self, index: usize) {
         if let Some(conn) = self.config.connections.get(index) {
-            self.new_connection = NewConnectionState {
-                name: conn.name.clone(),
-                db_type: conn.db_type.clone(),
-                host: conn.host.clone().unwrap_or_default(),
-                port: conn.port.map(|p| p.to_string()).unwrap_or_default(),
-                username: conn.username.clone().unwrap_or_default(),
-                password: conn.password.clone().unwrap_or_default(),
-                database: conn.database.clone(),
-                azure_auth_method: conn
-                    .azure_auth_method
-                    .clone()
-                    .unwrap_or(AzureAuthMethod::Credentials),
-                tenant_id: conn
-                    .tenant_id
-                    .clone()
-                    .unwrap_or_else(|| "common".to_string()),
-                active_field: ConnectionField::Name,
-                cursor_position: conn.name.len(),
-            };
+            self.new_connection = NewConnectionState::from_config(conn);
             self.editing_connection_index = Some(index);
             self.dialog_mode = DialogMode::EditConnection;
         }
@@ -1211,5 +1385,121 @@ impl AppState {
     pub fn adjust_query_editor_height(&mut self, delta: i16) {
         let new_height = (self.query_editor_height as i16 + delta).clamp(20, 80) as u16;
         self.query_editor_height = new_height;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_form_cycles_presets_and_ssl_and_keeps_them() {
+        let mut nc = NewConnectionState::default();
+        nc.cycle_flavor(); // Aucun -> MariaDB
+        assert_eq!(nc.flavor, Some(Flavor::MariaDb));
+        assert_eq!(nc.db_type, DatabaseType::MySQL);
+        assert_eq!(nc.port, "3306");
+        nc.cycle_ssl_mode();
+        let c = nc.to_config();
+        assert_eq!(c.flavor, Some(Flavor::MariaDb));
+        assert_eq!(c.ssl_mode, Some(SslMode::Require)); // Prefer -> Require
+    }
+
+    #[test]
+    fn cycling_past_the_last_flavor_returns_to_none() {
+        let mut nc = NewConnectionState::default();
+        for _ in 0..Flavor::ALL.len() {
+            nc.cycle_flavor();
+        }
+        assert_eq!(nc.flavor, Flavor::ALL.last().copied());
+        nc.cycle_flavor();
+        assert_eq!(nc.flavor, None);
+    }
+
+    #[test]
+    fn cycling_presets_keeps_a_typed_host() {
+        let mut nc = NewConnectionState {
+            host: "db.mine.example".into(),
+            ..Default::default()
+        };
+        for _ in 0..=Flavor::ALL.len() {
+            nc.cycle_flavor();
+            assert_eq!(nc.host, "db.mine.example", "{:?}", nc.flavor);
+        }
+        // A default host still follows the driver.
+        let mut nc = NewConnectionState::default();
+        nc.set_db_type(DatabaseType::SQLite);
+        nc.cycle_flavor(); // MariaDB
+        assert_eq!(nc.host, "localhost");
+    }
+
+    #[test]
+    fn tui_url_field_fills_the_form() {
+        let mut nc = NewConnectionState {
+            url: "mysql://u:p%23w@aws.connect.psdb.cloud/app?ssl-mode=VERIFY_IDENTITY".into(),
+            ..Default::default()
+        };
+        nc.apply_url().unwrap();
+        assert_eq!(nc.password, "p#w");
+        assert_eq!(nc.flavor, Some(Flavor::PlanetScale));
+        assert_eq!(nc.ssl_mode, SslMode::VerifyFull);
+        assert_eq!(nc.port, "3306");
+        assert!(nc.url.is_empty());
+
+        nc.url = "redis://x".into();
+        assert!(nc.apply_url().is_err());
+        assert_eq!(nc.host, "aws.connect.psdb.cloud"); // untouched
+    }
+
+    #[test]
+    fn pasted_url_resets_ssl_it_does_not_mention() {
+        let mut nc = NewConnectionState {
+            ssl_mode: SslMode::Require,
+            ssl_ca: "/etc/ca.pem".into(),
+            url: "postgres://u:p@localhost/db".into(),
+            ..Default::default()
+        };
+        nc.apply_url().unwrap();
+        assert_eq!(nc.ssl_mode, SslMode::Prefer);
+        assert!(nc.ssl_ca.is_empty());
+    }
+
+    #[test]
+    fn ssl_fields_are_skipped_for_other_engines() {
+        let t = DatabaseType::SQLServer;
+        let a = AzureAuthMethod::Credentials;
+        assert_ne!(
+            ConnectionField::Database.next_for(&t, &a),
+            ConnectionField::SslMode
+        );
+        assert_eq!(
+            ConnectionField::Database.next_for(&DatabaseType::Postgres, &a),
+            ConnectionField::SslMode
+        );
+    }
+
+    #[test]
+    fn editing_keeps_ssl_flavor_and_colour() {
+        let conn = ConnectionConfig {
+            ssl_mode: Some(SslMode::VerifyCa),
+            ssl_ca: Some("/etc/ca.pem".into()),
+            flavor: Some(Flavor::Neon),
+            color: Some([1, 2, 3]),
+            ..Default::default()
+        };
+        let c = NewConnectionState::from_config(&conn).to_config();
+        assert_eq!(c.ssl_mode, Some(SslMode::VerifyCa));
+        assert_eq!(c.ssl_ca, Some("/etc/ca.pem".into()));
+        assert_eq!(c.flavor, Some(Flavor::Neon));
+        assert_eq!(c.color, Some([1, 2, 3]));
+    }
+
+    #[test]
+    fn changing_driver_drops_the_flavor_and_ssl() {
+        let mut nc = NewConnectionState::default();
+        nc.cycle_flavor(); // MariaDB (MySQL)
+        nc.cycle_db_type(); // SQLite
+        let c = nc.to_config();
+        assert_eq!((c.flavor, c.ssl_mode, c.ssl_ca), (None, None, None));
     }
 }

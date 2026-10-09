@@ -1,6 +1,6 @@
 [package]
 name = "storingUnicorns"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 description = "A terminal-based database client inspired by DataGrip"
 license = "MIT"
@@ -26,6 +26,9 @@ tokio = { version = "1", features = ["full"] }
 # Database connectors
 sqlx = { version = "0.8", features = [
   "runtime-tokio",
+  # rustls with the system's certificates (corporate proxies, Keychain...);
+  # no OpenSSL (scripts/check-linked-libs.sh).
+  "tls-rustls-ring-native-roots",
   "postgres",
   "mysql",
   "sqlite",
@@ -68,6 +71,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Misc
 dirs = "5.0"
+# Provider connection URLs pasted in the connection dialog
+url = "2"
+percent-encoding = "2"
 
 # SQL formatting (GUI "Reformat")
 sqlformat = "0.3"

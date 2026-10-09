@@ -44,22 +44,36 @@ pub async fn fetch_columns(
         .collect())
 }
 
+/// An optional metadata list: an error becomes an empty list plus its text.
+fn degrade<T>(r: Result<Vec<T>>) -> (Vec<T>, Option<String>) {
+    match r {
+        Ok(v) => (v, None),
+        Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+    }
+}
+
 /// Columns (through `cache`), indexes and foreign keys of `table`, fetched
-/// concurrently.
+/// concurrently. Only the columns are required: servers that lack part of
+/// the catalog (CockroachDB, Redshift…) get empty index / key lists with
+/// the reason.
 pub async fn table_details(
     conn: &DatabaseConnection,
     cache: &TableCache,
     table: &str,
 ) -> Result<TableDetails> {
-    let (columns, indexes, foreign_keys) = tokio::try_join!(
+    let (columns, indexes, foreign_keys) = tokio::join!(
         cached_columns(conn, cache, table),
         conn.get_indexes(table),
         conn.get_foreign_keys(table),
-    )?;
+    );
+    let (indexes, indexes_error) = degrade(indexes);
+    let (foreign_keys, foreign_keys_error) = degrade(foreign_keys);
     Ok(TableDetails {
-        columns,
+        columns: columns?,
         indexes,
         foreign_keys,
+        indexes_error,
+        foreign_keys_error,
     })
 }
 
@@ -193,7 +207,26 @@ pub fn generate_ddl(table: &str, details: &TableDetails, quotes: (char, char)) -
             quote_list(&index.columns),
         ));
     }
-    format!("{};", statements.join(";\n\n"))
+    let mut ddl = format!("{};", statements.join(";\n\n"));
+    // Say what is missing rather than silently dropping it.
+    let notes = [
+        ("Index", &details.indexes_error),
+        ("Clés étrangères", &details.foreign_keys_error),
+    ];
+    for (what, error) in notes {
+        if let Some(e) = error {
+            // Any control character (lone \r included) could end the
+            // comment and turn the rest of the message into SQL.
+            let e = e
+                .split(|c: char| c.is_control())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            ddl.push_str(&format!("\n-- {what} non disponibles sur ce serveur : {e}"));
+        }
+    }
+    ddl
 }
 
 /// The table a modification applies to.
@@ -291,6 +324,15 @@ mod tests {
     }
 
     #[test]
+    fn degrade_keeps_the_error_text() {
+        let (v, e) = degrade::<u8>(Err(anyhow::anyhow!("relation pg_index does not exist")));
+        assert!(v.is_empty());
+        assert_eq!(e.as_deref(), Some("relation pg_index does not exist"));
+        let (v, e) = degrade(Ok(vec![1u8]));
+        assert_eq!((v, e), (vec![1], None));
+    }
+
+    #[test]
     fn generate_ddl_includes_columns_pk_fk_and_indexes() {
         use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo};
         let col = |n: &str, t: &str, null: bool, pk: bool| Column {
@@ -316,6 +358,7 @@ mod tests {
                 ref_table: "a".into(),
                 ref_columns: vec!["id".into()],
             }],
+            ..TableDetails::default()
         };
         let ddl = generate_ddl("\"b\"", &d, ('"', '"'));
         assert!(ddl.starts_with("CREATE TABLE \"b\" (\n"));
@@ -326,6 +369,34 @@ mod tests {
             ddl.contains("CONSTRAINT \"fk_a\" FOREIGN KEY (\"a_id\") REFERENCES \"a\" (\"id\")")
         );
         assert!(ddl.contains("CREATE INDEX \"ix_a\" ON \"b\" (\"a_id\");"));
+        assert!(!ddl.contains("--"), "{ddl}");
+    }
+
+    #[test]
+    fn generate_ddl_says_what_it_could_not_read() {
+        use crate::engine::models::Column;
+        let d = TableDetails {
+            columns: vec![Column {
+                name: "id".into(),
+                type_name: "integer".into(),
+                nullable: false,
+                is_primary_key: true,
+            }],
+            indexes_error: Some("relation pg_index\ndoes not exist".into()),
+            // A lone \r must not end the comment line either.
+            foreign_keys_error: Some("no\r\nfk\rDROP TABLE t".into()),
+            ..TableDetails::default()
+        };
+        let ddl = generate_ddl("\"b\"", &d, ('"', '"'));
+        assert!(ddl.starts_with("CREATE TABLE \"b\" (\n"), "{ddl}");
+        assert!(
+            ddl.ends_with(
+                ");\n\
+                 -- Index non disponibles sur ce serveur : relation pg_index does not exist\n\
+                 -- Clés étrangères non disponibles sur ce serveur : no fk DROP TABLE t"
+            ),
+            "{ddl}"
+        );
     }
 
     #[tokio::test]

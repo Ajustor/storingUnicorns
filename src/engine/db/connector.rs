@@ -7,7 +7,17 @@ use crate::engine::models::{
 };
 
 pub use super::sqlserver::SqlServerClient;
-use super::{azure, mysql, postgres, sqlite, sqlserver, utils};
+use super::{azure, mysql, postgres, sqlite, sqlserver, tls, utils};
+
+/// A known TLS failure gets a French hint; the driver's message stays in
+/// parentheses for diagnosis. Other errors are unchanged.
+fn explain_tls(e: anyhow::Error, config: &ConnectionConfig) -> anyhow::Error {
+    let host = config.host.as_deref().unwrap_or("localhost");
+    match tls::explain(&format!("{e:#}"), host, config.effective_ssl_mode()) {
+        Some(hint) => anyhow::anyhow!("{hint}\n({e:#})"),
+        None => e,
+    }
+}
 
 /// Unified database connection handle
 pub enum DatabaseConnection {
@@ -21,19 +31,25 @@ pub enum DatabaseConnection {
 impl DatabaseConnection {
     /// Connect to a database using the provided configuration
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
-        let conn_str = config.to_connection_string();
-
         match config.db_type {
             DatabaseType::Postgres => {
-                let pool = postgres::connect(&conn_str).await?;
+                tls::check_ca_for(config.effective_ssl_mode(), config.ssl_ca.as_deref())
+                    .map_err(anyhow::Error::msg)?;
+                let pool = postgres::connect(config)
+                    .await
+                    .map_err(|e| explain_tls(e, config))?;
                 Ok(DatabaseConnection::Postgres(pool))
             }
             DatabaseType::MySQL => {
-                let pool = mysql::connect(&conn_str).await?;
+                tls::check_ca_for(config.effective_ssl_mode(), config.ssl_ca.as_deref())
+                    .map_err(anyhow::Error::msg)?;
+                let pool = mysql::connect(config)
+                    .await
+                    .map_err(|e| explain_tls(e, config))?;
                 Ok(DatabaseConnection::MySQL(pool))
             }
             DatabaseType::SQLite => {
-                let pool = sqlite::connect(&conn_str).await?;
+                let pool = sqlite::connect(&config.to_connection_string()).await?;
                 Ok(DatabaseConnection::SQLite(pool))
             }
             DatabaseType::SQLServer => {

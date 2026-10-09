@@ -7,6 +7,29 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.10.0] - 2026-10-09
+
+### Nouveautés
+
+- **Connexions chiffrées (SSL/TLS)** pour PostgreSQL et MySQL : mode SSL
+  (désactivé, préféré, obligatoire, vérification de l'autorité ou complète) et
+  certificat CA optionnel. Les certificats du système sont reconnus. Le mode
+  « vérification de l'autorité » contrôle encore le nom du serveur (limite de
+  la bibliothèque sqlx) : le mode obligatoire chiffre sans vérifier.
+- **Modèles de connexion** : MariaDB, PlanetScale, CockroachDB, TimescaleDB,
+  Supabase, Neon et Redshift, avec le bon port et le bon mode SSL ; le produit
+  s'affiche dans l'explorateur.
+- **Coller une URL** (`postgresql://…?sslmode=require`) remplit le formulaire de
+  connexion.
+
+### Corrections
+
+- Les mots de passe contenant `@`, `:`, `/`, `#`, `?` ou `%` fonctionnent. Un
+  mot de passe saisi encodé pour contourner le problème (par exemple `p%40ss`
+  pour `p@ss`) doit désormais être saisi tel quel.
+- Les index et clés étrangères absents d'un serveur (CockroachDB, Redshift)
+  n'empêchent plus d'afficher la table.
+
 ## [0.9.1] - 2026-10-09
 
 Première version publiée de la 0.9 : la publication de la 0.9.0 avait échoué

@@ -4763,6 +4763,8 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "rust_decimal",
+ "rustls 0.23.45",
+ "rustls-native-certs 0.8.4",
  "serde",
  "serde_json",
  "sha2",
@@ -4938,7 +4940,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storingUnicorns"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "azure_core",
@@ -4952,6 +4954,7 @@ dependencies = [
  "egui_extras",
  "futures-util",
  "openssl",
+ "percent-encoding",
  "ratatui",
  "rfd",
  "rust_decimal",
@@ -4972,6 +4975,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
  "winresource",
 ]
 

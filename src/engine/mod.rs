@@ -4,5 +4,6 @@ pub mod config;
 pub mod db;
 pub mod models;
 pub mod ops;
+pub mod presets;
 pub mod services;
 pub mod sql;

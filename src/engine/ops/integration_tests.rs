@@ -8,18 +8,33 @@
 //! - `SU_IT_MYSQL=mysql://user:pw@host:port/db`
 //! - `SU_IT_MSSQL=host=127.0.0.1;port=1433;user=sa;password=...;database=db`
 //!   (the database must exist)
+//! - `SU_IT_MARIADB=mysql://user:pw@host:port/db`
+//! - `SU_IT_COCKROACH=postgres://root@host:port/defaultdb` (insecure mode)
+//! - `SU_IT_PG_TLS=host:port` + `SU_IT_PG_TLS_CA=<ca.pem>`: a PostgreSQL that
+//!   only accepts TLS (`hostssl` + `hostnossl ... reject`), user `postgres`,
+//!   password `a@b:c/d#e?f%g`, certificate for `localhost` signed by the CA.
+//!
+//! Servers for the last three (from Git Bash on Windows, prefix the
+//! CockroachDB line with `MSYS_NO_PATHCONV=1`):
+//!
+//! ```text
+//! docker run -d --name su-it-mariadb -p 43307:3306 -e MARIADB_ROOT_PASSWORD=pw -e MARIADB_DATABASE=it mariadb:11
+//! docker run -d --name su-it-crdb -p 46257:26257 cockroachdb/cockroach:latest start-single-node --insecure
+//! scripts/it-pg-tls.sh   # generates the CA + server cert, starts su-it-pg-tls on 45433
+//! ```
 //!
 //! The tests (re)create their own tables in schema `su_it` (MySQL: in the
 //! connection's database), so they can be run repeatedly.
 
 use crate::engine::db::DatabaseConnection;
-use crate::engine::models::{ConnectionConfig, DatabaseType, NULL_CELL};
+use crate::engine::models::{ConnectionConfig, DatabaseType, SslMode, NULL_CELL};
 use crate::engine::ops::query::run_script;
 use crate::engine::ops::rows::{
     detect_system_columns, submit_changes, transaction_bounds, RowChanges,
 };
 use crate::engine::ops::schema::{table_ddl, table_details};
 use crate::engine::ops::transfer::{import_csv, qualified};
+use crate::engine::presets::parse_url;
 use crate::engine::services::table_cache::TableCache;
 use crate::engine::sql::paging::{build_count, build_select, DataQuery};
 use crate::engine::sql::statements::quote_chars;
@@ -589,6 +604,27 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
+/// Password of the special-character tests: every URL delimiter.
+const SPECIAL_PASSWORD: &str = "a@b:c/d#e?f%g";
+
+/// The connection the dialog builds from `dsn` pasted as a URL.
+fn config_from_url(dsn: &str) -> ConnectionConfig {
+    let p = parse_url(dsn).unwrap_or_else(|e| panic!("{dsn}: {e}"));
+    ConnectionConfig {
+        name: "it".into(),
+        db_type: p.db_type,
+        host: p.host,
+        port: p.port,
+        username: p.username,
+        password: p.password,
+        database: p.database.unwrap_or_default(),
+        ssl_mode: p.ssl_mode,
+        ssl_ca: p.ssl_ca,
+        flavor: p.flavor,
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn integration_postgres() {
@@ -687,12 +723,28 @@ async fn integration_mysql() {
         eprintln!("SU_IT_MYSQL not set, skipping");
         return;
     };
-    let conn = DatabaseConnection::MySQL(sqlx::MySqlPool::connect(&dsn).await.unwrap());
+    run_mysql_suite(&dsn).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_mariadb() {
+    let Some(dsn) = env("SU_IT_MARIADB") else {
+        eprintln!("SU_IT_MARIADB not set, skipping");
+        return;
+    };
+    // Same suite as MySQL: MariaDB speaks its protocol.
+    run_mysql_suite(&dsn).await;
+}
+
+/// The MySQL scenario, also run against MariaDB.
+async fn run_mysql_suite(dsn: &str) {
+    let conn = DatabaseConnection::MySQL(sqlx::MySqlPool::connect(dsn).await.unwrap());
     // One connection: a transaction leaked into the pool would be reused.
     let single = DatabaseConnection::MySQL(
         sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(1)
-            .connect(&dsn)
+            .connect(dsn)
             .await
             .unwrap(),
     );
@@ -755,7 +807,8 @@ async fn integration_mysql() {
             ("CAST(1.5 AS FLOAT)", "1.5"),
             ("DATE '2024-01-02'", "2024-01-02"),
             ("TIMESTAMP '2024-01-02 03:04:05'", "2024-01-02 03:04:05"),
-            ("CAST('{\"k\": 1}' AS JSON)", "{\"k\": 1}"),
+            // A JSON value on MySQL, LONGTEXT on MariaDB (no `CAST(... AS JSON)`).
+            ("JSON_OBJECT('k', 1)", "{\"k\": 1}"),
             ("b'1'", "\u{1}"),
             ("NULL", NULL_CELL),
             ("'NULL'", "NULL"),
@@ -778,6 +831,21 @@ async fn integration_mysql() {
     let r = exec(&conn, "SELECT * FROM su_types").await;
     assert_eq!(r.rows[0], ["-1", "-2", "-3", "4", "5", "1", "2024", "y"]);
     exec(&conn, "DROP TABLE su_types").await;
+    // A password full of URL delimiters reaches the server untouched.
+    exec(&conn, "DROP USER IF EXISTS 'su_special'@'%'").await;
+    exec(
+        &conn,
+        &format!("CREATE USER 'su_special'@'%' IDENTIFIED BY '{SPECIAL_PASSWORD}'"),
+    )
+    .await;
+    let special = ConnectionConfig {
+        username: Some("su_special".into()),
+        password: Some(SPECIAL_PASSWORD.into()),
+        database: String::new(),
+        ..config_from_url(dsn)
+    };
+    let c = DatabaseConnection::connect(&special).await.unwrap();
+    assert_eq!(scalar(&c, "SELECT 1").await, "1");
 }
 
 /// `host=...;port=...;user=...;password=...;database=...`
@@ -907,4 +975,115 @@ async fn integration_mssql() {
         ],
     )
     .await;
+}
+
+fn host_port(spec: &str) -> (String, u16) {
+    let (h, p) = spec.rsplit_once(':').expect("host:port");
+    (h.to_string(), p.parse().expect("port"))
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_pg_tls() {
+    let (Some(spec), Some(ca)) = (env("SU_IT_PG_TLS"), env("SU_IT_PG_TLS_CA")) else {
+        eprintln!("SU_IT_PG_TLS / SU_IT_PG_TLS_CA not set, skipping");
+        return;
+    };
+    let (host, port) = host_port(&spec);
+    let config = |mode: SslMode, ca: Option<&str>| ConnectionConfig {
+        name: "tls".into(),
+        db_type: DatabaseType::Postgres,
+        host: Some(host.clone()),
+        port: Some(port),
+        username: Some("postgres".into()),
+        password: Some(SPECIAL_PASSWORD.into()),
+        database: "postgres".into(),
+        ssl_mode: Some(mode),
+        ssl_ca: ca.map(Into::into),
+        ..Default::default()
+    };
+    let refused = |c: ConnectionConfig| async move {
+        match DatabaseConnection::connect(&c).await {
+            Ok(_) => panic!("{:?} must be refused", c.ssl_mode),
+            Err(e) => format!("{e:#}"),
+        }
+    };
+    let in_tls = "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()";
+
+    let e = refused(config(SslMode::Disable, None)).await;
+    assert!(e.contains("exige une connexion chiffrée"), "{e}");
+
+    // Encrypted, unverified; the special-character password went through
+    // untouched.
+    let conn = DatabaseConnection::connect(&config(SslMode::Require, None))
+        .await
+        .unwrap();
+    assert_eq!(scalar(&conn, in_tls).await, "true");
+    // The default mode negotiates TLS too.
+    let conn = DatabaseConnection::connect(&config(SslMode::Prefer, None))
+        .await
+        .unwrap();
+    assert_eq!(scalar(&conn, in_tls).await, "true");
+
+    let e = refused(config(SslMode::VerifyFull, None)).await;
+    assert!(e.contains("Certificat du serveur non reconnu"), "{e}");
+
+    let conn = DatabaseConnection::connect(&config(SslMode::VerifyFull, Some(&ca)))
+        .await
+        .unwrap();
+    assert_eq!(scalar(&conn, in_tls).await, "true");
+
+    // The certificate names `localhost`, not the address.
+    if host == "localhost" {
+        let by_ip = ConnectionConfig {
+            host: Some("127.0.0.1".into()),
+            ..config(SslMode::VerifyFull, Some(&ca))
+        };
+        let e = refused(by_ip).await;
+        assert!(e.contains("ne correspond pas à 127.0.0.1"), "{e}");
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_cockroach() {
+    let Some(dsn) = env("SU_IT_COCKROACH") else {
+        eprintln!("SU_IT_COCKROACH not set, skipping");
+        return;
+    };
+    // Insecure node: the default `Prefer` falls back to plain text.
+    let conn = DatabaseConnection::connect(&config_from_url(&dsn))
+        .await
+        .unwrap();
+    exec(&conn, "DROP TABLE IF EXISTS su_crdb").await;
+    exec(
+        &conn,
+        "CREATE TABLE su_crdb (id INT PRIMARY KEY, name STRING)",
+    )
+    .await;
+    exec(&conn, "INSERT INTO su_crdb VALUES (1, 'a')").await;
+    let schemas = conn.get_tables_by_schema().await.unwrap();
+    assert!(
+        schemas
+            .iter()
+            .any(|s| s.tables.iter().any(|t| t.contains("su_crdb"))),
+        "{schemas:?}"
+    );
+    let cache = TableCache::default();
+    // Details must not fail even where Cockroach lacks catalog pieces.
+    let d = table_details(&conn, &cache, "public.su_crdb")
+        .await
+        .unwrap();
+    assert!(
+        d.columns.iter().any(|c| c.name == "name"),
+        "{:?}",
+        d.columns
+    );
+    table_ddl(&conn, &cache, &DatabaseType::Postgres, "public.su_crdb")
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar(&conn, "SELECT name FROM su_crdb WHERE id = 1").await,
+        "a"
+    );
 }

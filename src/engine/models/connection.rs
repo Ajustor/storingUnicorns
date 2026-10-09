@@ -44,6 +44,90 @@ impl std::fmt::Display for DatabaseType {
     }
 }
 
+/// TLS policy for PostgreSQL / MySQL (ignored by the other drivers).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum SslMode {
+    Disable,
+    /// TLS when the server offers it (psql's default).
+    #[default]
+    Prefer,
+    /// Encrypted, certificate not verified.
+    Require,
+    /// Encrypted, certificate signed by a trusted CA.
+    VerifyCa,
+    /// `VerifyCa` + the certificate matches the host name.
+    VerifyFull,
+}
+
+impl SslMode {
+    pub const ALL: [SslMode; 5] = [
+        SslMode::Disable,
+        SslMode::Prefer,
+        SslMode::Require,
+        SslMode::VerifyCa,
+        SslMode::VerifyFull,
+    ];
+}
+
+impl std::fmt::Display for SslMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SslMode::Disable => "Désactivé",
+            SslMode::Prefer => "Préféré",
+            SslMode::Require => "Obligatoire",
+            SslMode::VerifyCa => "Vérifier l'autorité (CA)",
+            SslMode::VerifyFull => "Vérification complète",
+        })
+    }
+}
+
+/// A PostgreSQL- or MySQL-compatible product. Display and dialog defaults
+/// only: the driver is still `db_type`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum Flavor {
+    MariaDb,
+    PlanetScale,
+    CockroachDb,
+    TimescaleDb,
+    Supabase,
+    Neon,
+    Redshift,
+}
+
+impl Flavor {
+    pub const ALL: [Flavor; 7] = [
+        Flavor::MariaDb,
+        Flavor::PlanetScale,
+        Flavor::CockroachDb,
+        Flavor::TimescaleDb,
+        Flavor::Supabase,
+        Flavor::Neon,
+        Flavor::Redshift,
+    ];
+
+    /// The driver this product speaks.
+    pub fn driver(self) -> DatabaseType {
+        match self {
+            Flavor::MariaDb | Flavor::PlanetScale => DatabaseType::MySQL,
+            _ => DatabaseType::Postgres,
+        }
+    }
+}
+
+impl std::fmt::Display for Flavor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Flavor::MariaDb => "MariaDB",
+            Flavor::PlanetScale => "PlanetScale",
+            Flavor::CockroachDb => "CockroachDB",
+            Flavor::TimescaleDb => "TimescaleDB",
+            Flavor::Supabase => "Supabase",
+            Flavor::Neon => "Neon",
+            Flavor::Redshift => "Redshift",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub name: String,
@@ -60,16 +144,38 @@ pub struct ConnectionConfig {
     /// RGB colour used to tag the connection in the GUI.
     #[serde(default)]
     pub color: Option<[u8; 3]>,
+    /// PostgreSQL / MySQL only; `None` = `SslMode::Prefer`.
+    #[serde(default)]
+    pub ssl_mode: Option<SslMode>,
+    /// Extra trusted CA certificate (PEM).
+    #[serde(default)]
+    pub ssl_ca: Option<std::path::PathBuf>,
+    /// Compatible product shown instead of the bare engine.
+    #[serde(default)]
+    pub flavor: Option<Flavor>,
 }
 
 impl ConnectionConfig {
+    pub fn effective_ssl_mode(&self) -> SslMode {
+        self.ssl_mode.unwrap_or_default()
+    }
+
+    /// The flavor when it matches the driver, else the engine name.
+    pub fn display_type(&self) -> String {
+        match self.flavor {
+            Some(f) if f.driver() == self.db_type => f.to_string(),
+            _ => self.db_type.to_string(),
+        }
+    }
+
+    /// For display and logs only; never contains the password. (SQLite
+    /// still connects with it: its string is just the file path.)
     pub fn to_connection_string(&self) -> String {
         match self.db_type {
             DatabaseType::Postgres => {
                 format!(
-                    "postgres://{}:{}@{}:{}/{}",
+                    "postgres://{}@{}:{}/{}",
                     self.username.as_deref().unwrap_or("postgres"),
-                    self.password.as_deref().unwrap_or(""),
                     self.host.as_deref().unwrap_or("localhost"),
                     self.port.unwrap_or(5432),
                     self.database
@@ -77,9 +183,8 @@ impl ConnectionConfig {
             }
             DatabaseType::MySQL => {
                 format!(
-                    "mysql://{}:{}@{}:{}/{}",
+                    "mysql://{}@{}:{}/{}",
                     self.username.as_deref().unwrap_or("root"),
-                    self.password.as_deref().unwrap_or(""),
                     self.host.as_deref().unwrap_or("localhost"),
                     self.port.unwrap_or(3306),
                     self.database
@@ -126,6 +231,9 @@ impl Default for ConnectionConfig {
             azure_auth_method: None,
             tenant_id: None,
             color: None,
+            ssl_mode: None,
+            ssl_ca: None,
+            flavor: None,
         }
     }
 }
@@ -169,6 +277,11 @@ pub struct TableDetails {
     pub columns: Vec<Column>,
     pub indexes: Vec<IndexInfo>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
+    /// Why `indexes` is empty when the server couldn't list them
+    /// (CockroachDB, Redshift…).
+    pub indexes_error: Option<String>,
+    /// Same for `foreign_keys`.
+    pub foreign_keys_error: Option<String>,
 }
 
 /// The value of a NULL cell. Cells are text, so NULL needs a value of its
@@ -248,6 +361,76 @@ mod tests {
         let c: ConnectionConfig =
             toml::from_str("name = \"x\"\ndb_type = \"SQLite\"\ndatabase = \"a.db\"").unwrap();
         assert_eq!(c.color, None);
+        assert_eq!(c.ssl_mode, None);
+        assert_eq!(c.ssl_ca, None);
+        assert_eq!(c.flavor, None);
+    }
+
+    #[test]
+    fn old_config_without_new_fields_loads() {
+        let json = r#"{"name":"a","db_type":"Postgres","host":"h","port":5432,
+            "username":"u","password":"p","database":"d"}"#;
+        let c: ConnectionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.ssl_mode, None);
+        assert_eq!(c.ssl_ca, None);
+        assert_eq!(c.flavor, None);
+        assert_eq!(c.effective_ssl_mode(), SslMode::Prefer);
+    }
+
+    #[test]
+    fn new_fields_round_trip() {
+        let c = ConnectionConfig {
+            ssl_mode: Some(SslMode::VerifyFull),
+            ssl_ca: Some("C:/ca.pem".into()),
+            flavor: Some(Flavor::Supabase),
+            ..Default::default()
+        };
+        let back: ConnectionConfig =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.ssl_mode, Some(SslMode::VerifyFull));
+        assert_eq!(back.ssl_ca, Some(std::path::PathBuf::from("C:/ca.pem")));
+        assert_eq!(back.flavor, Some(Flavor::Supabase));
+        // The connections file is TOML.
+        let back: ConnectionConfig = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.ssl_mode, Some(SslMode::VerifyFull));
+        assert_eq!(back.ssl_ca, Some(std::path::PathBuf::from("C:/ca.pem")));
+        assert_eq!(back.flavor, Some(Flavor::Supabase));
+    }
+
+    #[test]
+    fn connection_string_never_contains_the_password() {
+        let c = ConnectionConfig {
+            username: Some("u".into()),
+            password: Some("s3cr3t".into()),
+            ..Default::default()
+        };
+        assert!(!c.to_connection_string().contains("s3cr3t"));
+        assert_eq!(
+            c.to_connection_string(),
+            "postgres://u@localhost:5432/postgres"
+        );
+        let c = ConnectionConfig {
+            db_type: DatabaseType::MySQL,
+            port: Some(3306),
+            ..c
+        };
+        assert_eq!(
+            c.to_connection_string(),
+            "mysql://u@localhost:3306/postgres"
+        );
+    }
+
+    #[test]
+    fn display_type_shows_a_matching_flavor_only() {
+        let mut c = ConnectionConfig {
+            flavor: Some(Flavor::Supabase),
+            ..Default::default()
+        };
+        assert_eq!(c.display_type(), "Supabase");
+        c.db_type = DatabaseType::MySQL; // Supabase is PostgreSQL: ignored
+        assert_eq!(c.display_type(), "MySQL");
+        c.flavor = Some(Flavor::MariaDb);
+        assert_eq!(c.display_type(), "MariaDB");
     }
 
     #[test]

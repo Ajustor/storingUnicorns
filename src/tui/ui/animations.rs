@@ -220,7 +220,9 @@ pub fn render_neon_border(frame: &mut Frame, area: Rect, elapsed_ms: u128) {
 pub fn compute_modal_area(frame_area: Rect, dialog_mode: DialogMode) -> Rect {
     use crate::tui::ui::modals::centered_rect;
     match dialog_mode {
-        DialogMode::NewConnection | DialogMode::EditConnection => centered_rect(60, 70, frame_area),
+        DialogMode::NewConnection | DialogMode::EditConnection => {
+            crate::tui::ui::modals::connection_dialog_rect(frame_area)
+        }
         DialogMode::EditRow | DialogMode::AddRow => centered_rect(70, 80, frame_area),
         DialogMode::SchemaModify => centered_rect(70, 80, frame_area),
         DialogMode::Export | DialogMode::Import => centered_rect(50, 30, frame_area),

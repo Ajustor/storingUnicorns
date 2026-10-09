@@ -326,7 +326,10 @@ async fn connect_with_managed_identity(config: &ConnectionConfig) -> Result<TdsC
     // azure_identity 0.22 has no `ManagedIdentityCredential`: App Service,
     // Functions and Container Apps expose `IDENTITY_ENDPOINT` (system identity
     // only in this version), other Azure hosts (VM, scale sets, AKS…) IMDS.
-    let options = TokenCredentialOptions::default();
+    // The identity endpoint picks the authority itself; set it anyway so the
+    // options match the server's cloud.
+    let mut options = TokenCredentialOptions::default();
+    options.set_authority_host(format!("https://{}", cloud.authority_host()));
     let credential: std::sync::Arc<dyn TokenCredential> =
         if std::env::var_os("IDENTITY_ENDPOINT").is_some() {
             if client_id.is_some() {

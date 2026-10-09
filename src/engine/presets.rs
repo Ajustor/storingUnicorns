@@ -112,6 +112,8 @@ pub fn parse_url(input: &str) -> Result<ParsedUrl, String> {
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "sslmode" | "ssl-mode" | "ssl_mode" => ssl_mode = parse_ssl_mode(&value),
+            // `system` (psql >= 16): the system roots, which are always used.
+            "sslrootcert" | "ssl-ca" if value == "system" => ssl_ca = None,
             "sslrootcert" | "ssl-ca" => ssl_ca = Some(std::path::PathBuf::from(value.as_ref())),
             _ => {}
         }
@@ -265,6 +267,16 @@ mod tests {
             parse_url("postgres://h/d?sslmode=bogus").unwrap().ssl_mode,
             None
         );
+    }
+
+    #[test]
+    fn sslrootcert_system_means_the_system_roots() {
+        // psql >= 16 (Neon's docs): the system roots, which are always used.
+        let p =
+            parse_url("postgresql://u:p@ep-x.neon.tech/db?sslmode=verify-full&sslrootcert=system")
+                .unwrap();
+        assert_eq!(p.ssl_ca, None);
+        assert_eq!(p.ssl_mode, Some(SslMode::VerifyFull));
     }
 
     #[test]

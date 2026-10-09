@@ -1474,7 +1474,7 @@ pub(crate) async fn handle_execute_query(state: &mut AppState) {
                 result.rows.len(),
                 result.execution_time_ms
             );
-            show_result(state, result);
+            show_result(state, result, Some(query));
             state.set_status(msg);
         }
         Err(e) => state.set_status(format!("Query error: {e}")),
@@ -1493,6 +1493,11 @@ pub(crate) async fn handle_execute_current_query(state: &mut AppState) {
     state.is_loading = true;
     let outcome =
         ops::query::run_at_cursor(state.connection.as_ref().unwrap(), &text, cursor).await;
+    // The single statement that ran, if it was one.
+    let sql = match crate::engine::sql::statements::get_execution_unit_at_cursor(&text, cursor) {
+        crate::engine::sql::statements::ExecutionUnit::Single(sql) => Some(sql),
+        _ => None,
+    };
     state.is_loading = false;
     match outcome {
         Ok(Executed::Query(result)) => {
@@ -1501,7 +1506,7 @@ pub(crate) async fn handle_execute_current_query(state: &mut AppState) {
                 result.rows.len(),
                 result.execution_time_ms
             );
-            show_result(state, result);
+            show_result(state, result, sql);
             state.set_status(msg);
         }
         Ok(Executed::Transaction { result, statements }) => {
@@ -1517,7 +1522,7 @@ pub(crate) async fn handle_execute_current_query(state: &mut AppState) {
                     result.execution_time_ms
                 )
             };
-            show_result(state, result);
+            show_result(state, result, None);
             state.set_status(msg);
         }
         Err(RunError::Query(e)) => state.set_status(format!("Query error: {e}")),
@@ -1525,8 +1530,15 @@ pub(crate) async fn handle_execute_current_query(state: &mut AppState) {
     }
 }
 
-fn show_result(state: &mut AppState, result: crate::engine::models::QueryResult) {
+/// Show `result`, produced by `sql` (`None` for a transaction block: its
+/// rows can't be edited).
+fn show_result(
+    state: &mut AppState,
+    result: crate::engine::models::QueryResult,
+    sql: Option<String>,
+) {
     state.query_result = Some(result);
+    state.result_sql = sql;
     state.update_known_columns(); // Update columns for autocompletion
     state.compute_col_widths(); // Cache column widths once
     state.selected_row = 0;
@@ -3238,6 +3250,30 @@ mod tests {
             ..QueryResult::default()
         });
         state
+    }
+
+    #[tokio::test]
+    async fn row_dialogs_only_open_for_single_keyed_table_results() {
+        let mut state = debug_state().await;
+        state.query_result.as_mut().unwrap().primary_key = vec!["id".into()];
+        let open = |state: &mut AppState, sql: &str| {
+            state.result_sql = Some(sql.to_string());
+            state.editing_table_name = None;
+            state.dialog_mode = DialogMode::None;
+            state.open_edit_row_dialog();
+            state.editing_table_name.clone()
+        };
+        assert_eq!(open(&mut state, "SELECT * FROM t"), Some("t".into()));
+        assert!(matches!(state.dialog_mode, DialogMode::EditRow));
+        assert_eq!(open(&mut state, "SELECT valid_from, id, name FROM t"), Some("t".into()));
+        assert_eq!(open(&mut state, "SELECT * FROM t JOIN u ON u.id = t.id"), None);
+        assert!(matches!(state.dialog_mode, DialogMode::None));
+        assert!(state.status_message.starts_with("Read-only"));
+        state.query_result.as_mut().unwrap().primary_key.clear();
+        assert_eq!(open(&mut state, "SELECT * FROM t"), None, "no primary key");
+        state.result_sql = None;
+        state.open_delete_row_confirm();
+        assert!(matches!(state.dialog_mode, DialogMode::None));
     }
 
     #[tokio::test]

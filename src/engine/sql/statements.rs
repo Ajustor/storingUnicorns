@@ -183,30 +183,284 @@ pub fn get_execution_unit_at_cursor(input: &str, cursor_pos: usize) -> Execution
     }
 }
 
-/// Extract table name from a query (simple heuristic for SELECT ... FROM table)
-/// Supports schema.table format and quoted identifiers
+/// A token of a query, as needed to recognise its shape. Whitespace and
+/// comments are dropped.
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    /// A bare word: keyword or unquoted identifier (`valid_from`, `@x`).
+    Word(String),
+    /// A quoted identifier, quotes included (`"t"`, `` `t` ``, `[t]`).
+    Quoted(String),
+    /// A string literal.
+    Str,
+    Number,
+    /// Any other single character (`.`, `,`, `(`, `)`, `*`, `;`, `=`…).
+    Punct(char),
+}
+
+impl Tok {
+    /// Whether this is the keyword `kw` (upper case).
+    fn is(&self, kw: &str) -> bool {
+        matches!(self, Tok::Word(w) if w.eq_ignore_ascii_case(kw))
+    }
+
+    fn is_name(&self) -> bool {
+        matches!(self, Tok::Word(_) | Tok::Quoted(_))
+    }
+
+    fn text(&self) -> &str {
+        match self {
+            Tok::Word(w) | Tok::Quoted(w) => w,
+            _ => "",
+        }
+    }
+}
+
+/// Split `sql` into tokens, skipping whitespace and comments. String
+/// literals and quoted identifiers are single tokens, so words inside them
+/// (or inside identifiers such as `valid_from`) are never keywords.
+fn tokens(sql: &str) -> Vec<Tok> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let word_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$' | '@' | '#');
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '-' && next == Some('-') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            i += 2;
+            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                i += 1;
+            }
+            i += 2;
+        } else if matches!(c, '\'' | '"' | '`' | '[') {
+            let close = if c == '[' { ']' } else { c };
+            let start = i;
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == close {
+                    if chars.get(i + 1) == Some(&close) {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(chars.len());
+            out.push(if c == '\'' {
+                Tok::Str
+            } else {
+                Tok::Quoted(chars[start..i].iter().collect())
+            });
+        } else if c.is_ascii_digit() {
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '.') {
+                i += 1;
+            }
+            out.push(Tok::Number);
+        } else if word_char(c) {
+            let start = i;
+            while i < chars.len() && word_char(chars[i]) {
+                i += 1;
+            }
+            out.push(Tok::Word(chars[start..i].iter().collect()));
+        } else {
+            out.push(Tok::Punct(c));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A possibly qualified name starting at `toks[i]` (`t`, `s.t`, `"s"."t"`):
+/// its text without whitespace and the index after it.
+fn qualified_name(toks: &[Tok], mut i: usize) -> Option<(String, usize)> {
+    let mut name = String::new();
+    loop {
+        let part = toks.get(i).filter(|t| t.is_name())?;
+        name.push_str(part.text());
+        i += 1;
+        if toks.get(i) != Some(&Tok::Punct('.')) {
+            return Some((name, i));
+        }
+        name.push('.');
+        i += 1;
+    }
+}
+
+/// Clause keywords that may follow a table name, so they are not its alias.
+const AFTER_TABLE: &[&str] = &[
+    "WHERE",
+    "ORDER",
+    "LIMIT",
+    "OFFSET",
+    "FETCH",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "CROSS",
+    "NATURAL",
+    "OUTER",
+    "STRAIGHT_JOIN",
+    "GROUP",
+    "HAVING",
+    "WINDOW",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "MINUS",
+    "FOR",
+    "WITH",
+    "ON",
+    "USING",
+    "INTO",
+    "QUALIFY",
+];
+
+/// Keywords that may not appear (outside parentheses) after the table of a
+/// `single_table_source` query.
+const NOT_AFTER_SOURCE: &[&str] = &[
+    "JOIN",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "MINUS",
+    "GROUP",
+    "HAVING",
+    "WINDOW",
+    "INTO",
+    "FOR",
+    "FROM",
+    "SELECT",
+    "WITH",
+];
+
+/// Table name of a query (the first name after a top-level `FROM` keyword),
+/// as written, quotes kept so it can be reused in SQL. Lenient: the query
+/// may join other tables. Used for titles and default export names; use
+/// `single_table_source` to decide whether rows can be edited.
 pub fn extract_table_from_query(query: &str) -> Option<String> {
-    let query_upper = query.to_uppercase();
-    if let Some(from_pos) = query_upper.find("FROM") {
-        let after_from = query[from_pos + 4..].trim_start();
-        // Take the first word after FROM (including schema.table and quoted identifiers)
-        let table_name: String = after_from
-            .chars()
-            .take_while(|c| {
-                c.is_alphanumeric()
-                    || *c == '_'
-                    || *c == '.'
-                    || *c == '['
-                    || *c == ']'
-                    || *c == '"'
-                    || *c == '`'
-            })
-            .collect();
-        if !table_name.is_empty() {
-            return Some(table_name);
+    let toks = tokens(query);
+    let mut depth = 0i32;
+    for (i, tok) in toks.iter().enumerate() {
+        match tok {
+            Tok::Punct('(') => depth += 1,
+            Tok::Punct(')') => depth -= 1,
+            t if depth == 0 && t.is("FROM") => {
+                return qualified_name(&toks, i + 1).map(|(name, _)| name);
+            }
+            _ => {}
         }
     }
     None
+}
+
+/// The table a query reads when each of its rows is one row of that table,
+/// with its columns unchanged; `None` otherwise. Only this shape is accepted:
+///
+/// `SELECT [TOP n] <cols> FROM <table> [[AS] alias] [WHERE …] [ORDER BY …]
+/// [LIMIT/OFFSET/FETCH …]`
+///
+/// where `<cols>` lists `*`, `alias.*` or plain (possibly qualified) column
+/// names, without aliases or expressions (`SELECT name AS id` would make
+/// edits of "id" write to another column). Joins, comma lists, subqueries in
+/// FROM, set operations, GROUP BY/HAVING, DISTINCT, CTEs, `INTO`, `FOR XML`
+/// and several statements are rejected. Keywords are recognised as tokens,
+/// never inside identifiers (`valid_from`) or strings. The name is returned
+/// as written (quotes kept).
+pub fn single_table_source(sql: &str) -> Option<String> {
+    let mut toks = tokens(sql);
+    if toks.last() == Some(&Tok::Punct(';')) {
+        toks.pop();
+    }
+    if !toks.first()?.is("SELECT") {
+        return None;
+    }
+    let mut i = 1;
+    if toks.get(i)?.is("TOP") {
+        i += 1;
+        match toks.get(i)? {
+            Tok::Number => i += 1,
+            Tok::Punct('(')
+                if toks.get(i + 1) == Some(&Tok::Number)
+                    && toks.get(i + 2) == Some(&Tok::Punct(')')) =>
+            {
+                i += 3
+            }
+            _ => return None,
+        }
+    }
+
+    // Select list: `*`, `q.*` or `[q.]col`, comma separated, up to FROM.
+    loop {
+        let tok = toks.get(i)?;
+        if *tok == Tok::Punct('*') {
+            i += 1;
+        } else if tok.is_name() && !tok.is("FROM") && !tok.is("DISTINCT") && !tok.is("ALL") {
+            i += 1;
+            while toks.get(i) == Some(&Tok::Punct('.')) {
+                match toks.get(i + 1)? {
+                    Tok::Punct('*') => {
+                        i += 2;
+                        break;
+                    }
+                    t if t.is_name() => i += 2,
+                    _ => return None,
+                }
+            }
+        } else {
+            return None;
+        }
+        match toks.get(i)? {
+            Tok::Punct(',') => i += 1,
+            t if t.is("FROM") => break,
+            _ => return None,
+        }
+    }
+    i += 1; // FROM
+
+    let (table, mut i) = qualified_name(&toks, i)?;
+    let is_clause = |t: &Tok| AFTER_TABLE.iter().any(|kw| t.is(kw));
+    // Optional alias.
+    if toks.get(i).is_some_and(|t| t.is("AS")) {
+        i += 1;
+        if !toks.get(i).is_some_and(|t| t.is_name() && !is_clause(t)) {
+            return None;
+        }
+        i += 1;
+    } else if toks.get(i).is_some_and(|t| t.is_name() && !is_clause(t)) {
+        i += 1;
+    }
+
+    // What follows: only filtering, ordering and paging clauses.
+    match toks.get(i) {
+        None => return Some(table),
+        Some(t)
+            if ["WHERE", "ORDER", "LIMIT", "OFFSET", "FETCH"]
+                .iter()
+                .any(|kw| t.is(kw)) => {}
+        Some(_) => return None,
+    }
+    let mut depth = 0i32;
+    for tok in &toks[i..] {
+        match tok {
+            Tok::Punct('(') => depth += 1,
+            Tok::Punct(')') => depth -= 1,
+            // Another statement.
+            Tok::Punct(';') => return None,
+            t if depth == 0 && NOT_AFTER_SOURCE.iter().any(|kw| t.is(kw)) => return None,
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(table)
 }
 
 /// Identifier quote characters `(open, close)` for a database type.
@@ -377,6 +631,104 @@ mod helper_tests {
             Some("dbo.[Users]".into())
         );
         assert_eq!(extract_table_from_query("SELECT 1"), None);
+    }
+
+    #[test]
+    fn extract_table_ignores_from_inside_identifiers_and_strings() {
+        assert_eq!(
+            extract_table_from_query("SELECT valid_from FROM users"),
+            Some("users".into())
+        );
+        assert_eq!(
+            extract_table_from_query("SELECT 'FROM x' AS \"from\" FROM t1"),
+            Some("t1".into())
+        );
+        assert_eq!(
+            extract_table_from_query(
+                "-- FROM nope
+SELECT a FROM \"main\".\"t\" u"
+            ),
+            Some("\"main\".\"t\"".into())
+        );
+        assert_eq!(
+            extract_table_from_query("SELECT a FROM `db`.`my t` JOIN b ON 1=1"),
+            Some("`db`.`my t`".into())
+        );
+        assert_eq!(extract_table_from_query("SELECT fromage FROM"), None);
+    }
+
+    #[test]
+    fn single_table_source_accepts_one_plain_table() {
+        let some = |s: &str| Some(s.to_string());
+        for (sql, table) in [
+            ("SELECT * FROM users", "users"),
+            ("select * from users;", "users"),
+            ("SELECT valid_from FROM users", "users"),
+            (
+                "SELECT id, name FROM dbo.[Users] WHERE id > 1",
+                "dbo.[Users]",
+            ),
+            ("SELECT u.id, u.* FROM users u ORDER BY u.id DESC", "users"),
+            (
+                "SELECT \"id\" FROM \"main\".\"t\" AS x LIMIT 5 OFFSET 10",
+                "\"main\".\"t\"",
+            ),
+            (
+                "SELECT * FROM `db`.`t` WHERE (a = 1 OR b IN (SELECT b FROM c))",
+                "`db`.`t`",
+            ),
+            (
+                "SELECT * FROM [t] ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY",
+                "[t]",
+            ),
+            ("SELECT TOP 100 * FROM t", "t"),
+            ("SELECT TOP (10) id FROM t", "t"),
+            (
+                "/* c */ SELECT * -- x
+ FROM t WHERE a = 'UNION'",
+                "t",
+            ),
+        ] {
+            assert_eq!(single_table_source(sql), some(table), "{sql}");
+        }
+    }
+
+    #[test]
+    fn single_table_source_rejects_other_shapes() {
+        for sql in [
+            "SELECT 1",
+            "SELECT * FROM a JOIN b ON a.id = b.id",
+            "SELECT * FROM a INNER JOIN b ON a.id = b.id",
+            "SELECT * FROM a LEFT OUTER JOIN b USING (id)",
+            "SELECT * FROM a NATURAL JOIN b",
+            "SELECT * FROM a CROSS JOIN b",
+            "SELECT * FROM a, b",
+            "SELECT * FROM a x, b y WHERE x.id = y.id",
+            "SELECT * FROM (SELECT * FROM t) s",
+            "SELECT * FROM t UNION SELECT * FROM u",
+            "SELECT * FROM t WHERE a = 1 UNION ALL SELECT * FROM t",
+            "SELECT * FROM t INTERSECT SELECT * FROM u",
+            "SELECT * FROM t EXCEPT SELECT * FROM u",
+            "SELECT a, COUNT(*) FROM t GROUP BY a",
+            "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1",
+            "SELECT DISTINCT a FROM t",
+            "WITH c AS (SELECT * FROM t) SELECT * FROM c",
+            "SELECT name AS id FROM t",
+            "SELECT name id FROM t",
+            "SELECT upper(name) FROM t",
+            "SELECT a + 1 FROM t",
+            "SELECT * FROM t; DELETE FROM t",
+            "SELECT * FROM t FOR XML AUTO",
+            "SELECT * FROM t WITH (NOLOCK)",
+            "SELECT * INTO u FROM t",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "INSERT INTO t SELECT * FROM u",
+            "SELECT * FROM",
+            "",
+        ] {
+            assert_eq!(single_table_source(sql), None, "{sql}");
+        }
     }
 
     #[test]

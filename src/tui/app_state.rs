@@ -8,7 +8,12 @@ use crate::engine::services::table_cache::{FetchQueue, TableCache};
 use crate::engine::config::AppConfig;
 use crate::engine::db::DatabaseConnection;
 use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType, QueryResult, SchemaInfo};
+use crate::engine::sql::statements::single_table_source;
 use crate::tui::ui::modals::SchemaAction;
+
+/// Status shown when the current result can't be edited row by row.
+const READ_ONLY_RESULT: &str =
+    "Read-only result: rows must come from one table with its whole primary key";
 
 /// Active panel in the UI
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +307,8 @@ pub struct AppState {
 
     // Results state
     pub query_result: Option<QueryResult>,
+    /// The SQL that produced `query_result` (`None` for a transaction block).
+    pub result_sql: Option<String>,
     pub results_scroll: usize,
     pub results_scroll_x: usize,             // Horizontal scroll offset
     pub results_visible_height: Cell<usize>, // Updated each frame by render
@@ -388,6 +395,7 @@ impl AppState {
             fetch_queue: FetchQueue::default(),
             current_table_context: None,
             query_result: None,
+            result_sql: None,
             results_scroll: 0,
             results_scroll_x: 0,
             results_visible_height: Cell::new(0),
@@ -528,7 +536,11 @@ impl AppState {
     /// Open delete row confirmation dialog
     pub fn open_delete_row_confirm(&mut self) {
         if self.query_result.is_some() {
-            self.editing_table_name = self.extract_table_from_query();
+            self.editing_table_name = self.editable_result_table();
+            if self.editing_table_name.is_none() {
+                self.set_status(READ_ONLY_RESULT);
+                return;
+            }
             self.dialog_mode = DialogMode::DeleteRowConfirm;
         }
     }
@@ -926,10 +938,13 @@ impl AppState {
     pub fn open_edit_row_dialog(&mut self) {
         if let Some(ref result) = self.query_result {
             if let Some(row) = result.rows.get(self.selected_row) {
+                let Some(table) = self.editable_result_table() else {
+                    self.set_status(READ_ONLY_RESULT);
+                    return;
+                };
                 self.editing_row = Some(row.clone());
                 self.original_editing_row = Some(row.clone());
-                // Extract table name from query (simple heuristic)
-                self.editing_table_name = self.extract_table_from_query();
+                self.editing_table_name = Some(table);
                 self.editing_column = 0;
                 self.editing_cursor = row.first().map(|s| s.len()).unwrap_or(0);
                 self.system_columns = Vec::new(); // No system columns for edit mode
@@ -947,9 +962,13 @@ impl AppState {
             // Detect system columns (auto-generated: id, created_at, updated_at, etc.)
             self.system_columns = crate::engine::ops::rows::detect_system_columns(&result.columns);
 
+            let Some(table) = self.result_sql.as_deref().and_then(single_table_source) else {
+                self.set_status("Cannot add a row: the result does not read a single table");
+                return;
+            };
             self.editing_row = Some(empty_row);
             self.original_editing_row = None; // No original for new rows
-            self.editing_table_name = self.extract_table_from_query();
+            self.editing_table_name = Some(table);
 
             // Find first non-system column to start editing
             let first_editable = (0..result.columns.len())
@@ -967,31 +986,19 @@ impl AppState {
         self.system_columns.contains(&idx)
     }
 
-    /// Extract table name from current query (simple heuristic for SELECT ... FROM table)
-    /// Supports schema.table format and quoted identifiers
+    /// Table whose rows the current result shows, when they can be updated
+    /// or deleted (`ops::query::editable_table`: a single table with its
+    /// whole primary key in the result).
+    fn editable_result_table(&self) -> Option<String> {
+        let sql = self.result_sql.as_deref()?;
+        crate::engine::ops::query::editable_table(sql, self.query_result.as_ref()?)
+    }
+
+    /// Default table name for export/import: the table the last result (or
+    /// the editor's query) reads from.
     fn extract_table_from_query(&self) -> Option<String> {
-        let query_input = self.query_input();
-        let query = query_input.to_uppercase();
-        if let Some(from_pos) = query.find("FROM") {
-            let after_from = &query_input[from_pos + 4..].trim_start();
-            // Take the first word after FROM (including schema.table and quoted identifiers)
-            let table_name: String = after_from
-                .chars()
-                .take_while(|c| {
-                    c.is_alphanumeric()
-                        || *c == '_'
-                        || *c == '.'
-                        || *c == '['
-                        || *c == ']'
-                        || *c == '"'
-                        || *c == '`'
-                })
-                .collect();
-            if !table_name.is_empty() {
-                return Some(table_name);
-            }
-        }
-        None
+        let sql = self.result_sql.as_deref().unwrap_or(self.query_input());
+        crate::engine::sql::statements::extract_table_from_query(sql)
     }
 
     /// Update scroll positions to follow cursor

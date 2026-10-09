@@ -180,6 +180,10 @@ pub struct QueryResult {
     pub execution_time_ms: u128,
     /// True when fetching stopped at a row cap (more rows were available).
     pub truncated: bool,
+    /// Primary-key columns of the table the rows come from, when the query
+    /// reads a single table (`statements::single_table_source`); empty
+    /// otherwise or when that table has no primary key.
+    pub primary_key: Vec<String>,
 }
 
 /// Represents a table with its schema

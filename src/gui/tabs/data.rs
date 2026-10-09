@@ -441,6 +441,7 @@ mod tests {
             rows_affected: 0,
             execution_time_ms: 12,
             truncated: false,
+            primary_key: vec!["id".into()],
         }
     }
 

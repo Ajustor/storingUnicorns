@@ -5,8 +5,8 @@ use anyhow::{bail, Result};
 use crate::engine::db::DatabaseConnection;
 use crate::engine::models::{QueryResult, SchemaInfo};
 use crate::engine::sql::statements::{
-    extract_table_from_query, get_execution_unit_at_cursor, is_transaction_end,
-    is_transaction_start, split_statements, ExecutionUnit,
+    get_execution_unit_at_cursor, is_transaction_end, is_transaction_start, single_table_source,
+    split_statements, ExecutionUnit,
 };
 
 /// Outcome of executing the SQL at the cursor.
@@ -80,10 +80,14 @@ async fn run_query_limited(
     Ok(result)
 }
 
-/// When `sql` reads from a single table, flag the result columns with their
-/// nullability and primary-key status. Metadata lookups are best effort.
+/// When each row of `sql` is a row of a single table
+/// (`single_table_source`), flag the result columns with their nullability
+/// and primary-key status and record the table's key in
+/// `result.primary_key`. Joins and other shapes are left alone: a column
+/// named like a key column of the first table is not that key. Metadata
+/// lookups are best effort.
 async fn enrich(conn: &DatabaseConnection, sql: &str, result: &mut QueryResult) {
-    let Some(table) = extract_table_from_query(sql) else {
+    let Some(table) = single_table_source(sql) else {
         return;
     };
     if let Ok(nullability) = conn.get_column_nullability(&table).await {
@@ -97,7 +101,30 @@ async fn enrich(conn: &DatabaseConnection, sql: &str, result: &mut QueryResult) 
         for col in &mut result.columns {
             col.is_primary_key = pks.contains(&col.name);
         }
+        result.primary_key = pks;
     }
+}
+
+/// The table whose rows `result` (from `sql`) shows, when they can be
+/// edited: `sql` reads a single table (`single_table_source`), that table
+/// has a primary key, every key column appears exactly once in the result
+/// and no column name is repeated. Updates and deletes then target exactly
+/// the displayed row.
+pub fn editable_table(sql: &str, result: &QueryResult) -> Option<String> {
+    let table = single_table_source(sql)?;
+    if result.primary_key.is_empty() {
+        return None;
+    }
+    let names = &result.columns;
+    let unique = names
+        .iter()
+        .enumerate()
+        .all(|(i, c)| names[..i].iter().all(|o| o.name != c.name));
+    let keyed = result
+        .primary_key
+        .iter()
+        .all(|pk| names.iter().any(|c| c.name == *pk));
+    (unique && keyed).then_some(table)
 }
 
 /// Run one execution unit. Single statements are capped at `max_rows` and
@@ -264,6 +291,58 @@ mod tests {
         let name = r.columns.iter().find(|c| c.name == "name").unwrap();
         assert!(id.is_primary_key);
         assert!(!name.nullable);
+    }
+
+    #[tokio::test]
+    async fn only_single_table_results_are_enriched_and_editable() {
+        let conn = sqlite_mem(&[
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, valid_from TEXT)",
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER)",
+            "CREATE TABLE pair (a INTEGER, b INTEGER, v TEXT, PRIMARY KEY (a, b))",
+            "CREATE TABLE nokey (x INTEGER, y TEXT)",
+            "INSERT INTO users VALUES (1, 'Alice', '2024'), (2, 'Bob', NULL)",
+            "INSERT INTO orders VALUES (10, 1, 5)",
+            "INSERT INTO pair VALUES (1, 1, 'x'), (1, 2, 'y')",
+            "INSERT INTO nokey VALUES (1, 'a')",
+        ])
+        .await;
+        let editable = |sql: &'static str| {
+            let conn = &conn;
+            async move {
+                let r = run_query(conn, sql).await.unwrap();
+                (editable_table(sql, &r), r)
+            }
+        };
+
+        let (table, r) = editable("SELECT valid_from, id FROM users").await;
+        assert_eq!(table.as_deref(), Some("users"));
+        assert_eq!(r.primary_key, ["id"]);
+        assert!(r.columns[1].is_primary_key);
+
+        // A join: the "id" column is not flagged, nothing is editable.
+        let (table, r) =
+            editable("SELECT o.id, u.name FROM orders o JOIN users u ON u.id = o.user_id").await;
+        assert_eq!(table, None);
+        assert!(r.columns.iter().all(|c| !c.is_primary_key));
+        assert!(r.primary_key.is_empty());
+
+        // Composite key: every key column must be selected, once.
+        let (table, r) = editable("SELECT a, v FROM pair").await;
+        assert_eq!(table, None, "b missing");
+        assert_eq!(r.primary_key, ["a", "b"]);
+        let (table, _) = editable("SELECT a, b, v FROM pair").await;
+        assert_eq!(table.as_deref(), Some("pair"));
+        let (table, _) = editable("SELECT a, b, a FROM pair").await;
+        assert_eq!(table, None, "a twice");
+        let (table, _) = editable("SELECT *, v FROM pair").await;
+        assert_eq!(table, None, "duplicate column names");
+
+        // No primary key: never editable.
+        let (table, _) = editable("SELECT * FROM nokey").await;
+        assert_eq!(table, None);
+        // Aliases and expressions: not editable.
+        let (table, _) = editable("SELECT name AS id FROM users").await;
+        assert_eq!(table, None);
     }
 
     #[tokio::test]

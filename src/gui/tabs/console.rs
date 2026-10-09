@@ -8,7 +8,7 @@ use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_phosphor::regular as icon;
 
 use crate::engine::models::{Column, QueryResult};
-use crate::engine::ops::query::StatementOutcome;
+use crate::engine::ops::query::{editable_table, StatementOutcome};
 use crate::engine::ops::rows::{detect_system_columns, RowChanges};
 use crate::engine::sql::format::format_sql;
 use crate::engine::sql::statements::extract_table_from_query;
@@ -75,10 +75,10 @@ impl ResultTab {
     }
 }
 
-/// A console result is editable when it reads a single table and has a
-/// primary key column.
+/// A console result is editable when its rows are rows of one table whose
+/// whole primary key is shown (`ops::query::editable_table`).
 pub fn is_editable(sql: &str, result: &QueryResult) -> bool {
-    extract_table_from_query(sql).is_some() && result.columns.iter().any(|c| c.is_primary_key)
+    editable_table(sql, result).is_some()
 }
 
 pub struct LogLine {
@@ -757,7 +757,7 @@ fn result_view(
     if action != GridAction::Submit || r.grid.edits.is_empty() {
         return None;
     }
-    let table = extract_table_from_query(&r.sql)?;
+    let table = editable_table(&r.sql, &r.result)?;
     let columns = r.result.columns.clone();
     Some(ConsoleAction::Submit {
         result_index: index,
@@ -897,6 +897,7 @@ mod tests {
 
     fn with_pk(mut r: QueryResult) -> QueryResult {
         r.columns[0].is_primary_key = true;
+        r.primary_key = vec![r.columns[0].name.clone()];
         r
     }
 
@@ -904,10 +905,25 @@ mod tests {
     fn editable_when_one_table_with_a_primary_key() {
         let keyed = with_pk(result(&["id", "name"], 1));
         assert!(is_editable("SELECT * FROM users", &keyed));
+        assert!(is_editable("SELECT id, valid_from FROM users", &keyed));
         assert!(!is_editable("SELECT 1", &keyed), "no table");
+        assert!(
+            !is_editable("SELECT * FROM users u JOIN roles r ON r.id = u.id", &keyed),
+            "join"
+        );
+        assert!(
+            !is_editable("SELECT * FROM users UNION SELECT * FROM users", &keyed),
+            "union"
+        );
         assert!(
             !is_editable("SELECT * FROM users", &result(&["id"], 1)),
             "no key"
+        );
+        let mut partial = with_pk(result(&["id", "name"], 1));
+        partial.primary_key.push("tenant".into());
+        assert!(
+            !is_editable("SELECT * FROM users", &partial),
+            "a key column is missing"
         );
         let mut c = ConsoleTab::new(String::new(), 0);
         apply_outcomes(&mut c, vec![ok("SELECT * FROM users", keyed)], Local::now());

@@ -305,7 +305,9 @@ impl Flat {
                 for index in 0..count {
                     self.push(4, RowKind::Item { at, group, index });
                 }
-                if count == 0 && group_error(d, group).is_some() {
+                // After the lines it has: keys still list the primary key
+                // when the foreign keys couldn't be read.
+                if group_error(d, group).is_some() {
                     self.push(4, RowKind::GroupError { at, group });
                 }
             }
@@ -744,11 +746,60 @@ mod tests {
             ]
         );
         assert_eq!(flat.rows[5].depth, 4);
-        // A closed group, or one with lines, shows no note.
+        // A closed group shows no note.
         let flat = flatten(&[f.view("a")], "", opened(&ids[..2]));
         assert!(!kinds(&flat)
             .iter()
             .any(|k| matches!(k, RowKind::GroupError { .. })));
+    }
+
+    #[test]
+    fn failed_foreign_keys_show_under_the_primary_key() {
+        let mut f = Fixture::new(vec![schema("main", &["t"])]);
+        let ids = [
+            connection_id("a"),
+            table_id("a", "main", "t"),
+            group_id("a", "main", "t", Group::Keys),
+        ];
+        f.details.insert(
+            "\"main\".\"t\"".into(),
+            Ok(TableDetails {
+                columns: vec![Column {
+                    name: "id".into(),
+                    type_name: "INTEGER".into(),
+                    nullable: false,
+                    is_primary_key: true,
+                }],
+                foreign_keys_error: Some("no fk".into()),
+                ..TableDetails::default()
+            }),
+        );
+        let flat = flatten(&[f.view("a")], "", opened(&ids));
+        let at = TableAt {
+            conn: 0,
+            schema: 0,
+            table: 0,
+        };
+        assert_eq!(
+            kinds(&flat)[4..7],
+            [
+                RowKind::Group {
+                    at,
+                    group: Group::Keys,
+                    count: 1,
+                    open: true
+                },
+                RowKind::Item {
+                    at,
+                    group: Group::Keys,
+                    index: 0
+                },
+                RowKind::GroupError {
+                    at,
+                    group: Group::Keys
+                },
+            ]
+        );
     }
 
     #[test]

@@ -191,6 +191,27 @@ pub struct ConsoleContext<'a> {
     pub tables: &'a dyn Fn() -> Vec<String>,
 }
 
+/// Whether this frame's input carries typed text. On Windows AltGr is
+/// reported as Ctrl+Alt, so typing `€` (AltGr+E on AZERTY) also looks like
+/// Ctrl+Alt+E: such a key is a character, not a shortcut.
+pub fn typed_text(events: &[egui::Event]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, egui::Event::Text(t) if !t.is_empty()))
+}
+
+/// Whether Escape cancels the running query: only from the editor or with
+/// nothing focused (a filter or WHERE field uses Escape to leave itself),
+/// and not while the completion popup or a cell editor would take it.
+pub fn escape_cancels(
+    focused: Option<egui::Id>,
+    editor: egui::Id,
+    completion_open: bool,
+    grid_editing: bool,
+) -> bool {
+    focused.is_none_or(|f| f == editor) && !completion_open && !grid_editing
+}
+
 /// Title of the `index`-th (1-based) result tab of `sql`.
 pub fn result_title(sql: &str, index: usize, truncated: bool) -> String {
     let table = extract_table_from_query(sql)
@@ -557,16 +578,18 @@ impl ConsoleTab {
         // focus, or nothing has (they must not steal keys from other fields).
         let editor_keys = ctx.memory(|m| m.focused().is_none_or(|f| f == id));
         let pressed = |s: &KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(s));
+        // AltGr+key: a character for the focused field, not a shortcut.
+        let typed = ctx.input(|i| typed_text(&i.events));
         let mut action = None;
-        if pressed(&HISTORY) {
+        if !typed && pressed(&HISTORY) {
             action = Some(ConsoleAction::History(String::new()));
         }
-        if editor_keys && pressed(&FORMAT) {
+        if editor_keys && !typed && pressed(&FORMAT) {
             self.format(&ctx, cx.tab);
         }
         if cx.running {
-            if !self.completion.open
-                && !self.grid_editing()
+            let focused = ctx.memory(|m| m.focused());
+            if escape_cancels(focused, id, self.completion.open, self.grid_editing())
                 && pressed(&KeyboardShortcut::new(Modifiers::NONE, Key::Escape))
             {
                 action = Some(ConsoleAction::Cancel);
@@ -907,6 +930,37 @@ mod tests {
             result: Ok(r),
             elapsed_ms: 5,
         }
+    }
+
+    #[test]
+    fn altgr_characters_are_not_shortcuts() {
+        let key = egui::Event::Key {
+            key: Key::E,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: HISTORY.modifiers,
+        };
+        assert!(!typed_text(std::slice::from_ref(&key)), "a real Ctrl+Alt+E");
+        assert!(typed_text(&[key, egui::Event::Text("€".into())]), "AltGr+E");
+        assert!(!typed_text(&[egui::Event::Text(String::new())]));
+    }
+
+    #[test]
+    fn escape_cancels_only_from_the_editor_or_nothing() {
+        let editor = egui::Id::new("editor");
+        let filter = egui::Id::new("filter");
+        assert!(escape_cancels(None, editor, false, false));
+        assert!(escape_cancels(Some(editor), editor, false, false));
+        assert!(
+            !escape_cancels(Some(filter), editor, false, false),
+            "filter field"
+        );
+        assert!(
+            !escape_cancels(Some(editor), editor, true, false),
+            "completion"
+        );
+        assert!(!escape_cancels(None, editor, false, true), "cell editor");
     }
 
     #[test]

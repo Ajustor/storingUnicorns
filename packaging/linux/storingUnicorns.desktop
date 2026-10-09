@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=storingUnicorns
+GenericName=Database Client
+Comment=Database client for PostgreSQL, MySQL, SQLite and SQL Server
+Exec=storingUnicorns
+Icon=storingUnicorns
+Terminal=false
+Categories=Development;Database;
+StartupWMClass=storingUnicorns

@@ -87,6 +87,11 @@ where
 /// Dropping this guard therefore *closes* the connection, which makes the
 /// database roll the transaction back. Only `release`, called once the block
 /// has run to its `COMMIT`/`ROLLBACK`, gives the connection back to the pool.
+///
+/// The close is abrupt (socket dropped, no goodbye message): a graceful close
+/// keeps the connection's pool slot until it completes, and over TLS (seen
+/// with MySQL) it completed only once the interrupted statement ended, so the
+/// next query of a small pool waited for it.
 pub struct TxConnection<DB: Database> {
     conn: Option<PoolConnection<DB>>,
 }
@@ -120,9 +125,10 @@ impl<DB: Database> std::ops::DerefMut for TxConnection<DB> {
 
 impl<DB: Database> Drop for TxConnection<DB> {
     fn drop(&mut self) {
-        if let Some(mut conn) = self.conn.take() {
-            // Closed (in a spawned task) instead of returned to the pool.
-            conn.close_on_drop();
+        if let Some(conn) = self.conn.take() {
+            // Dropping the detached connection drops its socket: closed
+            // instead of returned to the pool, and its slot freed at once.
+            drop(conn.detach());
         }
     }
 }

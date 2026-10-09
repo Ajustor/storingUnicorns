@@ -88,8 +88,7 @@ impl QueryTabsState {
     pub fn save(&self) -> Result<()> {
         let path = Self::queries_path()?;
         let content = toml::to_string_pretty(self)?;
-        fs::write(path, content)?;
-        Ok(())
+        crate::engine::config::write_atomic(&path, content.as_bytes())
     }
 
     /// Create a new state with one default tab

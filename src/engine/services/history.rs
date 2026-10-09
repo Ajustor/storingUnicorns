@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::engine::config::AppConfig;
+use crate::engine::config::{write_atomic, AppConfig};
 
 /// One executed query.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -22,6 +22,8 @@ pub struct HistoryEntry {
 }
 
 /// Query history backed by a JSON file. Entries are kept oldest first.
+/// Cloned to be saved off the UI thread.
+#[derive(Clone)]
 pub struct History {
     entries: Vec<HistoryEntry>,
     path: PathBuf,
@@ -63,16 +65,13 @@ impl History {
         }
     }
 
-    /// Write the history to its file (through a temporary file, so a crash
-    /// mid-write never leaves a truncated history).
+    /// Write the history to its file through a uniquely named temporary file
+    /// (`write_atomic`): a crash mid-write never leaves a truncated history,
+    /// and concurrent saves (two instances, a background save) never clobber
+    /// each other's temporary file.
     pub fn save(&self) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(&self.entries)?)?;
-        fs::rename(&tmp, &self.path)?;
-        Ok(())
+        let json = serde_json::to_string_pretty(&self.entries)?;
+        write_atomic(&self.path, json.as_bytes())
     }
 
     /// Newest first, case-insensitive substring match on `sql`; empty query → all.
@@ -124,6 +123,29 @@ mod tests {
         let r = h.search("users");
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].at, 3);
+    }
+
+    #[test]
+    fn concurrent_saves_never_clobber_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.json");
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let mut h = History::load_from(path.clone());
+                std::thread::spawn(move || {
+                    for i in 0..20 {
+                        h.push(e(&format!("SELECT {t}, {i}"), i));
+                        h.save().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // One writer's complete history, and no temporary file left behind.
+        assert_eq!(History::load_from(path.clone()).search("").len(), 20);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

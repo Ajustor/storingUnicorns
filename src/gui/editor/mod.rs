@@ -112,6 +112,8 @@ pub struct EditorOutput {
     pub cursor: usize,
     /// Selected byte range, when not empty.
     pub selection: Option<(usize, usize)>,
+    /// The text was changed this frame (typing or completion).
+    pub changed: bool,
 }
 
 /// Draw the editor filling `min_height` (more when the text is longer).
@@ -131,6 +133,7 @@ pub fn show(
         job.wrap.max_width = wrap_width;
         ui.fonts(|f| f.layout_job(job))
     };
+    let len = text.len();
     // Navigation keys go to the popup while it is open.
     let triggered = completion.intercept_keys(ui, text, id);
     let output = egui::TextEdit::multiline(text)
@@ -141,11 +144,16 @@ pub fn show(
         .hint_text("SELECT * FROM …")
         .layouter(&mut layouter)
         .show(ui);
+    let changed = output.response.changed();
     completion.after_edit(ui, &output, text, id, &cx, triggered);
 
     let (cursor, selection) =
         cursor_and_selection(ui.ctx(), id, text).unwrap_or((text.len(), None));
-    EditorOutput { cursor, selection }
+    EditorOutput {
+        cursor,
+        selection,
+        changed: changed || text.len() != len,
+    }
 }
 
 #[cfg(test)]

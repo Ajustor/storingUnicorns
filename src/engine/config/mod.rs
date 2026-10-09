@@ -1,7 +1,8 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use crate::engine::models::ConnectionConfig;
 
@@ -46,6 +47,35 @@ pub fn app_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Replace `path` with `contents` through a uniquely named temporary file
+/// in the same directory, renamed over it: a crash mid-write never leaves a
+/// truncated file, and concurrent writers (two instances, overlapping
+/// background saves) never share a temporary file. The last rename wins.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(contents)?;
+    tmp.as_file().sync_all()?;
+    // Windows refuses to replace a file that another rename or a reader is
+    // holding for a moment: retry briefly.
+    let mut attempts = 0;
+    loop {
+        match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempts < 20 && e.error.kind() == std::io::ErrorKind::PermissionDenied => {
+                attempts += 1;
+                tmp = e.file;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(e.error.into()),
+        }
+    }
+}
+
 impl AppConfig {
     /// Get the config file path
     pub fn config_path() -> Result<PathBuf> {
@@ -68,8 +98,7 @@ impl AppConfig {
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path()?;
         let content = toml::to_string_pretty(self)?;
-        fs::write(path, content)?;
-        Ok(())
+        write_atomic(&path, content.as_bytes())
     }
 
     /// Add a new connection
@@ -116,6 +145,20 @@ mod tests {
             Some(PathBuf::from("/cfg").join("storing-unicorns"))
         );
         assert_eq!(resolve_app_dir(None, None), None);
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("f.json");
+        write_atomic(&path, b"one").unwrap();
+        write_atomic(&path, b"two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["f.json"]);
     }
 
     #[test]

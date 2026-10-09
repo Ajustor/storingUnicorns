@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_phosphor::regular as icon;
@@ -13,6 +14,7 @@ use crate::updater::{ExitAction, Updater};
 
 use super::dialogs::{self, connection::same_target, transfer, Dialog};
 use super::history_popup::{self, HistoryPopup};
+use super::persist::{self, Saver, CONSOLES_DELAY};
 use super::sessions::{Session, Sessions};
 use super::status::{self, Status, StatusKind};
 use super::table_search::TableSearch;
@@ -57,6 +59,13 @@ pub struct App {
     /// "Fermer quand même" was answered: the next close request quits even
     /// with pending edits.
     pub quit_confirmed: bool,
+    /// Writes the history off the UI thread after each run.
+    history_saver: Saver<History>,
+    /// Writes `queries.toml` off the UI thread.
+    consoles_saver: Saver<QueryTabsState>,
+    /// Last change of the consoles not saved yet (saved `CONSOLES_DELAY`
+    /// after it).
+    consoles_edited: Option<Instant>,
 }
 
 impl App {
@@ -113,6 +122,17 @@ impl App {
             unbound_restored: false,
             closed: false,
             quit_confirmed: false,
+            history_saver: Saver::new(|h: &History| {
+                if let Err(e) = h.save() {
+                    tracing::error!("saving history: {e}");
+                }
+            }),
+            consoles_saver: Saver::new(|s: &QueryTabsState| {
+                if let Err(e) = s.save() {
+                    tracing::error!("saving consoles: {e}");
+                }
+            }),
+            consoles_edited: None,
         }
     }
 
@@ -205,6 +225,7 @@ impl App {
             if self.config.last_connection.as_deref() == Some(old.as_str()) {
                 self.config.last_connection = Some(new.clone());
             }
+            self.consoles_changed();
             self.sessions.errors.remove(&old);
             // Metadata caches are keyed by name.
             self.worker.forget(&old);
@@ -263,7 +284,14 @@ impl App {
             .cloned()
     }
 
+    /// The consoles changed (text, title, connection, opened or closed):
+    /// save them a moment later.
+    pub fn consoles_changed(&mut self) {
+        self.consoles_edited = Some(Instant::now());
+    }
+
     pub fn new_console(&mut self, connection: &str, query: String) -> TabId {
+        self.consoles_changed();
         let title = format!("Console {}", self.tabs.console_count() + 1);
         let cursor = query.len();
         self.tabs.add(
@@ -453,6 +481,9 @@ impl App {
     pub fn close_tab(&mut self, index: usize) {
         if let Some(tab) = self.tabs.close(index) {
             self.worker.cancel(tab.id);
+            if matches!(tab.kind, TabKind::Console(_)) {
+                self.consoles_changed();
+            }
         }
     }
 
@@ -474,9 +505,32 @@ impl App {
         }
     }
 
-    /// Write every console (open or not yet restored) to `queries.toml`.
+    /// Write every console (open or not yet restored) to `queries.toml` now
+    /// (after any background save, which would otherwise overwrite it).
     pub fn save_consoles(&mut self) -> anyhow::Result<()> {
+        self.consoles_saver.flush();
+        self.consoles_edited = None;
         tabs::persisted_consoles(&self.tabs, &self.pending_consoles).save()
+    }
+
+    /// Save the consoles in the background once they haven't changed for
+    /// `CONSOLES_DELAY`.
+    fn autosave_consoles(&mut self, ctx: &egui::Context) {
+        for tab in &mut self.tabs.list {
+            if let TabKind::Console(c) = &mut tab.kind {
+                if std::mem::take(&mut c.edited) {
+                    self.consoles_edited = Some(Instant::now());
+                }
+            }
+        }
+        let now = Instant::now();
+        if persist::should_save(self.consoles_edited, now, CONSOLES_DELAY) {
+            self.consoles_edited = None;
+            let state = tabs::persisted_consoles(&self.tabs, &self.pending_consoles);
+            self.consoles_saver.save(state);
+        } else if let Some(left) = persist::save_due_in(self.consoles_edited, now, CONSOLES_DELAY) {
+            ctx.request_repaint_after(left);
+        }
     }
 
     fn on_connected(&mut self, session: Session) {
@@ -700,6 +754,7 @@ impl App {
                 ok: o.result.is_ok(),
             });
         }
+        self.history_saver.save(self.history.clone());
         tab.summary = Some(console::apply_outcomes(
             c,
             &tab.connection,
@@ -737,6 +792,7 @@ impl App {
             ConsoleAction::Rebind(name) => {
                 tab.connection = name;
                 c.completion = Default::default();
+                self.consoles_changed();
             }
             ConsoleAction::History(search) => {
                 self.dialog = Some(Dialog::History(HistoryPopup::new(search)));
@@ -854,6 +910,8 @@ impl App {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
+        // Background saves first: they must not land after these.
+        self.history_saver.flush();
         if let Err(e) = self.save_consoles() {
             tracing::error!("saving consoles: {e}");
         }
@@ -1046,6 +1104,7 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default().show(ctx, |ui| self.central(ui));
         dialogs::show(self, ctx);
+        self.autosave_consoles(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
             let pending = if self.quit_confirmed {
@@ -1060,5 +1119,10 @@ impl eframe::App for App {
                 self.on_close();
             }
         }
+    }
+
+    /// Final flush, whatever way the app ends (`on_close` runs once).
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.on_close();
     }
 }

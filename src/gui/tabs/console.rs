@@ -138,6 +138,9 @@ pub struct ConsoleTab {
     pub submitting: Option<u64>,
     /// Result tab whose SQL is re-run after a Submit (the running script).
     pub refreshing: Option<u64>,
+    /// The text changed since the app last looked (it saves consoles a
+    /// moment after their last edit).
+    pub edited: bool,
 }
 
 /// How to run the console's SQL.
@@ -367,6 +370,7 @@ impl ConsoleTab {
             next_result_id: 1,
             submitting: None,
             refreshing: None,
+            edited: false,
         }
     }
 
@@ -450,6 +454,7 @@ impl ConsoleTab {
         self.query.replace_range(start..end, sql);
         self.cursor = start + sql.len();
         self.selection = None;
+        self.edited = true;
         let id = Self::editor_id(tab);
         editor::set_cursor(ctx, id, &self.query, self.cursor);
         ctx.memory_mut(|m| m.request_focus(id));
@@ -466,6 +471,7 @@ impl ConsoleTab {
         self.query.replace_range(start..end, &formatted);
         self.cursor = start + formatted.len();
         self.selection = None;
+        self.edited = true;
         editor::set_cursor(ctx, Self::editor_id(tab), &self.query, self.cursor);
     }
 
@@ -527,6 +533,7 @@ impl ConsoleTab {
             .inner;
         self.cursor = out.cursor;
         self.selection = out.selection;
+        self.edited |= out.changed;
         self.splitter(ui);
 
         if let Some(a) = self.results_area(ui, id, &cx) {

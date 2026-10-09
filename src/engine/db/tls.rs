@@ -40,6 +40,11 @@ pub fn explain(message: &str, host: &str, mode: SslMode) -> Option<String> {
         } else {
             "Le serveur exige une connexion chiffrée : passe le mode SSL à Obligatoire.".into()
         })
+    } else if mode == SslMode::Prefer {
+        // After a fallback the message holds both attempts and the plain-text
+        // error is the real cause (a wrong password…): a hint about the TLS
+        // half would hide it.
+        None
     } else if m.contains("notvalidforname") || m.contains("not valid for name") {
         // rustls: `NotValidForName`, or `NotValidForNameContext` printed as
         // "certificate not valid for name …".
@@ -137,6 +142,20 @@ mod tests {
         let hint = explain(refused, "h", SslMode::Prefer).unwrap();
         assert!(hint.contains("exige une connexion chiffrée"), "{hint}");
         assert!(!hint.contains("Obligatoire"), "{hint}");
+    }
+
+    #[test]
+    fn prefer_leaves_the_plain_text_cause_alone() {
+        // After the fallback, the plain-text error is the real cause: a
+        // certificate hint about the TLS half would hide it.
+        let m = "TLS : invalid peer certificate: UnsupportedCertVersion ; sans chiffrement :                  password authentication failed for user \"u\"";
+        assert_eq!(explain(m, "h", SslMode::Prefer), None);
+        let m = "invalid peer certificate: certificate not valid for name \"h\"";
+        assert_eq!(explain(m, "h", SslMode::Prefer), None);
+        assert_eq!(
+            explain("server does not support TLS", "h", SslMode::Prefer),
+            None
+        );
     }
 
     fn io(kind: std::io::ErrorKind) -> sqlx::Error {

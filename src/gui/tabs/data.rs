@@ -105,6 +105,8 @@ pub struct DataTab {
     pub result: Option<QueryResult>,
     /// Rows matching the filter; `None` while counting.
     pub total: Option<u64>,
+    /// Why the rows could not be counted (shown on the "?" page count).
+    pub count_error: Option<String>,
     pub grid: GridState,
     pub loading: bool,
     /// Last database error (page load or submit), shown above the grid.
@@ -150,6 +152,7 @@ impl DataTab {
             order_input: String::new(),
             result: None,
             total: None,
+            count_error: None,
             grid: GridState::default(),
             loading: false,
             error: None,
@@ -263,7 +266,10 @@ impl DataTab {
                 None
             }
             Event::Count { outcome, .. } => {
-                self.total = outcome.ok();
+                (self.total, self.count_error) = match outcome {
+                    Ok(n) => (Some(n), None),
+                    Err(e) => (None, Some(e)),
+                };
                 None
             }
             Event::Submitted { outcome, .. } => match outcome {
@@ -391,11 +397,19 @@ impl DataTab {
                 nav = Some(Nav::Page(page - 1));
             }
             let total = pages.map_or_else(|| "?".to_string(), |p| p.to_string());
-            ui.label(format!("page {} / {total}", page + 1))
-                .on_hover_text(match self.total {
-                    Some(t) => format!("{t} ligne(s)"),
-                    None => "Comptage…".to_string(),
-                });
+            let text = format!("page {} / {total}", page + 1);
+            match (&self.count_error, self.total) {
+                (Some(e), _) => {
+                    ui.colored_label(ERROR, format!("{text} {}", icon::WARNING))
+                        .on_hover_text(format!("Comptage impossible : {e}"));
+                }
+                (None, Some(t)) => {
+                    ui.label(text).on_hover_text(format!("{t} ligne(s)"));
+                }
+                (None, None) => {
+                    ui.label(text).on_hover_text("Comptage…");
+                }
+            }
             if button(ui, icon::CARET_RIGHT, has_next, "Page suivante") {
                 nav = Some(Nav::Page(page + 1));
             }
@@ -683,6 +697,21 @@ mod tests {
         t.on_event(page_event(Ok(page(2))));
         assert_eq!(t.error, None);
         assert_eq!(t.result.as_ref().unwrap().rows.len(), 2);
+    }
+
+    #[test]
+    fn count_errors_are_kept_for_display() {
+        let mut t = tab_with_page();
+        let count = |outcome| Event::Count {
+            tab: 1,
+            run: 5,
+            outcome,
+        };
+        t.on_event(count(Err("permission denied".into())));
+        assert_eq!(t.total, None);
+        assert_eq!(t.count_error.as_deref(), Some("permission denied"));
+        t.on_event(count(Ok(7)));
+        assert_eq!((t.total, t.count_error.as_deref()), (Some(7), None));
     }
 
     #[test]

@@ -343,6 +343,7 @@ impl App {
                 );
                 if count {
                     d.total = None;
+                    d.count_error = None;
                     tab.runs.count = Some(self.worker.count(id, conn, build_count(&d.query)));
                 }
             }
@@ -608,10 +609,22 @@ impl App {
             | Event::Count { .. }
             | Event::Submitted { .. }
             | Event::Ddl { .. }) => {
-                // Tabs closed meanwhile simply drop their outcome.
+                // Tabs closed meanwhile drop their outcome; a submit still
+                // reports whether it was applied.
                 let Some(id) = ev.tab() else {
                     return;
                 };
+                if self.tabs.find(id).is_none() {
+                    if let Event::Submitted { outcome, .. } = ev {
+                        match outcome {
+                            Ok(n) => self.success(format!("{n} modification(s) appliquée(s)")),
+                            Err(e) => {
+                                self.error(format!("Submit annulé (transaction annulée) : {e}"))
+                            }
+                        }
+                    }
+                    return;
+                }
                 if let Some(action) = self.tabs.find(id).and_then(|tab| tab.on_event(ev)) {
                     self.data_action(id, action);
                 }
@@ -692,35 +705,25 @@ impl App {
         let (Event::Submitted { outcome, .. }, TabKind::Console(c)) = (ev, &mut tab.kind) else {
             return;
         };
-        let Some(id) = c.submitting.take() else {
-            return;
-        };
-        let Some(r) = c.results.iter_mut().find(|r| r.id == id) else {
-            return;
-        };
-        match outcome {
-            Ok(n) => {
-                r.grid.editing = None;
-                r.grid.edits.clear();
-                r.error = None;
-                let sql = r.sql.clone();
-                let text = format!("{n} modification(s) appliquée(s)");
+        // Reported even when the result tab was closed or replaced meanwhile.
+        let report = console::apply_submitted(c, outcome);
+        match report.status {
+            Ok(text) => {
                 tab.summary = Some(text.clone());
                 // A run in progress keeps going: the result refreshes on the next run.
-                if let (None, Some(conn)) = (tab.runs.script, self.sessions.conn(&r.connection)) {
-                    let run = self
-                        .worker
-                        .run_script(tab.id, conn, sql, Some(console::MAX_ROWS));
-                    tab.runs.script = Some(run);
-                    c.refreshing = Some(id);
-                    c.running_since = Some(std::time::Instant::now());
+                if let Some((id, sql, connection)) = report.refresh {
+                    if let (None, Some(conn)) = (tab.runs.script, self.sessions.conn(&connection)) {
+                        let run =
+                            self.worker
+                                .run_script(tab.id, conn, sql, Some(console::MAX_ROWS));
+                        tab.runs.script = Some(run);
+                        c.refreshing = Some(id);
+                        c.running_since = Some(std::time::Instant::now());
+                    }
                 }
                 self.success(text);
             }
-            Err(e) => {
-                r.error = Some(e.clone());
-                self.error(format!("Submit annulé (transaction annulée) : {e}"));
-            }
+            Err(e) => self.error(e),
         }
     }
 

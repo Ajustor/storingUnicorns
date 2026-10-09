@@ -328,6 +328,44 @@ pub fn apply_outcomes(
     }
 }
 
+/// What to do once a console Submit finished.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SubmitReport {
+    /// Status-bar message: success, or the error.
+    pub status: Result<String, String>,
+    /// Result tab to re-run (id, SQL, connection), when it still exists.
+    pub refresh: Option<(u64, String, String)>,
+}
+
+/// Apply the outcome of the Submit of `console.submitting`: on success its
+/// edits are cleared and it is to be re-run; on failure the error is shown
+/// on it. The outcome is reported even if the result tab was closed or
+/// replaced meanwhile.
+pub fn apply_submitted(console: &mut ConsoleTab, outcome: Result<usize, String>) -> SubmitReport {
+    let id = console.submitting.take();
+    let result = id.and_then(|id| console.results.iter_mut().find(|r| r.id == id));
+    match outcome {
+        Ok(n) => SubmitReport {
+            status: Ok(format!("{n} modification(s) appliquée(s)")),
+            refresh: result.map(|r| {
+                r.grid.editing = None;
+                r.grid.edits.clear();
+                r.error = None;
+                (r.id, r.sql.clone(), r.connection.clone())
+            }),
+        },
+        Err(e) => {
+            if let Some(r) = result {
+                r.error = Some(e.clone());
+            }
+            SubmitReport {
+                status: Err(format!("Submit annulé (transaction annulée) : {e}")),
+                refresh: None,
+            }
+        }
+    }
+}
+
 /// Outcome of the re-run of result tab `id` after a Submit: its rows are
 /// replaced (edits and focus dropped), the run is logged. Returns the
 /// status-bar summary.
@@ -1184,6 +1222,53 @@ mod tests {
             result_connection(r, |n| n == "dev"),
             Err("Connexion prod fermée".to_string())
         );
+    }
+
+    #[test]
+    fn submit_outcome_is_reported_even_without_its_result_tab() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        apply_outcomes(
+            &mut c,
+            "prod",
+            vec![ok("SELECT * FROM a", with_pk(result(&["id"], 1)))],
+            Local::now(),
+        );
+        let id = c.results[0].id;
+        let r = &mut c.results[0];
+        r.grid.edits.set(
+            &r.result.rows,
+            grid::changes::RowRef::Base(0),
+            0,
+            "z".into(),
+        );
+
+        c.submitting = Some(id);
+        let failed = apply_submitted(&mut c, Err("NOT NULL".into()));
+        assert_eq!(
+            failed.status,
+            Err("Submit annulé (transaction annulée) : NOT NULL".into())
+        );
+        assert_eq!(c.results[0].error.as_deref(), Some("NOT NULL"));
+        assert!(!c.results[0].grid.edits.is_empty(), "edits kept");
+
+        c.submitting = Some(id);
+        let ok = apply_submitted(&mut c, Ok(1));
+        assert_eq!(ok.status, Ok("1 modification(s) appliquée(s)".into()));
+        assert_eq!(
+            ok.refresh,
+            Some((id, "SELECT * FROM a".into(), "prod".into()))
+        );
+        assert!(c.results[0].grid.edits.is_empty() && c.results[0].error.is_none());
+        assert_eq!(c.submitting, None);
+
+        // The result tab was closed while its submit ran.
+        c.submitting = Some(id);
+        c.results.clear();
+        let gone = apply_submitted(&mut c, Ok(2));
+        assert_eq!(gone.status, Ok("2 modification(s) appliquée(s)".into()));
+        assert_eq!(gone.refresh, None);
+        let gone = apply_submitted(&mut c, Err("x".into()));
+        assert!(gone.status.is_err());
     }
 
     #[test]

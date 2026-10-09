@@ -348,8 +348,7 @@ pub fn apply_submitted(console: &mut ConsoleTab, outcome: Result<usize, String>)
         Ok(n) => SubmitReport {
             status: Ok(format!("{n} modification(s) appliquée(s)")),
             refresh: result.map(|r| {
-                r.grid.editing = None;
-                r.grid.edits.clear();
+                r.grid.discard_edits();
                 r.error = None;
                 (r.id, r.sql.clone(), r.connection.clone())
             }),

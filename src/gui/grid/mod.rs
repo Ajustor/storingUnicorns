@@ -126,6 +126,10 @@ pub struct GridState {
     select_all: bool,
     /// Scroll the focused cell into view (after a keyboard move).
     scroll_to_selected: bool,
+    /// Bumped whenever row references may point to other rows (a new
+    /// result, dropped or removed new rows): a `RowRef` taken under another
+    /// generation must not be written to.
+    pub generation: u64,
 }
 
 impl Default for GridState {
@@ -142,6 +146,7 @@ impl Default for GridState {
             view_source: (0, 0),
             select_all: false,
             scroll_to_selected: false,
+            generation: 0,
         }
     }
 }
@@ -257,6 +262,7 @@ impl GridState {
         self.editing = None;
         self.edits.clear();
         self.view_dirty = true;
+        self.generation += 1;
     }
 
     fn ensure_view(&mut self, rows: &[Vec<String>]) {
@@ -385,6 +391,7 @@ impl GridState {
         let RowRef::New(removed) = r else {
             return;
         };
+        self.generation += 1;
         let follow = |row: RowRef| match row {
             RowRef::New(j) if j == removed => None,
             RowRef::New(j) if j > removed => Some(RowRef::New(j - 1)),
@@ -397,9 +404,15 @@ impl GridState {
             .and_then(|(row, c, text)| Some((follow(row)?, c, text)));
     }
 
+    /// Drop every pending edit and the open cell editor.
+    pub fn discard_edits(&mut self) {
+        self.revert();
+    }
+
     fn revert(&mut self) {
         self.editing = None;
         self.edits.clear();
+        self.generation += 1;
     }
 
     /// Keys while a cell is being edited. The cell editor loses its focus on

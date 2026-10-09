@@ -208,8 +208,7 @@ impl DataTab {
     /// "Abandonner": drop the edits and do the navigation that was asked.
     pub fn discard_and_continue(&mut self) -> Option<DataAction> {
         let nav = self.confirm.take()?;
-        self.grid.editing = None;
-        self.grid.edits.clear();
+        self.grid.discard_edits();
         Some(self.apply(nav))
     }
 
@@ -274,8 +273,7 @@ impl DataTab {
             }
             Event::Submitted { outcome, .. } => match outcome {
                 Ok(n) => {
-                    self.grid.editing = None;
-                    self.grid.edits.clear();
+                    self.grid.discard_edits();
                     self.error = None;
                     if let Some(nav) = self.after_submit.take() {
                         self.apply(nav);

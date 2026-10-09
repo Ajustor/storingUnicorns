@@ -132,31 +132,6 @@ pub async fn get_tables_by_schema(pool: &MySqlPool) -> Result<Vec<SchemaInfo>> {
     Ok(group_tables_by_schema(rows))
 }
 
-/// Insert a new row into a MySQL table
-pub async fn insert_row(
-    pool: &MySqlPool,
-    table_name: &str,
-    columns: &[Column],
-    values: &[String],
-    system_columns: &[usize],
-) -> Result<u64> {
-    let (columns_part, values_part) =
-        super::utils::build_insert_parts(columns, values, system_columns, '`', '`');
-
-    if columns_part.is_empty() {
-        return Err(anyhow::anyhow!("No columns to insert"));
-    }
-
-    let query = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        table_name, columns_part, values_part
-    );
-
-    tracing::debug!("MySQL INSERT query: {}", query);
-    let result = sqlx::query(&query).execute(pool).await?;
-    Ok(result.rows_affected())
-}
-
 /// `(schema, table)` of a possibly qualified/quoted name; the schema is
 /// empty when not given, which the queries turn into `DATABASE()`.
 fn split_table(table_name: &str) -> (String, String) {

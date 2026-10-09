@@ -1747,15 +1747,8 @@ async fn handle_insert_row(state: &mut AppState) {
         }
     };
 
-    // Typed `NULL`, or left empty: NULL.
     let values = match &state.editing_row {
-        Some(row) => row
-            .iter()
-            .map(|text| match text.as_str() {
-                "" | "NULL" => crate::engine::models::NULL_CELL.to_string(),
-                _ => text.clone(),
-            })
-            .collect::<Vec<_>>(),
+        Some(row) => row.iter().map(|text| app_state::insert_cell(text)).collect::<Vec<_>>(),
         None => {
             state.set_status("Cannot insert: row data not found");
             state.close_dialog();
@@ -1770,27 +1763,14 @@ async fn handle_insert_row(state: &mut AppState) {
         return;
     }
 
-    // Get system columns to exclude from insert
-    let system_cols = state.system_columns.clone();
-
     // Debug mode: show query in editor instead of executing
     if state.debug_mode {
-        let quote_chars = state.get_quote_chars();
-        if let Some(query) = db::utils::build_insert_query(
-            &table_name,
-            &columns,
-            &values,
-            &system_cols,
-            quote_chars.0,
-            quote_chars.1,
-        ) {
-            let query_len = query.len();
-            state.set_query(query);
-            state.set_cursor_position(query_len);
-            state.set_status("Debug: INSERT query copied to editor (not executed)");
-        } else {
-            state.set_status("Debug: No columns to insert");
-        }
+        let db_type = state.connection.as_ref().unwrap().db_type();
+        let query = db::utils::build_insert_query(&table_name, &columns, &values, &db_type);
+        let query_len = query.len();
+        state.set_query(query);
+        state.set_cursor_position(query_len);
+        state.set_status("Debug: INSERT query copied to editor (not executed)");
         state.close_dialog();
         return;
     }
@@ -1798,14 +1778,9 @@ async fn handle_insert_row(state: &mut AppState) {
     state.set_status("Inserting row...");
 
     // Perform the insert
-    let result = ops::rows::insert_row(
-        state.connection.as_ref().unwrap(),
-        &table_name,
-        &columns,
-        &values,
-        &system_cols,
-    )
-    .await;
+    let result =
+        ops::rows::insert_row(state.connection.as_ref().unwrap(), &table_name, &columns, &values)
+            .await;
 
     match result {
         Ok(rows_affected) => {
@@ -3364,5 +3339,32 @@ mod tests {
         handle_insert_row(&mut state).await;
         assert_eq!(count(state.connection.as_ref().unwrap(), "t").await, "1");
         assert!(state.status_message.starts_with("Debug:"));
+    }
+
+    #[tokio::test]
+    async fn insert_row_leaves_empty_fields_to_their_defaults() {
+        let mut state = debug_state().await;
+        // Debug mode shows the INSERT: the empty id is left out.
+        state.editing_row = Some(vec!["".into(), "b".into()]);
+        handle_insert_row(&mut state).await;
+        assert_eq!(state.query_input(), "INSERT INTO t (\"name\") VALUES ('b')");
+        state.editing_row = Some(vec!["".into(), "NULL".into()]);
+        handle_insert_row(&mut state).await;
+        assert_eq!(state.query_input(), "INSERT INTO t (\"name\") VALUES (NULL)");
+        state.editing_row = Some(vec!["".into(), "".into()]);
+        handle_insert_row(&mut state).await;
+        assert_eq!(state.query_input(), "INSERT INTO t DEFAULT VALUES");
+        // Executed.
+        state.debug_mode = false;
+        state.editing_row = Some(vec!["".into(), "c".into()]);
+        handle_insert_row(&mut state).await;
+        let r = state
+            .connection
+            .as_ref()
+            .unwrap()
+            .execute_query("SELECT id, name FROM t ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(r.rows[1], ["2", "c"]);
     }
 }

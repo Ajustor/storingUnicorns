@@ -30,6 +30,16 @@ pub fn cell_from_edit_text(text: &str, original: &str) -> String {
     }
 }
 
+/// Cell of a new row from the add-row editor's `text`: left empty, it gets
+/// its default (not inserted); `NULL` typed means NULL.
+pub fn insert_cell(text: &str) -> Option<String> {
+    match text {
+        "" => None,
+        "NULL" => Some(NULL_CELL.to_string()),
+        _ => Some(text.to_string()),
+    }
+}
+
 /// Status shown when the current result can't be edited row by row.
 const READ_ONLY_RESULT: &str =
     "Read-only result: rows must come from one table with its whole primary key";

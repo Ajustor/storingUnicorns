@@ -8,7 +8,8 @@ use egui::{Color32, Key, Modifiers, RichText, Sense, Stroke, StrokeKind};
 use egui_extras::{Column as TableColumn, TableBuilder};
 use egui_phosphor::regular as icon;
 
-use crate::engine::models::{display_cell, is_null, QueryResult, NULL_CELL};
+use crate::engine::models::{display_cell, is_null, Column, QueryResult, NULL_CELL};
+use crate::engine::ops::rows::detect_system_columns;
 use crate::gui::theme::{ACCENT, ERROR, SUCCESS};
 
 use changes::{PendingEdits, RowRef};
@@ -100,9 +101,9 @@ pub struct GridState {
     pub selected: Option<(RowRef, usize)>,
     /// Cell being edited and its text.
     pub editing: Option<(RowRef, usize, String)>,
-    /// The edited cell was NULL: its editor starts empty and, left empty,
-    /// keeps the NULL.
-    editing_null: bool,
+    /// The edited cell was NULL, or a new row's untouched cell: its editor
+    /// starts empty and, left empty, keeps the cell as it was.
+    editing_blank: bool,
     pub edits: PendingEdits,
     /// Client-side view: indices of base rows after filter/sort (consoles only).
     pub view: Vec<usize>,
@@ -127,7 +128,7 @@ impl Default for GridState {
         Self {
             selected: None,
             editing: None,
-            editing_null: false,
+            editing_blank: false,
             edits: PendingEdits::default(),
             view: Vec::new(),
             filter: String::new(),
@@ -196,6 +197,16 @@ fn plural_rows(n: usize) -> String {
     format!("{n} {}", if n == 1 { "ligne" } else { "lignes" })
 }
 
+/// Where typing starts in a new row: the first column that is neither
+/// filled by the database (`detect_system_columns`) nor part of the key.
+pub fn first_input_column(columns: &[Column]) -> usize {
+    let system = detect_system_columns(columns);
+    (0..columns.len())
+        .find(|i| !system.contains(i) && !columns[*i].is_primary_key)
+        .or_else(|| (0..columns.len()).find(|i| !system.contains(i)))
+        .unwrap_or(0)
+}
+
 /// Text shown for a cell and whether it is NULL (drawn weak and italic):
 /// the text "NULL" is an ordinary value.
 pub fn cell_display(value: &str) -> (&str, bool) {
@@ -225,6 +236,10 @@ enum CellAction {
     CopyValue(RowRef, usize),
     CopyRow(RowRef),
     SetNull(RowRef, usize),
+    /// Set the empty string.
+    SetEmpty(RowRef, usize),
+    /// A new row's cell back to its default.
+    SetDefault(RowRef, usize),
     AddRow,
     ToggleDelete(RowRef),
 }
@@ -326,8 +341,8 @@ impl GridState {
             return;
         }
         let value = self.edits.value(rows, r, c);
-        self.editing_null = is_null(value);
-        let text = if self.editing_null { "" } else { value };
+        self.editing_blank = is_null(value) || self.edits.is_default(r, c);
+        let text = if is_null(value) { "" } else { value };
         self.editing = Some((r, c, text.to_string()));
         self.select(r, c);
         self.select_all = true;
@@ -336,22 +351,19 @@ impl GridState {
 
     fn commit_edit(&mut self, rows: &[Vec<String>]) {
         if let Some((r, c, text)) = self.editing.take() {
-            if !(self.editing_null && text.is_empty()) {
+            if !(self.editing_blank && text.is_empty()) {
                 self.edits.set(rows, r, c, text);
             }
         }
     }
 
-    /// Alt+Insert: a new row, editing its first non-key cell.
+    /// Alt+Insert: a new row, editing its first cell that the database
+    /// does not seem to fill itself (`detect_system_columns`: only a hint,
+    /// any cell can be typed).
     fn add_row(&mut self, ctx: &egui::Context, result: &QueryResult) {
         self.commit_edit(&result.rows);
         let r = self.edits.add_row(result.columns.len());
-        let c = result
-            .columns
-            .iter()
-            .position(|c| !c.is_primary_key)
-            .unwrap_or(0);
-        self.start_edit(ctx, &result.rows, r, c);
+        self.start_edit(ctx, &result.rows, r, first_input_column(&result.columns));
     }
 
     fn revert(&mut self) {
@@ -654,10 +666,13 @@ pub fn show(
                                         }
                                         _ => {
                                             let value = edits.value(rows, r, c);
+                                            let text = if edits.is_default(r, c) {
+                                                RichText::new("DEFAULT").weak().italics()
+                                            } else {
+                                                cell_text(value, deleted)
+                                            };
                                             ui.add(
-                                                egui::Label::new(cell_text(value, deleted))
-                                                    .selectable(false)
-                                                    .truncate(),
+                                                egui::Label::new(text).selectable(false).truncate(),
                                             );
                                         }
                                     }
@@ -734,6 +749,18 @@ pub fn show(
                 .collect();
             ctx.copy_text(to_tsv(&row));
         }
+        Some(CellAction::SetEmpty(r, c)) => {
+            state.commit_edit(rows);
+            state.edits.set(rows, r, c, String::new());
+            state.selected = Some((r, c));
+            focus_grid();
+        }
+        Some(CellAction::SetDefault(r, c)) => {
+            state.commit_edit(rows);
+            state.edits.reset_default(r, c);
+            state.selected = Some((r, c));
+            focus_grid();
+        }
         Some(CellAction::SetNull(r, c)) => {
             state.commit_edit(rows);
             state.edits.set(rows, r, c, NULL_CELL.into());
@@ -794,6 +821,18 @@ fn context_menu(
             format!("{} Mettre à NULL", icon::PROHIBIT),
             CellAction::SetNull(r, c),
         );
+        item(
+            ui,
+            format!("{} Chaîne vide", icon::TEXT_AA),
+            CellAction::SetEmpty(r, c),
+        );
+        if matches!(r, RowRef::New(_)) {
+            item(
+                ui,
+                format!("{} Valeur par défaut", icon::ARROW_COUNTER_CLOCKWISE),
+                CellAction::SetDefault(r, c),
+            );
+        }
     }
     item(
         ui,
@@ -967,6 +1006,39 @@ mod tests {
         g.editing.as_mut().unwrap().2 = "".into();
         g.commit_edit(&rows);
         assert_eq!(g.edits.value(&rows, RowRef::Base(1), 0), "");
+    }
+
+    #[test]
+    fn new_row_cells_stay_default_unless_typed_and_typing_starts_after_ids() {
+        let ctx = egui::Context::default();
+        let column = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            is_primary_key: name == "id",
+        };
+        let result = QueryResult {
+            columns: vec![
+                column("id", "int"),
+                column("created_at", "timestamp"),
+                column("name", "text"),
+            ],
+            rows: vec![],
+            ..Default::default()
+        };
+        assert_eq!(first_input_column(&result.columns), 2);
+        let mut g = GridState::default();
+        g.add_row(&ctx, &result);
+        let r = RowRef::New(0);
+        assert_eq!(g.editing.as_ref().map(|e| (e.0, e.1)), Some((r, 2)));
+        g.commit_edit(&result.rows);
+        assert!(g.edits.is_default(r, 2), "left empty: still the default");
+        // A system column can be typed, and is then inserted.
+        g.start_edit(&ctx, &result.rows, r, 0);
+        g.editing.as_mut().unwrap().2 = "42".into();
+        g.commit_edit(&result.rows);
+        let c = g.edits.to_row_changes(&result.rows);
+        assert_eq!(c.inserts, vec![vec![Some("42".into()), None, None]]);
     }
 
     #[test]

@@ -384,21 +384,13 @@ impl Worker {
         db_type: DatabaseType,
         table: String,
         columns: Vec<Column>,
-        system_columns: Vec<usize>,
         changes: RowChanges,
     ) -> RunId {
         let run = self.next_run();
         self.spawn(async move {
-            let outcome = ops::rows::submit_changes(
-                &conn,
-                &db_type,
-                &table,
-                &columns,
-                &system_columns,
-                &changes,
-            )
-            .await
-            .map_err(err);
+            let outcome = ops::rows::submit_changes(&conn, &db_type, &table, &columns, &changes)
+                .await
+                .map_err(err);
             Event::Submitted { tab, run, outcome }
         });
         run
@@ -729,7 +721,6 @@ mod tests {
             DatabaseType::SQLite,
             "t".into(),
             r.columns.clone(),
-            vec![0],
             changes,
         );
         let Event::Submitted { tab, run, outcome } = next_event(&mut w) else {

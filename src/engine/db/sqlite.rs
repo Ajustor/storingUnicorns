@@ -150,31 +150,6 @@ pub async fn get_tables_by_schema(pool: &SqlitePool) -> Result<Vec<SchemaInfo>> 
     }])
 }
 
-/// Insert a new row into a SQLite table
-pub async fn insert_row(
-    pool: &SqlitePool,
-    table_name: &str,
-    columns: &[Column],
-    values: &[String],
-    system_columns: &[usize],
-) -> Result<u64> {
-    let (columns_part, values_part) =
-        super::utils::build_insert_parts(columns, values, system_columns, '"', '"');
-
-    if columns_part.is_empty() {
-        return Err(anyhow::anyhow!("No columns to insert"));
-    }
-
-    let query = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        table_name, columns_part, values_part
-    );
-
-    tracing::debug!("SQLite INSERT query: {}", query);
-    let result = sqlx::query(&query).execute(pool).await?;
-    Ok(result.rows_affected())
-}
-
 /// `PRAGMA [schema.]pragma('arg')`, the schema (`main`, `temp` or an
 /// attached database) quoted, the argument escaped.
 fn pragma_on(schema: Option<&str>, pragma: &str, arg: &str) -> String {

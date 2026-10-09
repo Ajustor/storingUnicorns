@@ -8,7 +8,7 @@ use egui_phosphor::regular as icon;
 
 use crate::engine::models::QueryResult;
 use crate::engine::ops::query::has_full_key;
-use crate::engine::ops::rows::{detect_system_columns, NO_PRIMARY_KEY};
+use crate::engine::ops::rows::NO_PRIMARY_KEY;
 use crate::engine::sql::paging::{toggle_order, DataQuery};
 use crate::gui::editor::highlight_job;
 use crate::gui::grid::changes::PendingEdits;
@@ -96,8 +96,6 @@ pub struct DataTab {
     pub loading: bool,
     /// Last database error (page load or submit), shown above the grid.
     pub error: Option<String>,
-    /// Columns filled by the database, left out of inserts.
-    pub system_columns: Vec<usize>,
     /// Identifier quotes of the connection.
     pub quotes: (char, char),
     /// Navigation waiting for the "Abandonner les modifications ?" answer.
@@ -137,7 +135,6 @@ impl DataTab {
             grid: GridState::default(),
             loading: false,
             error: None,
-            system_columns: Vec::new(),
             quotes,
             confirm: None,
             after_submit: None,
@@ -228,7 +225,6 @@ impl DataTab {
                             .map(|c| quote_ident(c, self.quotes))
                             .collect();
                         self.sort = order_indicator(&self.query.order_by, &quoted);
-                        self.system_columns = detect_system_columns(&r.columns);
                         self.result = Some(r);
                         self.grid.new_result();
                         self.error = None;
@@ -626,13 +622,12 @@ mod tests {
     }
 
     #[test]
-    fn page_sets_system_columns_sort_and_summary() {
+    fn page_sets_sort_and_summary() {
         let mut t = DataTab::new("\"t\"".into(), ('"', '"'));
         assert_eq!(t.summary(), None);
         t.query.order_by = "\"name\" DESC".into();
         t.query.page = 1;
         t.on_event(page_event(Ok(page(500))));
-        assert_eq!(t.system_columns, vec![0]);
         assert_eq!(t.sort, Some((1, false)));
         assert_eq!(t.summary().unwrap(), "page 2/? · 500 lignes · 12 ms");
         t.on_event(Event::Count {

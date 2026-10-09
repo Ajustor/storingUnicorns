@@ -7,7 +7,7 @@ use sqlx::{Database, Either, Executor, IntoArguments};
 #[cfg(test)]
 use crate::engine::models::NULL_CELL;
 use crate::engine::models::{is_null, Column, DatabaseType, ForeignKeyInfo, IndexInfo, SchemaInfo};
-use crate::engine::sql::statements::split_statements;
+use crate::engine::sql::statements::{quote_chars, split_statements};
 
 /// Execute `query` exactly once and collect both its rows and its
 /// `DB::QueryResult` (affected-row counts summed via `Extend`) from the same
@@ -436,24 +436,22 @@ fn map_bit_value(value: &str) -> String {
     }
 }
 
-/// Build INSERT query column list and values list
-/// Returns (columns_part, values_part) excluding system-generated columns
+/// Column list and values list of an INSERT, as `(columns, values)`: only
+/// the cells that were set (`Some`); the others are left out so that the
+/// database applies their DEFAULT / identity.
 pub fn build_insert_parts(
     columns: &[Column],
-    values: &[String],
-    system_columns: &[usize],
+    values: &[Option<String>],
     quote_start: char,
     quote_end: char,
 ) -> (String, String) {
     let mut col_parts: Vec<String> = Vec::new();
     let mut val_parts: Vec<String> = Vec::new();
 
-    for (idx, (col, val)) in columns.iter().zip(values.iter()).enumerate() {
-        // Skip system-generated columns
-        if system_columns.contains(&idx) {
+    for (col, val) in columns.iter().zip(values.iter()) {
+        let Some(val) = val else {
             continue;
-        }
-
+        };
         col_parts.push(format!("{}{}{}", quote_start, col.name, quote_end));
         val_parts.push(sql_literal(col, val));
     }
@@ -483,26 +481,24 @@ pub fn build_update_query(
     ))
 }
 
-/// Build a complete INSERT query string
+/// The INSERT of a new row: the cells that were set (`Some`), the others
+/// getting their default. With no cell set, a row of defaults:
+/// `DEFAULT VALUES` (MySQL: `() VALUES ()`).
 pub fn build_insert_query(
     table_name: &str,
     columns: &[Column],
-    values: &[String],
-    system_columns: &[usize],
-    quote_start: char,
-    quote_end: char,
-) -> Option<String> {
-    let (columns_part, values_part) =
-        build_insert_parts(columns, values, system_columns, quote_start, quote_end);
-
-    if columns_part.is_empty() {
-        return None;
+    values: &[Option<String>],
+    db: &DatabaseType,
+) -> String {
+    let (quote_start, quote_end) = quote_chars(db);
+    let (columns_part, values_part) = build_insert_parts(columns, values, quote_start, quote_end);
+    if !columns_part.is_empty() {
+        format!("INSERT INTO {table_name} ({columns_part}) VALUES ({values_part})")
+    } else if *db == DatabaseType::MySQL {
+        format!("INSERT INTO {table_name} () VALUES ()")
+    } else {
+        format!("INSERT INTO {table_name} DEFAULT VALUES")
     }
-
-    Some(format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        table_name, columns_part, values_part
-    ))
 }
 
 /// Build a WHERE clause for identifying a specific row (for DELETE).
@@ -702,17 +698,59 @@ mod tests {
             build_where_clause(&cols, &["1".into(), "".into()], '"', '"'),
             "\"c\" = 1 AND \"c\" = ''"
         );
+        let set = |a: &str, b: &str| [Some(a.to_string()), Some(b.to_string())];
         assert_eq!(
-            build_insert_parts(&cols, &[NULL_CELL.into(), NULL_CELL.into()], &[], '"', '"').1,
+            build_insert_parts(&cols, &set(NULL_CELL, NULL_CELL), '"', '"').1,
             "NULL, NULL"
         );
         assert_eq!(
-            build_insert_parts(&cols, &["7".into(), "".into()], &[], '"', '"').1,
+            build_insert_parts(&cols, &set("7", ""), '"', '"').1,
             "7, ''"
         );
         assert_eq!(
-            build_insert_parts(&cols, &["7".into(), "NULL".into()], &[], '"', '"').1,
+            build_insert_parts(&cols, &set("7", "NULL"), '"', '"').1,
             "7, 'NULL'"
+        );
+    }
+
+    /// Only the cells that were set are inserted; none set: a row of
+    /// defaults, in each dialect's syntax.
+    #[test]
+    fn insert_lists_only_the_cells_that_were_set() {
+        let col = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            is_primary_key: name == "id",
+        };
+        let cols = [col("id", "int"), col("name", "text"), col("status", "text")];
+        let some = |v: &str| Some(v.to_string());
+        assert_eq!(
+            build_insert_query(
+                "t",
+                &cols,
+                &[None, some("x"), None],
+                &DatabaseType::Postgres
+            ),
+            "INSERT INTO t (\"name\") VALUES ('x')"
+        );
+        // A typed id (a "system" column) is kept.
+        assert_eq!(
+            build_insert_query(
+                "t",
+                &cols,
+                &[some("42"), None, some("")],
+                &DatabaseType::SQLServer
+            ),
+            "INSERT INTO t ([id], [status]) VALUES (42, '')"
+        );
+        assert_eq!(
+            build_insert_query("t", &cols, &[None, None, None], &DatabaseType::SQLite),
+            "INSERT INTO t DEFAULT VALUES"
+        );
+        assert_eq!(
+            build_insert_query("`t`", &cols, &[None, None, None], &DatabaseType::MySQL),
+            "INSERT INTO `t` () VALUES ()"
         );
     }
 

@@ -9,7 +9,7 @@ use egui_phosphor::regular as icon;
 
 use crate::engine::models::{Column, QueryResult};
 use crate::engine::ops::query::{editable_table, StatementOutcome};
-use crate::engine::ops::rows::{detect_system_columns, RowChanges, NO_PRIMARY_KEY};
+use crate::engine::ops::rows::{RowChanges, NO_PRIMARY_KEY};
 use crate::engine::sql::format::format_sql;
 use crate::engine::sql::statements::{extract_table_from_query, single_table_source};
 use crate::gui::editor::{self, completion::Completion, EditorContext};
@@ -146,7 +146,6 @@ pub enum ConsoleAction {
         result_index: usize,
         table: String,
         columns: Vec<Column>,
-        system_columns: Vec<usize>,
         changes: RowChanges,
     },
 }
@@ -772,7 +771,6 @@ fn result_view(
     Some(ConsoleAction::Submit {
         result_index: index,
         table,
-        system_columns: detect_system_columns(&columns),
         changes: r.grid.edits.to_row_changes(&r.result.rows),
         columns,
     })

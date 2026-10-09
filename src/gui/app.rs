@@ -327,7 +327,6 @@ impl App {
                     db_type,
                     d.table.clone(),
                     result.columns.clone(),
-                    d.system_columns.clone(),
                     d.grid.edits.to_row_changes(&result.rows),
                 );
                 d.error = None;
@@ -705,7 +704,6 @@ impl App {
                 result_index,
                 table,
                 columns,
-                system_columns,
                 changes,
             } => {
                 if tab.runs.submit.is_some() {
@@ -724,15 +722,9 @@ impl App {
                 r.error = None;
                 c.submitting = Some(r.id);
                 let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
-                let run = self.worker.submit(
-                    tab.id,
-                    conn,
-                    db_type,
-                    table,
-                    columns,
-                    system_columns,
-                    changes,
-                );
+                let run = self
+                    .worker
+                    .submit(tab.id, conn, db_type, table, columns, changes);
                 tab.runs.submit = Some(run);
                 tab.summary = Some("Submit…".into());
             }

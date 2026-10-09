@@ -462,38 +462,6 @@ pub async fn get_tables_by_schema(client: &SqlServerClient) -> Result<Vec<Schema
     Ok(group_tables_by_schema(tuples))
 }
 
-/// Insert a new row into a SQL Server table
-pub async fn insert_row(
-    client: &SqlServerClient,
-    table_name: &str,
-    columns: &[Column],
-    values: &[String],
-    system_columns: &[usize],
-) -> Result<u64> {
-    let (columns_part, values_part) =
-        super::utils::build_insert_parts(columns, values, system_columns, '[', ']');
-
-    if columns_part.is_empty() {
-        return Err(anyhow::anyhow!("No columns to insert"));
-    }
-
-    let query = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        table_name, columns_part, values_part
-    );
-
-    tracing::debug!("SQL Server INSERT query: {}", query);
-    execute_counted(client, &query).await
-}
-
-/// Run a DML statement and return its affected-row count.
-async fn execute_counted(client: &SqlServerClient, query: &str) -> Result<u64> {
-    let mut client = client.lock().await?;
-    let outcome = async { Ok(client.execute(query, &[]).await?.total()) }.await;
-    client.settle(&outcome);
-    outcome
-}
-
 /// Rows of a metadata `query` taking the schema (`@P1`, NULL for the
 /// default one) and the table name (`@P2`).
 async fn query_rows(

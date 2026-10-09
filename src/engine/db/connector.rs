@@ -3,7 +3,7 @@ use sqlx::{MySqlPool, PgPool, SqlitePool};
 use std::time::Instant;
 
 use crate::engine::models::{
-    Column, ConnectionConfig, DatabaseType, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
+    ConnectionConfig, DatabaseType, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
 };
 
 pub use super::sqlserver::SqlServerClient;
@@ -188,34 +188,6 @@ impl DatabaseConnection {
             DatabaseConnection::SQLite(pool) => sqlite::get_tables_by_schema(pool).await,
             DatabaseConnection::SQLServer(client) => sqlserver::get_tables_by_schema(client).await,
             DatabaseConnection::Azure(client) => azure::get_tables_by_schema(client).await,
-        }
-    }
-
-    /// Insert a new row into the database
-    /// Excludes system-generated columns (like auto-increment, timestamps)
-    pub async fn insert_row(
-        &self,
-        table_name: &str,
-        columns: &[Column],
-        values: &[String],
-        system_columns: &[usize],
-    ) -> Result<u64> {
-        match self {
-            DatabaseConnection::Postgres(pool) => {
-                postgres::insert_row(pool, table_name, columns, values, system_columns).await
-            }
-            DatabaseConnection::MySQL(pool) => {
-                mysql::insert_row(pool, table_name, columns, values, system_columns).await
-            }
-            DatabaseConnection::SQLite(pool) => {
-                sqlite::insert_row(pool, table_name, columns, values, system_columns).await
-            }
-            DatabaseConnection::SQLServer(client) => {
-                sqlserver::insert_row(client, table_name, columns, values, system_columns).await
-            }
-            DatabaseConnection::Azure(client) => {
-                sqlserver::insert_row(client, table_name, columns, values, system_columns).await
-            }
         }
     }
 

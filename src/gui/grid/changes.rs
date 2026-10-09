@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::engine::models::NULL_CELL;
 use crate::engine::ops::rows::RowChanges;
 
 /// Identifies a displayed row: an existing row by its index in the base
@@ -20,7 +19,8 @@ pub struct PendingEdits {
     /// (base row, column) → new value
     edited: BTreeMap<(usize, usize), String>,
     deleted: BTreeSet<usize>,
-    inserted: Vec<Vec<String>>,
+    /// New rows: the cells the user set; `None` cells get their default.
+    inserted: Vec<Vec<Option<String>>>,
 }
 
 impl PendingEdits {
@@ -49,9 +49,29 @@ impl PendingEdits {
                 .edited
                 .get(&(i, col))
                 .or_else(|| base.get(i).and_then(|r| r.get(col))),
-            RowRef::New(i) => self.inserted.get(i).and_then(|r| r.get(col)),
+            RowRef::New(i) => self
+                .inserted
+                .get(i)
+                .and_then(|r| r.get(col))
+                .and_then(Option::as_ref),
         };
         cell.map_or("", String::as_str)
+    }
+
+    /// Whether a cell of a new row was left untouched: it is not inserted,
+    /// the database applies its DEFAULT / identity.
+    pub fn is_default(&self, row: RowRef, col: usize) -> bool {
+        matches!(row, RowRef::New(i)
+            if self.inserted.get(i).and_then(|r| r.get(col)).is_some_and(Option::is_none))
+    }
+
+    /// Give a cell of a new row back to its default.
+    pub fn reset_default(&mut self, row: RowRef, col: usize) {
+        if let RowRef::New(i) = row {
+            if let Some(cell) = self.inserted.get_mut(i).and_then(|r| r.get_mut(col)) {
+                *cell = None;
+            }
+        }
     }
 
     /// Whether a base cell was changed. New rows: false (the whole row is new).
@@ -76,15 +96,15 @@ impl PendingEdits {
             }
             RowRef::New(i) => {
                 if let Some(cell) = self.inserted.get_mut(i).and_then(|r| r.get_mut(col)) {
-                    *cell = value;
+                    *cell = Some(value);
                 }
             }
         }
     }
 
-    /// Append a new row of `ncols` NULL cells; returns its ref.
+    /// Append a new row of `ncols` untouched cells; returns its ref.
     pub fn add_row(&mut self, ncols: usize) -> RowRef {
-        self.inserted.push(vec![NULL_CELL.to_string(); ncols]);
+        self.inserted.push(vec![None; ncols]);
         RowRef::New(self.inserted.len() - 1)
     }
 
@@ -192,10 +212,28 @@ mod tests {
             vec![(b[0].clone(), vec!["1".to_string(), "z".to_string()])]
         );
         assert_eq!(c.deletes, vec![b[1].clone()]);
+        assert_eq!(c.inserts, vec![vec![None, Some("c".to_string())]]);
+    }
+
+    #[test]
+    fn new_rows_only_carry_the_cells_that_were_set() {
+        let b = base();
+        let mut p = PendingEdits::default();
+        let r = p.add_row(3);
+        assert!(p.is_default(r, 0) && p.is_default(r, 2));
+        assert_eq!(p.value(&b, r, 0), "", "shown empty");
+        p.set(&b, r, 0, "42".into());
+        p.set(&b, r, 2, "".into());
+        assert!(!p.is_default(r, 0) && !p.is_default(r, 2));
+        assert!(p.is_default(r, 1));
+        assert!(!p.is_default(RowRef::Base(0), 0), "only new rows");
+        let c = p.to_row_changes(&b);
         assert_eq!(
             c.inserts,
-            vec![vec![NULL_CELL.to_string(), "c".to_string()]]
+            vec![vec![Some("42".into()), None, Some("".into())]]
         );
+        p.reset_default(r, 0);
+        assert!(p.is_default(r, 0));
     }
 
     #[test]

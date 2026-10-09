@@ -27,16 +27,16 @@ pub async fn update_row(
     conn.execute_checked_batch(&[sql], &[Some(1)]).await
 }
 
-/// Insert a row, skipping the auto-generated `system_columns` indices.
+/// Insert a row of the cells that were set (`Some`); the others get their
+/// default (`build_insert_query`).
 pub async fn insert_row(
     conn: &DatabaseConnection,
     table: &str,
     columns: &[Column],
-    values: &[String],
-    system_columns: &[usize],
+    values: &[Option<String>],
 ) -> Result<u64> {
-    conn.insert_row(table, columns, values, system_columns)
-        .await
+    let sql = build_insert_query(table, columns, values, &conn.db_type());
+    Ok(conn.execute_query(&sql).await?.rows_affected)
 }
 
 /// Delete the row matching `values`, quoting identifiers with `quotes`.
@@ -57,7 +57,9 @@ pub async fn delete_row(
 pub struct RowChanges {
     /// (original row, edited row)
     pub updates: Vec<(Vec<String>, Vec<String>)>,
-    pub inserts: Vec<Vec<String>>,
+    /// New rows: the cells the user set (`Some`); the others get their
+    /// default.
+    pub inserts: Vec<Vec<Option<String>>>,
     /// Original rows to delete.
     pub deletes: Vec<Vec<String>>,
 }
@@ -89,7 +91,6 @@ pub async fn submit_changes(
     db: &DatabaseType,
     table: &str,
     columns: &[Column],
-    system_columns: &[usize],
     changes: &RowChanges,
 ) -> Result<usize> {
     if changes.is_empty() {
@@ -106,9 +107,10 @@ pub async fn submit_changes(
     let updates = changes.updates.iter().filter_map(|(original, new)| {
         build_update_query(table, columns, original, new, qs, qe).map(|sql| (sql, Some(1)))
     });
-    let inserts = changes.inserts.iter().filter_map(|values| {
-        build_insert_query(table, columns, values, system_columns, qs, qe).map(|sql| (sql, None))
-    });
+    let inserts = changes
+        .inserts
+        .iter()
+        .map(|values| (build_insert_query(table, columns, values, db), None));
     let (statements, expected): (Vec<String>, Vec<Option<u64>>) =
         deletes.chain(updates).chain(inserts).unzip();
     if statements.is_empty() {
@@ -153,8 +155,9 @@ pub async fn truncate_tables(
     report
 }
 
-/// Indices of columns the database fills itself (ids, serials, timestamps),
-/// left out of INSERT statements by default.
+/// Indices of columns the database probably fills itself (ids, serials,
+/// timestamps). Only a hint for where to start typing in a new row: what
+/// is inserted is what the user set.
 pub fn detect_system_columns(columns: &[Column]) -> Vec<usize> {
     let first = columns
         .first()
@@ -217,6 +220,10 @@ mod tests {
         vec![a.into(), b.into()]
     }
 
+    fn new_row(a: Option<&str>, b: Option<&str>) -> Vec<Option<String>> {
+        vec![a.map(str::to_string), b.map(str::to_string)]
+    }
+
     #[tokio::test]
     async fn update_insert_delete_roundtrip() {
         let conn = sqlite_mem(SETUP).await;
@@ -224,7 +231,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1);
-        let n = insert_row(&conn, "t", &cols(), &row("", "c"), &[0])
+        let n = insert_row(&conn, "t", &cols(), &new_row(None, Some("c")))
             .await
             .unwrap();
         assert_eq!(n, 1);
@@ -269,10 +276,10 @@ mod tests {
         let conn = sqlite_mem(SETUP).await;
         let changes = RowChanges {
             updates: vec![(row("1", "a"), row("1", "A"))],
-            inserts: vec![row("", "c")],
+            inserts: vec![new_row(None, Some("c"))],
             deletes: vec![row("2", "b")],
         };
-        let n = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[0], &changes)
+        let n = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &changes)
             .await
             .unwrap();
         assert_eq!(n, 3);
@@ -293,11 +300,11 @@ mod tests {
         .await;
         let changes = RowChanges {
             updates: vec![(row("1", "a"), row("1", "z"))],
-            inserts: vec![row("", NULL_CELL)], // violates NOT NULL
+            inserts: vec![new_row(None, Some(NULL_CELL))], // violates NOT NULL
             deletes: vec![],
         };
         assert!(
-            submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[0], &changes)
+            submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &changes)
                 .await
                 .is_err()
         );
@@ -323,10 +330,10 @@ mod tests {
                 // Deleted (or its key changed) since it was loaded.
                 (row("7", "x"), row("7", "y")),
             ],
-            inserts: vec![row("", "c")],
+            inserts: vec![new_row(None, Some("c"))],
             deletes: vec![row("2", "b")],
         };
-        let err = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[0], &changes)
+        let err = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &changes)
             .await
             .unwrap_err()
             .to_string();
@@ -370,7 +377,7 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            let err = submit_changes(&conn, &DatabaseType::SQLite, "d", &columns, &[], &changes)
+            let err = submit_changes(&conn, &DatabaseType::SQLite, "d", &columns, &changes)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -412,10 +419,10 @@ mod tests {
             .collect();
         let changes = RowChanges {
             updates: vec![(row("x", "y"), row("x", "z"))],
-            inserts: vec![row("p", "q")],
+            inserts: vec![new_row(Some("p"), Some("q"))],
             deletes: vec![],
         };
-        let err = submit_changes(&conn, &DatabaseType::SQLite, "n", &columns, &[], &changes)
+        let err = submit_changes(&conn, &DatabaseType::SQLite, "n", &columns, &changes)
             .await
             .unwrap_err()
             .to_string();
@@ -433,13 +440,13 @@ mod tests {
         };
         assert!(!changes.is_empty());
         assert_eq!(changes.len(), 1);
-        let n = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[0], &changes)
+        let n = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &changes)
             .await
             .unwrap();
         assert_eq!(n, 0);
         let empty = RowChanges::default();
         assert!(empty.is_empty());
-        let n = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[0], &empty)
+        let n = submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &empty)
             .await
             .unwrap();
         assert_eq!(n, 0);
@@ -455,10 +462,13 @@ mod tests {
                 (row("1", "a"), row("1", "NULL")),
                 (row("2", "b"), row("2", NULL_CELL)),
             ],
-            inserts: vec![row("3", ""), row("4", NULL_CELL)],
+            inserts: vec![
+                new_row(Some("3"), Some("")),
+                new_row(Some("4"), Some(NULL_CELL)),
+            ],
             deletes: vec![],
         };
-        submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[], &changes)
+        submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &changes)
             .await
             .unwrap();
         let r = conn
@@ -473,6 +483,58 @@ mod tests {
         assert_eq!(
             got,
             [("NULL", "0"), (NULL_CELL, "1"), ("", "0"), (NULL_CELL, "1")]
+        );
+    }
+
+    /// New rows insert only the cells the user set: defaults and identities
+    /// apply to the others, a typed id is kept, and a row with nothing set
+    /// is a row of defaults.
+    #[tokio::test]
+    async fn inserts_leave_untouched_columns_to_their_defaults() {
+        let conn = sqlite_mem(&["CREATE TABLE d (id INTEGER PRIMARY KEY, name TEXT, \
+             status TEXT NOT NULL DEFAULT 'new', n INTEGER DEFAULT 5)"])
+        .await;
+        let columns: Vec<Column> = ["id", "name", "status", "n"]
+            .iter()
+            .map(|n| Column {
+                name: n.to_string(),
+                type_name: if *n == "id" || *n == "n" {
+                    "INTEGER"
+                } else {
+                    "TEXT"
+                }
+                .into(),
+                nullable: *n != "status",
+                is_primary_key: *n == "id",
+            })
+            .collect();
+        assert_eq!(detect_system_columns(&columns), [0], "id looks generated");
+        let some = |v: &str| Some(v.to_string());
+        let changes = RowChanges {
+            inserts: vec![
+                vec![None, some("a"), None, None],
+                vec![some("42"), some("typed id"), some("done"), some("")],
+                vec![None, None, None, None],
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            submit_changes(&conn, &DatabaseType::SQLite, "d", &columns, &changes)
+                .await
+                .unwrap(),
+            3
+        );
+        let r = conn
+            .execute_query("SELECT id, name, status, n FROM d ORDER BY name IS NULL, name")
+            .await
+            .unwrap();
+        assert_eq!(
+            r.rows,
+            vec![
+                vec!["1", "a", "new", "5"],
+                vec!["42", "typed id", "done", NULL_CELL],
+                vec!["43", NULL_CELL, "new", "5"],
+            ]
         );
     }
 

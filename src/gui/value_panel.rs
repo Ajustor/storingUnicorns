@@ -164,7 +164,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let hint = if panel.null { "NULL" } else { "" };
+            let hint = if panel.null {
+                "NULL"
+            } else if f.edits.is_default(f.row, f.col) {
+                "DEFAULT"
+            } else {
+                ""
+            };
             fn edit<'t>(text: &'t mut dyn egui::TextBuffer, hint: &str) -> egui::TextEdit<'t> {
                 egui::TextEdit::multiline(text)
                     .code_editor()

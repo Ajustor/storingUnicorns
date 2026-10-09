@@ -394,7 +394,8 @@ impl NewConnectionState {
         self.ssl_mode = SslMode::ALL[(i + 1) % SslMode::ALL.len()];
     }
 
-    /// Fill the form from `self.url`; on error nothing changes.
+    /// Fill the form from `self.url` (see the SSL / password rules below);
+    /// on error nothing changes.
     pub fn apply_url(&mut self) -> Result<(), String> {
         let p = presets::parse_url(&self.url)?;
         self.set_db_type(p.db_type);
@@ -414,12 +415,14 @@ impl NewConnectionState {
         if let Some(d) = p.database {
             self.database = d;
         }
-        if let Some(m) = p.ssl_mode {
-            self.ssl_mode = m;
-        }
-        if let Some(ca) = p.ssl_ca {
-            self.ssl_ca = ca.display().to_string();
-        }
+        // The URL describes the whole connection: SSL settings it doesn't
+        // mention go back to their defaults. A missing password keeps the
+        // typed one (URLs are often shared without it).
+        self.ssl_mode = p.ssl_mode.unwrap_or_default();
+        self.ssl_ca = p
+            .ssl_ca
+            .map(|ca| ca.display().to_string())
+            .unwrap_or_default();
         self.url.clear();
         Ok(())
     }
@@ -1424,6 +1427,19 @@ mod tests {
         nc.url = "redis://x".into();
         assert!(nc.apply_url().is_err());
         assert_eq!(nc.host, "aws.connect.psdb.cloud"); // untouched
+    }
+
+    #[test]
+    fn pasted_url_resets_ssl_it_does_not_mention() {
+        let mut nc = NewConnectionState {
+            ssl_mode: SslMode::Require,
+            ssl_ca: "/etc/ca.pem".into(),
+            url: "postgres://u:p@localhost/db".into(),
+            ..Default::default()
+        };
+        nc.apply_url().unwrap();
+        assert_eq!(nc.ssl_mode, SslMode::Prefer);
+        assert!(nc.ssl_ca.is_empty());
     }
 
     #[test]

@@ -146,7 +146,8 @@ impl ConnectionForm {
         }
     }
 
-    /// Fill the form from `self.url`; on error nothing changes.
+    /// Fill the form from `self.url` (see the SSL / password rules below);
+    /// on error nothing changes.
     pub fn apply_url(&mut self) -> Result<(), String> {
         let p = presets::parse_url(&self.url)?;
         self.set_db_type(p.db_type);
@@ -167,12 +168,14 @@ impl ConnectionForm {
         if let Some(d) = p.database {
             self.database = d;
         }
-        if let Some(m) = p.ssl_mode {
-            self.ssl_mode = m;
-        }
-        if let Some(ca) = p.ssl_ca {
-            self.ssl_ca = ca.display().to_string();
-        }
+        // The URL describes the whole connection: SSL settings it doesn't
+        // mention go back to their defaults. A missing password keeps the
+        // typed one (URLs are often shared without it).
+        self.ssl_mode = p.ssl_mode.unwrap_or_default();
+        self.ssl_ca = p
+            .ssl_ca
+            .map(|ca| ca.display().to_string())
+            .unwrap_or_default();
         self.url.clear();
         Ok(())
     }
@@ -573,6 +576,22 @@ mod tests {
         f.url = "redis://x".into();
         assert!(f.apply_url().is_err());
         assert_eq!(f.host, "db.abc.supabase.co"); // untouched
+    }
+
+    #[test]
+    fn pasted_url_resets_ssl_it_does_not_mention_but_keeps_the_password() {
+        let mut f = ConnectionForm::new(None);
+        f.ssl_mode = SslMode::Require;
+        f.ssl_ca = "C:/ca.pem".into();
+        f.password = "typed".into();
+        f.url = "postgres://u@localhost/db".into();
+        f.apply_url().unwrap();
+        assert_eq!(f.ssl_mode, SslMode::Prefer);
+        assert!(f.ssl_ca.is_empty());
+        assert_eq!(f.password, "typed");
+        f.url = "postgres://u:p@localhost/db".into();
+        f.apply_url().unwrap();
+        assert_eq!(f.password, "p");
     }
 
     #[test]

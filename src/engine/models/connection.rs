@@ -60,7 +60,6 @@ pub enum SslMode {
 }
 
 impl SslMode {
-    #[allow(dead_code)] // TODO(tls-presets): drop once the dialogs use it.
     pub const ALL: [SslMode; 5] = [
         SslMode::Disable,
         SslMode::Prefer,
@@ -96,7 +95,6 @@ pub enum Flavor {
 }
 
 impl Flavor {
-    #[allow(dead_code)] // TODO(tls-presets): drop once the dialogs use it.
     pub const ALL: [Flavor; 7] = [
         Flavor::MariaDb,
         Flavor::PlanetScale,

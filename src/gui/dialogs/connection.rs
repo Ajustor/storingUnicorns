@@ -2,7 +2,8 @@
 
 use egui::{Sense, Stroke, StrokeKind};
 
-use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType};
+use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType, Flavor, SslMode};
+use crate::engine::presets;
 use crate::gui::theme::{self, CONNECTION_COLORS, ERROR, SUCCESS};
 
 const DB_TYPES: [DatabaseType; 5] = [
@@ -39,6 +40,8 @@ pub fn same_target(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
         && a.database == b.database
         && a.azure_auth_method == b.azure_auth_method
         && a.tenant_id == b.tenant_id
+        && a.ssl_mode == b.ssl_mode
+        && a.ssl_ca == b.ssl_ca
 }
 
 pub struct ConnectionForm {
@@ -54,6 +57,14 @@ pub struct ConnectionForm {
     pub azure_auth: AzureAuthMethod,
     pub tenant_id: String,
     pub color: Option<[u8; 3]>,
+    /// Compatible product; `None` = the bare engine.
+    pub flavor: Option<Flavor>,
+    pub ssl_mode: SslMode,
+    /// CA certificate path; empty = system roots only.
+    pub ssl_ca: String,
+    /// Pasted connection URL, consumed by "Remplir".
+    pub url: String,
+    pub url_error: Option<String>,
     pub error: Option<String>,
     pub testing: bool,
     pub test_result: Option<Result<(), String>>,
@@ -86,6 +97,14 @@ impl ConnectionForm {
             db_type: c.db_type,
             database: c.database,
             color: c.color,
+            flavor: c.flavor,
+            ssl_mode: c.ssl_mode.unwrap_or_default(),
+            ssl_ca: c
+                .ssl_ca
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            url: String::new(),
+            url_error: None,
             error: None,
             testing: false,
             test_result: None,
@@ -96,11 +115,66 @@ impl ConnectionForm {
         if self.port.is_empty() || self.port == default_port(&self.db_type) {
             self.port = default_port(&t).to_string();
         }
+        if self.flavor.is_some_and(|f| f.driver() != t) {
+            self.flavor = None;
+        }
         self.db_type = t;
     }
 
     fn uses_server(&self) -> bool {
         self.db_type != DatabaseType::SQLite
+    }
+
+    /// Whether the driver honours the SSL settings (PostgreSQL / MySQL).
+    fn uses_tls(&self) -> bool {
+        matches!(self.db_type, DatabaseType::Postgres | DatabaseType::MySQL)
+    }
+
+    /// Choose a product (None = bare engine): driver, port and SSL mode;
+    /// the user only when empty or still a driver default; the host is
+    /// never overwritten.
+    pub fn apply_preset(&mut self, flavor: Option<Flavor>) {
+        self.flavor = flavor;
+        let Some(f) = flavor else { return };
+        let p = presets::preset(f);
+        self.set_db_type(p.db_type);
+        self.port = p.port.to_string();
+        self.ssl_mode = p.ssl_mode;
+        let u = self.username.trim();
+        if u.is_empty() || u == "postgres" || u == "root" {
+            self.username = p.username.to_string();
+        }
+    }
+
+    /// Fill the form from `self.url`; on error nothing changes.
+    pub fn apply_url(&mut self) -> Result<(), String> {
+        let p = presets::parse_url(&self.url)?;
+        self.set_db_type(p.db_type);
+        self.flavor = p.flavor;
+        if let Some(h) = p.host {
+            self.host = h;
+        }
+        self.port = p
+            .port
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| default_port(&self.db_type).to_string());
+        if let Some(u) = p.username {
+            self.username = u;
+        }
+        if let Some(pw) = p.password {
+            self.password = pw;
+        }
+        if let Some(d) = p.database {
+            self.database = d;
+        }
+        if let Some(m) = p.ssl_mode {
+            self.ssl_mode = m;
+        }
+        if let Some(ca) = p.ssl_ca {
+            self.ssl_ca = ca.display().to_string();
+        }
+        self.url.clear();
+        Ok(())
     }
 
     /// Build the config, or a French error message for the form.
@@ -148,10 +222,13 @@ impl ConnectionForm {
             azure_auth_method: azure.then(|| self.azure_auth.clone()),
             tenant_id: if azure { opt(&self.tenant_id) } else { None },
             color: self.color,
-            // Filled by the SSL / preset fields of the dialog (later task).
-            ssl_mode: None,
-            ssl_ca: None,
-            flavor: None,
+            ssl_mode: self.uses_tls().then_some(self.ssl_mode),
+            ssl_ca: if self.uses_tls() {
+                opt(&self.ssl_ca).map(Into::into)
+            } else {
+                None
+            },
+            flavor: self.flavor.filter(|f| f.driver() == self.db_type),
         })
     }
 
@@ -174,6 +251,36 @@ impl ConnectionForm {
 
                 ui.label("Couleur");
                 self.color_row(ui);
+                ui.end_row();
+
+                ui.label("Coller une URL");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.url)
+                            .hint_text("postgresql://user:pass@host:5432/db?sslmode=require"),
+                    );
+                    if ui
+                        .add_enabled(!self.url.trim().is_empty(), egui::Button::new("Remplir"))
+                        .clicked()
+                    {
+                        self.url_error = self.apply_url().err();
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Modèle");
+                let mut flavor = self.flavor;
+                egui::ComboBox::from_id_salt("flavor")
+                    .selected_text(flavor.map_or("Aucun".to_string(), |f| f.to_string()))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut flavor, None, "Aucun");
+                        for f in Flavor::ALL {
+                            ui.selectable_value(&mut flavor, Some(f), f.to_string());
+                        }
+                    });
+                if flavor != self.flavor {
+                    self.apply_preset(flavor);
+                }
                 ui.end_row();
 
                 ui.label("Type");
@@ -210,6 +317,9 @@ impl ConnectionForm {
                 }
             });
 
+        if let Some(e) = &self.url_error {
+            ui.colored_label(ERROR, e);
+        }
         if let Some(e) = &self.error {
             ui.colored_label(ERROR, e);
         }
@@ -245,7 +355,8 @@ impl ConnectionForm {
 
     fn server_fields(&mut self, ui: &mut egui::Ui) {
         ui.label("Hôte");
-        ui.text_edit_singleline(&mut self.host);
+        let hint = self.flavor.map_or("", |f| presets::preset(f).host_hint);
+        ui.add(egui::TextEdit::singleline(&mut self.host).hint_text(hint));
         ui.end_row();
         ui.label("Port");
         ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(80.0));
@@ -277,6 +388,34 @@ impl ConnectionForm {
         }
         ui.label("Base");
         ui.text_edit_singleline(&mut self.database);
+        ui.end_row();
+        if self.uses_tls() {
+            self.ssl_fields(ui);
+        }
+    }
+
+    fn ssl_fields(&mut self, ui: &mut egui::Ui) {
+        ui.label("SSL");
+        egui::ComboBox::from_id_salt("ssl_mode")
+            .selected_text(self.ssl_mode.to_string())
+            .show_ui(ui, |ui| {
+                for m in SslMode::ALL {
+                    ui.selectable_value(&mut self.ssl_mode, m, m.to_string());
+                }
+            });
+        ui.end_row();
+        ui.label("Certificat CA");
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.ssl_ca).hint_text("racines du système"));
+            if ui.button(egui_phosphor::regular::FOLDER_OPEN).clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Certificat", &["pem", "crt", "cer"])
+                    .pick_file()
+                {
+                    self.ssl_ca = p.display().to_string();
+                }
+            }
+        });
         ui.end_row();
     }
 
@@ -390,6 +529,93 @@ mod tests {
         assert!(same_target(&a, &b));
         let c = ConnectionConfig {
             database: "elsewhere".into(),
+            ..a.clone()
+        };
+        assert!(!same_target(&a, &c));
+    }
+
+    #[test]
+    fn preset_fills_driver_port_ssl_and_keeps_typed_values() {
+        let mut f = ConnectionForm::new(None);
+        f.host = "mine.example".into();
+        f.username = String::new();
+        f.apply_preset(Some(Flavor::CockroachDb));
+        assert_eq!(f.db_type, DatabaseType::Postgres);
+        assert_eq!(f.port, "26257");
+        assert_eq!(f.ssl_mode, SslMode::Require);
+        assert_eq!(f.host, "mine.example");
+        assert_eq!(f.username, "root");
+        f.apply_preset(None);
+        assert_eq!(f.flavor, None);
+    }
+
+    #[test]
+    fn preset_keeps_a_typed_username() {
+        let mut f = ConnectionForm::new(None);
+        f.username = "alice".into();
+        f.apply_preset(Some(Flavor::MariaDb));
+        assert_eq!(f.db_type, DatabaseType::MySQL);
+        assert_eq!(f.username, "alice");
+    }
+
+    #[test]
+    fn pasted_url_fills_every_field() {
+        let mut f = ConnectionForm::new(None);
+        f.url =
+            "postgresql://postgres:p%40ss@db.abc.supabase.co:5432/postgres?sslmode=require".into();
+        f.apply_url().unwrap();
+        assert_eq!(f.host, "db.abc.supabase.co");
+        assert_eq!(f.password, "p@ss");
+        assert_eq!(f.ssl_mode, SslMode::Require);
+        assert_eq!(f.flavor, Some(Flavor::Supabase));
+        assert!(f.url.is_empty());
+
+        f.url = "redis://x".into();
+        assert!(f.apply_url().is_err());
+        assert_eq!(f.host, "db.abc.supabase.co"); // untouched
+    }
+
+    #[test]
+    fn validate_keeps_ssl_and_flavor_for_pg_mysql_only() {
+        let mut f = ConnectionForm::new(None);
+        f.name = "x".into();
+        f.ssl_mode = SslMode::VerifyFull;
+        f.ssl_ca = "C:/ca.pem".into();
+        f.flavor = Some(Flavor::Neon);
+        let c = f.validate(&[]).unwrap();
+        assert_eq!(c.ssl_mode, Some(SslMode::VerifyFull));
+        assert_eq!(c.ssl_ca, Some("C:/ca.pem".into()));
+        assert_eq!(c.flavor, Some(Flavor::Neon));
+        f.set_db_type(DatabaseType::SQLServer);
+        let c = f.validate(&[]).unwrap();
+        assert_eq!((c.ssl_mode, c.ssl_ca, c.flavor), (None, None, None));
+    }
+
+    #[test]
+    fn editing_keeps_ssl_settings_and_flavor() {
+        let edited = ConnectionConfig {
+            ssl_mode: Some(SslMode::VerifyCa),
+            ssl_ca: Some("/etc/ca.pem".into()),
+            flavor: Some(Flavor::TimescaleDb),
+            ..existing()[0].clone()
+        };
+        let f = ConnectionForm::new(Some(edited));
+        let c = f.validate(&existing()).unwrap();
+        assert_eq!(c.ssl_mode, Some(SslMode::VerifyCa));
+        assert_eq!(c.ssl_ca, Some("/etc/ca.pem".into()));
+        assert_eq!(c.flavor, Some(Flavor::TimescaleDb));
+    }
+
+    #[test]
+    fn ssl_settings_are_part_of_the_target() {
+        let a = ConnectionConfig::default();
+        let b = ConnectionConfig {
+            ssl_mode: Some(SslMode::Require),
+            ..a.clone()
+        };
+        assert!(!same_target(&a, &b));
+        let c = ConnectionConfig {
+            ssl_ca: Some("ca.pem".into()),
             ..a.clone()
         };
         assert!(!same_target(&a, &c));

@@ -9,15 +9,20 @@ use crate::engine::models::{
 
 use super::utils::{fetch_rows_and_result, group_tables_by_schema, split_qualified, TxConnection};
 
-/// Options built field by field: no URL, so any character works in the
-/// password. (Like a URL, unset fields still fall back to the PG* variables.)
+/// Options built field by field: the password never goes through a URL, so
+/// any character works in it. Host, port, user, database and SSL mode always
+/// come from `config`. As with libpq, what `config` leaves unset falls back
+/// to the environment: without a password, `PGPASSWORD`, then the pgpass
+/// file (`PGPASSFILE`, `~/.pgpass`, `%APPDATA%\postgresql\pgpass.conf`);
+/// without a CA, `PGSSLROOTCERT`; and always `PGSSLCERT`, `PGSSLKEY`,
+/// `PGAPPNAME`, `PGOPTIONS`.
 pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
     // NOTE: `VerifyCa` still checks the host name. sqlx 0.8.6's
     // `NoHostnameTlsVerifier` (sqlx-core/src/net/tls/tls_rustls.rs) only
     // ignores `CertificateError::NotValidForName`, while rustls 0.23 reports
     // a mismatch as `NotValidForNameContext`. Not patched here: `tls::explain`
     // says so and points to `Require` instead.
-    let mut o = PgConnectOptions::new_without_pgpass()
+    let mut o = base_options(config)
         .host(config.host.as_deref().unwrap_or("localhost"))
         .port(config.port.unwrap_or(5432))
         .username(config.username.as_deref().unwrap_or("postgres"))
@@ -36,6 +41,32 @@ pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
         o = o.ssl_root_cert(ca);
     }
     o
+}
+
+/// The options `connect_options` starts from. Without a password, sqlx's
+/// URL parser is the only public way to read the pgpass file for *our*
+/// host/port/user/database (`PgConnectOptions::new()` looks it up for the
+/// defaults, before the fields are set), so those four go through a URL's
+/// query string, which `url` encodes and sqlx decodes.
+fn base_options(config: &ConnectionConfig) -> PgConnectOptions {
+    if config.password.is_some() {
+        return PgConnectOptions::new_without_pgpass();
+    }
+    let mut url = url::Url::parse("postgres://localhost").expect("static URL");
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("host", config.host.as_deref().unwrap_or("localhost"))
+            .append_pair("port", &config.port.unwrap_or(5432).to_string())
+            .append_pair("user", config.username.as_deref().unwrap_or("postgres"));
+        if !config.database.is_empty() {
+            query.append_pair("dbname", &config.database);
+        }
+    }
+    // Can't fail: every value is a valid string and the port a number.
+    url.as_str()
+        .parse()
+        .unwrap_or_else(|_| PgConnectOptions::new_without_pgpass())
 }
 
 /// Connect to PostgreSQL. In `Prefer` mode, a failed TLS handshake is retried
@@ -535,6 +566,63 @@ mod tests {
             "{debug}"
         );
         assert!(debug.contains("C:/certs/ca.pem"), "{debug}");
+    }
+
+    #[test]
+    fn without_a_password_the_fields_still_apply() {
+        let c = ConnectionConfig {
+            host: Some("h-é.example".into()),
+            port: Some(6543),
+            username: Some("al ice@x".into()),
+            password: None,
+            database: "my db/1".into(),
+            ssl_mode: Some(SslMode::Require),
+            ssl_ca: Some("C:/certs/ca.pem".into()),
+            ..Default::default()
+        };
+        let o = connect_options(&c);
+        assert_eq!(o.get_host(), "h-é.example");
+        assert_eq!(o.get_port(), 6543);
+        assert_eq!(o.get_username(), "al ice@x");
+        assert_eq!(o.get_database(), Some("my db/1"));
+        assert!(matches!(o.get_ssl_mode(), PgSslMode::Require));
+        assert!(format!("{o:?}").contains("C:/certs/ca.pem"));
+    }
+
+    #[test]
+    fn without_a_password_pgpass_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pgpass.conf");
+        std::fs::write(&file, "pgpass-test.invalid:5499:shop:bob:fr0m-pgpass\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        // Only this test sets PGPASSFILE, and only its host matches the file.
+        std::env::set_var("PGPASSFILE", &file);
+        let c = ConnectionConfig {
+            host: Some("pgpass-test.invalid".into()),
+            port: Some(5499),
+            username: Some("bob".into()),
+            password: None,
+            database: "shop".into(),
+            ..Default::default()
+        };
+        let without = format!("{:?}", connect_options(&c));
+        let with = format!(
+            "{:?}",
+            connect_options(&ConnectionConfig {
+                password: Some("typed".into()),
+                ..c
+            })
+        );
+        std::env::remove_var("PGPASSFILE");
+        assert!(
+            without.contains(r#"password: Some("fr0m-pgpass")"#),
+            "{without}"
+        );
+        assert!(with.contains(r#"password: Some("typed")"#), "{with}");
     }
 
     #[test]

@@ -43,7 +43,17 @@ pub fn explain(message: &str, host: &str, mode: SslMode) -> Option<String> {
     } else if m.contains("notvalidforname") || m.contains("not valid for name") {
         // rustls: `NotValidForName`, or `NotValidForNameContext` printed as
         // "certificate not valid for name …".
-        Some(format!("Le certificat ne correspond pas à {host}."))
+        Some(if mode == SslMode::VerifyCa {
+            // sqlx can't skip the name check with rustls 0.23 (see the NOTE
+            // in `postgres::connect_options`).
+            format!(
+                "Le certificat ne correspond pas à {host}. La vérification du nom ne peut \
+                 pas être désactivée pour l'instant : utilise Obligatoire pour une \
+                 connexion chiffrée sans vérification."
+            )
+        } else {
+            format!("Le certificat ne correspond pas à {host}.")
+        })
     } else if m.contains("unknownissuer") || m.contains("invalid peer certificate") {
         Some(
             "Certificat du serveur non reconnu : indique son certificat CA, ou passe le \
@@ -102,6 +112,22 @@ mod tests {
              SSL à Obligatoire (chiffré, sans vérification)."
         );
         assert_eq!(h("password authentication failed for user \"u\""), None);
+    }
+
+    #[test]
+    fn verify_ca_name_mismatch_is_honest() {
+        let m = "invalid peer certificate: certificate not valid for name \"db.example.com\"; \
+                 certificate is only valid for other.example.com";
+        assert_eq!(
+            explain(m, "db.example.com", SslMode::VerifyCa).unwrap(),
+            "Le certificat ne correspond pas à db.example.com. La vérification du nom ne \
+             peut pas être désactivée pour l'instant : utilise Obligatoire pour une \
+             connexion chiffrée sans vérification."
+        );
+        assert_eq!(
+            explain(m, "db.example.com", SslMode::VerifyFull).unwrap(),
+            "Le certificat ne correspond pas à db.example.com."
+        );
     }
 
     #[test]

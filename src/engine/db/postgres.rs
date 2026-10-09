@@ -12,6 +12,11 @@ use super::utils::{fetch_rows_and_result, group_tables_by_schema, split_qualifie
 /// Options built field by field: no URL, so any character works in the
 /// password. (Like a URL, unset fields still fall back to the PG* variables.)
 pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
+    // NOTE: `VerifyCa` still checks the host name. sqlx 0.8.6's
+    // `NoHostnameTlsVerifier` (sqlx-core/src/net/tls/tls_rustls.rs) only
+    // ignores `CertificateError::NotValidForName`, while rustls 0.23 reports
+    // a mismatch as `NotValidForNameContext`. Not patched here: `tls::explain`
+    // says so and points to `Require` instead.
     let mut o = PgConnectOptions::new_without_pgpass()
         .host(config.host.as_deref().unwrap_or("localhost"))
         .port(config.port.unwrap_or(5432))

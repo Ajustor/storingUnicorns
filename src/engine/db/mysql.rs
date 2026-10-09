@@ -15,6 +15,11 @@ use super::utils::{
 /// Options built field by field: no URL, so any character works in the
 /// password.
 pub fn connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
+    // NOTE: `VerifyCa` still checks the host name. sqlx 0.8.6's
+    // `NoHostnameTlsVerifier` (sqlx-core/src/net/tls/tls_rustls.rs) only
+    // ignores `CertificateError::NotValidForName`, while rustls 0.23 reports
+    // a mismatch as `NotValidForNameContext`. Not patched here: `tls::explain`
+    // says so and points to `Require` instead.
     let mut o = MySqlConnectOptions::new()
         .host(config.host.as_deref().unwrap_or("localhost"))
         .port(config.port.unwrap_or(3306))

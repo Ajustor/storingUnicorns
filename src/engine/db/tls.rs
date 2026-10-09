@@ -72,6 +72,15 @@ pub fn explain(message: &str, host: &str, mode: SslMode) -> Option<String> {
     }
 }
 
+/// `check_ca` when `mode` reads the CA (sqlx only uses it to verify): a
+/// stale path must not block a Disable / Prefer / Require connection.
+pub fn check_ca_for(mode: SslMode, path: Option<&Path>) -> Result<(), String> {
+    match mode {
+        SslMode::VerifyCa | SslMode::VerifyFull => check_ca(path),
+        SslMode::Disable | SslMode::Prefer | SslMode::Require => Ok(()),
+    }
+}
+
 /// Fail early, in French, when the CA file can't be read or isn't PEM.
 pub fn check_ca(path: Option<&Path>) -> Result<(), String> {
     let Some(p) = path else {
@@ -211,5 +220,17 @@ mod tests {
         std::fs::write(&ca, "not a certificate").unwrap();
         let e = check_ca(Some(&ca)).unwrap_err();
         assert!(e.contains("pas un certificat PEM"), "{e}");
+    }
+
+    #[test]
+    fn a_stale_ca_only_blocks_the_modes_that_read_it() {
+        let stale = Some(std::path::Path::new("Z:/does/not/exist.pem"));
+        for mode in [SslMode::Disable, SslMode::Prefer, SslMode::Require] {
+            assert!(check_ca_for(mode, stale).is_ok(), "{mode:?}");
+        }
+        for mode in [SslMode::VerifyCa, SslMode::VerifyFull] {
+            assert!(check_ca_for(mode, stale).is_err(), "{mode:?}");
+            assert!(check_ca_for(mode, None).is_ok(), "{mode:?}");
+        }
     }
 }

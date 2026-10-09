@@ -33,14 +33,16 @@ impl DatabaseConnection {
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
         match config.db_type {
             DatabaseType::Postgres => {
-                tls::check_ca(config.ssl_ca.as_deref()).map_err(anyhow::Error::msg)?;
+                tls::check_ca_for(config.effective_ssl_mode(), config.ssl_ca.as_deref())
+                    .map_err(anyhow::Error::msg)?;
                 let pool = postgres::connect(config)
                     .await
                     .map_err(|e| explain_tls(e, config))?;
                 Ok(DatabaseConnection::Postgres(pool))
             }
             DatabaseType::MySQL => {
-                tls::check_ca(config.ssl_ca.as_deref()).map_err(anyhow::Error::msg)?;
+                tls::check_ca_for(config.effective_ssl_mode(), config.ssl_ca.as_deref())
+                    .map_err(anyhow::Error::msg)?;
                 let pool = mysql::connect(config)
                     .await
                     .map_err(|e| explain_tls(e, config))?;

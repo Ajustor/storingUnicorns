@@ -26,7 +26,6 @@ pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
         .host(config.host.as_deref().unwrap_or("localhost"))
         .port(config.port.unwrap_or(5432))
         .username(config.username.as_deref().unwrap_or("postgres"))
-        .database(&config.database)
         .ssl_mode(match config.effective_ssl_mode() {
             SslMode::Disable => PgSslMode::Disable,
             SslMode::Prefer => PgSslMode::Prefer,
@@ -34,6 +33,11 @@ pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
             SslMode::VerifyCa => PgSslMode::VerifyCa,
             SslMode::VerifyFull => PgSslMode::VerifyFull,
         });
+    // Unset rather than empty, as the URL path used to: the server (or the
+    // environment) picks the default database.
+    if !config.database.is_empty() {
+        o = o.database(&config.database);
+    }
     if let Some(p) = &config.password {
         o = o.password(p);
     }
@@ -566,6 +570,20 @@ mod tests {
             "{debug}"
         );
         assert!(debug.contains("C:/certs/ca.pem"), "{debug}");
+    }
+
+    #[test]
+    fn an_empty_database_is_not_sent() {
+        // Unset, the server defaults it to the user name (or PGDATABASE
+        // applies); an empty name would be sent as is.
+        for password in [None, Some("p".to_string())] {
+            let o = connect_options(&ConnectionConfig {
+                password,
+                database: String::new(),
+                ..Default::default()
+            });
+            assert_ne!(o.get_database(), Some(""));
+        }
     }
 
     #[test]

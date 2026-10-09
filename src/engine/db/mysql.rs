@@ -24,7 +24,6 @@ pub fn connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
         .host(config.host.as_deref().unwrap_or("localhost"))
         .port(config.port.unwrap_or(3306))
         .username(config.username.as_deref().unwrap_or("root"))
-        .database(&config.database)
         .ssl_mode(match config.effective_ssl_mode() {
             SslMode::Disable => MySqlSslMode::Disabled,
             SslMode::Prefer => MySqlSslMode::Preferred,
@@ -32,6 +31,10 @@ pub fn connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
             SslMode::VerifyCa => MySqlSslMode::VerifyCa,
             SslMode::VerifyFull => MySqlSslMode::VerifyIdentity,
         });
+    // Unset rather than empty, as the URL path used to: no default database.
+    if !config.database.is_empty() {
+        o = o.database(&config.database);
+    }
     if let Some(p) = &config.password {
         o = o.password(p);
     }
@@ -360,6 +363,15 @@ mod tests {
             db_type: DatabaseType::MySQL,
             ..c
         }
+    }
+
+    #[test]
+    fn an_empty_database_is_not_sent() {
+        let o = connect_options(&mysql(ConnectionConfig {
+            database: String::new(),
+            ..Default::default()
+        }));
+        assert_eq!(o.get_database(), None);
     }
 
     #[test]

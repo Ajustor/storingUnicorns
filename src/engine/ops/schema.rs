@@ -207,7 +207,19 @@ pub fn generate_ddl(table: &str, details: &TableDetails, quotes: (char, char)) -
             quote_list(&index.columns),
         ));
     }
-    format!("{};", statements.join(";\n\n"))
+    let mut ddl = format!("{};", statements.join(";\n\n"));
+    // Say what is missing rather than silently dropping it.
+    let notes = [
+        ("Index", &details.indexes_error),
+        ("Clés étrangères", &details.foreign_keys_error),
+    ];
+    for (what, error) in notes {
+        if let Some(e) = error {
+            let e = e.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+            ddl.push_str(&format!("\n-- {what} non disponibles sur ce serveur : {e}"));
+        }
+    }
+    ddl
 }
 
 /// The table a modification applies to.
@@ -350,6 +362,33 @@ mod tests {
             ddl.contains("CONSTRAINT \"fk_a\" FOREIGN KEY (\"a_id\") REFERENCES \"a\" (\"id\")")
         );
         assert!(ddl.contains("CREATE INDEX \"ix_a\" ON \"b\" (\"a_id\");"));
+        assert!(!ddl.contains("--"), "{ddl}");
+    }
+
+    #[test]
+    fn generate_ddl_says_what_it_could_not_read() {
+        use crate::engine::models::Column;
+        let d = TableDetails {
+            columns: vec![Column {
+                name: "id".into(),
+                type_name: "integer".into(),
+                nullable: false,
+                is_primary_key: true,
+            }],
+            indexes_error: Some("relation pg_index\ndoes not exist".into()),
+            foreign_keys_error: Some("no\r\nfk".into()),
+            ..TableDetails::default()
+        };
+        let ddl = generate_ddl("\"b\"", &d, ('"', '"'));
+        assert!(ddl.starts_with("CREATE TABLE \"b\" (\n"), "{ddl}");
+        assert!(
+            ddl.ends_with(
+                ");\n\
+                 -- Index non disponibles sur ce serveur : relation pg_index does not exist\n\
+                 -- Clés étrangères non disponibles sur ce serveur : no fk"
+            ),
+            "{ddl}"
+        );
     }
 
     #[tokio::test]

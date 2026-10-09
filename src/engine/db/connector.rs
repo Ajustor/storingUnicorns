@@ -7,7 +7,17 @@ use crate::engine::models::{
 };
 
 pub use super::sqlserver::SqlServerClient;
-use super::{azure, mysql, postgres, sqlite, sqlserver, utils};
+use super::{azure, mysql, postgres, sqlite, sqlserver, tls, utils};
+
+/// A known TLS failure gets a French hint; the driver's message stays in
+/// parentheses for diagnosis. Other errors are unchanged.
+fn explain_tls(e: anyhow::Error, config: &ConnectionConfig) -> anyhow::Error {
+    let host = config.host.as_deref().unwrap_or("localhost");
+    match tls::explain(&format!("{e:#}"), host) {
+        Some(hint) => anyhow::anyhow!("{hint}\n({e:#})"),
+        None => e,
+    }
+}
 
 /// Unified database connection handle
 pub enum DatabaseConnection {
@@ -23,11 +33,17 @@ impl DatabaseConnection {
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
         match config.db_type {
             DatabaseType::Postgres => {
-                let pool = postgres::connect(config).await?;
+                tls::check_ca(config.ssl_ca.as_deref()).map_err(anyhow::Error::msg)?;
+                let pool = postgres::connect(config)
+                    .await
+                    .map_err(|e| explain_tls(e, config))?;
                 Ok(DatabaseConnection::Postgres(pool))
             }
             DatabaseType::MySQL => {
-                let pool = mysql::connect(config).await?;
+                tls::check_ca(config.ssl_ca.as_deref()).map_err(anyhow::Error::msg)?;
+                let pool = mysql::connect(config)
+                    .await
+                    .map_err(|e| explain_tls(e, config))?;
                 Ok(DatabaseConnection::MySQL(pool))
             }
             DatabaseType::SQLite => {

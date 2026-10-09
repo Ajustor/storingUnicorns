@@ -7,6 +7,32 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Nouveautés
+
+- **Azure SQL : identité managée affectée par l'utilisateur.** Le champ
+  « ID client de l'identité » choisit l'identité à utiliser (vide = identité
+  système). Sur App Service, Functions et Container Apps, seule l'identité
+  système est prise en charge pour l'instant.
+- **Azure SQL : cloud déduit de l'hôte.** Les serveurs Azure Government
+  (`*.database.usgovcloudapi.net`) et Azure Chine (`*.database.chinacloudapi.cn`)
+  obtiennent un jeton pour le bon cloud ; le cloud détecté s'affiche à côté de
+  l'hôte. Un nom personnalisé (alias DNS) est traité comme le cloud public. Si
+  Azure CLI est réglé sur un autre cloud, le message d'erreur indique la
+  commande `az cloud set --name …` à lancer.
+
+### Corrections
+
+- **Azure SQL : l'authentification « Managed Identity » utilisait en réalité
+  Azure CLI.** Elle interroge désormais le point de terminaison d'identité
+  managée de la ressource Azure, avec un message clair quand la machine n'en a
+  pas.
+- **Azure SQL : le certificat du serveur est vérifié.** Les connexions Azure
+  (jeton Entra ID comme authentification SQL) acceptaient n'importe quel
+  certificat alors qu'un jeton ou un mot de passe est envoyé au serveur. Les
+  connexions SQL Server ne changent pas.
+
 ## [0.10.0] - 2026-10-09
 
 ### Nouveautés

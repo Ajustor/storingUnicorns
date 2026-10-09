@@ -4952,6 +4952,7 @@ dependencies = [
  "egui_extras",
  "futures-util",
  "openssl",
+ "percent-encoding",
  "ratatui",
  "rfd",
  "rust_decimal",
@@ -4972,6 +4973,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
  "winresource",
 ]
 

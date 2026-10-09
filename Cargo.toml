@@ -68,6 +68,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Misc
 dirs = "5.0"
+# Provider connection URLs pasted in the connection dialog
+url = "2"
+percent-encoding = "2"
 
 # SQL formatting (GUI "Reformat")
 sqlformat = "0.3"

@@ -86,6 +86,11 @@ pub enum RowKind {
         group: Group,
         index: usize,
     },
+    /// `group` couldn't be loaded on this server.
+    GroupError {
+        at: TableAt,
+        group: Group,
+    },
 }
 
 /// One line of the tree.
@@ -300,6 +305,9 @@ impl Flat {
                 for index in 0..count {
                     self.push(4, RowKind::Item { at, group, index });
                 }
+                if count == 0 && group_error(d, group).is_some() {
+                    self.push(4, RowKind::GroupError { at, group });
+                }
             }
         }
     }
@@ -315,6 +323,15 @@ fn group_len(d: &TableDetails, group: Group) -> usize {
         Group::Columns => d.columns.len(),
         Group::Keys => usize::from(has_pk(d)) + d.foreign_keys.len(),
         Group::Indexes => d.indexes.len(),
+    }
+}
+
+/// Why `group` is empty, when the server couldn't list it.
+pub(super) fn group_error(d: &TableDetails, group: Group) -> Option<&str> {
+    match group {
+        Group::Columns => None,
+        Group::Keys => d.foreign_keys_error.as_deref(),
+        Group::Indexes => d.indexes_error.as_deref(),
     }
 }
 
@@ -616,6 +633,7 @@ mod tests {
                     ref_table: "u".into(),
                     ref_columns: vec!["id".into()],
                 }],
+                ..TableDetails::default()
             }),
         );
         f.loading.insert("\"main\".\"u\"".into(), 1);
@@ -675,6 +693,62 @@ mod tests {
                 at: TableAt { table: 1, ..at }
             })
         );
+    }
+
+    #[test]
+    fn empty_groups_that_failed_to_load_say_so() {
+        let mut f = Fixture::new(vec![schema("main", &["t"])]);
+        let ids = [
+            connection_id("a"),
+            table_id("a", "main", "t"),
+            group_id("a", "main", "t", Group::Keys),
+            group_id("a", "main", "t", Group::Indexes),
+        ];
+        f.details.insert(
+            "\"main\".\"t\"".into(),
+            Ok(TableDetails {
+                indexes_error: Some("relation pg_index does not exist".into()),
+                foreign_keys_error: Some("no fk".into()),
+                ..TableDetails::default()
+            }),
+        );
+        let flat = flatten(&[f.view("a")], "", opened(&ids));
+        let at = TableAt {
+            conn: 0,
+            schema: 0,
+            table: 0,
+        };
+        assert_eq!(
+            kinds(&flat)[4..],
+            [
+                RowKind::Group {
+                    at,
+                    group: Group::Keys,
+                    count: 0,
+                    open: true
+                },
+                RowKind::GroupError {
+                    at,
+                    group: Group::Keys
+                },
+                RowKind::Group {
+                    at,
+                    group: Group::Indexes,
+                    count: 0,
+                    open: true
+                },
+                RowKind::GroupError {
+                    at,
+                    group: Group::Indexes
+                },
+            ]
+        );
+        assert_eq!(flat.rows[5].depth, 4);
+        // A closed group, or one with lines, shows no note.
+        let flat = flatten(&[f.view("a")], "", opened(&ids[..2]));
+        assert!(!kinds(&flat)
+            .iter()
+            .any(|k| matches!(k, RowKind::GroupError { .. })));
     }
 
     #[test]

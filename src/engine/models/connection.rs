@@ -281,6 +281,11 @@ pub struct TableDetails {
     pub columns: Vec<Column>,
     pub indexes: Vec<IndexInfo>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
+    /// Why `indexes` is empty when the server couldn't list them
+    /// (CockroachDB, Redshift…).
+    pub indexes_error: Option<String>,
+    /// Same for `foreign_keys`.
+    pub foreign_keys_error: Option<String>,
 }
 
 /// The value of a NULL cell. Cells are text, so NULL needs a value of its

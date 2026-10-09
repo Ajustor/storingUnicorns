@@ -24,8 +24,8 @@ use super::sessions::{Session, Sessions};
 use super::status::one_line;
 use super::theme::{self, ACCENT, ERROR};
 use tree::{
-    conn_views, connection_id, flatten, group_id, has_pk, inputs_key, schema_id, table_id, Group,
-    Row, RowKind, TableAt, Tree,
+    conn_views, connection_id, flatten, group_error, group_id, has_pk, inputs_key, schema_id,
+    table_id, Group, Row, RowKind, TableAt, Tree,
 };
 
 /// What the user asked for while the tree was drawn (applied afterwards, so
@@ -371,6 +371,23 @@ fn row_contents(
         RowKind::Item { at, group, index } => {
             if let Some(Ok(d)) = cx.table(at).and_then(|t| t.details()) {
                 item_row(ui, d, group, index);
+            }
+        }
+        RowKind::GroupError { at, group } => {
+            let d = cx.table(at).and_then(|t| t.details());
+            if let Some(e) = d
+                .and_then(|d| d.as_ref().ok())
+                .and_then(|d| group_error(d, group))
+            {
+                ui.add(
+                    Label::new(
+                        RichText::new("Non disponible sur ce serveur")
+                            .weak()
+                            .small(),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(e);
             }
         }
     }

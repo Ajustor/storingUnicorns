@@ -44,22 +44,36 @@ pub async fn fetch_columns(
         .collect())
 }
 
+/// An optional metadata list: an error becomes an empty list plus its text.
+fn degrade<T>(r: Result<Vec<T>>) -> (Vec<T>, Option<String>) {
+    match r {
+        Ok(v) => (v, None),
+        Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+    }
+}
+
 /// Columns (through `cache`), indexes and foreign keys of `table`, fetched
-/// concurrently.
+/// concurrently. Only the columns are required: servers that lack part of
+/// the catalog (CockroachDB, Redshift…) get empty index / key lists with
+/// the reason.
 pub async fn table_details(
     conn: &DatabaseConnection,
     cache: &TableCache,
     table: &str,
 ) -> Result<TableDetails> {
-    let (columns, indexes, foreign_keys) = tokio::try_join!(
+    let (columns, indexes, foreign_keys) = tokio::join!(
         cached_columns(conn, cache, table),
         conn.get_indexes(table),
         conn.get_foreign_keys(table),
-    )?;
+    );
+    let (indexes, indexes_error) = degrade(indexes);
+    let (foreign_keys, foreign_keys_error) = degrade(foreign_keys);
     Ok(TableDetails {
-        columns,
+        columns: columns?,
         indexes,
         foreign_keys,
+        indexes_error,
+        foreign_keys_error,
     })
 }
 
@@ -291,6 +305,15 @@ mod tests {
     }
 
     #[test]
+    fn degrade_keeps_the_error_text() {
+        let (v, e) = degrade::<u8>(Err(anyhow::anyhow!("relation pg_index does not exist")));
+        assert!(v.is_empty());
+        assert_eq!(e.as_deref(), Some("relation pg_index does not exist"));
+        let (v, e) = degrade(Ok(vec![1u8]));
+        assert_eq!((v, e), (vec![1], None));
+    }
+
+    #[test]
     fn generate_ddl_includes_columns_pk_fk_and_indexes() {
         use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo};
         let col = |n: &str, t: &str, null: bool, pk: bool| Column {
@@ -316,6 +339,7 @@ mod tests {
                 ref_table: "a".into(),
                 ref_columns: vec!["id".into()],
             }],
+            ..TableDetails::default()
         };
         let ddl = generate_ddl("\"b\"", &d, ('"', '"'));
         assert!(ddl.starts_with("CREATE TABLE \"b\" (\n"));

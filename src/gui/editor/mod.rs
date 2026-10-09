@@ -186,13 +186,6 @@ pub fn show(
     let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| -> Arc<Galley> {
         cache.layout(ui, text, columns, wrap_width)
     };
-    if text.len() > HIGHLIGHT_MAX_BYTES {
-        ui.label(
-            egui::RichText::new("Coloration désactivée (gros script)")
-                .small()
-                .weak(),
-        );
-    }
     let len = text.len();
     // Navigation keys go to the popup while it is open.
     let triggered = completion.intercept_keys(ui, text, id);

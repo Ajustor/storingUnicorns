@@ -313,6 +313,14 @@ impl ConsoleTab {
             action = Some(a);
         }
         ui.separator();
+        if self.query.len() > editor::HIGHLIGHT_MAX_BYTES {
+            // Outside the editor's scroll area, so it stays in view.
+            ui.label(
+                RichText::new("Coloration désactivée (gros script)")
+                    .small()
+                    .weak(),
+            );
+        }
 
         // Editor, resizable through the splitter below it.
         let max_editor = (ui.available_height() - 120.0).max(60.0);

@@ -8,7 +8,7 @@ use egui::{Color32, Key, Modifiers, RichText, Sense, Stroke, StrokeKind};
 use egui_extras::{Column as TableColumn, TableBuilder};
 use egui_phosphor::regular as icon;
 
-use crate::engine::models::QueryResult;
+use crate::engine::models::{display_cell, is_null, QueryResult, NULL_CELL};
 use crate::gui::theme::{ACCENT, ERROR, SUCCESS};
 
 use changes::{PendingEdits, RowRef};
@@ -42,7 +42,8 @@ enum SortKey {
 impl SortKey {
     fn of(cell: Option<&String>) -> Self {
         match cell.map(String::as_str) {
-            None | Some("NULL") => Self::Null,
+            None => Self::Null,
+            Some(v) if is_null(v) => Self::Null,
             Some(v) => match v.trim().parse::<f64>() {
                 Ok(n) if !n.is_nan() => Self::Number(n),
                 _ => Self::Text(v.to_lowercase()),
@@ -99,6 +100,9 @@ pub struct GridState {
     pub selected: Option<(RowRef, usize)>,
     /// Cell being edited and its text.
     pub editing: Option<(RowRef, usize, String)>,
+    /// The edited cell was NULL: its editor starts empty and, left empty,
+    /// keeps the NULL.
+    editing_null: bool,
     pub edits: PendingEdits,
     /// Client-side view: indices of base rows after filter/sort (consoles only).
     pub view: Vec<usize>,
@@ -123,6 +127,7 @@ impl Default for GridState {
         Self {
             selected: None,
             editing: None,
+            editing_null: false,
             edits: PendingEdits::default(),
             view: Vec::new(),
             filter: String::new(),
@@ -191,9 +196,15 @@ fn plural_rows(n: usize) -> String {
     format!("{n} {}", if n == 1 { "ligne" } else { "lignes" })
 }
 
+/// Text shown for a cell and whether it is NULL (drawn weak and italic):
+/// the text "NULL" is an ordinary value.
+pub fn cell_display(value: &str) -> (&str, bool) {
+    (display_cell(value), is_null(value))
+}
+
 fn cell_text(value: &str, deleted: bool) -> RichText {
-    let text = if value == "NULL" {
-        RichText::new("NULL").weak().italics()
+    let text = if let (shown, true) = cell_display(value) {
+        RichText::new(shown).weak().italics()
     } else {
         match value.char_indices().nth(MAX_CELL_CHARS) {
             Some((end, _)) => RichText::new(format!("{}…", &value[..end])),
@@ -314,8 +325,10 @@ impl GridState {
         if self.edits.is_deleted(r) {
             return;
         }
-        let value = self.edits.value(rows, r, c).to_string();
-        self.editing = Some((r, c, value));
+        let value = self.edits.value(rows, r, c);
+        self.editing_null = is_null(value);
+        let text = if self.editing_null { "" } else { value };
+        self.editing = Some((r, c, text.to_string()));
         self.select(r, c);
         self.select_all = true;
         ctx.request_repaint();
@@ -323,7 +336,9 @@ impl GridState {
 
     fn commit_edit(&mut self, rows: &[Vec<String>]) {
         if let Some((r, c, text)) = self.editing.take() {
-            self.edits.set(rows, r, c, text);
+            if !(self.editing_null && text.is_empty()) {
+                self.edits.set(rows, r, c, text);
+            }
         }
     }
 
@@ -416,7 +431,7 @@ impl GridState {
         }
         let copy = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
         if let (true, Some((r, c))) = (copy, self.selected) {
-            ctx.copy_text(self.edits.value(&result.rows, r, c).to_string());
+            ctx.copy_text(display_cell(self.edits.value(&result.rows, r, c)).to_string());
         }
         if !editable {
             return GridAction::None;
@@ -711,17 +726,17 @@ pub fn show(
             }
         }
         Some(CellAction::CopyValue(r, c)) => {
-            ctx.copy_text(state.edits.value(rows, r, c).to_string());
+            ctx.copy_text(display_cell(state.edits.value(rows, r, c)).to_string());
         }
         Some(CellAction::CopyRow(r)) => {
             let row: Vec<String> = (0..ncols)
-                .map(|c| state.edits.value(rows, r, c).to_string())
+                .map(|c| display_cell(state.edits.value(rows, r, c)).to_string())
                 .collect();
             ctx.copy_text(to_tsv(&row));
         }
         Some(CellAction::SetNull(r, c)) => {
             state.commit_edit(rows);
-            state.edits.set(rows, r, c, "NULL".into());
+            state.edits.set(rows, r, c, NULL_CELL.into());
             state.selected = Some((r, c));
             focus_grid();
         }
@@ -911,12 +926,47 @@ mod tests {
 
     #[test]
     fn sort_puts_null_first_then_numbers_then_text_and_is_stable() {
-        let r = col(&["x", "2", "NULL", "a", "1", "x", "NULL"]);
+        let r = col(&["x", "2", NULL_CELL, "a", "1", "x", NULL_CELL]);
         assert_eq!(sorted_view(&r, 0, true), vec![2, 6, 4, 1, 3, 0, 5]);
+        // The text "NULL" is text.
+        let t = col(&["NULL", NULL_CELL, "A"]);
+        assert_eq!(sorted_view(&t, 0, true), vec![1, 2, 0]);
         // Descending reverses the order of keys, equal keys keep theirs.
         assert_eq!(sorted_view(&r, 0, false), vec![0, 5, 3, 1, 4, 2, 6]);
         // Out-of-range column: unchanged order.
         assert_eq!(sorted_view(&col(&["b", "a"]), 3, true), vec![0, 1]);
+    }
+
+    #[test]
+    fn null_cells_are_shown_as_null_apart_from_the_text_null() {
+        assert_eq!(cell_display(NULL_CELL), ("NULL", true));
+        assert_eq!(cell_display("NULL"), ("NULL", false));
+        assert_eq!(cell_display(""), ("", false));
+    }
+
+    #[test]
+    fn editing_a_null_cell_starts_empty_and_keeps_null_unless_typed() {
+        let ctx = egui::Context::default();
+        let rows = col(&[NULL_CELL, "NULL"]);
+        let mut g = GridState::default();
+        g.start_edit(&ctx, &rows, RowRef::Base(0), 0);
+        assert_eq!(
+            g.editing.as_ref().unwrap().2,
+            "",
+            "no sentinel in the editor"
+        );
+        g.commit_edit(&rows);
+        assert!(g.edits.is_empty(), "left empty: still NULL");
+        g.start_edit(&ctx, &rows, RowRef::Base(0), 0);
+        g.editing.as_mut().unwrap().2 = "x".into();
+        g.commit_edit(&rows);
+        assert_eq!(g.edits.value(&rows, RowRef::Base(0), 0), "x");
+        // The text "NULL" is edited as text.
+        g.start_edit(&ctx, &rows, RowRef::Base(1), 0);
+        assert_eq!(g.editing.as_ref().unwrap().2, "NULL");
+        g.editing.as_mut().unwrap().2 = "".into();
+        g.commit_edit(&rows);
+        assert_eq!(g.edits.value(&rows, RowRef::Base(1), 0), "");
     }
 
     #[test]

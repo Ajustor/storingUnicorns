@@ -1,7 +1,9 @@
 use anyhow::Result;
 use sqlx::{postgres::PgRow, Column as SqlxColumn, PgPool, Row, TypeInfo};
 
-use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
+use crate::engine::models::{
+    Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, NULL_CELL,
+};
 
 use super::utils::{fetch_rows_and_result, group_tables_by_schema, split_qualified, TxConnection};
 
@@ -387,7 +389,7 @@ fn get_value(row: &PgRow, index: usize) -> String {
     use sqlx::ValueRef;
     let raw = match row.try_get_raw(index) {
         Ok(raw) if !raw.is_null() => raw,
-        _ => return "NULL".to_string(),
+        _ => return NULL_CELL.to_string(),
     };
     let type_name = raw.type_info().name().to_string();
     row.try_get::<String, _>(index)

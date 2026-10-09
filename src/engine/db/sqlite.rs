@@ -1,7 +1,9 @@
 use anyhow::Result;
 use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, SqlitePool, TypeInfo, ValueRef};
 
-use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
+use crate::engine::models::{
+    Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, NULL_CELL,
+};
 
 use super::utils::{fetch_rows_and_result, is_dml, split_qualified, TxConnection};
 
@@ -351,11 +353,11 @@ pub async fn close(pool: SqlitePool) {
 }
 
 /// Text of a cell; NULL of any type (an untyped NULL decodes as "" through
-/// `String`) is checked first and shown as `NULL`.
+/// `String`) is checked first and returned as `NULL_CELL`.
 fn get_value(row: &SqliteRow, index: usize) -> String {
     match row.try_get_raw(index) {
         Ok(raw) if !raw.is_null() => {}
-        _ => return "NULL".to_string(),
+        _ => return NULL_CELL.to_string(),
     }
     row.try_get::<String, _>(index)
         .or_else(|_| row.try_get::<i32, _>(index).map(|v| v.to_string()))
@@ -382,7 +384,7 @@ fn get_value(row: &SqliteRow, index: usize) -> String {
             row.try_get::<Vec<u8>, _>(index)
                 .map(|v| String::from_utf8_lossy(&v).into_owned())
         })
-        .unwrap_or_else(|_| "NULL".to_string())
+        .unwrap_or_else(|_| NULL_CELL.to_string())
 }
 
 #[cfg(test)]
@@ -420,10 +422,13 @@ mod tests {
     #[tokio::test]
     async fn null_of_any_type_is_shown_as_null() {
         let pool = mem_pool().await;
-        let r = execute_query(&pool, "SELECT NULL AS a, CAST(NULL AS TEXT) AS b, '' AS c")
-            .await
-            .unwrap();
-        assert_eq!(r.rows, vec![vec!["NULL", "NULL", ""]]);
+        let r = execute_query(
+            &pool,
+            "SELECT NULL AS a, CAST(NULL AS TEXT) AS b, '' AS c, 'NULL' AS d",
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.rows, vec![vec![NULL_CELL, NULL_CELL, "", "NULL"]]);
     }
 
     #[tokio::test]

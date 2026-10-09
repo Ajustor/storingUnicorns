@@ -11,6 +11,7 @@ use ratatui::{
 
 use super::clickable::{ClickableRegistry, ClickableType};
 use super::layout::PanelType;
+use crate::engine::models::display_cell;
 use crate::tui::{ActivePanel, AppState};
 
 fn panel_style(active: bool) -> Style {
@@ -1005,7 +1006,7 @@ pub fn render_results_panel(
                     };
                     let cells: Vec<&str> = row[visible_col_range.clone()]
                         .iter()
-                        .map(|s| s.as_str())
+                        .map(|s| display_cell(s))
                         .collect();
                     Row::new(cells).style(style)
                 })
@@ -1030,7 +1031,7 @@ pub fn render_results_panel(
                         .get(visible_col_range.clone())
                         .unwrap_or(&[])
                         .iter()
-                        .map(|s| s.as_str())
+                        .map(|s| display_cell(s))
                         .collect();
                     Row::new(cells).style(style)
                 })

@@ -8,6 +8,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::engine::models::{
     Column, ConnectionConfig, DatabaseType, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
+    NULL_CELL,
 };
 
 use crate::engine::sql::statements::split_statements;
@@ -732,7 +733,7 @@ fn get_value(row: &tiberius::Row, index: usize) -> String {
         v.as_ref().map(ToString::to_string)
     }
     let Some((_, data)) = row.cells().nth(index) else {
-        return "NULL".to_string();
+        return NULL_CELL.to_string();
     };
     let value = match data {
         ColumnData::U8(v) => text(v),
@@ -774,7 +775,7 @@ fn get_value(row: &tiberius::Row, index: usize) -> String {
                     .map(|v| v.to_string())
             }),
     };
-    value.unwrap_or_else(|| "NULL".to_string())
+    value.unwrap_or_else(|| NULL_CELL.to_string())
 }
 
 #[cfg(test)]

@@ -8,8 +8,27 @@ use crate::engine::services::table_cache::{FetchQueue, TableCache};
 use crate::engine::config::AppConfig;
 use crate::engine::db::DatabaseConnection;
 use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType, QueryResult, SchemaInfo};
+use crate::engine::models::{display_cell, NULL_CELL};
 use crate::engine::sql::statements::single_table_source;
 use crate::tui::ui::modals::SchemaAction;
+
+/// Text of a cell in the row editor: NULL is shown (and typed) as `NULL`.
+pub fn cell_to_edit_text(cell: &str) -> String {
+    display_cell(cell).to_string()
+}
+
+/// Value of a cell from the row editor's `text`, the cell holding
+/// `original` before: unchanged text keeps the original value (so a stored
+/// text "NULL" stays a string), `NULL` typed means NULL.
+pub fn cell_from_edit_text(text: &str, original: &str) -> String {
+    if text == display_cell(original) {
+        original.to_string()
+    } else if text == "NULL" {
+        NULL_CELL.to_string()
+    } else {
+        text.to_string()
+    }
+}
 
 /// Status shown when the current result can't be edited row by row.
 const READ_ONLY_RESULT: &str =
@@ -942,7 +961,7 @@ impl AppState {
                     self.set_status(READ_ONLY_RESULT);
                     return;
                 };
-                self.editing_row = Some(row.clone());
+                self.editing_row = Some(row.iter().map(|c| cell_to_edit_text(c)).collect());
                 self.original_editing_row = Some(row.clone());
                 self.editing_table_name = Some(table);
                 self.editing_column = 0;

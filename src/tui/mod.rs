@@ -1645,7 +1645,11 @@ async fn handle_save_row(state: &mut AppState) {
     };
 
     let new_values = match &state.editing_row {
-        Some(row) => row.clone(),
+        Some(row) => row
+            .iter()
+            .zip(&original_values)
+            .map(|(text, original)| app_state::cell_from_edit_text(text, original))
+            .collect::<Vec<_>>(),
         None => {
             state.set_status("Cannot save: edited row not found");
             state.close_dialog();
@@ -1743,8 +1747,15 @@ async fn handle_insert_row(state: &mut AppState) {
         }
     };
 
+    // Typed `NULL`, or left empty: NULL.
     let values = match &state.editing_row {
-        Some(row) => row.clone(),
+        Some(row) => row
+            .iter()
+            .map(|text| match text.as_str() {
+                "" | "NULL" => crate::engine::models::NULL_CELL.to_string(),
+                _ => text.clone(),
+            })
+            .collect::<Vec<_>>(),
         None => {
             state.set_status("Cannot insert: row data not found");
             state.close_dialog();
@@ -3274,6 +3285,61 @@ mod tests {
         state.result_sql = None;
         state.open_delete_row_confirm();
         assert!(matches!(state.dialog_mode, DialogMode::None));
+    }
+
+    #[test]
+    fn row_editor_maps_null_at_its_boundary() {
+        use crate::engine::models::NULL_CELL;
+        use app_state::{cell_from_edit_text, cell_to_edit_text};
+        assert_eq!(cell_to_edit_text(NULL_CELL), "NULL");
+        assert_eq!(cell_to_edit_text("x"), "x");
+        // Unchanged: the original value, NULL or the text "NULL".
+        assert_eq!(cell_from_edit_text("NULL", NULL_CELL), NULL_CELL);
+        assert_eq!(cell_from_edit_text("NULL", "NULL"), "NULL");
+        // Typed NULL means NULL; anything else is text, empty included.
+        assert_eq!(cell_from_edit_text("NULL", "a"), NULL_CELL);
+        assert_eq!(cell_from_edit_text("", NULL_CELL), "");
+        assert_eq!(cell_from_edit_text("b", "a"), "b");
+    }
+
+    #[tokio::test]
+    async fn save_row_writes_typed_null_and_keeps_null_text() {
+        use crate::engine::models::NULL_CELL;
+        let mut state = debug_state().await;
+        state.debug_mode = false;
+        let conn = state.connection.as_ref().unwrap();
+        conn.execute_query("INSERT INTO t (id, name) VALUES (2, 'NULL')")
+            .await
+            .unwrap();
+        state.query_result.as_mut().unwrap().primary_key = vec!["id".into()];
+        state.query_result.as_mut().unwrap().rows = vec![
+            vec!["1".into(), "a".into()],
+            vec!["2".into(), "NULL".into()],
+        ];
+        state.result_sql = Some("SELECT * FROM t".into());
+        // Row 1: NULL typed.
+        state.selected_row = 0;
+        state.open_edit_row_dialog();
+        state.editing_row.as_mut().unwrap()[1] = "NULL".into();
+        handle_save_row(&mut state).await;
+        // Row 2 holds the text "NULL": saved unchanged except its id column.
+        state.selected_row = 1;
+        state.open_edit_row_dialog();
+        assert_eq!(state.editing_row.as_ref().unwrap()[1], "NULL");
+        state.editing_row.as_mut().unwrap()[0] = "3".into();
+        handle_save_row(&mut state).await;
+        let conn = state.connection.as_ref().unwrap();
+        let r = conn
+            .execute_query("SELECT id, name FROM t ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(
+            r.rows,
+            vec![
+                vec!["1".to_string(), NULL_CELL.to_string()],
+                vec!["3".to_string(), "NULL".to_string()],
+            ]
+        );
     }
 
     #[tokio::test]

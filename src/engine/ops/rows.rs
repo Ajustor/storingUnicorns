@@ -191,7 +191,7 @@ pub fn detect_system_columns(columns: &[Column]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::models::Column;
+    use crate::engine::models::{Column, NULL_CELL};
     use crate::engine::ops::test_support::{count, sqlite_mem};
 
     const SETUP: &[&str] = &[
@@ -293,7 +293,7 @@ mod tests {
         .await;
         let changes = RowChanges {
             updates: vec![(row("1", "a"), row("1", "z"))],
-            inserts: vec![row("", "NULL")], // violates NOT NULL
+            inserts: vec![row("", NULL_CELL)], // violates NOT NULL
             deletes: vec![],
         };
         assert!(
@@ -444,6 +444,36 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0);
         assert_eq!(count(&conn, "t").await, "2");
+    }
+
+    /// The text "NULL", the empty string and NULL are three different values.
+    #[tokio::test]
+    async fn null_text_and_empty_string_round_trip() {
+        let conn = sqlite_mem(SETUP).await;
+        let changes = RowChanges {
+            updates: vec![
+                (row("1", "a"), row("1", "NULL")),
+                (row("2", "b"), row("2", NULL_CELL)),
+            ],
+            inserts: vec![row("3", ""), row("4", NULL_CELL)],
+            deletes: vec![],
+        };
+        submit_changes(&conn, &DatabaseType::SQLite, "t", &cols(), &[], &changes)
+            .await
+            .unwrap();
+        let r = conn
+            .execute_query("SELECT name, name IS NULL FROM t ORDER BY id")
+            .await
+            .unwrap();
+        let got: Vec<(&str, &str)> = r
+            .rows
+            .iter()
+            .map(|r| (r[0].as_str(), r[1].as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [("NULL", "0"), (NULL_CELL, "1"), ("", "0"), (NULL_CELL, "1")]
+        );
     }
 
     #[test]

@@ -171,6 +171,27 @@ pub struct TableDetails {
     pub foreign_keys: Vec<ForeignKeyInfo>,
 }
 
+/// The value of a NULL cell. Cells are text, so NULL needs a value of its
+/// own that can't be typed: a private-use character before "NULL". Drivers
+/// produce it, grids show it as an italic "NULL", "Mettre à NULL" sets it
+/// and the SQL builders turn it into `NULL`; the text "NULL" is a string
+/// like any other.
+pub const NULL_CELL: &str = "\u{E000}NULL";
+
+/// Whether `cell` is NULL (`NULL_CELL`).
+pub fn is_null(cell: &str) -> bool {
+    cell == NULL_CELL
+}
+
+/// Text to show for `cell`: "NULL" for NULL, the value otherwise.
+pub fn display_cell(cell: &str) -> &str {
+    if is_null(cell) {
+        "NULL"
+    } else {
+        cell
+    }
+}
+
 /// Represents query results
 #[derive(Debug, Clone, Default)]
 pub struct QueryResult {
@@ -227,6 +248,16 @@ mod tests {
         let c: ConnectionConfig =
             toml::from_str("name = \"x\"\ndb_type = \"SQLite\"\ndatabase = \"a.db\"").unwrap();
         assert_eq!(c.color, None);
+    }
+
+    #[test]
+    fn null_cell_is_not_the_text_null() {
+        assert!(is_null(NULL_CELL));
+        assert!(!is_null("NULL"));
+        assert!(!is_null(""));
+        assert_eq!(display_cell(NULL_CELL), "NULL");
+        assert_eq!(display_cell("NULL"), "NULL");
+        assert_eq!(display_cell("x"), "x");
     }
 
     #[test]

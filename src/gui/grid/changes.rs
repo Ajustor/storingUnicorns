@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::engine::models::NULL_CELL;
 use crate::engine::ops::rows::RowChanges;
 
 /// Identifies a displayed row: an existing row by its index in the base
@@ -81,9 +82,9 @@ impl PendingEdits {
         }
     }
 
-    /// Append an empty new row (`ncols` empty strings); returns its ref.
+    /// Append a new row of `ncols` NULL cells; returns its ref.
     pub fn add_row(&mut self, ncols: usize) -> RowRef {
-        self.inserted.push(vec![String::new(); ncols]);
+        self.inserted.push(vec![NULL_CELL.to_string(); ncols]);
         RowRef::New(self.inserted.len() - 1)
     }
 
@@ -191,7 +192,10 @@ mod tests {
             vec![(b[0].clone(), vec!["1".to_string(), "z".to_string()])]
         );
         assert_eq!(c.deletes, vec![b[1].clone()]);
-        assert_eq!(c.inserts, vec![vec!["".to_string(), "c".to_string()]]);
+        assert_eq!(
+            c.inserts,
+            vec![vec![NULL_CELL.to_string(), "c".to_string()]]
+        );
     }
 
     #[test]

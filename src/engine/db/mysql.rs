@@ -1,7 +1,9 @@
 use anyhow::Result;
 use sqlx::{mysql::MySqlRow, Column as SqlxColumn, MySqlPool, Row, TypeInfo};
 
-use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
+use crate::engine::models::{
+    Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, NULL_CELL,
+};
 
 use super::utils::{
     fetch_rows_and_result, group_foreign_keys, group_indexes, group_tables_by_schema,
@@ -325,9 +327,9 @@ fn get_value(row: &MySqlRow, index: usize) -> String {
     use sqlx::ValueRef;
     match row.try_get_raw(index) {
         Ok(raw) if !raw.is_null() => {}
-        _ => return "NULL".to_string(),
+        _ => return NULL_CELL.to_string(),
     }
     row.try_get_unchecked::<&[u8], _>(index)
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-        .unwrap_or_else(|_| "NULL".to_string())
+        .unwrap_or_else(|_| NULL_CELL.to_string())
 }

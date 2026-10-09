@@ -6,7 +6,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
-use crate::engine::models::Column;
+use crate::engine::models::{is_null, Column, NULL_CELL};
 
 use super::app::App;
 use super::grid::changes::{PendingEdits, RowRef};
@@ -63,7 +63,7 @@ impl ValuePanel {
         self.key = Some(key);
         self.value_hash = hash;
         self.error = None;
-        self.null = value == "NULL";
+        self.null = is_null(value);
         let (text, json) = match pretty_json(value) {
             Some(p) => (p, true),
             None if self.null => (String::new(), false),
@@ -153,7 +153,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 )
                 .clicked()
             {
-                set = Some("NULL".to_string());
+                set = Some(NULL_CELL.to_string());
             }
         });
     }
@@ -254,9 +254,12 @@ mod tests {
         assert!(p.dirty(), "same cell and value keep the buffer");
         p.sync((1, 0, RowRef::Base(1), 2), r#"{"a":1}"#);
         assert!(!p.dirty(), "another cell resets it");
-        p.sync((1, 0, RowRef::Base(1), 2), "NULL");
+        p.sync((1, 0, RowRef::Base(1), 2), NULL_CELL);
         assert!(p.null && !p.json);
         assert_eq!(p.buffer, "");
+        p.sync((1, 0, RowRef::Base(1), 2), "NULL");
+        assert!(!p.null, "the text NULL is a value");
+        assert_eq!(p.buffer, "NULL");
     }
 
     #[test]

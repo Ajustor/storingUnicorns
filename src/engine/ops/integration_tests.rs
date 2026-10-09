@@ -13,7 +13,7 @@
 //! connection's database), so they can be run repeatedly.
 
 use crate::engine::db::DatabaseConnection;
-use crate::engine::models::{ConnectionConfig, DatabaseType};
+use crate::engine::models::{ConnectionConfig, DatabaseType, NULL_CELL};
 use crate::engine::ops::query::run_script;
 use crate::engine::ops::rows::{
     detect_system_columns, submit_changes, transaction_bounds, RowChanges,
@@ -327,7 +327,7 @@ async fn exercise(conn: &DatabaseConnection, d: &Dialect) {
     let mut edited = row_of("1");
     edited[3] = "S1".into();
     let mut nulled = row_of("2");
-    nulled[3] = "NULL".into();
+    nulled[3] = NULL_CELL.into();
     let changes = RowChanges {
         updates: vec![
             (row_of("1"), edited),
@@ -345,7 +345,7 @@ async fn exercise(conn: &DatabaseConnection, d: &Dialect) {
         parent_rows(conn, d).await,
         [
             ("1".into(), "S1".into()),
-            ("2".into(), "NULL".into()),
+            ("2".into(), NULL_CELL.into()),
             ("3".into(), "p3".into()),
             ("4".into(), "y".into()),
             ("7".into(), "p'7".into()),
@@ -643,7 +643,8 @@ async fn integration_postgres() {
             ("TIMESTAMP '2024-01-02 03:04:05'", "2024-01-02 03:04:05"),
             ("'x'::char(1)", "x"),
             ("'1 day'::interval", "1 day"),
-            ("NULL::int", "NULL"),
+            ("NULL::int", NULL_CELL),
+            ("'NULL'::text", "NULL"),
         ],
     )
     .await;
@@ -723,7 +724,8 @@ async fn integration_mysql() {
             ("TIMESTAMP '2024-01-02 03:04:05'", "2024-01-02 03:04:05"),
             ("CAST('{\"k\": 1}' AS JSON)", "{\"k\": 1}"),
             ("b'1'", "\u{1}"),
-            ("NULL", "NULL"),
+            ("NULL", NULL_CELL),
+            ("'NULL'", "NULL"),
         ],
     )
     .await;
@@ -862,7 +864,8 @@ async fn integration_mssql() {
                 "2024-01-02 03:04:05",
             ),
             ("N'héllo'", "héllo"),
-            ("CAST(NULL AS INT)", "NULL"),
+            ("CAST(NULL AS INT)", NULL_CELL),
+            ("'NULL'", "NULL"),
         ],
     )
     .await;

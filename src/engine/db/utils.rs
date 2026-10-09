@@ -4,7 +4,9 @@ use futures_util::TryStreamExt;
 use sqlx::pool::PoolConnection;
 use sqlx::{Database, Either, Executor, IntoArguments};
 
-use crate::engine::models::{Column, DatabaseType, ForeignKeyInfo, IndexInfo, SchemaInfo};
+#[cfg(test)]
+use crate::engine::models::NULL_CELL;
+use crate::engine::models::{is_null, Column, DatabaseType, ForeignKeyInfo, IndexInfo, SchemaInfo};
 use crate::engine::sql::statements::split_statements;
 
 /// Execute `query` exactly once and collect both its rows and its
@@ -332,11 +334,15 @@ pub fn group_foreign_keys(
     keys
 }
 
-/// SQL literal for `value` in column `col`. For numeric types a number is
-/// left unquoted and an empty value is NULL; anything else is a quoted
+/// SQL literal for `value` in column `col`: `NULL` for `NULL_CELL`. For
+/// numeric types a number is left unquoted and an empty value is NULL;
+/// anything else (the text "NULL" and the empty string included) is a quoted
 /// string, so a non-numeric value typed in a numeric column is rejected by
 /// the database instead of being run as SQL.
 fn sql_literal(col: &Column, value: &str) -> String {
+    if is_null(value) {
+        return "NULL".to_string();
+    }
     let value = if is_bit_type(&col.type_name) {
         map_bit_value(value)
     } else {
@@ -359,11 +365,7 @@ fn sql_literal(col: &Column, value: &str) -> String {
 
 /// `"col" = <literal>`, or `"col" IS NULL` for a NULL value.
 fn where_part(col: &Column, value: &str, quote_start: char, quote_end: char) -> String {
-    let literal = if value == "NULL" {
-        "NULL".to_string()
-    } else {
-        sql_literal(col, value)
-    };
+    let literal = sql_literal(col, value);
     if literal == "NULL" {
         format!("{quote_start}{}{quote_end} IS NULL", col.name)
     } else {
@@ -386,12 +388,11 @@ pub fn build_update_clauses(
         .zip(original_values.iter().zip(new_values.iter()))
         .filter(|(_, (orig, new))| orig != new)
         .map(|(col, (_, new))| {
-            let literal = if new == "NULL" {
-                "NULL".to_string()
-            } else {
+            format!(
+                "{quote_start}{}{quote_end} = {}",
+                col.name,
                 sql_literal(col, new)
-            };
-            format!("{quote_start}{}{quote_end} = {literal}", col.name)
+            )
         })
         .collect();
 
@@ -454,12 +455,7 @@ pub fn build_insert_parts(
         }
 
         col_parts.push(format!("{}{}{}", quote_start, col.name, quote_end));
-
-        if val == "NULL" || val.is_empty() {
-            val_parts.push("NULL".to_string());
-        } else {
-            val_parts.push(sql_literal(col, val));
-        }
+        val_parts.push(sql_literal(col, val));
     }
 
     (col_parts.join(", "), val_parts.join(", "))
@@ -659,15 +655,64 @@ mod tests {
         let (set, filter) = build_update_clauses(
             &cols,
             &["1".into(), "a".into()],
-            &["".into(), "NULL".into()],
+            &["".into(), NULL_CELL.into()],
             '"',
             '"',
         );
         assert_eq!(set, "\"c\" = NULL, \"c\" = NULL");
         assert_eq!(filter, "\"c\" = 1 AND \"c\" = 'a'");
         assert_eq!(
-            build_where_clause(&cols, &["NULL".into(), "x".into()], '[', ']'),
+            build_where_clause(&cols, &[NULL_CELL.into(), "x".into()], '[', ']'),
             "[c] IS NULL AND [c] = 'x'"
+        );
+    }
+
+    /// NULL is the `NULL_CELL` sentinel; the text "NULL" and the empty
+    /// string are ordinary values.
+    #[test]
+    fn null_cell_versus_null_text_and_empty_string() {
+        let col = |ty: &str| Column {
+            name: "c".into(),
+            type_name: ty.into(),
+            nullable: true,
+            is_primary_key: true,
+        };
+        let cols = [col("int"), col("text")];
+        let (set, _) = build_update_clauses(
+            &cols,
+            &["1".into(), "a".into()],
+            &[NULL_CELL.into(), "NULL".into()],
+            '"',
+            '"',
+        );
+        assert_eq!(set, "\"c\" = NULL, \"c\" = 'NULL'");
+        let (set, _) = build_update_clauses(
+            &cols,
+            &["1".into(), "a".into()],
+            &["1".into(), "".into()],
+            '"',
+            '"',
+        );
+        assert_eq!(set, "\"c\" = ''");
+        assert_eq!(
+            build_where_clause(&cols, &["1".into(), "NULL".into()], '"', '"'),
+            "\"c\" = 1 AND \"c\" = 'NULL'"
+        );
+        assert_eq!(
+            build_where_clause(&cols, &["1".into(), "".into()], '"', '"'),
+            "\"c\" = 1 AND \"c\" = ''"
+        );
+        assert_eq!(
+            build_insert_parts(&cols, &[NULL_CELL.into(), NULL_CELL.into()], &[], '"', '"').1,
+            "NULL, NULL"
+        );
+        assert_eq!(
+            build_insert_parts(&cols, &["7".into(), "".into()], &[], '"', '"').1,
+            "7, ''"
+        );
+        assert_eq!(
+            build_insert_parts(&cols, &["7".into(), "NULL".into()], &[], '"', '"').1,
+            "7, 'NULL'"
         );
     }
 

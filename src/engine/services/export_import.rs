@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::engine::models::QueryResult;
+use crate::engine::models::{is_null, QueryResult};
 
 /// State for filesystem path autocompletion
 #[derive(Debug, Clone)]
@@ -494,7 +494,11 @@ pub fn export_to_csv(result: &QueryResult) -> String {
             .iter()
             .enumerate()
             .map(|(idx, v)| {
-                if idx < result.columns.len() && is_bit_type(&result.columns[idx].type_name) {
+                if is_null(v) {
+                    // NULL: an empty field (as the CSV import reads it).
+                    String::new()
+                } else if idx < result.columns.len() && is_bit_type(&result.columns[idx].type_name)
+                {
                     escape_csv_field(&map_bit_value(v))
                 } else {
                     escape_csv_field(v)
@@ -536,7 +540,7 @@ pub fn export_to_sql_insert(
             .iter()
             .enumerate()
             .map(|(idx, val)| {
-                if val == "NULL" || val.is_empty() {
+                if is_null(val) {
                     "NULL".to_string()
                 } else {
                     let escaped = val.replace('\'', "''");
@@ -871,5 +875,44 @@ impl BatchTruncateState {
                 format!("{1}{0}{2}.{1}{3}{2}", schema, quote_start, quote_end, table)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::models::{Column, NULL_CELL};
+
+    fn result() -> QueryResult {
+        let col = |name: &str, ty: &str| Column {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            is_primary_key: false,
+        };
+        QueryResult {
+            columns: vec![col("n", "INTEGER"), col("t", "TEXT")],
+            rows: vec![
+                vec![NULL_CELL.into(), NULL_CELL.into()],
+                vec!["1".into(), "NULL".into()],
+                vec!["2".into(), "".into()],
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn csv_export_writes_null_as_an_empty_field() {
+        assert_eq!(export_to_csv(&result()), "n,t\n,\n1,NULL\n2,\n");
+    }
+
+    #[test]
+    fn sql_export_distinguishes_null_text_and_empty_string() {
+        let sql = export_to_sql_insert(&result(), "x", '"', '"');
+        let lines: Vec<&str> = sql.lines().filter(|l| l.starts_with("INSERT")).collect();
+        assert_eq!(lines.len(), 3, "{sql}");
+        assert!(lines[0].ends_with("VALUES (NULL, NULL);"), "{sql}");
+        assert!(lines[1].ends_with("VALUES (1, 'NULL');"), "{sql}");
+        assert!(lines[2].ends_with("VALUES (2, '');"), "{sql}");
     }
 }

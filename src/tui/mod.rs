@@ -699,6 +699,22 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
         KeyCode::Right if nc.active_field == ConnectionField::AzureAuth => {
             nc.cycle_azure_auth_method();
         }
+        KeyCode::Left | KeyCode::Right if nc.active_field == ConnectionField::Flavor => {
+            nc.cycle_flavor();
+        }
+        KeyCode::Left | KeyCode::Right if nc.active_field == ConnectionField::SslMode => {
+            nc.cycle_ssl_mode();
+        }
+        KeyCode::Enter if nc.active_field == ConnectionField::Url && !nc.url.trim().is_empty() => {
+            // Fill the form from the pasted URL instead of saving.
+            match nc.apply_url() {
+                Ok(()) => {
+                    nc.cursor_position = 0;
+                    state.set_status("Champs remplis depuis l'URL");
+                }
+                Err(e) => state.set_status(e),
+            }
+        }
         KeyCode::Enter => {
             // Save the connection
             let config = nc.to_config();
@@ -3366,5 +3382,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.rows[1], ["2", "c"]);
+    }
+
+    #[test]
+    fn connection_dialog_url_presets_and_ssl_survive_an_edit() {
+        use crate::engine::models::{ConnectionConfig, Flavor, SslMode};
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        let key = |state: &mut AppState, k: KeyCode| {
+            handle_dialog_input(state, k, KeyModifiers::NONE);
+        };
+        state.open_new_connection_dialog();
+        key(&mut state, KeyCode::Tab); // URL
+        for c in "postgres://u:p%40ss@db.abc.supabase.co/app".chars() {
+            key(&mut state, KeyCode::Char(c));
+        }
+        key(&mut state, KeyCode::Enter); // fills, doesn't save
+        assert!(state.config.connections.is_empty());
+        assert_eq!(state.new_connection.flavor, Some(Flavor::Supabase));
+        assert_eq!(state.new_connection.password, "p@ss");
+        while state.new_connection.active_field != ConnectionField::SslMode {
+            key(&mut state, KeyCode::Tab);
+        }
+        key(&mut state, KeyCode::Right); // Prefer -> Require
+        state.config.connections.push(ConnectionConfig::default()); // index 0
+        state.new_connection.color = Some([9, 9, 9]);
+        key(&mut state, KeyCode::Enter);
+        assert_eq!(state.config.connections.len(), 2);
+
+        state.open_edit_connection_dialog(1);
+        key(&mut state, KeyCode::Enter);
+        let saved = &state.config.connections[1];
+        assert_eq!(saved.flavor, Some(Flavor::Supabase));
+        assert_eq!(saved.ssl_mode, Some(SslMode::Require));
+        assert_eq!(saved.color, Some([9, 9, 9]));
+        assert_eq!(saved.host.as_deref(), Some("db.abc.supabase.co"));
     }
 }

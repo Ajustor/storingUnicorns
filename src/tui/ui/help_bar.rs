@@ -79,7 +79,7 @@ fn dialog_help(mode: DialogMode) -> Vec<(&'static str, &'static str)> {
             ("Tab", "Next field"),
             ("Enter", "Save"),
             ("Esc", "Cancel"),
-            ("←/→", "Cycle type"),
+            ("←/→", "Cycle value"),
         ],
         DialogMode::EditRow | DialogMode::AddRow => {
             vec![("Tab", "Next field"), ("Enter", "Save"), ("Esc", "Cancel")]

@@ -1,6 +1,6 @@
 [package]
 name = "storingUnicorns"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 description = "A terminal-based database client inspired by DataGrip"
 license = "MIT"
@@ -79,12 +79,20 @@ tachyonfx = "0.9"
 azure_identity = "0.22"
 azure_core = "0.22"
 
-# Self-update from GitHub Pages
-ureq = "3"
+# Self-update from GitHub Pages. `platform-verifier`: trust the system's
+# certificates, so HTTPS works behind a corporate proxy or an antivirus whose
+# root only the Keychain / Windows store / system CA bundle knows.
+ureq = { version = "3", features = ["platform-verifier"] }
 semver = "1"
 sha2 = "0.10"
 self-replace = "1"
 tempfile = "3"
+
+# Azure AD goes through reqwest + native-tls, which links OpenSSL on Linux;
+# its soname differs between distributions, so build it into the binary.
+# (macOS uses Security.framework and Windows SChannel: nothing to vendor.)
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
 winresource = "0.1"

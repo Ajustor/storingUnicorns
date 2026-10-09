@@ -82,6 +82,12 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      # The binary must start on a bare system: no Homebrew library on macOS,
+      # no OpenSSL from the build machine on Linux.
+      - name: Check linked libraries
+        if: matrix.os != 'windows-latest'
+        run: bash scripts/check-linked-libs.sh target/${{ matrix.target }}/release/storingUnicorns
+
       - name: Prepare code signing (Windows)
         if: matrix.os == 'windows-latest' && env.HAS_CERT == 'true'
         shell: pwsh

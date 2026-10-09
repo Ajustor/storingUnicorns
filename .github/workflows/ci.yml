@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The release builds on these same three runners.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libssl-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libglib2.0-dev \
+            libxkbcommon-x11-dev libwayland-dev
+
+      - name: cargo test
+        run: cargo test
+
+  # Same build as release.yml, so a PR that would break the release fails here.
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: storingUnicorns-linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: storingUnicorns-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: storingUnicorns-windows-x64.exe
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libssl-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libglib2.0-dev \
+            libxkbcommon-x11-dev libwayland-dev
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # See scripts/check-linked-libs.sh: no Homebrew library on macOS, no
+      # OpenSSL from the build machine on Linux.
+      - name: Check linked libraries
+        if: matrix.os != 'windows-latest'
+        run: bash scripts/check-linked-libs.sh target/${{ matrix.target }}/release/storingUnicorns
+
+      - name: Run the binary
+        shell: bash
+        run: target/${{ matrix.target }}/release/storingUnicorns --version
+
+      - name: Build Windows installer (MSI)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path target\release | Out-Null
+          Copy-Item target\${{ matrix.target }}\release\storingUnicorns.exe target\release\storingUnicorns.exe -Force
+          $wixDir = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*" | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $wixDir) {
+            choco install wixtoolset --no-progress -y
+            $wixDir = Get-ChildItem "C:\Program Files (x86)\WiX Toolset*" | Sort-Object Name -Descending | Select-Object -First 1
+          }
+          $candle = Join-Path $wixDir.FullName "bin\candle.exe"
+          $light  = Join-Path $wixDir.FullName "bin\light.exe"
+          # MSI versions are x.y.z only.
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value.Split('-')[0]
+          & $candle -arch x64 "-dProductVersion=$version" -out wix\main.wixobj wix\main.wxs
+          if ($LASTEXITCODE -ne 0) { throw "candle failed" }
+          & $light -ext WixUIExtension -out storingUnicorns-setup.msi wix\main.wixobj
+          if ($LASTEXITCODE -ne 0) { throw "light failed" }

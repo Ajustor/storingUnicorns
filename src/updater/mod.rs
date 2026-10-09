@@ -584,6 +584,8 @@ mod tests {
         assert!(verify_digest(b"abc", "").is_err());
     }
 
+    // Windows paths: `\` is not a separator elsewhere, and only Windows calls it.
+    #[cfg(windows)]
     #[test]
     fn kind_for_location_detects_program_files() {
         let pf = Some(std::ffi::OsString::from(r"C:\Program Files"));

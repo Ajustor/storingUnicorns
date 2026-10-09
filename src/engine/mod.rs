@@ -4,5 +4,7 @@ pub mod config;
 pub mod db;
 pub mod models;
 pub mod ops;
+#[allow(dead_code)] // TODO(tls-presets): drop once the dialogs use it.
+pub mod presets;
 pub mod services;
 pub mod sql;

@@ -33,9 +33,19 @@ pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
     o
 }
 
-/// Connect to PostgreSQL
+/// Connect to PostgreSQL. In `Prefer` mode, a failed TLS handshake is retried
+/// without TLS (see `tls::should_retry_plain`).
 pub async fn connect(config: &ConnectionConfig) -> Result<PgPool> {
-    Ok(PgPool::connect_with(connect_options(config)).await?)
+    let options = connect_options(config);
+    match PgPool::connect_with(options.clone()).await {
+        Err(e) if super::tls::should_retry_plain(config.effective_ssl_mode(), &e) => {
+            tracing::debug!("TLS failed in Prefer mode ({e}); retrying without TLS");
+            PgPool::connect_with(options.ssl_mode(PgSslMode::Disable))
+                .await
+                .map_err(|plain| anyhow::anyhow!("TLS : {e} ; sans chiffrement : {plain}"))
+        }
+        result => Ok(result?),
+    }
 }
 
 /// Convert fetched rows into a `QueryResult`.

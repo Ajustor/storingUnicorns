@@ -36,9 +36,19 @@ pub fn connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
     o
 }
 
-/// Connect to MySQL
+/// Connect to MySQL. In `Prefer` mode, a failed TLS handshake is retried
+/// without TLS (see `tls::should_retry_plain`).
 pub async fn connect(config: &ConnectionConfig) -> Result<MySqlPool> {
-    Ok(MySqlPool::connect_with(connect_options(config)).await?)
+    let options = connect_options(config);
+    match MySqlPool::connect_with(options.clone()).await {
+        Err(e) if super::tls::should_retry_plain(config.effective_ssl_mode(), &e) => {
+            tracing::debug!("TLS failed in Prefer mode ({e}); retrying without TLS");
+            MySqlPool::connect_with(options.ssl_mode(MySqlSslMode::Disabled))
+                .await
+                .map_err(|plain| anyhow::anyhow!("TLS : {e} ; sans chiffrement : {plain}"))
+        }
+        result => Ok(result?),
+    }
 }
 
 /// Convert fetched rows into a `QueryResult`.

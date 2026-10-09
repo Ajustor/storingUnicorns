@@ -2,13 +2,44 @@
 
 use std::path::Path;
 
-/// A hint replacing the driver's message for a known TLS failure.
-pub fn explain(message: &str, host: &str) -> Option<String> {
+use crate::engine::models::SslMode;
+
+/// Whether a `Prefer` connection that failed should be retried without
+/// TLS, like libpq's `prefer`: the server offered TLS but the handshake
+/// failed (old protocol versions, X.509 v1 or weak-key certificates...).
+/// rustls errors surface as `Io(InvalidData)`, a server dropping the
+/// handshake as EOF / reset; a refused connection is not retried.
+pub fn should_retry_plain(mode: SslMode, e: &sqlx::Error) -> bool {
+    use std::io::ErrorKind;
+    if mode != SslMode::Prefer {
+        return false;
+    }
+    match e {
+        sqlx::Error::Tls(_) => true,
+        sqlx::Error::Io(io) => matches!(
+            io.kind(),
+            ErrorKind::InvalidData
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+        ),
+        _ => false,
+    }
+}
+
+/// A hint replacing the driver's message for a known TLS failure, for a
+/// connection made in `mode`.
+pub fn explain(message: &str, host: &str, mode: SslMode) -> Option<String> {
     let m = message.to_ascii_lowercase();
     if (m.contains("pg_hba.conf") && m.contains("no encryption"))
         || m.contains("require_secure_transport")
     {
-        Some("Le serveur exige une connexion chiffrée : passe le mode SSL à Obligatoire.".into())
+        Some(if mode == SslMode::Prefer {
+            // TLS was tried first and failed: switching modes won't help.
+            "Le serveur exige une connexion chiffrée, mais la négociation TLS a échoué.".into()
+        } else {
+            "Le serveur exige une connexion chiffrée : passe le mode SSL à Obligatoire.".into()
+        })
     } else if m.contains("notvalidforname") || m.contains("not valid for name") {
         // rustls: `NotValidForName`, or `NotValidForNameContext` printed as
         // "certificate not valid for name …".
@@ -46,7 +77,7 @@ mod tests {
 
     #[test]
     fn known_tls_failures_get_a_french_hint() {
-        let h = |m: &str| explain(m, "db.example.com");
+        let h = |m: &str| explain(m, "db.example.com", SslMode::Disable);
         assert!(h("error returned from database: no pg_hba.conf entry for host \"1.2.3.4\", user \"u\", database \"d\", no encryption")
             .unwrap().contains("passe le mode SSL à Obligatoire"));
         assert!(h("error returned from database: 3159 (HY000): Connections using insecure transport are prohibited while --require_secure_transport=ON.")
@@ -71,6 +102,53 @@ mod tests {
              SSL à Obligatoire (chiffré, sans vérification)."
         );
         assert_eq!(h("password authentication failed for user \"u\""), None);
+    }
+
+    #[test]
+    fn prefer_never_suggests_obligatoire() {
+        let refused = "TLS: received fatal alert: ProtocolVersion; then: error returned \
+                       from database: no pg_hba.conf entry for host \"1.2.3.4\", no encryption";
+        let hint = explain(refused, "h", SslMode::Prefer).unwrap();
+        assert!(hint.contains("exige une connexion chiffrée"), "{hint}");
+        assert!(!hint.contains("Obligatoire"), "{hint}");
+    }
+
+    fn io(kind: std::io::ErrorKind) -> sqlx::Error {
+        sqlx::Error::Io(std::io::Error::new(kind, "x"))
+    }
+
+    #[test]
+    fn only_prefer_retries_in_plain_text_after_a_tls_failure() {
+        use std::io::ErrorKind;
+        let tls = || sqlx::Error::Tls("handshake failure".into());
+        assert!(should_retry_plain(SslMode::Prefer, &tls()));
+        // rustls errors (bad certificate, alerts) surface as InvalidData;
+        // a server dropping the handshake as EOF / reset.
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ] {
+            assert!(should_retry_plain(SslMode::Prefer, &io(kind)), "{kind:?}");
+        }
+        assert!(!should_retry_plain(
+            SslMode::Prefer,
+            &io(ErrorKind::ConnectionRefused)
+        ));
+        assert!(!should_retry_plain(
+            SslMode::Prefer,
+            &sqlx::Error::PoolTimedOut
+        ));
+        for mode in [
+            SslMode::Disable,
+            SslMode::Require,
+            SslMode::VerifyCa,
+            SslMode::VerifyFull,
+        ] {
+            assert!(!should_retry_plain(mode, &tls()), "{mode:?}");
+            assert!(!should_retry_plain(mode, &io(ErrorKind::InvalidData)));
+        }
     }
 
     #[test]

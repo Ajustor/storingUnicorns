@@ -13,7 +13,7 @@ use super::{azure, mysql, postgres, sqlite, sqlserver, tls, utils};
 /// parentheses for diagnosis. Other errors are unchanged.
 fn explain_tls(e: anyhow::Error, config: &ConnectionConfig) -> anyhow::Error {
     let host = config.host.as_deref().unwrap_or("localhost");
-    match tls::explain(&format!("{e:#}"), host) {
+    match tls::explain(&format!("{e:#}"), host, config.effective_ssl_mode()) {
         Some(hint) => anyhow::anyhow!("{hint}\n({e:#})"),
         None => e,
     }

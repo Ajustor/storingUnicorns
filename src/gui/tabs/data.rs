@@ -25,6 +25,19 @@ pub fn page_count(total: u64, page_size: usize) -> usize {
     total.div_ceil(size).max(1) as usize
 }
 
+/// Why a grid is read-only for now: its edits are being submitted, or its
+/// rows are about to be replaced. Edits made meanwhile would be lost (a
+/// successful submit clears the edits, a new page drops them).
+pub fn busy_hint(submitting: bool, loading: bool) -> Option<&'static str> {
+    if submitting {
+        Some("Envoi en cours…")
+    } else if loading {
+        Some("Chargement…")
+    } else {
+        None
+    }
+}
+
 /// Whether the page can be replaced without losing pending edits.
 pub fn can_leave(edits: &PendingEdits) -> bool {
     edits.is_empty()
@@ -115,6 +128,8 @@ pub struct DataContext {
     pub tab: TabId,
     pub connected: bool,
     pub submitting: bool,
+    /// A page load is pending.
+    pub loading: bool,
 }
 
 impl DataTab {
@@ -289,7 +304,11 @@ impl DataTab {
         if let Some(hint) = self.read_only_hint() {
             ui.label(RichText::new(format!("{} {hint}", icon::LOCK)).weak());
         }
-        let editable = self.editable();
+        let busy = busy_hint(cx.submitting, cx.loading);
+        if let (Some(hint), true) = (busy, self.editable()) {
+            ui.label(RichText::new(format!("{} {hint}", icon::HOURGLASS)).weak());
+        }
+        let editable = self.editable() && busy.is_none();
         let Some(result) = &self.result else {
             if self.loading {
                 ui.spinner();
@@ -503,6 +522,14 @@ mod tests {
         assert_eq!(page_count(501, 500), 2);
         assert_eq!(page_count(4321, 500), 9);
         assert_eq!(page_count(10, 0), 10, "no division by zero");
+    }
+
+    #[test]
+    fn grid_is_read_only_while_submitting_or_loading() {
+        assert_eq!(busy_hint(false, false), None);
+        assert_eq!(busy_hint(true, false), Some("Envoi en cours…"));
+        assert_eq!(busy_hint(false, true), Some("Chargement…"));
+        assert_eq!(busy_hint(true, true), Some("Envoi en cours…"));
     }
 
     #[test]

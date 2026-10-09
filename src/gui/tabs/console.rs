@@ -346,6 +346,23 @@ impl ConsoleTab {
         id
     }
 
+    /// Why result tab `index` is read-only for now: its edits are being
+    /// submitted, or its rows are about to be replaced (re-run after a
+    /// submit, or a run that replaces the unpinned results). Edits made
+    /// meanwhile would be lost. `running`: the console's script run is pending.
+    pub fn result_lock(&self, index: usize, running: bool) -> Option<&'static str> {
+        let r = self.results.get(index)?;
+        if self.submitting == Some(r.id) {
+            Some("Envoi en cours…")
+        } else if self.refreshing == Some(r.id)
+            || (running && self.refreshing.is_none() && !r.pinned)
+        {
+            Some("Chargement…")
+        } else {
+            None
+        }
+    }
+
     /// A cell of the active result is being edited (Escape cancels it first).
     fn grid_editing(&self) -> bool {
         self.results
@@ -466,7 +483,7 @@ impl ConsoleTab {
         self.selection = out.selection;
         self.splitter(ui);
 
-        if let Some(a) = self.results_area(ui, id) {
+        if let Some(a) = self.results_area(ui, id, cx.running) {
             action = Some(a);
         }
         action
@@ -595,7 +612,12 @@ impl ConsoleTab {
         ui.painter().hline(rect.x_range(), rect.center().y, stroke);
     }
 
-    fn results_area(&mut self, ui: &mut egui::Ui, id: egui::Id) -> Option<ConsoleAction> {
+    fn results_area(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        running: bool,
+    ) -> Option<ConsoleAction> {
         let mut close = None;
         ui.horizontal_wrapped(|ui| {
             for (i, r) in self.results.iter_mut().enumerate() {
@@ -653,8 +675,9 @@ impl ConsoleTab {
         }
         ui.separator();
         let active = self.active_result;
+        let lock = self.result_lock(active, running);
         match self.results.get_mut(active) {
-            Some(r) => result_view(ui, id, active, r),
+            Some(r) => result_view(ui, id, active, r, lock),
             None => self.log_view(ui, id),
         }
     }
@@ -733,6 +756,7 @@ fn result_view(
     id: egui::Id,
     index: usize,
     r: &mut ResultTab,
+    lock: Option<&str>,
 ) -> Option<ConsoleAction> {
     if let Some(e) = &r.error {
         ui.colored_label(
@@ -746,13 +770,16 @@ fn result_view(
     if let Some(hint) = read_only_hint(&r.sql, &r.result) {
         ui.label(RichText::new(format!("{} {hint}", icon::LOCK)).weak());
     }
+    if let (Some(hint), true) = (lock, r.editable) {
+        ui.label(RichText::new(format!("{} {hint}", icon::HOURGLASS)).weak());
+    }
     let action = grid::show(
         ui,
         id.with(("result", r.id)),
         &mut r.grid,
         GridOptions {
             result: &r.result,
-            editable: r.editable,
+            editable: r.editable && lock.is_none(),
             server_sort: false,
             sort_indicator: None,
         },
@@ -1002,6 +1029,37 @@ mod tests {
         assert_eq!(summary, "Erreur · 2 ms");
         assert_eq!(c.results[0].error.as_deref(), Some("gone"));
         assert!(!c.log[3].ok);
+    }
+
+    #[test]
+    fn results_are_read_only_while_submitted_or_replaced() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        apply_outcomes(
+            &mut c,
+            vec![
+                ok("SELECT * FROM a", with_pk(result(&["id"], 1))),
+                ok("SELECT * FROM b", with_pk(result(&["id"], 1))),
+            ],
+            Local::now(),
+        );
+        c.results[1].pinned = true;
+        let (a, b) = (c.results[0].id, c.results[1].id);
+        assert_eq!(c.result_lock(0, false), None);
+        assert_eq!(c.result_lock(9, true), None, "no such result");
+
+        c.submitting = Some(a);
+        assert_eq!(c.result_lock(0, false), Some("Envoi en cours…"));
+        assert_eq!(c.result_lock(1, false), None);
+        c.submitting = None;
+
+        // A run replaces the unpinned results only.
+        assert_eq!(c.result_lock(0, true), Some("Chargement…"));
+        assert_eq!(c.result_lock(1, true), None);
+
+        // The re-run after a submit replaces that result only.
+        c.refreshing = Some(b);
+        assert_eq!(c.result_lock(0, true), None);
+        assert_eq!(c.result_lock(1, true), Some("Chargement…"));
     }
 
     #[test]

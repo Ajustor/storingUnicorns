@@ -349,6 +349,12 @@ impl GridState {
         ctx.request_repaint();
     }
 
+    /// Write the open cell editor's text into `edits` and close it, so that
+    /// pending work is complete before deciding whether it can be dropped.
+    pub fn commit_editing(&mut self, rows: &[Vec<String>]) {
+        self.commit_edit(rows);
+    }
+
     fn commit_edit(&mut self, rows: &[Vec<String>]) {
         if let Some((r, c, text)) = self.editing.take() {
             if !(self.editing_blank && text.is_empty()) {
@@ -491,6 +497,10 @@ pub fn show(
     let before = state.selected;
     state.ensure_view(rows);
     state.clamp(rows, ncols);
+    if !opts.editable {
+        // Became read-only while a cell was edited: keep what was typed.
+        state.commit_editing(rows);
+    }
 
     // Keyboard target of the grid; it senses no clicks.
     ui.interact(
@@ -903,6 +913,10 @@ fn footer(
         }
         ui.separator();
         ui.label(RichText::new(format!("{} modification(s)", state.edits.count())).color(AMBER));
+        // Read-only (a submit or a reload is running): nothing to apply or drop.
+        if !editable {
+            return;
+        }
         if ui
             .button(RichText::new(format!("{} Submit", icon::CHECK)).color(SUCCESS))
             .on_hover_text("Appliquer dans une transaction (Ctrl+Entrée)")

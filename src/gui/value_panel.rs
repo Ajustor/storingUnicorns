@@ -10,6 +10,7 @@ use crate::engine::models::{is_null, Column, NULL_CELL};
 
 use super::app::App;
 use super::grid::changes::{PendingEdits, RowRef};
+use super::tabs::data::busy_hint;
 use super::tabs::{TabId, TabKind};
 use super::theme::{ACCENT, ERROR};
 
@@ -194,14 +195,18 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 fn focus(tabs: &mut super::tabs::Tabs) -> Option<Focus<'_>> {
     let tab = tabs.active_mut()?;
     let id = tab.id;
+    let runs = &tab.runs;
+    // Read-only while a submit or a reload is pending (see `busy_hint`).
     let (result_id, result, grid, editable) = match &mut tab.kind {
         TabKind::Data(d) => {
-            let editable = d.editable();
+            let busy = busy_hint(runs.submit.is_some(), runs.page.is_some());
+            let editable = d.editable() && busy.is_none();
             (0, d.result.as_ref()?, &mut d.grid, editable)
         }
         TabKind::Console(c) => {
+            let lock = c.result_lock(c.active_result, runs.script.is_some());
             let r = c.results.get_mut(c.active_result)?;
-            (r.id, &r.result, &mut r.grid, r.editable)
+            (r.id, &r.result, &mut r.grid, r.editable && lock.is_none())
         }
         TabKind::Ddl(_) => return None,
     };

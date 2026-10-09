@@ -908,6 +908,7 @@ impl App {
                         tab: tab.id,
                         connected: sessions.open.contains_key(&tab.connection),
                         submitting: tab.runs.submit.is_some(),
+                        loading: tab.runs.page.is_some(),
                     },
                 );
                 None

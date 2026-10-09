@@ -124,10 +124,18 @@ pub fn is_transaction_start(stmt: &str) -> bool {
 
 /// Classify a statement as a transaction terminator:
 /// `COMMIT`, `ROLLBACK`, `END` (and their `… TRANSACTION/TRAN` variants).
+/// `ROLLBACK [WORK|TRAN|TRANSACTION] TO [SAVEPOINT] x` keeps the transaction
+/// open, so it is not one.
 pub fn is_transaction_end(stmt: &str) -> bool {
-    match stmt.split_whitespace().next().map(|w| w.to_uppercase()) {
-        Some(w) => w == "COMMIT" || w == "ROLLBACK" || w == "END",
-        None => false,
+    let words: Vec<String> = stmt
+        .split_whitespace()
+        .take(3)
+        .map(|w| w.to_uppercase())
+        .collect();
+    match words.first().map(String::as_str) {
+        Some("COMMIT" | "END") => true,
+        Some("ROLLBACK") => !words[1..].iter().any(|w| w == "TO"),
+        _ => false,
     }
 }
 
@@ -298,6 +306,27 @@ mod execution_unit_tests {
         assert_eq!(
             get_execution_unit_at_cursor(sql, 0),
             ExecutionUnit::UnterminatedTransaction
+        );
+    }
+
+    #[test]
+    fn rollback_to_savepoint_does_not_end_the_block() {
+        let sql = "BEGIN;
+SAVEPOINT a;
+DELETE FROM t;
+ROLLBACK TO SAVEPOINT a;
+                   rollback work to a;
+COMMIT;";
+        assert_eq!(
+            get_execution_unit_at_cursor(sql, 0),
+            tx(&[
+                "BEGIN",
+                "SAVEPOINT a",
+                "DELETE FROM t",
+                "ROLLBACK TO SAVEPOINT a",
+                "rollback work to a",
+                "COMMIT"
+            ])
         );
     }
 

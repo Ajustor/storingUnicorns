@@ -3,7 +3,9 @@ use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, SqlitePool, TypeInfo, V
 
 use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo};
 
-use super::utils::{build_update_clauses, fetch_rows_and_result, is_dml, split_qualified};
+use super::utils::{
+    build_update_clauses, fetch_rows_and_result, is_dml, split_qualified, TxConnection,
+};
 
 /// Connect to SQLite
 pub async fn connect(conn_str: &str) -> Result<SqlitePool> {
@@ -98,7 +100,8 @@ pub async fn execute_query_limited(
 /// Returns the last statement that returned rows; if none did, the last one
 /// that changed rows (or an empty result).
 pub async fn execute_transaction(pool: &SqlitePool, statements: &[String]) -> Result<QueryResult> {
-    let mut conn = pool.acquire().await?;
+    // Closed instead of pooled if the block does not run to completion.
+    let mut conn = TxConnection::new(pool.acquire().await?);
     // Prefer the last statement that returned rows; if none did, fall back to
     // the last one that changed rows, so trailing `COMMIT`/`ROLLBACK` don't
     // hide the DML count.
@@ -115,13 +118,18 @@ pub async fn execute_transaction(pool: &SqlitePool, statements: &[String]) -> Re
                 }
             }
             Err(e) => {
-                // Best-effort rollback on the same connection before bubbling up.
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                // Roll back on the same connection before bubbling up. If
+                // that fails the transaction may still be open: the guard
+                // closes the connection instead of pooling it.
+                if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_ok() {
+                    conn.release();
+                }
                 return Err(e);
             }
         }
     }
 
+    conn.release();
     Ok(last_rows.or(last_changed).unwrap_or_default())
 }
 
@@ -700,6 +708,63 @@ mod tests {
         // Same SQL again: a cached statement must not keep the old names.
         let after = execute_query(&pool, "SELECT * FROM t").await.unwrap();
         assert_eq!(after.columns[0].name, "b");
+    }
+
+    /// Aborting a transaction block mid-way (GUI cancel) must not hand the
+    /// connection back to the pool with the transaction still open: the next
+    /// statement would run inside it (never committed) and the database
+    /// would stay locked for every other connection.
+    #[tokio::test]
+    async fn aborted_transaction_does_not_leak_an_open_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("t.db").display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (a INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The second statement streams rows for a long time.
+        let stmts = [
+            "BEGIN".to_string(),
+            "INSERT INTO t VALUES (1)".to_string(),
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+             WHERE x < 100000000) SELECT x FROM c"
+                .to_string(),
+            "COMMIT".to_string(),
+        ];
+        let task_pool = pool.clone();
+        let handle = tokio::spawn(async move { execute_transaction(&task_pool, &stmts).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!handle.is_finished(), "the block must still be running");
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+
+        // Same pool: an autocommit INSERT.
+        execute_query(&pool, "INSERT INTO t VALUES (2)")
+            .await
+            .unwrap();
+
+        // A separate, fresh pool sees it committed (and the aborted INSERT
+        // rolled back), without hitting a lock.
+        let fresh = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let rows: Vec<(i64,)> = sqlx::query_as("SELECT a FROM t ORDER BY a")
+            .fetch_all(&fresh)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![(2,)]);
+        sqlx::query("INSERT INTO t VALUES (3)")
+            .execute(&fresh)
+            .await
+            .expect("the database must not stay locked");
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, QueryResult, Sche
 
 use super::utils::{
     build_update_clauses, fetch_rows_and_result, group_tables_by_schema, split_qualified,
+    TxConnection,
 };
 
 /// Connect to PostgreSQL
@@ -81,7 +82,8 @@ pub async fn execute_query_limited(
 /// connection. Statements include the user's `BEGIN`/`COMMIT`/`ROLLBACK`.
 /// On any error the transaction is rolled back and the error is returned.
 pub async fn execute_transaction(pool: &PgPool, statements: &[String]) -> Result<QueryResult> {
-    let mut conn = pool.acquire().await?;
+    // Closed instead of pooled if the block does not run to completion.
+    let mut conn = TxConnection::new(pool.acquire().await?);
     // Prefer the last statement that returned rows; if none did, fall back to
     // the last one that changed rows, so trailing `COMMIT`/`ROLLBACK` don't
     // hide the DML count.
@@ -98,12 +100,18 @@ pub async fn execute_transaction(pool: &PgPool, statements: &[String]) -> Result
                 }
             }
             Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                // Roll back on the same connection before bubbling up. If
+                // that fails the transaction may still be open: the guard
+                // closes the connection instead of pooling it.
+                if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_ok() {
+                    conn.release();
+                }
                 return Err(e);
             }
         }
     }
 
+    conn.release();
     Ok(last_rows.or(last_changed).unwrap_or_default())
 }
 

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use futures_util::TryStreamExt;
+use sqlx::pool::PoolConnection;
 use sqlx::{Database, Either, Executor, IntoArguments};
 
 use crate::engine::models::{Column, ForeignKeyInfo, IndexInfo, SchemaInfo};
@@ -71,6 +72,57 @@ where
         }
     }
     Ok((rows, done, truncated))
+}
+
+/// A pooled connection dedicated to a transaction block run with raw
+/// `BEGIN`/`COMMIT` statements.
+///
+/// sqlx returns a dropped `PoolConnection` to the pool after a mere ping: if
+/// the block is interrupted (task aborted by a GUI cancel, error whose
+/// `ROLLBACK` failed…) its transaction would stay open on a pooled connection,
+/// the next query borrowing it would run inside that transaction (never
+/// committed) and the locks it holds would block every other connection.
+/// Dropping this guard therefore *closes* the connection, which makes the
+/// database roll the transaction back. Only `release`, called once the block
+/// has run to its `COMMIT`/`ROLLBACK`, gives the connection back to the pool.
+pub struct TxConnection<DB: Database> {
+    conn: Option<PoolConnection<DB>>,
+}
+
+impl<DB: Database> TxConnection<DB> {
+    pub fn new(conn: PoolConnection<DB>) -> Self {
+        Self { conn: Some(conn) }
+    }
+
+    /// The block completed: return the connection to the pool.
+    pub fn release(mut self) {
+        drop(self.conn.take());
+    }
+}
+
+impl<DB: Database> std::ops::Deref for TxConnection<DB> {
+    type Target = DB::Connection;
+
+    fn deref(&self) -> &DB::Connection {
+        self.conn.as_deref().expect("connection already released")
+    }
+}
+
+impl<DB: Database> std::ops::DerefMut for TxConnection<DB> {
+    fn deref_mut(&mut self) -> &mut DB::Connection {
+        self.conn
+            .as_deref_mut()
+            .expect("connection already released")
+    }
+}
+
+impl<DB: Database> Drop for TxConnection<DB> {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            // Closed (in a spawned task) instead of returned to the pool.
+            conn.close_on_drop();
+        }
+    }
 }
 
 /// A possibly quoted, qualified table name as shown to the user:

@@ -403,6 +403,61 @@ async fn exercise(conn: &DatabaseConnection, d: &Dialect) {
     );
 }
 
+/// A transaction block interrupted while it runs (the GUI's cancel drops
+/// the future) must leave nothing open: the next statement on `conn` is
+/// committed on its own and the block's INSERT is rolled back, as seen from
+/// the `other`, independent connection. `slow` runs for several seconds.
+async fn cancelled_transaction_leaves_nothing_open(
+    conn: &DatabaseConnection,
+    other: &DatabaseConnection,
+    d: &Dialect,
+    slow: &str,
+) {
+    let parent = d.q("parent");
+    let (begin, commit) = transaction_bounds(&d.db);
+    let block = vec![
+        begin.to_string(),
+        format!("INSERT INTO {parent} (a, b, name) VALUES (80, 800, 'cancelled')"),
+        slow.to_string(),
+        commit.to_string(),
+    ];
+    let run = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        conn.execute_transaction(&block),
+    )
+    .await;
+    assert!(run.is_err(), "the block must be interrupted while running");
+
+    exec(
+        conn,
+        &format!("INSERT INTO {parent} (a, b, name) VALUES (81, 810, 'after')"),
+    )
+    .await;
+    let check = async {
+        (
+            scalar(
+                other,
+                &format!("SELECT COUNT(*) FROM {parent} WHERE a = 80"),
+            )
+            .await,
+            scalar(
+                other,
+                &format!("SELECT COUNT(*) FROM {parent} WHERE a = 81"),
+            )
+            .await,
+        )
+    };
+    let counts = tokio::time::timeout(std::time::Duration::from_secs(20), check)
+        .await
+        .expect("blocked by a transaction left open by the cancelled block");
+    assert_eq!(
+        counts,
+        ("0".to_string(), "1".to_string()),
+        "cancelled INSERT rolled back, later INSERT committed"
+    );
+    exec(conn, &format!("DELETE FROM {parent} WHERE a IN (80, 81)")).await;
+}
+
 /// Every `(expression, expected text)` decodes to the expected string.
 async fn check_decoding(conn: &DatabaseConnection, cases: &[(&str, &str)]) {
     let select = cases
@@ -437,6 +492,14 @@ async fn integration_postgres() {
         return;
     };
     let conn = DatabaseConnection::Postgres(sqlx::PgPool::connect(&dsn).await.unwrap());
+    // One connection: a transaction leaked into the pool would be reused.
+    let single = DatabaseConnection::Postgres(
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await
+            .unwrap(),
+    );
     let d = Dialect {
         db: DatabaseType::Postgres,
         schema: "su_it".into(),
@@ -456,6 +519,7 @@ async fn integration_postgres() {
         ],
     };
     exercise(&conn, &d).await;
+    cancelled_transaction_leaves_nothing_open(&single, &conn, &d, "SELECT pg_sleep(5)").await;
     // A function body full of `;` stays one statement.
     let out = run_script(
         &conn,
@@ -508,6 +572,14 @@ async fn integration_mysql() {
         return;
     };
     let conn = DatabaseConnection::MySQL(sqlx::MySqlPool::connect(&dsn).await.unwrap());
+    // One connection: a transaction leaked into the pool would be reused.
+    let single = DatabaseConnection::MySQL(
+        sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&dsn)
+            .await
+            .unwrap(),
+    );
     let schema = scalar(&conn, "SELECT DATABASE()").await;
     let d = Dialect {
         db: DatabaseType::MySQL,
@@ -526,6 +598,7 @@ async fn integration_mysql() {
         ],
     };
     exercise(&conn, &d).await;
+    cancelled_transaction_leaves_nothing_open(&single, &conn, &d, "SELECT SLEEP(5)").await;
     // Bare names resolve in the current database.
     let cols = conn.get_table_column_details("parent").await.unwrap();
     assert_eq!(cols.len(), 4);

@@ -47,8 +47,8 @@ pub struct App {
     pub show_value_panel: bool,
     pub value_panel: ValuePanel,
     pub status: Status,
-    /// Import/export progress `(done, total, label)`.
-    pub progress: Option<(usize, usize, String)>,
+    /// Import/export/truncate progress, per operation.
+    pub progress: status::Progress,
     pub dialog: Option<Dialog>,
     /// Persisted consoles whose connection hasn't been opened yet.
     pending_consoles: Vec<QueryTab>,
@@ -116,7 +116,7 @@ impl App {
             show_value_panel: false,
             value_panel: ValuePanel::default(),
             status,
-            progress: None,
+            progress: status::Progress::default(),
             dialog: None,
             pending_consoles,
             unbound_restored: false,
@@ -629,7 +629,12 @@ impl App {
                     self.data_action(id, action);
                 }
             }
-            Event::Progress { done, total, label } => self.progress = Some((done, total, label)),
+            Event::Progress {
+                op,
+                done,
+                total,
+                label,
+            } => self.progress.update(op, done, total, label),
             Event::SchemaApplied {
                 name,
                 table,
@@ -642,11 +647,12 @@ impl App {
                 Err(e) => self.error(format!("Export impossible : {e}")),
             },
             Event::Imported {
+                op,
                 name,
                 table,
                 outcome,
             } => {
-                self.progress = None;
+                self.progress.finish(op);
                 if outcome.as_ref().is_ok_and(|s| s.succeeded() > 0) {
                     self.reload_data_tabs(&name, Some(&table));
                 }
@@ -664,8 +670,13 @@ impl App {
                     Err(e) => self.error(format!("{table} : {e}")),
                 }
             }
-            Event::Batch { name, kind, report } => {
-                self.progress = None;
+            Event::Batch {
+                op,
+                name,
+                kind,
+                report,
+            } => {
+                self.progress.finish(op);
                 if kind != "Export" && report.succeeded > 0 {
                     self.reload_data_tabs(&name, None);
                 }

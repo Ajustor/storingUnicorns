@@ -8,6 +8,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -91,21 +92,40 @@ pub enum Event {
     /// Rows written and the file path.
     Exported(Result<(usize, PathBuf), String>),
     Imported {
+        op: OpId,
         name: String,
         table: String,
         outcome: Result<ImportStats, String>,
     },
     /// `kind` is "Export", "Import" or "Vidage".
     Batch {
+        op: OpId,
         name: String,
         kind: &'static str,
         report: BatchReport,
     },
+    /// Progress of transfer `op` (throttled, see `progress_due`).
     Progress {
+        op: OpId,
         done: usize,
         total: usize,
         label: String,
     },
+}
+
+/// Identifies one import / export / truncate, whose progress is reported.
+pub type OpId = u64;
+
+/// Shortest interval between two progress events of one operation.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Whether a progress step is worth an event: the first and the last ones,
+/// else at most one per `PROGRESS_INTERVAL` (a per-row event flooded the
+/// UI with repaints).
+pub fn progress_due(last: Option<Instant>, now: Instant, done: usize, total: usize) -> bool {
+    done == 0
+        || done >= total
+        || last.is_none_or(|t| now.saturating_duration_since(t) >= PROGRESS_INTERVAL)
 }
 
 impl Event {
@@ -234,12 +254,20 @@ impl Worker {
         self.running.insert(tab, handle);
     }
 
-    /// Progress callback usable from inside a spawned task.
-    fn progress(&self) -> impl FnMut(usize, usize, &str) + Send + 'static {
+    /// Progress callback of operation `op`, usable from inside a spawned
+    /// task; throttled (`progress_due`).
+    fn progress(&self, op: OpId) -> impl FnMut(usize, usize, &str) + Send + 'static {
         let tx = self.tx.clone();
         let repaint = self.repaint.clone();
+        let mut last = None;
         move |done, total, label| {
+            let now = Instant::now();
+            if !progress_due(last, now, done, total) {
+                return;
+            }
+            last = Some(now);
             let _ = tx.send(Event::Progress {
+                op,
                 done,
                 total,
                 label: label.to_string(),
@@ -458,14 +486,15 @@ impl Worker {
     }
 
     pub fn import_csv(
-        &self,
+        &mut self,
         name: String,
         conn: Conn,
         table: String,
         path: PathBuf,
         quotes: (char, char),
-    ) {
-        let mut progress = self.progress();
+    ) -> OpId {
+        let op = self.next_run();
+        let mut progress = self.progress(op);
         self.spawn(async move {
             let outcome = match tokio::fs::read_to_string(&path).await {
                 Ok(content) => {
@@ -478,24 +507,27 @@ impl Worker {
                 Err(e) => Err(format!("{}: {e}", path.display())),
             };
             Event::Imported {
+                op,
                 name,
                 table,
                 outcome,
             }
         });
+        op
     }
 
     /// Export each `(schema, table)` to `dir`, created if missing.
     pub fn export_tables(
-        &self,
+        &mut self,
         name: String,
         conn: Conn,
         tables: Vec<(String, String)>,
         dir: PathBuf,
         format: ExportFormat,
         quotes: (char, char),
-    ) {
-        let progress = self.progress();
+    ) -> OpId {
+        let op = self.next_run();
+        let progress = self.progress(op);
         self.spawn(async move {
             let report = match tokio::fs::create_dir_all(&dir).await {
                 Ok(()) => {
@@ -509,43 +541,51 @@ impl Worker {
                 },
             };
             Event::Batch {
+                op,
                 name,
                 kind: "Export",
                 report,
             }
         });
+        op
     }
 
     pub fn import_tables(
-        &self,
+        &mut self,
         name: String,
         conn: Conn,
         tables: Vec<(String, String)>,
         dir: PathBuf,
         quotes: (char, char),
-    ) {
-        let progress = self.progress();
+    ) -> OpId {
+        let op = self.next_run();
+        let progress = self.progress(op);
         self.spawn(async move {
             let report = ops::transfer::import_tables(&conn, &tables, &dir, quotes, progress).await;
             Event::Batch {
+                op,
                 name,
                 kind: "Import",
                 report,
             }
         });
+        op
     }
 
     /// `DELETE FROM` each (already quoted) table.
-    pub fn truncate_tables(&self, name: String, conn: Conn, tables: Vec<String>) {
-        let progress = self.progress();
+    pub fn truncate_tables(&mut self, name: String, conn: Conn, tables: Vec<String>) -> OpId {
+        let op = self.next_run();
+        let progress = self.progress(op);
         self.spawn(async move {
             let report = ops::rows::truncate_tables(&conn, &tables, progress).await;
             Event::Batch {
+                op,
                 name,
                 kind: "Vidage",
                 report,
             }
         });
+        op
     }
 }
 
@@ -554,7 +594,6 @@ mod tests {
     use super::*;
     use crate::engine::models::{ConnectionConfig, DatabaseType};
     use crate::engine::ops::rows::RowChanges;
-    use std::time::{Duration, Instant};
 
     fn sqlite_config(dir: &tempfile::TempDir) -> ConnectionConfig {
         let path = dir.path().join("test.db");
@@ -650,6 +689,17 @@ mod tests {
         assert_eq!((tab, run), (3, id));
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].result.as_ref().unwrap().rows.len(), 2);
+    }
+
+    #[test]
+    fn progress_is_throttled_but_keeps_first_and_last_steps() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        assert!(progress_due(None, t0, 3, 10), "first event");
+        assert!(progress_due(Some(t0), t0, 0, 10), "start");
+        assert!(progress_due(Some(t0), t0, 10, 10), "end");
+        assert!(!progress_due(Some(t0), t0 + ms(10), 4, 10));
+        assert!(progress_due(Some(t0), t0 + ms(50), 4, 10));
     }
 
     #[test]

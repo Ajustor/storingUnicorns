@@ -125,14 +125,14 @@ pub fn open_import(app: &mut App, connection: &str, table: &str) {
     else {
         return;
     };
-    app.progress = Some((0, 0, "lignes".into()));
-    app.worker.import_csv(
+    let op = app.worker.import_csv(
         connection.to_string(),
         conn,
         table.to_string(),
         path,
         quotes,
     );
+    app.progress.update(op, 0, 0, "lignes");
 }
 
 /// Ask before emptying `tables` (qualified) of `connection`.
@@ -184,9 +184,10 @@ pub fn confirm_truncate_ui(
         if ui.add(danger).clicked() {
             match app.sessions.conn(connection) {
                 Some(conn) => {
-                    app.progress = Some((0, tables.len(), "tables".into()));
-                    app.worker
-                        .truncate_tables(connection.to_string(), conn, tables.to_vec());
+                    let op =
+                        app.worker
+                            .truncate_tables(connection.to_string(), conn, tables.to_vec());
+                    app.progress.update(op, 0, tables.len(), "tables");
                 }
                 None => app.error(format!("{connection} n'est pas connectée")),
             }
@@ -304,13 +305,14 @@ fn start_batch(app: &mut App, b: &BatchDialog, selected: Vec<(String, String)>) 
             open_truncate(app, &name, tables);
         }
         (BatchKind::Export, Some(dir)) => {
-            app.progress = Some((0, n, "tables".into()));
-            app.worker
+            let op = app
+                .worker
                 .export_tables(name, conn, selected, dir, b.format, quotes);
+            app.progress.update(op, 0, n, "tables");
         }
         (BatchKind::Import, Some(dir)) => {
-            app.progress = Some((0, n, "tables".into()));
-            app.worker.import_tables(name, conn, selected, dir, quotes);
+            let op = app.worker.import_tables(name, conn, selected, dir, quotes);
+            app.progress.update(op, 0, n, "tables");
         }
         _ => {}
     }

@@ -7,6 +7,7 @@ use crate::updater::{UpdateEvent, UpdateState};
 
 use super::app::App;
 use super::theme::{self, ERROR, SUCCESS};
+use super::worker::OpId;
 
 /// First non-blank line of `text`, with " …" when lines were dropped:
 /// multi-line errors must not grow the status bar or a panel.
@@ -22,6 +23,34 @@ pub fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
 pub fn one_line_label(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Response {
     ui.add(egui::Label::new(RichText::new(one_line(text)).color(color)).truncate())
         .on_hover_text(text)
+}
+
+/// Progress of the running transfers (import / export / truncate), each
+/// keyed by its operation so that two of them don't overwrite each other.
+/// The status bar shows the one updated last.
+#[derive(Debug, Default)]
+pub struct Progress {
+    /// `(op, done, total, label)`, least recently updated first.
+    ops: Vec<(OpId, usize, usize, String)>,
+}
+
+impl Progress {
+    pub fn update(&mut self, op: OpId, done: usize, total: usize, label: impl Into<String>) {
+        self.ops.retain(|o| o.0 != op);
+        self.ops.push((op, done, total, label.into()));
+    }
+
+    /// Operation `op` ended.
+    pub fn finish(&mut self, op: OpId) {
+        self.ops.retain(|o| o.0 != op);
+    }
+
+    /// `(done, total, label)` of the operation updated last.
+    pub fn current(&self) -> Option<(usize, usize, &str)> {
+        self.ops
+            .last()
+            .map(|(_, done, total, label)| (*done, *total, label.as_str()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,8 +159,8 @@ fn message(app: &App, ui: &mut egui::Ui) {
     if let Some(name) = app.sessions.connecting.iter().next() {
         ui.spinner();
         ui.label(format!("Connexion à {name}…"));
-    } else if let Some((done, total, label)) = &app.progress {
-        ui.add(egui::ProgressBar::new(*done as f32 / (*total).max(1) as f32).desired_width(160.0));
+    } else if let Some((done, total, label)) = app.progress.current() {
+        ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).desired_width(160.0));
         ui.label(format!("{done}/{total} {label}"));
     } else {
         let color = match app.status.kind {
@@ -200,6 +229,22 @@ fn connections(app: &App, ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_of_concurrent_operations_does_not_clobber() {
+        let mut p = Progress::default();
+        assert_eq!(p.current(), None);
+        p.update(1, 0, 10, "tables");
+        p.update(2, 0, 500, "lignes");
+        assert_eq!(p.current(), Some((0, 500, "lignes")), "most recent");
+        p.update(1, 3, 10, "tables");
+        assert_eq!(p.current(), Some((3, 10, "tables")));
+        p.finish(1);
+        assert_eq!(p.current(), Some((0, 500, "lignes")), "the other one stays");
+        p.finish(2);
+        p.finish(7);
+        assert_eq!(p.current(), None);
+    }
 
     #[test]
     fn one_line_keeps_the_first_line_only() {

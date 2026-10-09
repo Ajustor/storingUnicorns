@@ -157,9 +157,7 @@ fn apply(app: &mut App, ctx: &egui::Context, action: Action) {
         }
         Action::LoadDetails { connection, table } => {
             if let Some(s) = app.sessions.get_mut(&connection) {
-                s.loading.insert(table.clone());
-                let conn = s.conn.clone();
-                app.worker.table_details(connection, conn, table);
+                s.load_details(&mut app.worker, &connection, &table);
             }
         }
         Action::OpenData {
@@ -460,7 +458,7 @@ fn table_node(
     );
     if n.open {
         let key = key();
-        if !session.details.contains_key(&key) && !session.loading.contains(&key) {
+        if !session.details.contains_key(&key) && !session.loading.contains_key(&key) {
             actions.push(Action::LoadDetails {
                 connection: connection.clone(),
                 table: key,

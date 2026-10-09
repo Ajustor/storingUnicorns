@@ -50,9 +50,12 @@ pub enum Event {
         name: String,
         outcome: Result<Vec<SchemaInfo>, String>,
     },
+    /// Details of `table`, for request `run` (a refresh or a newer request
+    /// for the same table makes it stale).
     Details {
         name: String,
         table: String,
+        run: RunId,
         outcome: Result<TableDetails, String>,
     },
     /// Console execution, one outcome per executed unit.
@@ -330,7 +333,8 @@ impl Worker {
     }
 
     /// Columns, indexes and foreign keys of `table` on connection `name`.
-    pub fn table_details(&mut self, name: String, conn: Conn, table: String) {
+    pub fn table_details(&mut self, name: String, conn: Conn, table: String) -> RunId {
+        let run = self.next_run();
         let cache = self.cache_for(&name);
         self.spawn(async move {
             let outcome = ops::schema::table_details(&conn, &cache, &table)
@@ -339,9 +343,11 @@ impl Worker {
             Event::Details {
                 name,
                 table,
+                run,
                 outcome,
             }
         });
+        run
     }
 
     /// Execute every statement of `text` (F5 / selection).
@@ -797,6 +803,7 @@ mod tests {
             name,
             table,
             outcome,
+            ..
         } = next_event(&mut w)
         else {
             panic!("expected Details")

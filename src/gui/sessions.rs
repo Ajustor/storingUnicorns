@@ -1,11 +1,11 @@
 //! Open connections and the metadata cached for them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::engine::models::{ConnectionConfig, SchemaInfo, TableDetails};
 use crate::engine::sql::statements::quote_chars;
 
-use super::worker::Conn;
+use super::worker::{Conn, RunId, Worker};
 
 pub struct Session {
     pub config: ConnectionConfig,
@@ -14,8 +14,9 @@ pub struct Session {
     pub schemas: Vec<SchemaInfo>,
     /// table (qualified) → details, filled lazily by the explorer.
     pub details: HashMap<String, Result<TableDetails, String>>,
-    /// Tables whose details have been requested and not received yet.
-    pub loading: HashSet<String>,
+    /// Tables whose details have been requested and not received yet, with
+    /// the request awaited: an answer to another one is stale.
+    pub loading: HashMap<String, RunId>,
 }
 
 impl Session {
@@ -26,9 +27,34 @@ impl Session {
             conn,
             schemas,
             details: HashMap::new(),
-            loading: HashSet::new(),
+            loading: HashMap::new(),
         }
     }
+
+    /// Request the details of `table` (qualified) of this session `name`,
+    /// superseding a request still running for it.
+    pub fn load_details(&mut self, worker: &mut Worker, name: &str, table: &str) {
+        let run = worker.table_details(name.to_string(), self.conn.clone(), table.to_string());
+        self.loading.insert(table.to_string(), run);
+    }
+}
+
+/// Store the details of `table` answered by request `run`, unless that
+/// request is no longer awaited (the metadata was refreshed, or the table's
+/// details requested again, since): returns whether they were stored.
+pub fn accept_details(
+    details: &mut HashMap<String, Result<TableDetails, String>>,
+    loading: &mut HashMap<String, RunId>,
+    table: String,
+    run: RunId,
+    outcome: Result<TableDetails, String>,
+) -> bool {
+    if loading.get(&table) != Some(&run) {
+        return false;
+    }
+    loading.remove(&table);
+    details.insert(table, outcome);
+    true
 }
 
 #[derive(Default)]
@@ -119,6 +145,36 @@ mod tests {
                 s("dev", "main", "t"),
             ]
         );
+    }
+
+    #[test]
+    fn stale_details_are_dropped() {
+        let (mut details, mut loading) = (HashMap::new(), HashMap::new());
+        let ok = || Ok(TableDetails::default());
+        loading.insert("t".to_string(), 2);
+        assert!(
+            !accept_details(&mut details, &mut loading, "t".into(), 1, ok()),
+            "superseded"
+        );
+        assert!(details.is_empty());
+        assert!(accept_details(
+            &mut details,
+            &mut loading,
+            "t".into(),
+            2,
+            ok()
+        ));
+        assert!(details.contains_key("t") && loading.is_empty());
+        // After a refresh (nothing awaited any more) a late answer is dropped.
+        details.clear();
+        assert!(!accept_details(
+            &mut details,
+            &mut loading,
+            "t".into(),
+            2,
+            ok()
+        ));
+        assert!(details.is_empty());
     }
 
     #[test]

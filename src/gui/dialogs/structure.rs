@@ -74,10 +74,8 @@ pub fn open(app: &mut App, connection: &str, table: &str, title: &str) {
     let Some(session) = app.sessions.get_mut(connection) else {
         return;
     };
-    if !session.details.contains_key(table) && session.loading.insert(table.to_string()) {
-        let conn = session.conn.clone();
-        app.worker
-            .table_details(connection.to_string(), conn, table.to_string());
+    if !session.details.contains_key(table) && !session.loading.contains_key(table) {
+        session.load_details(&mut app.worker, connection, table);
     }
     app.dialog = Some(Dialog::Structure(StructureDialog {
         connection: connection.to_string(),
@@ -109,9 +107,8 @@ pub fn on_applied(app: &mut App, name: String, table: String, outcome: Result<St
             app.success(format!("Structure de {} modifiée", display_name(&table)));
             if let Some(s) = app.sessions.get_mut(&name) {
                 s.details.remove(&table);
-                s.loading.insert(table.clone());
-                let conn = s.conn.clone();
-                app.worker.table_details(name.clone(), conn, table.clone());
+                // Supersedes a request still running (it predates the change).
+                s.load_details(&mut app.worker, &name, &table);
             }
             app.reload_data_tabs(&name, Some(&table));
         }
@@ -176,7 +173,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui, d: &mut StructureDialog) -> bool {
 
     let session = app.sessions.get(&d.connection);
     let sqlite = session.is_some_and(|s| s.config.db_type == DatabaseType::SQLite);
-    match session.map(|s| (s.details.get(&d.table), s.loading.contains(&d.table))) {
+    match session.map(|s| (s.details.get(&d.table), s.loading.contains_key(&d.table))) {
         None => {
             ui.colored_label(ERROR, format!("{} n'est pas connectée", d.connection));
         }

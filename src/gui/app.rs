@@ -15,7 +15,7 @@ use crate::updater::{ExitAction, Updater};
 use super::dialogs::{self, connection::same_target, transfer, Dialog};
 use super::history_popup::{self, HistoryPopup};
 use super::persist::{self, Saver, CONSOLES_DELAY};
-use super::sessions::{Session, Sessions};
+use super::sessions::{self, Session, Sessions};
 use super::status::{self, Status, StatusKind};
 use super::table_search::TableSearch;
 use super::tabs::console::{self, ConsoleAction, ConsoleContext, ConsoleTab, RunKind};
@@ -602,11 +602,12 @@ impl App {
             Event::Details {
                 name,
                 table,
+                run,
                 outcome,
             } => {
                 if let Some(s) = self.sessions.get_mut(&name) {
-                    s.loading.remove(&table);
-                    s.details.insert(table, outcome);
+                    // Answers predating a refresh or a newer request are stale.
+                    sessions::accept_details(&mut s.details, &mut s.loading, table, run, outcome);
                 }
             }
             ev @ Event::Script { .. } => self.on_script(ev),

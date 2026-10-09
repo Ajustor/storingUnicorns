@@ -5,8 +5,8 @@ use anyhow::{anyhow, Result};
 use crate::engine::db::DatabaseConnection;
 use crate::engine::ops::rows::BatchReport;
 use crate::engine::services::export_import::{
-    build_upsert_import_actions, export_to_file, parse_csv, BatchExportState, ExportFormat,
-    ImportAction,
+    batch_file_name, build_upsert_import_actions, export_to_file, find_batch_csv, parse_csv,
+    ExportFormat, ImportAction,
 };
 use crate::engine::sql::statements::quote_ident;
 
@@ -83,7 +83,8 @@ pub fn qualified(schema: &str, table: &str, quotes: (char, char)) -> String {
     )
 }
 
-/// Export each `(schema, table)` to `<dir>/<table>.<ext>`. `dir` must exist:
+/// Export each `(schema, table)` to `<dir>/<schema>.<table>.<ext>` (see
+/// [`batch_file_name`]). `dir` must exist:
 /// the caller creates it so it can report that failure on its own.
 /// `progress(done, total, table)` is called before each table.
 pub async fn export_tables(
@@ -101,11 +102,7 @@ pub async fn export_tables(
     for (i, (schema, table)) in tables.iter().enumerate() {
         progress(i, tables.len(), table);
         let full = qualified(schema, table, quotes);
-        let file = dir.join(format!(
-            "{}.{}",
-            BatchExportState::clean_table_name(table),
-            format.extension()
-        ));
+        let file = dir.join(batch_file_name(schema, table, format.extension()));
         let outcome = match conn.execute_query(&format!("SELECT * FROM {full}")).await {
             Ok(result) => export_to_file(
                 &result,
@@ -132,7 +129,8 @@ pub async fn export_tables(
 /// Rows between two progress reports of a batch import.
 pub const ROW_PROGRESS_STEP: usize = 100;
 
-/// Import `<dir>/<table>.csv` into each `(schema, table)`. A table stops at
+/// Import `<dir>/<schema>.<table>.csv` (or the `<table>.csv` of older
+/// exports, see [`find_batch_csv`]) into each `(schema, table)`. A table stops at
 /// its first failing row and counts as failed. `progress(done, total, label)`
 /// is called before each table (label `table`) and every
 /// [`ROW_PROGRESS_STEP`] rows (label `table row/rows`).
@@ -149,7 +147,11 @@ pub async fn import_tables(
     };
     'tables: for (i, (schema, table)) in tables.iter().enumerate() {
         progress(i, tables.len(), table);
-        let path = dir.join(format!("{}.csv", BatchExportState::clean_table_name(table)));
+        let Some(path) = find_batch_csv(dir, schema, table, Path::exists) else {
+            let name = batch_file_name(schema, table, "csv");
+            report.errors.push(format!("{table}: {name} introuvable"));
+            continue;
+        };
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -241,7 +243,7 @@ mod tests {
         )
         .await;
         assert_eq!(report.succeeded, 1, "{:?}", report.errors);
-        assert!(dir.path().join("t.csv").exists());
+        assert!(dir.path().join("main.t.csv").exists());
 
         conn.execute_query("DELETE FROM t").await.unwrap();
         let mut labels = Vec::new();
@@ -255,5 +257,63 @@ mod tests {
         assert_eq!(labels.first(), Some(&(0, 1, "t".to_string())));
         assert_eq!(labels.last(), Some(&(0, 1, "t 2/2".to_string())));
         assert_eq!(count(&conn, "t").await, "2");
+    }
+
+    #[tokio::test]
+    async fn batch_files_never_leave_the_folder() {
+        let conn = sqlite_mem(&[
+            "CREATE TABLE \"a/b\" (id INTEGER PRIMARY KEY, v TEXT)",
+            "CREATE TABLE \"..\" (id INTEGER PRIMARY KEY)",
+            "INSERT INTO \"a/b\" VALUES (1, 'x')",
+        ])
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("dump");
+        std::fs::create_dir(&dir).unwrap();
+        let tables = vec![
+            ("main".to_string(), "a/b".to_string()),
+            ("main".to_string(), "..".to_string()),
+        ];
+        let report = export_tables(
+            &conn,
+            &tables,
+            &dir,
+            ExportFormat::Csv,
+            ('"', '"'),
+            |_, _, _| {},
+        )
+        .await;
+        assert_eq!(report.succeeded, 2, "{:?}", report.errors);
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        assert_eq!(files, ["main....csv", "main.a_b.csv"]);
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "nothing outside"
+        );
+
+        conn.execute_query("DELETE FROM \"a/b\"").await.unwrap();
+        let report = import_tables(&conn, &tables[..1], &dir, ('"', '"'), |_, _, _| {}).await;
+        assert_eq!(report.succeeded, 1, "{:?}", report.errors);
+        assert_eq!(count(&conn, "\"a/b\"").await, "1");
+    }
+
+    #[tokio::test]
+    async fn batch_import_reads_files_of_older_exports() {
+        let conn = sqlite_mem(SETUP).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.csv"), "id,name\n7,old\n").unwrap();
+        let tables = vec![("main".to_string(), "t".to_string())];
+        let report = import_tables(&conn, &tables, dir.path(), ('"', '"'), |_, _, _| {}).await;
+        assert_eq!(report.succeeded, 1, "{:?}", report.errors);
+        assert_eq!(count(&conn, "t").await, "3");
+
+        let missing = vec![("main".to_string(), "nope".to_string())];
+        let report = import_tables(&conn, &missing, dir.path(), ('"', '"'), |_, _, _| {}).await;
+        assert_eq!(report.errors, ["nope: main.nope.csv introuvable"]);
     }
 }

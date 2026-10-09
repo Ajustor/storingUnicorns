@@ -593,7 +593,7 @@ pub fn render_batch_import_dialog(frame: &mut Frame, state: &AppState) {
     ]));
 
     lines.push(Line::from(Span::styled(
-        "  (CSV files named {table}.csv will be imported)",
+        "  (CSV files named {schema}.{table}.csv or {table}.csv will be imported)",
         Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::from(""));
@@ -625,9 +625,13 @@ pub fn render_batch_import_dialog(frame: &mut Frame, state: &AppState) {
         let is_highlighted = *i == batch.selected_index && batch.active_field == 1;
 
         // Check if corresponding CSV file exists
-        let clean_name = crate::engine::services::export_import::BatchExportState::clean_table_name(table);
-        let csv_path = std::path::Path::new(&batch.directory).join(format!("{}.csv", clean_name));
-        let file_exists = csv_path.exists();
+        let file_exists = crate::engine::services::export_import::find_batch_csv(
+            std::path::Path::new(&batch.directory),
+            schema,
+            table,
+            std::path::Path::exists,
+        )
+        .is_some();
 
         let style = if is_highlighted {
             Style::default()

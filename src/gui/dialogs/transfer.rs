@@ -9,7 +9,7 @@ use egui_phosphor::regular as icon;
 use crate::engine::db::utils::display_qualified;
 use crate::engine::models::{QueryResult, SchemaInfo};
 use crate::engine::ops::transfer::qualified;
-use crate::engine::services::export_import::{BatchExportState, ExportFormat};
+use crate::engine::services::export_import::{find_batch_csv, BatchExportState, ExportFormat};
 
 use super::super::app::App;
 use super::super::theme::ERROR;
@@ -62,12 +62,12 @@ impl BatchDialog {
             .collect()
     }
 
-    /// Import: tick exactly the tables with a `<table>.csv` in `dir`
-    /// (`exists` checks a path). No-op without a folder.
+    /// Import: tick exactly the tables with a CSV in `dir` (see
+    /// `find_batch_csv`; `exists` checks a path). No-op without a folder.
     pub fn select_matching_files(&mut self, exists: impl Fn(&Path) -> bool) {
         let Some(dir) = &self.dir else { return };
-        for (_, t, sel) in &mut self.items {
-            *sel = exists(&dir.join(format!("{}.csv", BatchExportState::clean_table_name(t))));
+        for (s, t, sel) in &mut self.items {
+            *sel = find_batch_csv(dir, s, t, &exists).is_some();
         }
     }
 }
@@ -235,6 +235,7 @@ pub fn batch_ui(app: &mut App, ui: &mut egui::Ui, b: &mut BatchDialog) -> bool {
         });
     }
     if b.kind == BatchKind::Export {
+        ui.label(RichText::new("Un fichier <schéma>.<table>.<ext> par table.").weak());
         ui.horizontal(|ui| {
             ui.label("Format :");
             ui.radio_value(&mut b.format, ExportFormat::Csv, "CSV");
@@ -242,7 +243,12 @@ pub fn batch_ui(app: &mut App, ui: &mut egui::Ui, b: &mut BatchDialog) -> bool {
         });
     }
     if b.kind == BatchKind::Import {
-        ui.label(RichText::new("Un fichier <table>.csv par table, cochée s'il existe.").weak());
+        ui.label(
+            RichText::new(
+                "Un fichier <schéma>.<table>.csv (ou <table>.csv) par table, cochée s'il existe.",
+            )
+            .weak(),
+        );
     }
     ui.horizontal(|ui| {
         if ui.small_button("Tout").clicked() {
@@ -365,8 +371,12 @@ mod tests {
         b.select_matching_files(|_| true);
         assert_eq!(b.selected().len(), 3);
         b.dir = Some(PathBuf::from("dump"));
-        b.select_matching_files(|p| p == Path::new("dump").join("c.csv"));
+        // `aux` is a Windows device name: the file is `_aux.c.csv`.
+        b.select_matching_files(|p| p == Path::new("dump").join("_aux.c.csv"));
         assert_eq!(b.selected(), vec![pair("aux", "c")]);
+        // Files of older exports (`<table>.csv`) still count.
+        b.select_matching_files(|p| p == Path::new("dump").join("a.csv"));
+        assert_eq!(b.selected(), vec![pair("main", "a")]);
     }
 
     #[test]

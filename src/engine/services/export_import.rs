@@ -350,13 +350,77 @@ impl BatchExportState {
             .collect()
     }
 
-    /// Clean table name for file path (remove quotes, special chars)
+    /// `name` without identifier quotes: the file stem of older batch
+    /// exports (see [`find_batch_csv`]).
     pub fn clean_table_name(name: &str) -> String {
         name.replace('"', "")
             .replace('`', "")
             .replace('[', "")
             .replace(']', "")
     }
+}
+
+/// `name` (unquoted) made safe as a file name on every platform: path
+/// separators, the characters Windows refuses (`<>:"/\|?*`) and control
+/// characters replaced by `_`; leading dots replaced by `_` (no hidden file,
+/// no `..`); a Windows device name (`CON`, `NUL`, `COM1`…) as first
+/// dot-separated part prefixed by `_`.
+pub fn safe_file_stem(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            let reserved = matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*');
+            if reserved || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let dots = out.len() - out.trim_start_matches('.').len();
+    out.replace_range(..dots, &"_".repeat(dots));
+    let first = out.split('.').next().unwrap_or_default().trim_end();
+    let device = matches!(
+        first.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+    ) || (first.len() == 4
+        && first.is_ascii()
+        && ["COM", "LPT"]
+            .iter()
+            .any(|p| first[..3].eq_ignore_ascii_case(p))
+        && first.as_bytes()[3].is_ascii_digit()
+        && first.as_bytes()[3] != b'0');
+    if device || out.is_empty() {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// File of `(schema, table)` in a batch export folder:
+/// `<schema>.<table>.<ext>`, made safe by [`safe_file_stem`]. The schema
+/// keeps tables of the same name apart (`public.logs`, `audit.logs`).
+pub fn batch_file_name(schema: &str, table: &str, ext: &str) -> String {
+    format!("{}.{ext}", safe_file_stem(&format!("{schema}.{table}")))
+}
+
+/// CSV file of `(schema, table)` in a batch import folder: its
+/// [`batch_file_name`], else the `<table>.csv` written by older versions
+/// (only when that is a plain file name of the folder). `exists` checks a
+/// path.
+pub fn find_batch_csv(
+    dir: &Path,
+    schema: &str,
+    table: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let current = dir.join(batch_file_name(schema, table, "csv"));
+    if exists(&current) {
+        return Some(current);
+    }
+    let legacy = BatchExportState::clean_table_name(table);
+    (safe_file_stem(&legacy) == legacy)
+        .then(|| dir.join(format!("{legacy}.csv")))
+        .filter(|p| exists(p))
 }
 
 /// State for batch import dialog
@@ -431,9 +495,7 @@ impl BatchImportState {
     pub fn auto_select_matching_files(&mut self) {
         let dir = Path::new(&self.directory);
         for entry in &mut self.tables {
-            let clean_name = BatchExportState::clean_table_name(&entry.1);
-            let csv_path = dir.join(format!("{}.csv", clean_name));
-            entry.2 = csv_path.exists();
+            entry.2 = find_batch_csv(dir, &entry.0, &entry.1, Path::exists).is_some();
         }
     }
 }
@@ -915,5 +977,83 @@ mod tests {
         assert!(lines[0].ends_with("VALUES (NULL, NULL);"), "{sql}");
         assert!(lines[1].ends_with("VALUES (1, 'NULL');"), "{sql}");
         assert!(lines[2].ends_with("VALUES (2, '');"), "{sql}");
+    }
+    #[test]
+    fn batch_file_names_include_the_schema() {
+        assert_eq!(batch_file_name("public", "logs", "csv"), "public.logs.csv");
+        assert_eq!(batch_file_name("main", "t", "sql"), "main.t.sql");
+        assert_ne!(
+            batch_file_name("public", "logs", "csv"),
+            batch_file_name("audit", "logs", "csv")
+        );
+    }
+
+    #[test]
+    fn batch_file_names_stay_in_the_folder() {
+        for (schema, table) in [
+            ("public", "../../evil"),
+            ("..", "x"),
+            ("a/b", "c\\d"),
+            ("s", "/etc/passwd"),
+            ("C:", "t"),
+        ] {
+            let name = batch_file_name(schema, table, "csv");
+            assert!(
+                !name.contains(['/', '\\', ':']) && !name.starts_with('.'),
+                "{schema}.{table} -> {name}"
+            );
+            let path = Path::new("dump").join(&name);
+            assert_eq!(path.parent(), Some(Path::new("dump")), "{name}");
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some(name.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn safe_file_stem_replaces_reserved_characters() {
+        assert_eq!(
+            safe_file_stem("a<b>c:d\"e/f\\g|h?i*j"),
+            "a_b_c_d_e_f_g_h_i_j"
+        );
+        assert_eq!(safe_file_stem("tab\tle\u{1}"), "tab_le_");
+        assert_eq!(safe_file_stem("[t]`u`"), "[t]`u`", "valid in file names");
+        assert_eq!(safe_file_stem("..hidden"), "__hidden");
+        assert_eq!(safe_file_stem(""), "_");
+    }
+
+    #[test]
+    fn safe_file_stem_avoids_windows_device_names() {
+        for name in ["CON", "con", "Nul", "aux.t", "COM1", "lpt9.x", "prn"] {
+            assert!(safe_file_stem(name).starts_with('_'), "{name}");
+        }
+        for name in ["console", "com", "com10", "t.con", "nullable"] {
+            assert!(!safe_file_stem(name).starts_with('_'), "{name}");
+        }
+    }
+
+    #[test]
+    fn batch_import_prefers_the_new_name_then_the_legacy_one() {
+        let dir = Path::new("dump");
+        let only =
+            |names: &'static [&'static str]| move |p: &Path| names.iter().any(|n| p == dir.join(n));
+        let both = only(&["main.t.csv", "t.csv"]);
+        assert_eq!(
+            find_batch_csv(dir, "main", "t", both),
+            Some(dir.join("main.t.csv"))
+        );
+        let legacy = only(&["t.csv"]);
+        assert_eq!(
+            find_batch_csv(dir, "main", "t", legacy),
+            Some(dir.join("t.csv"))
+        );
+        assert_eq!(find_batch_csv(dir, "main", "t", only(&[])), None);
+        // A legacy name that isn't a plain file name is never looked up.
+        let new = dir.join(batch_file_name("main", "../t", "csv"));
+        let any = |_: &Path| true;
+        assert_eq!(find_batch_csv(dir, "main", "../t", any), Some(new.clone()));
+        let all_but_new = |p: &Path| p != new;
+        assert_eq!(find_batch_csv(dir, "main", "../t", all_but_new), None);
     }
 }

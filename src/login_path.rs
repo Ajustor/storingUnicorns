@@ -1,7 +1,11 @@
 //! An app started from the Finder or the Dock gets launchd's minimal `PATH`
-//! (`/usr/bin:/bin:/usr/sbin:/sbin`): no Homebrew, so the Azure CLI (`az`,
-//! Azure AD sign-in) would not be found. Like VS Code, take the `PATH` of the
-//! user's login shell instead.
+//! (`/usr/bin:/bin:/usr/sbin:/sbin`): no Homebrew, so the Azure CLI (`az`, Azure AD sign-in)
+//! would not be found. Like VS Code, take the `PATH` of the user's login shell instead.
+//!
+//! The shell writes its `PATH` to a file rather than to a pipe: a startup file that starts
+//! a background process (ssh-agent, gpg-agent, a plugin's update check...) hands it the
+//! shell's stdout, and reading a pipe to its end then waited for that process, so the app
+//! never opened its window.
 
 // Only macOS imports the PATH; the helpers stay compiled (and tested) everywhere.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -10,8 +14,6 @@ use std::time::Duration;
 
 /// launchd's default `PATH` for GUI apps.
 const LAUNCHD_PATH: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
-/// Delimits the `PATH` in the shell's output, which startup files may clutter.
-const MARKER: &str = "__STORINGUNICORNS_PATH__";
 /// A slow or stuck shell startup file must not hold the window back for long.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -27,7 +29,10 @@ pub fn import() {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/bin/zsh".into());
-    match login_shell_path(&shell) {
+    // An interactive login shell, as a new Terminal window starts it.
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.args(["-l", "-i", "-c"]);
+    match shell_path(cmd, TIMEOUT) {
         Some(path) => std::env::set_var("PATH", path),
         None => tracing::warn!("could not read the PATH of {shell}; keeping {current}"),
     }
@@ -43,28 +48,30 @@ fn is_launchd_path(path: &str) -> bool {
         .all(|dir| LAUNCHD_PATH.contains(&dir))
 }
 
-/// Run `shell` as an interactive login shell (what a new Terminal window does) and read
-/// the `PATH` it ends up with.
-#[cfg(target_os = "macos")]
-fn login_shell_path(shell: &str) -> Option<String> {
-    use std::io::Read as _;
-    use std::process::{Command, Stdio};
+/// Run `shell` (its last argument a `-c`) with a command that writes its `PATH` to a
+/// file, and read it. Gives up after `timeout`, killing the shell.
+#[cfg(unix)]
+fn shell_path(mut shell: std::process::Command, timeout: Duration) -> Option<String> {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
 
-    let mut child = Command::new(shell)
-        .args(["-l", "-i", "-c"])
-        .arg(format!("printf '{MARKER}%s{MARKER}' \"$PATH\""))
+    // Unique per call: the tests run several at once.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("storingUnicorns-{}-{n}.path", std::process::id());
+    let out = std::env::temp_dir().join(name);
+    let out_str = out.to_str().filter(|s| !s.contains('\''))?;
+    let _ = std::fs::remove_file(&out);
+    let mut child = shell
+        .arg(format!("printf '%s' \"$PATH\" > '{out_str}'"))
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
+        // Away from our process group: nothing it starts can signal the app.
+        .process_group(0)
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut out = String::new();
-        let _ = stdout.read_to_string(&mut out);
-        out
-    });
-    let deadline = std::time::Instant::now() + TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -74,19 +81,14 @@ fn login_shell_path(shell: &str) -> Option<String> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = std::fs::remove_file(&out);
                 return None;
             }
         }
     }
-    parse_output(&reader.join().ok()?)
-}
-
-/// The `PATH` between the markers of the shell's output.
-fn parse_output(out: &str) -> Option<String> {
-    let start = out.find(MARKER)? + MARKER.len();
-    let len = out[start..].find(MARKER)?;
-    let path = out[start..start + len].trim();
-    (!path.is_empty()).then(|| path.to_string())
+    let path = std::fs::read_to_string(&out).ok();
+    let _ = std::fs::remove_file(&out);
+    path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty())
 }
 
 #[cfg(test)]
@@ -103,15 +105,47 @@ mod tests {
         ));
     }
 
+    /// `sh -c '<startup>; eval "$0"' <our command>`: a stand-in for a login shell whose
+    /// startup files run `startup`.
+    #[cfg(unix)]
+    fn fake_shell(startup: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.env("PATH", "/opt/tools/bin:/usr/bin:/bin")
+            .arg("-c")
+            .arg(format!("{startup}\neval \"$0\""));
+        cmd
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn path_is_read_between_the_markers() {
-        let out = format!("motd\nWelcome!\n{MARKER}/opt/homebrew/bin:/usr/bin{MARKER}");
-        assert_eq!(
-            parse_output(&out).as_deref(),
-            Some("/opt/homebrew/bin:/usr/bin")
+    fn path_is_read_from_the_shell() {
+        let path = shell_path(fake_shell("echo 'Welcome!'"), TIMEOUT);
+        assert_eq!(path.as_deref(), Some("/opt/tools/bin:/usr/bin:/bin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_process_started_by_the_shell_is_not_waited_for() {
+        let start = std::time::Instant::now();
+        let path = shell_path(fake_shell("sleep 30 &"), TIMEOUT);
+        assert_eq!(path.as_deref(), Some("/opt/tools/bin:/usr/bin:/bin"));
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
         );
-        assert_eq!(parse_output("no markers"), None);
-        assert_eq!(parse_output(&format!("{MARKER}{MARKER}")), None);
-        assert_eq!(parse_output(&format!("{MARKER}/usr/bin")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_shell_is_given_up_on() {
+        let start = std::time::Instant::now();
+        let path = shell_path(fake_shell("sleep 30"), Duration::from_millis(300));
+        assert_eq!(path, None);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
     }
 }

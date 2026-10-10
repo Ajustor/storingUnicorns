@@ -7,6 +7,14 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Corrections
+
+- **macOS : l'app restait bloquée au démarrage** sans ouvrir sa fenêtre quand un
+  fichier de démarrage du shell (`.zshrc`…) laissait un processus en
+  arrière-plan (ssh-agent, gpg-agent, vérification de mise à jour d'un plugin…).
+
 ## [0.11.0] - 2026-10-09
 
 ### Nouveautés

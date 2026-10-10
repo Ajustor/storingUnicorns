@@ -96,6 +96,14 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: bash scripts/build-macos-app.sh target/${{ matrix.target }}/release/storingUnicorns storingUnicorns-macos-arm64.dmg
 
+      - name: Open the app (macOS)
+        if: matrix.os == 'macos-latest'
+        # A startup file that leaves a process in the background (like ssh-agent or a
+        # plugin's update check) once kept the app from opening its window.
+        run: |
+          for rc in ~/.zshrc ~/.bash_profile; do echo '(sleep 300 &)' >> "$rc"; done
+          bash scripts/smoke-test-macos-app.sh storingUnicorns-macos-arm64.dmg storingUnicorns storingUnicorns "$HOME/Library/Application Support/storing-unicorns/debug.log"
+
       - name: Build Windows installer (MSI)
         if: matrix.os == 'windows-latest'
         shell: pwsh

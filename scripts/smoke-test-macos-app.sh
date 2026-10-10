@@ -12,7 +12,8 @@ exe="$3"
 crash_log="${4:-}"
 WAIT=30
 
-work=$(mktemp -d)
+# Real path: the process runs from /private/var/..., not the /var/... symlink.
+work=$(cd "$(mktemp -d)" && pwd -P)
 mnt="$work/mnt"
 hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" > /dev/null
 cp -R "$mnt/$name.app" "$work/"

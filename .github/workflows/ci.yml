@@ -102,6 +102,9 @@ jobs:
         # plugin's update check) once kept the app from opening its window.
         run: |
           for rc in ~/.zshrc ~/.bash_profile; do echo '(sleep 300 &)' >> "$rc"; done
+          # Apps opened from the Finder get launchd's minimal PATH (the runner sets a
+          # fuller one), so the app reads the login shell's.
+          launchctl setenv PATH /usr/bin:/bin:/usr/sbin:/sbin
           bash scripts/smoke-test-macos-app.sh storingUnicorns-macos-arm64.dmg storingUnicorns storingUnicorns "$HOME/Library/Application Support/storing-unicorns/debug.log"
 
       - name: Build Windows installer (MSI)

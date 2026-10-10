@@ -41,6 +41,11 @@ impl Mode {
         let mut tui_requested = false;
         let mut opts = TuiOptions::default();
         for arg in args {
+            // The process serial number macOS may pass to an app started from the
+            // Finder (first launch after download).
+            if arg.starts_with("-psn_") {
+                continue;
+            }
             let is_tui_arg = match arg.as_str() {
                 "-v" | "--version" => return Mode::Version,
                 "-h" | "--help" => return Mode::Help,
@@ -134,6 +139,15 @@ mod tests {
     #[test]
     fn unknown_argument_is_an_error() {
         assert_eq!(parse(&["frobnicate"]), Mode::Invalid("frobnicate".into()));
+    }
+
+    #[test]
+    fn finder_process_serial_number_is_ignored() {
+        assert_eq!(parse(&["-psn_0_12345"]), Mode::Gui);
+        assert_eq!(
+            parse(&["-psn_0_12345", "tui"]),
+            Mode::Tui(TuiOptions::default())
+        );
     }
 
     #[test]

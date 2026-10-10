@@ -4,10 +4,17 @@
 #
 # Usage: scripts/build-macos-app.sh <binary> <output.dmg>
 #
-# The bundle is signed ad hoc (no Apple Developer ID): macOS asks for
-# confirmation on the first launch (right-click > Open, or System Settings >
-# Privacy & Security > Open Anyway). The in-app updater replaces
-# Contents/MacOS/storingUnicorns in place (src/updater/mod.rs).
+# The bundle is signed ad hoc (no Apple Developer ID), with the Hardened
+# Runtime. macOS asks for confirmation on the first launch (right-click >
+# Open, or System Settings > Privacy & Security > Open Anyway).
+#
+# macOS 26 (Tahoe): an ad-hoc signed app installed in /Applications hangs in
+# the dynamic linker (syspolicyd wants it notarised) without a word; in
+# ~/Applications it starts. Only a Developer ID signature with notarisation
+# lifts that.
+#
+# The in-app updater replaces Contents/MacOS/storingUnicorns in place
+# (src/updater/mod.rs).
 set -euo pipefail
 
 bin="$1"
@@ -41,7 +48,13 @@ for size in 16 32 128 256; do
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 
-codesign --force --deep --sign - "$app"
+# Hardened Runtime (--options runtime): without it, macOS 26 stops the app in
+# dyld before any of its code runs. disable-library-validation: see
+# packaging/macos/entitlements.plist.
+codesign --force --deep --sign - \
+  --options runtime \
+  --entitlements packaging/macos/entitlements.plist \
+  "$app"
 codesign --verify --deep --strict "$app"
 
 ln -s /Applications "$work/dmg/Applications"

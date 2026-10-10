@@ -2,6 +2,9 @@
 name = "storingUnicorns"
 version = "0.11.0"
 edition = "2021"
+# egui_extras 0.31 pulls in mime_guess2 2.3.1, an edition 2024 crate: an older
+# toolchain fails here with a clear message instead.
+rust-version = "1.85"
 description = "A terminal-based database client inspired by DataGrip"
 license = "MIT"
 

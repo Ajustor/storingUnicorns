@@ -14,6 +14,17 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
 - **macOS : l'app restait bloquée au démarrage** sans ouvrir sa fenêtre quand un
   fichier de démarrage du shell (`.zshrc`…) laissait un processus en
   arrière-plan (ssh-agent, gpg-agent, vérification de mise à jour d'un plugin…).
+- **macOS 26 (Tahoe) : l'app ne se lançait pas, sans aucun message.** Le
+  bundle est maintenant signé avec le Hardened Runtime (`--options runtime`) :
+  sans lui, macOS 26 suspendait le processus dans le chargeur dynamique avant
+  la moindre ligne de code.
+  **Note :** même ainsi, macOS 26 (`syspolicyd`) bloque une app signée ad hoc
+  (sans Developer ID Apple) installée dans `/Applications`. Installez-la dans
+  `~/Applications`, où macOS 26 la laisse démarrer.
+- **Build : version minimale de Rust** (`rust-version = "1.85"`). `egui_extras`
+  tire `mime_guess2` 2.3.1, en édition 2024 : un toolchain plus ancien échoue
+  désormais avec un message clair plutôt qu'une erreur de dépendance
+  (`edition2024` non stabilisée).
 
 ## [0.11.0] - 2026-10-09
 

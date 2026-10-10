@@ -246,6 +246,9 @@ Depuis la [page de téléchargement](https://ajustor.github.io/storingUnicorns/)
 - macOS (Apple Silicon) : ouvrez `storingUnicorns-macos-arm64.dmg` et glissez **storingUnicorns**
   dans **Applications**. L'app est signée ad hoc, sans notarisation Apple : au premier lancement,
   clic droit → **Ouvrir** (ou Réglages Système → Confidentialité et sécurité → **Ouvrir quand même**).
+  **macOS 26 (Tahoe)** bloque sans un mot une app signée ad hoc installée dans `/Applications` :
+  glissez-la plutôt dans `~/Applications` (le dossier Applications de votre dossier personnel,
+  à créer s'il n'existe pas). Seule une signature Developer ID notarisée par Apple lèverait cette limite.
 - Linux (x86_64) : `chmod +x storingUnicorns-linux-x64.AppImage` puis lancez-la (FUSE requis :
   paquet `libfuse2` ou `fuse`) ; `./storingUnicorns-linux-x64.AppImage tui` ouvre l'interface terminal.
 

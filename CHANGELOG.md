@@ -21,6 +21,10 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
   la commande pour réinstaller ; l'app continue ensuite de se mettre à jour
   toute seule.
 
+- **Version en cours dans la barre d'état**, tout à gauche : `v0.x.y` dans
+  l'interface graphique (un clic vérifie les mises à jour, comme avant) et dans
+  l'interface terminal.
+
 ### Modifications
 
 - La page de téléchargement présente d'abord l'installation macOS par le

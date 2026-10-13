@@ -41,7 +41,7 @@ jq -n --arg version "${TAG#v}" --arg notes "$notes" --arg page "$BASE_URL/" \
   > site/latest.json
 
 cp assets/icon.png site/icon.png
-cp scripts/install.sh scripts/install.ps1 site/
+cp scripts/install.sh scripts/install.ps1 scripts/install-macos.sh site/
 python3 scripts/build-pages.py pages/index.html site/latest.json "$dir" site/index.html CHANGELOG.md
 
 cat site/latest.json

@@ -1202,6 +1202,10 @@ pub fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let status = Line::from(vec![
+        Span::styled(
+            concat!(" v", env!("CARGO_PKG_VERSION"), " | "),
+            Style::default().fg(Color::Gray),
+        ),
         Span::styled(connection_info, Style::default().fg(Color::Green)),
         Span::styled(&state.status_message, Style::default().fg(Color::White)),
     ]);
@@ -1246,5 +1250,13 @@ mod tests {
         assert!(list.contains("prod (Supabase)"), "{list}");
         let bar = screen(|f| render_status_bar(f, f.area(), &state));
         assert!(bar.contains("Connected: prod (Supabase)"), "{bar}");
+    }
+
+    #[test]
+    fn status_bar_starts_with_the_version() {
+        let state = AppState::new(AppConfig::default(), false, true);
+        let bar = screen(|f| render_status_bar(f, f.area(), &state));
+        let version = concat!(" v", env!("CARGO_PKG_VERSION"), " | Disconnected");
+        assert!(bar.starts_with(version), "{bar}");
     }
 }

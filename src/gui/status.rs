@@ -141,6 +141,8 @@ pub fn update_banner(app: &mut App, ctx: &egui::Context) {
 pub fn status_bar(app: &mut App, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
         ui.horizontal(|ui| {
+            version(app, ui);
+            ui.separator();
             connections(app, ui);
             ui.separator();
             if let Some(summary) = app.tabs.active().and_then(|t| t.summary.clone()) {
@@ -177,20 +179,26 @@ fn message(app: &App, ui: &mut egui::Ui) {
     }
 }
 
-/// Version / update check, theme toggle, value panel toggle.
-fn right_side(app: &mut App, ui: &mut egui::Ui) {
-    let version = format!("v{}", crate::updater::current_version());
+/// The running version, at the far left; a click checks for updates.
+fn version(app: &mut App, ui: &mut egui::Ui) {
+    let version = crate::updater::current_version();
     let hover = match &app.updater.state {
-        UpdateState::Failed(e) => format!("Dernière vérification en échec : {e}"),
-        _ => "Vérifier les mises à jour".to_string(),
+        UpdateState::Failed(e) => {
+            format!("storingUnicorns {version} — dernière vérification en échec : {e}")
+        }
+        _ => format!("storingUnicorns {version} — vérifier les mises à jour"),
     };
     if ui
-        .link(RichText::new(version).weak())
+        .link(RichText::new(format!("v{version}")).weak())
         .on_hover_text(hover)
         .clicked()
     {
         app.updater.check(true, None);
     }
+}
+
+/// Theme toggle, value panel toggle.
+fn right_side(app: &mut App, ui: &mut egui::Ui) {
     if ui
         .button(app.theme.icon())
         .on_hover_text("Thème : système / sombre / clair")

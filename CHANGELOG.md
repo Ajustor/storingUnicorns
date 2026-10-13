@@ -7,6 +7,26 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Nouveautés
+
+- **macOS : installation en une ligne dans le Terminal**, désormais la méthode
+  recommandée sur Mac :
+  `curl -fsSL https://ajustor.github.io/storingUnicorns/install-macos.sh | bash`.
+  Le script télécharge la dernière version, vérifie son SHA-256, installe
+  **storingUnicorns.app** dans `~/Apps` (où Spotlight la trouve) et ajoute la
+  commande `storingUnicorns` au `PATH`. Installée ainsi, l'app n'affiche plus
+  d'avertissement « app dangereuse » et n'est pas bloquée par macOS 26. Relancez
+  la commande pour réinstaller ; l'app continue ensuite de se mettre à jour
+  toute seule.
+
+### Modifications
+
+- La page de téléchargement présente d'abord l'installation macOS par le
+  Terminal. Avec le `.dmg`, glissez l'app ailleurs que dans un dossier
+  « Applications » : macOS 26 y bloque les apps non notarisées.
+
 ## [0.11.0] - 2026-10-09
 
 ### Nouveautés

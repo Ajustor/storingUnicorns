@@ -243,9 +243,22 @@ src/
 
 Depuis la [page de téléchargement](https://ajustor.github.io/storingUnicorns/) :
 
-- macOS (Apple Silicon) : ouvrez `storingUnicorns-macos-arm64.dmg` et glissez **storingUnicorns**
-  dans **Applications**. L'app est signée ad hoc, sans notarisation Apple : au premier lancement,
-  clic droit → **Ouvrir** (ou Réglages Système → Confidentialité et sécurité → **Ouvrir quand même**).
+- macOS (Apple Silicon), recommandé : dans le Terminal,
+
+  ```sh
+  curl -fsSL https://ajustor.github.io/storingUnicorns/install-macos.sh | bash
+  ```
+
+  Le script (`scripts/install-macos.sh`) télécharge le `.dmg` de la dernière version, vérifie son
+  SHA-256, installe l'app dans `~/Apps` (`STORINGUNICORNS_APP_DIR` pour un autre dossier, jamais un
+  dossier nommé « Applications ») et ajoute `storingUnicorns` au `PATH`. Téléchargée par `curl`,
+  l'app n'a pas l'attribut de quarantaine : ni avertissement Gatekeeper, ni blocage sous macOS 26.
+  Relancez la commande pour réinstaller.
+- macOS, sans le Terminal : ouvrez `storingUnicorns-macos-arm64.dmg` et glissez **storingUnicorns**
+  sur le Bureau ou dans un dossier qui ne s'appelle pas « Applications » (macOS 26 y bloque les apps
+  non notarisées ; sous macOS 15 et antérieur, **Applications** convient). L'app est signée ad hoc,
+  sans notarisation Apple : au premier lancement, clic droit → **Ouvrir** (ou Réglages Système →
+  Confidentialité et sécurité → **Ouvrir quand même**).
 - Linux (x86_64) : `chmod +x storingUnicorns-linux-x64.AppImage` puis lancez-la (FUSE requis :
   paquet `libfuse2` ou `fuse`) ; `./storingUnicorns-linux-x64.AppImage tui` ouvre l'interface terminal.
 

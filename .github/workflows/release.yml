@@ -131,6 +131,30 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: bash scripts/build-macos-app.sh target/${{ matrix.target }}/release/storingUnicorns storingUnicorns-macos-arm64.dmg
 
+      # Run the Terminal installer (scripts/install-macos.sh) against this
+      # build: a local latest.json served over file:// stands in for the site.
+      - name: Test the install script (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -euo pipefail
+          site="$RUNNER_TEMP/site"
+          mkdir -p "$site"
+          cp storingUnicorns-macos-arm64.dmg "$site/"
+          sha=$(shasum -a 256 "$site/storingUnicorns-macos-arm64.dmg" | cut -d' ' -f1)
+          jq -n --arg url "file://$site/storingUnicorns-macos-arm64.dmg" --arg sha "$sha" \
+            '{version: "test", assets: [{name: "storingUnicorns-macos-arm64.dmg", url: $url, sha256: $sha}]}' \
+            > "$site/latest.json"
+          export STORINGUNICORNS_BASE_URL="file://$site" STORINGUNICORNS_APP_DIR="$RUNNER_TEMP/Apps"
+          bash scripts/install-macos.sh
+          app="$STORINGUNICORNS_APP_DIR/storingUnicorns.app"
+          codesign --verify --deep --strict "$app"
+          for dir in /usr/local/bin "$HOME/.local/bin"; do
+            if [ -L "$dir/storingUnicorns" ]; then link="$dir/storingUnicorns"; break; fi
+          done
+          test "$(readlink "$link")" = "$app/Contents/MacOS/storingUnicorns"
+          # Running it again updates in place.
+          bash scripts/install-macos.sh
+
       - name: Build Windows installer (MSI)
         if: matrix.os == 'windows-latest'
         shell: pwsh

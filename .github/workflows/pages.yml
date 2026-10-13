@@ -14,6 +14,7 @@ on:
       - 'scripts/build-site.sh'
       - 'scripts/install.sh'
       - 'scripts/install.ps1'
+      - 'scripts/install-macos.sh'
       - 'assets/icon.png'
       - '.github/workflows/pages.yml'
   workflow_dispatch:

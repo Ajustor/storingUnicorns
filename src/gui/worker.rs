@@ -22,6 +22,7 @@ use crate::engine::ops::{
     query::StatementOutcome,
     rows::{BatchReport, RowChanges},
     transfer::ImportStats,
+    tx::ManualTx,
 };
 use crate::engine::services::export_import::{export_to_file, ExportFormat};
 use crate::engine::services::table_cache::TableCache;
@@ -33,6 +34,32 @@ pub type TabId = u64;
 /// may still deliver its event; the tab drops events of runs it no longer
 /// waits for.
 pub type RunId = u64;
+
+/// Where a tab's SQL runs: the connection's pool (auto-commit), or the
+/// connection's manual transaction.
+#[derive(Clone)]
+pub enum Runner {
+    Auto(Conn),
+    Manual(Arc<ManualTx>),
+}
+
+impl Runner {
+    /// Where rows are read (in manual mode they show the pending changes).
+    pub fn data(&self) -> Conn {
+        match self {
+            Runner::Auto(conn) => conn.clone(),
+            Runner::Manual(tx) => tx.conn(),
+        }
+    }
+
+    /// Where metadata is read.
+    pub fn meta(&self) -> Conn {
+        match self {
+            Runner::Auto(conn) => conn.clone(),
+            Runner::Manual(tx) => tx.meta(),
+        }
+    }
+}
 
 /// Result of a background operation. Errors are carried as display strings.
 pub enum Event {
@@ -106,6 +133,18 @@ pub enum Event {
         name: String,
         kind: &'static str,
         report: BatchReport,
+    },
+    /// The manual transaction mode of connection `name` was turned on.
+    TxOpened {
+        name: String,
+        outcome: Result<Arc<ManualTx>, String>,
+    },
+    /// The manual transaction of `name` was committed (else rolled back):
+    /// number of statements it held.
+    TxEnded {
+        name: String,
+        commit: bool,
+        outcome: Result<usize, String>,
     },
     /// Progress of transfer `op` (throttled, see `progress_due`).
     Progress {
@@ -356,13 +395,16 @@ impl Worker {
     pub fn run_script(
         &mut self,
         tab: TabId,
-        conn: Conn,
+        runner: Runner,
         text: String,
         max_rows: Option<usize>,
     ) -> RunId {
         let run = self.next_run();
         self.spawn_for_tab(tab, async move {
-            let outcomes = ops::query::run_script(&conn, &text, max_rows).await;
+            let outcomes = match runner {
+                Runner::Auto(conn) => ops::query::run_script(&conn, &text, max_rows).await,
+                Runner::Manual(tx) => tx.run_script(&text, max_rows).await,
+            };
             Event::Script { tab, run, outcomes }
         });
         run
@@ -372,24 +414,30 @@ impl Worker {
     pub fn run_at_cursor(
         &mut self,
         tab: TabId,
-        conn: Conn,
+        runner: Runner,
         text: String,
         cursor: usize,
         max_rows: Option<usize>,
     ) -> RunId {
         let run = self.next_run();
         self.spawn_for_tab(tab, async move {
-            let outcomes = ops::query::run_at_cursor_outcomes(&conn, &text, cursor, max_rows).await;
+            let outcomes = match runner {
+                Runner::Auto(conn) => {
+                    ops::query::run_at_cursor_outcomes(&conn, &text, cursor, max_rows).await
+                }
+                Runner::Manual(tx) => tx.run_at_cursor(&text, cursor, max_rows).await,
+            };
             Event::Script { tab, run, outcomes }
         });
         run
     }
 
     /// Load one page of a data editor; replaces the tab's pending load.
-    pub fn load_page(&mut self, tab: TabId, conn: Conn, table: String, sql: String) -> RunId {
+    pub fn load_page(&mut self, tab: TabId, runner: Runner, table: String, sql: String) -> RunId {
         let run = self.next_run();
+        let (conn, meta) = (runner.data(), runner.meta());
         self.spawn_for_tab(tab, async move {
-            let outcome = ops::query::run_table_page(&conn, &sql, &table)
+            let outcome = ops::query::run_table_page(&conn, &meta, &sql, &table)
                 .await
                 .map_err(err);
             Event::Page { tab, run, outcome }
@@ -411,12 +459,12 @@ impl Worker {
     }
 
     /// Apply a data editor's or console result's pending changes in one
-    /// transaction.
+    /// transaction (in manual mode: in the open transaction, not committed).
     #[allow(clippy::too_many_arguments)]
     pub fn submit(
         &mut self,
         tab: TabId,
-        conn: Conn,
+        runner: Runner,
         db_type: DatabaseType,
         table: String,
         columns: Vec<Column>,
@@ -424,12 +472,50 @@ impl Worker {
     ) -> RunId {
         let run = self.next_run();
         self.spawn(async move {
-            let outcome = ops::rows::submit_changes(&conn, &db_type, &table, &columns, &changes)
-                .await
-                .map_err(err);
+            let outcome = match runner {
+                Runner::Auto(conn) => {
+                    ops::rows::submit_changes(&conn, &db_type, &table, &columns, &changes).await
+                }
+                Runner::Manual(tx) => tx.submit(&table, &columns, &changes).await,
+            }
+            .map_err(err);
             Event::Submitted { tab, run, outcome }
         });
         run
+    }
+
+    /// Turn on the manual transaction mode of connection `name`: open its
+    /// dedicated session. `meta` is the connection's pool.
+    pub fn open_tx(&self, name: String, config: ConnectionConfig, meta: Conn) {
+        self.spawn(async move {
+            let outcome = ManualTx::open(&config, meta)
+                .await
+                .map(Arc::new)
+                .map_err(err);
+            Event::TxOpened { name, outcome }
+        });
+    }
+
+    /// Commit (else roll back) the manual transaction of `name`.
+    pub fn end_tx(&self, name: String, tx: Arc<ManualTx>, commit: bool) {
+        self.spawn(async move {
+            let outcome = if commit {
+                tx.commit().await
+            } else {
+                tx.rollback().await
+            }
+            .map_err(err);
+            Event::TxEnded {
+                name,
+                commit,
+                outcome,
+            }
+        });
+    }
+
+    /// Roll back what `tx` holds and close its session, without an event.
+    pub fn close_tx(&self, tx: Arc<ManualTx>) {
+        self.rt.spawn(async move { tx.close().await });
     }
 
     /// `CREATE TABLE` of `table`, from fresh metadata.
@@ -670,7 +756,7 @@ mod tests {
         let mut w = Worker::new(|| {});
         let conn = connected(&mut w, &dir);
 
-        let id = w.run_script(1, conn, "SELECT * FROM t".into(), Some(1000));
+        let id = w.run_script(1, Runner::Auto(conn), "SELECT * FROM t".into(), Some(1000));
         assert!(w.is_running(1));
         assert!(w.any_running());
         let Event::Script { tab, run, outcomes } = next_event(&mut w) else {
@@ -690,7 +776,7 @@ mod tests {
         let conn = connected(&mut w, &dir);
 
         let text = "SELECT 1;\nSELECT * FROM t;";
-        let id = w.run_at_cursor(3, conn, text.into(), text.len() - 3, None);
+        let id = w.run_at_cursor(3, Runner::Auto(conn), text.into(), text.len() - 3, None);
         let Event::Script { tab, run, outcomes } = next_event(&mut w) else {
             panic!("expected Script")
         };
@@ -734,7 +820,7 @@ mod tests {
         // A recursive CTE that runs for a long time.
         let slow = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c \
                     WHERE x < 1000000000) SELECT count(*) FROM c";
-        w.run_script(1, conn, slow.into(), None);
+        w.run_script(1, Runner::Auto(conn), slow.into(), None);
         assert!(w.is_running(1));
         assert!(!w.cancel(2), "nothing runs in tab 2");
         assert!(w.cancel(1));
@@ -750,7 +836,7 @@ mod tests {
 
         let id = w.load_page(
             7,
-            conn.clone(),
+            Runner::Auto(conn.clone()),
             "t".into(),
             "SELECT * FROM t LIMIT 500 OFFSET 0".into(),
         );
@@ -775,7 +861,7 @@ mod tests {
         };
         let id = w.submit(
             7,
-            conn.clone(),
+            Runner::Auto(conn.clone()),
             DatabaseType::SQLite,
             "t".into(),
             r.columns.clone(),
@@ -827,8 +913,18 @@ mod tests {
         let mut w = Worker::new(|| {});
         let conn = connected(&mut w, &dir);
 
-        let first = w.load_page(7, conn.clone(), "t".into(), "SELECT * FROM t".into());
-        let second = w.load_page(7, conn, "t".into(), "SELECT name FROM t".into());
+        let first = w.load_page(
+            7,
+            Runner::Auto(conn.clone()),
+            "t".into(),
+            "SELECT * FROM t".into(),
+        );
+        let second = w.load_page(
+            7,
+            Runner::Auto(conn),
+            "t".into(),
+            "SELECT name FROM t".into(),
+        );
         assert_ne!(first, second, "each operation gets its own run id");
         // The first load may or may not have delivered before being aborted;
         // whatever arrives, only `second` is the run the tab waits for.
@@ -843,5 +939,55 @@ mod tests {
             }
             assert_eq!(run, first, "unexpected run id");
         }
+    }
+
+    #[test]
+    fn manual_transaction_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Worker::new(|| {});
+        let conn = connected(&mut w, &dir);
+
+        let config = ConnectionConfig {
+            name: "test".into(),
+            db_type: DatabaseType::SQLite,
+            database: dir.path().join("test.db").display().to_string(),
+            ..Default::default()
+        };
+        w.open_tx("test".into(), config, conn.clone());
+        let Event::TxOpened { name, outcome } = next_event(&mut w) else {
+            panic!("expected TxOpened")
+        };
+        assert_eq!(name, "test");
+        let tx = outcome.unwrap();
+
+        let runner = Runner::Manual(tx.clone());
+        w.run_script(1, runner.clone(), "DELETE FROM t".into(), None);
+        let Event::Script { outcomes, .. } = next_event(&mut w) else {
+            panic!("expected Script")
+        };
+        assert!(outcomes[0].result.is_ok());
+        assert_eq!(tx.status().statements, 1);
+
+        // Pages read through the transaction see the pending delete; the
+        // shared connection does not.
+        w.load_page(2, runner, "t".into(), "SELECT * FROM t".into());
+        let Event::Page { outcome, .. } = next_event(&mut w) else {
+            panic!("expected Page")
+        };
+        assert!(outcome.unwrap().rows.is_empty());
+        w.count(2, conn.clone(), "SELECT COUNT(*) FROM t".into());
+        let Event::Count { outcome, .. } = next_event(&mut w) else {
+            panic!("expected Count")
+        };
+        assert_eq!(outcome, Ok(2));
+
+        w.end_tx("test".into(), tx, false);
+        let Event::TxEnded {
+            commit, outcome, ..
+        } = next_event(&mut w)
+        else {
+            panic!("expected TxEnded")
+        };
+        assert_eq!((commit, outcome), (false, Ok(1)));
     }
 }

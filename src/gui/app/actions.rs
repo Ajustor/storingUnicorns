@@ -24,14 +24,12 @@ impl App {
                 let Some(session) = self.sessions.get(&tab.connection) else {
                     return;
                 };
-                let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
+                let (runner, db_type) = (session.runner(), session.config.db_type.clone());
                 d.needs_load = false;
                 d.loading = true;
                 let sql = build_select(&d.query, &db_type);
-                tab.runs.page = Some(
-                    self.worker
-                        .load_page(id, conn.clone(), d.table.clone(), sql),
-                );
+                let conn = runner.data();
+                tab.runs.page = Some(self.worker.load_page(id, runner, d.table.clone(), sql));
                 if count {
                     d.total = None;
                     d.count_error = None;
@@ -54,10 +52,10 @@ impl App {
                     self.not_connected(&connection);
                     return;
                 };
-                let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
+                let (runner, db_type) = (session.runner(), session.config.db_type.clone());
                 let run = self.worker.submit(
                     id,
-                    conn,
+                    runner,
                     db_type,
                     d.table.clone(),
                     result.columns.clone(),
@@ -75,7 +73,8 @@ impl App {
             }
             DataAction::Applied(n) => {
                 let close = std::mem::take(&mut d.close_after_submit);
-                self.success(format!("{n} modification(s) appliquée(s)"));
+                let note = self.sessions.submit_note(&tab.connection);
+                self.success(format!("{n} modification(s) appliquée(s){note}"));
                 if close {
                     self.close_tab_id(id);
                 } else {
@@ -83,7 +82,17 @@ impl App {
                 }
             }
             DataAction::SubmitFailed(e) => {
-                self.error(format!("Submit annulé (transaction annulée) : {e}"))
+                // In manual mode only this Submit is undone (savepoint).
+                let undone = if self.sessions.is_manual(&tab.connection) {
+                    "le reste de la transaction est conservé"
+                } else {
+                    "transaction annulée"
+                };
+                self.error(format!("Submit annulé ({undone}) : {e}"))
+            }
+            DataAction::Tx(action) => {
+                let connection = tab.connection.clone();
+                self.tx_action(&connection, action);
             }
             DataAction::Export => {
                 let Some(result) = d.result.clone() else {
@@ -129,6 +138,10 @@ impl App {
             ConsoleAction::History(search) => {
                 self.dialog = Some(Dialog::History(HistoryPopup::new(search)));
             }
+            ConsoleAction::Tx(action) => {
+                let connection = tab.connection.clone();
+                self.tx_action(&connection, action);
+            }
             ConsoleAction::Export {
                 result,
                 table,
@@ -161,10 +174,10 @@ impl App {
                 };
                 r.error = None;
                 c.submitting = Some(r.id);
-                let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
+                let (runner, db_type) = (session.runner(), session.config.db_type.clone());
                 let run = self
                     .worker
-                    .submit(tab.id, conn, db_type, table, columns, changes);
+                    .submit(tab.id, runner, db_type, table, columns, changes);
                 tab.runs.submit = Some(run);
                 tab.summary = Some("Submit…".into());
             }
@@ -179,16 +192,16 @@ impl App {
         let TabKind::Console(c) = &mut tab.kind else {
             return;
         };
-        let Some(conn) = self.sessions.conn(&tab.connection) else {
+        let Some(runner) = self.sessions.runner(&tab.connection) else {
             let connection = tab.connection.clone();
             self.not_connected(&connection);
             return;
         };
         let max = Some(console::MAX_ROWS);
         let run = match kind {
-            RunKind::Script(text) => self.worker.run_script(tab.id, conn, text, max),
+            RunKind::Script(text) => self.worker.run_script(tab.id, runner, text, max),
             RunKind::AtCursor { text, cursor } => {
-                self.worker.run_at_cursor(tab.id, conn, text, cursor, max)
+                self.worker.run_at_cursor(tab.id, runner, text, cursor, max)
             }
         };
         tab.runs.script = Some(run);

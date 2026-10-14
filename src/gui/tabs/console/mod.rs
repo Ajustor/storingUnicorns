@@ -14,6 +14,7 @@ use crate::engine::ops::rows::RowChanges;
 use crate::engine::sql::format::format_sql;
 use crate::gui::editor::{self, completion::Completion, EditorContext};
 use crate::gui::theme::{self, ACCENT, ERROR};
+use crate::gui::tx::{self, TxAction, TxView};
 
 use super::TabId;
 
@@ -104,6 +105,8 @@ pub enum ConsoleAction {
         table: String,
         connection: String,
     },
+    /// Transaction mode, Commit or Rollback of the console's connection.
+    Tx(TxAction),
     /// Apply the pending edits of result tab `result_index`.
     Submit {
         result_index: usize,
@@ -126,6 +129,8 @@ pub struct ConsoleContext<'a> {
     /// False while a modal is open: no shortcut fires.
     pub shortcuts: bool,
     pub tables: &'a dyn Fn() -> Vec<String>,
+    /// Transaction mode of the connection.
+    pub tx: TxView,
 }
 
 /// Whether this frame's input carries typed text. On Windows AltGr is
@@ -460,6 +465,9 @@ impl ConsoleTab {
             ui.separator();
             if let Some(name) = connection_selector(ui, cx) {
                 action = Some(ConsoleAction::Rebind(name));
+            }
+            if let Some(a) = tx::controls(ui, cx.tab, cx.tx) {
+                action = Some(ConsoleAction::Tx(a));
             }
         });
         action

@@ -16,6 +16,7 @@ use crate::gui::grid::changes::PendingEdits;
 use crate::gui::grid::{self, GridAction, GridOptions, GridState};
 use crate::gui::status::one_line_label;
 use crate::gui::theme::ERROR;
+use crate::gui::tx::{self, TxAction, TxView};
 use crate::gui::worker::{Event, TabId};
 
 pub const PAGE_SIZE: usize = 500;
@@ -88,6 +89,8 @@ pub enum DataAction {
     SubmitFailed(String),
     /// Export the current page.
     Export,
+    /// Transaction mode, Commit or Rollback of the connection.
+    Tx(TxAction),
 }
 
 pub struct DataTab {
@@ -131,6 +134,8 @@ pub struct DataContext {
     pub submitting: bool,
     /// A page load is pending.
     pub loading: bool,
+    /// Transaction mode of the connection.
+    pub tx: TxView,
 }
 
 impl DataTab {
@@ -427,6 +432,10 @@ impl DataTab {
                 .clicked()
             {
                 action = Some(DataAction::Ddl);
+            }
+            ui.separator();
+            if let Some(a) = tx::controls(ui, cx.tab, cx.tx) {
+                action = Some(DataAction::Tx(a));
             }
         });
         match nav {

@@ -1,6 +1,7 @@
 use anyhow::Result;
+use sqlx::pool::PoolOptions;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
-use sqlx::{postgres::PgRow, Column as SqlxColumn, PgPool, Row, TypeInfo};
+use sqlx::{postgres::PgRow, Column as SqlxColumn, PgPool, Postgres, Row, TypeInfo};
 
 use crate::engine::models::{
     Column, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, SslMode,
@@ -75,12 +76,12 @@ fn base_options(config: &ConnectionConfig) -> PgConnectOptions {
 
 /// Connect to PostgreSQL. In `Prefer` mode, a failed TLS handshake is retried
 /// without TLS (see `tls::should_retry_plain`).
-pub async fn connect(config: &ConnectionConfig) -> Result<PgPool> {
+pub async fn connect(config: &ConnectionConfig, pool: PoolOptions<Postgres>) -> Result<PgPool> {
     let options = connect_options(config);
-    match PgPool::connect_with(options.clone()).await {
+    match pool.clone().connect_with(options.clone()).await {
         Err(e) if super::tls::should_retry_plain(config.effective_ssl_mode(), &e) => {
             tracing::debug!("TLS failed in Prefer mode ({e}); retrying without TLS");
-            PgPool::connect_with(options.ssl_mode(PgSslMode::Disable))
+            pool.connect_with(options.ssl_mode(PgSslMode::Disable))
                 .await
                 .map_err(|plain| anyhow::anyhow!("TLS : {e} ; sans chiffrement : {plain}"))
         }

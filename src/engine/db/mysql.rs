@@ -1,6 +1,7 @@
 use anyhow::Result;
 use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
-use sqlx::{mysql::MySqlRow, Column as SqlxColumn, MySqlPool, Row, TypeInfo};
+use sqlx::pool::PoolOptions;
+use sqlx::{mysql::MySqlRow, Column as SqlxColumn, MySql, MySqlPool, Row, TypeInfo};
 
 use crate::engine::models::{
     Column, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, SslMode,
@@ -46,12 +47,12 @@ pub fn connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
 
 /// Connect to MySQL. In `Prefer` mode, a failed TLS handshake is retried
 /// without TLS (see `tls::should_retry_plain`).
-pub async fn connect(config: &ConnectionConfig) -> Result<MySqlPool> {
+pub async fn connect(config: &ConnectionConfig, pool: PoolOptions<MySql>) -> Result<MySqlPool> {
     let options = connect_options(config);
-    match MySqlPool::connect_with(options.clone()).await {
+    match pool.clone().connect_with(options.clone()).await {
         Err(e) if super::tls::should_retry_plain(config.effective_ssl_mode(), &e) => {
             tracing::debug!("TLS failed in Prefer mode ({e}); retrying without TLS");
-            MySqlPool::connect_with(options.ssl_mode(MySqlSslMode::Disabled))
+            pool.connect_with(options.ssl_mode(MySqlSslMode::Disabled))
                 .await
                 .map_err(|plain| anyhow::anyhow!("TLS : {e} ; sans chiffrement : {plain}"))
         }

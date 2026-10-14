@@ -28,6 +28,7 @@ use super::worker::Worker;
 mod actions;
 mod events;
 mod tabbar;
+mod tx;
 
 pub const NEW_CONSOLE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::T);
 pub const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
@@ -271,9 +272,19 @@ impl App {
 
     /// Drop the session of `name`; its tabs stay open, marked disconnected.
     pub fn disconnect(&mut self, name: &str) {
-        if self.sessions.open.remove(name).is_some() {
+        if let Some(session) = self.sessions.open.remove(name) {
             self.worker.forget(name);
-            self.info(format!("{name} déconnecté"));
+            let pending = session.pending_statements();
+            if let Some(tx) = session.manual_tx() {
+                self.worker.close_tx(tx.clone());
+            }
+            if pending > 0 {
+                self.info(format!(
+                    "{name} déconnecté, transaction annulée ({pending} instruction(s))"
+                ));
+            } else {
+                self.info(format!("{name} déconnecté"));
+            }
         }
     }
 
@@ -516,14 +527,20 @@ impl eframe::App for App {
         self.autosave_consoles(ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            let pending = if self.quit_confirmed {
-                0
+            let (edits, transactions) = if self.quit_confirmed {
+                (0, Vec::new())
             } else {
-                self.tabs.with_pending_edits(None)
+                (
+                    self.tabs.with_pending_edits(None),
+                    self.sessions.pending_transactions(),
+                )
             };
-            if pending > 0 {
+            if edits > 0 || !transactions.is_empty() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.dialog = Some(Dialog::ConfirmQuit(pending));
+                self.dialog = Some(Dialog::ConfirmQuit {
+                    edits,
+                    transactions,
+                });
             } else {
                 self.on_close();
             }

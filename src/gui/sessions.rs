@@ -1,11 +1,31 @@
 //! Open connections and the metadata cached for them.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::engine::models::{ConnectionConfig, SchemaInfo, TableDetails};
+use crate::engine::ops::tx::ManualTx;
 use crate::engine::sql::statements::quote_chars;
 
-use super::worker::{Conn, RunId, Worker};
+use super::tx::TxView;
+use super::worker::{Conn, RunId, Runner, Worker};
+
+/// Transaction mode of a session.
+#[derive(Default)]
+pub enum TxMode {
+    /// Each statement commits on its own.
+    #[default]
+    Auto,
+    /// Switching to manual: the dedicated session is being opened.
+    Opening,
+    Manual {
+        tx: Arc<ManualTx>,
+        /// A Commit or Rollback is running.
+        ending: bool,
+        /// Back to auto-commit once that Commit or Rollback succeeded.
+        then_auto: bool,
+    },
+}
 
 pub struct Session {
     pub config: ConnectionConfig,
@@ -17,6 +37,7 @@ pub struct Session {
     /// Tables whose details have been requested and not received yet, with
     /// the request awaited: an answer to another one is stale.
     pub loading: HashMap<String, RunId>,
+    pub tx: TxMode,
 }
 
 impl Session {
@@ -28,6 +49,45 @@ impl Session {
             schemas,
             details: HashMap::new(),
             loading: HashMap::new(),
+            tx: TxMode::Auto,
+        }
+    }
+
+    /// Where the consoles and grids of this session run their SQL.
+    pub fn runner(&self) -> Runner {
+        match &self.tx {
+            TxMode::Manual { tx, .. } => Runner::Manual(tx.clone()),
+            _ => Runner::Auto(self.conn.clone()),
+        }
+    }
+
+    pub fn manual_tx(&self) -> Option<&Arc<ManualTx>> {
+        match &self.tx {
+            TxMode::Manual { tx, .. } => Some(tx),
+            _ => None,
+        }
+    }
+
+    /// Statements waiting for a Commit (0 in auto-commit mode).
+    pub fn pending_statements(&self) -> usize {
+        self.manual_tx().map_or(0, |tx| {
+            let s = tx.status();
+            if s.open {
+                s.statements
+            } else {
+                0
+            }
+        })
+    }
+
+    pub fn tx_view(&self) -> TxView {
+        match &self.tx {
+            TxMode::Auto => TxView::Auto,
+            TxMode::Opening => TxView::Opening,
+            TxMode::Manual { tx, ending, .. } => TxView::Manual {
+                status: tx.status(),
+                ending: *ending,
+            },
         }
     }
 
@@ -85,6 +145,39 @@ impl Sessions {
 
     pub fn conn(&self, name: &str) -> Option<Conn> {
         self.open.get(name).map(|s| s.conn.clone())
+    }
+
+    pub fn runner(&self, name: &str) -> Option<Runner> {
+        self.open.get(name).map(Session::runner)
+    }
+
+    /// Suffix of a Submit's success message: in manual mode its changes
+    /// still need a Commit.
+    pub fn submit_note(&self, name: &str) -> &'static str {
+        if self.is_manual(name) {
+            " (en attente de Commit)"
+        } else {
+            ""
+        }
+    }
+
+    /// Whether connection `name` is in manual transaction mode.
+    pub fn is_manual(&self, name: &str) -> bool {
+        self.open.get(name).is_some_and(|s| s.manual_tx().is_some())
+    }
+
+    pub fn tx_view(&self, name: &str) -> TxView {
+        self.open.get(name).map_or(TxView::Off, Session::tx_view)
+    }
+
+    /// `(connection, statements)` of the manual transactions holding
+    /// statements not committed.
+    pub fn pending_transactions(&self) -> Vec<(String, usize)> {
+        self.open
+            .iter()
+            .map(|(name, s)| (name.clone(), s.pending_statements()))
+            .filter(|(_, n)| *n > 0)
+            .collect()
     }
 
     /// All `(connection, schema, table)` triples, for Ctrl+N and completion.

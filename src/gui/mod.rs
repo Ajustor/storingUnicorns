@@ -12,6 +12,7 @@ mod status;
 mod table_search;
 mod tabs;
 mod theme;
+mod tx;
 mod value_panel;
 mod worker;
 

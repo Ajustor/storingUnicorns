@@ -55,14 +55,19 @@ pub async fn run_query(conn: &DatabaseConnection, sql: &str) -> Result<QueryResu
 /// `run_query` for a page of `table`'s rows (`SELECT * …`). Drivers read
 /// the column list from the returned rows, so an empty page has none: take
 /// it from the table's metadata then, so headers and inserts still work.
+/// The rows are read on `conn`, the metadata on `meta` (the same connection,
+/// or the session's pool when `conn` holds a manual transaction: a failing
+/// metadata query must not break it).
 pub async fn run_table_page(
     conn: &DatabaseConnection,
+    meta: &DatabaseConnection,
     sql: &str,
     table: &str,
 ) -> Result<QueryResult> {
-    let mut result = run_query(conn, sql).await?;
+    let mut result = conn.execute_query(sql).await?;
+    enrich(meta, sql, &mut result).await;
     if result.columns.is_empty() && result.rows.is_empty() {
-        if let Ok(columns) = conn.get_table_column_details(table).await {
+        if let Ok(columns) = meta.get_table_column_details(table).await {
             result.columns = columns;
         }
     }
@@ -86,7 +91,7 @@ async fn run_query_limited(
 /// `result.primary_key`. Joins and other shapes are left alone: a column
 /// named like a key column of the first table is not that key. Metadata
 /// lookups are best effort.
-async fn enrich(conn: &DatabaseConnection, sql: &str, result: &mut QueryResult) {
+pub(crate) async fn enrich(conn: &DatabaseConnection, sql: &str, result: &mut QueryResult) {
     let Some(table) = single_table_source(sql) else {
         return;
     };
@@ -353,7 +358,7 @@ mod tests {
     async fn table_page_of_an_empty_table_still_has_its_columns() {
         let conn =
             sqlite_mem(&["CREATE TABLE e (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"]).await;
-        let r = run_table_page(&conn, "SELECT * FROM e LIMIT 500", "e")
+        let r = run_table_page(&conn, &conn, "SELECT * FROM e LIMIT 500", "e")
             .await
             .unwrap();
         assert!(r.rows.is_empty());
@@ -366,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn table_page_with_rows_keeps_the_result_columns() {
         let conn = sqlite_mem(SETUP).await;
-        let r = run_table_page(&conn, "SELECT * FROM users", "users")
+        let r = run_table_page(&conn, &conn, "SELECT * FROM users", "users")
             .await
             .unwrap();
         assert_eq!(r.rows.len(), 2);

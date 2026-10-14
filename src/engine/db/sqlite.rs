@@ -1,5 +1,6 @@
 use anyhow::Result;
-use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, SqlitePool, TypeInfo, ValueRef};
+use sqlx::pool::PoolOptions;
+use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, Sqlite, SqlitePool, TypeInfo, ValueRef};
 
 use crate::engine::models::{
     Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, NULL_CELL,
@@ -8,9 +9,8 @@ use crate::engine::models::{
 use super::utils::{fetch_rows_and_result, is_dml, split_qualified, TxConnection};
 
 /// Connect to SQLite
-pub async fn connect(conn_str: &str) -> Result<SqlitePool> {
-    let pool = SqlitePool::connect(conn_str).await?;
-    Ok(pool)
+pub async fn connect(conn_str: &str, pool: PoolOptions<Sqlite>) -> Result<SqlitePool> {
+    Ok(pool.connect(conn_str).await?)
 }
 
 /// Convert fetched rows into a `QueryResult`.

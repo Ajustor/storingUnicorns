@@ -7,6 +7,32 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.13.0] - 2026-10-14
+
+### Nouveautés
+
+- **Mode de transaction manuel, comme dans DataGrip.** Le sélecteur
+  **Tx : Auto / Manuel** de la barre d'outils des consoles et des onglets de
+  données s'applique à toute la connexion. En **Auto**, chaque instruction est
+  validée tout de suite, comme avant. En **Manuel**, requêtes et Submit
+  s'accumulent dans une transaction ouverte sur une session dédiée : les
+  grilles montrent déjà vos changements, et vous les validez avec **Commit**
+  ou les annulez avec **Rollback**. Le nombre d'instructions en attente reste
+  affiché. Un Submit en échec n'annule que lui-même, le reste de la
+  transaction est conservé.
+
+- Repasser en Auto avec une transaction en cours demande s'il faut la valider
+  ou l'annuler, et quitter l'application prévient qu'une transaction est encore
+  ouverte. Se déconnecter annule la transaction en cours.
+
+### Limites connues
+
+- MySQL : une instruction DDL (`CREATE`, `ALTER`…) valide implicitement ce qui
+  la précède dans la transaction.
+- SQLite : un import ou un vidage lancé depuis l'explorateur pendant une
+  transaction manuelle avec écritures peut échouer avec « database is locked ».
+- Pas encore disponible dans l'interface terminal.
+
 ## [0.12.0] - 2026-10-13
 
 ### Nouveautés

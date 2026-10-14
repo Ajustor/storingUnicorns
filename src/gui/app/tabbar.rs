@@ -130,6 +130,7 @@ impl App {
                         running: tab.runs.script.is_some(),
                         shortcuts,
                         tables: &tables,
+                        tx: sessions.tx_view(name),
                     },
                 )
             }
@@ -141,6 +142,7 @@ impl App {
                         connected: sessions.open.contains_key(&tab.connection),
                         submitting: tab.runs.submit.is_some(),
                         loading: tab.runs.page.is_some(),
+                        tx: sessions.tx_view(&tab.connection),
                     },
                 );
                 None

@@ -36,8 +36,15 @@ pub enum Dialog {
         id: TabId,
         kind: RunKind,
     },
-    /// Quit although this many tabs have pending edits.
-    ConfirmQuit(usize),
+    /// Quit although `edits` tabs have pending edits and these
+    /// `(connection, statements)` manual transactions are not committed.
+    ConfirmQuit {
+        edits: usize,
+        transactions: Vec<(String, usize)>,
+    },
+    /// Leave the manual transaction mode of this connection, whose
+    /// transaction holds statements: Commit or Rollback first.
+    EndTx(String),
     /// Columns of one table of one connection.
     Structure(StructureDialog),
     /// Empty these (qualified) tables of `connection`.
@@ -149,14 +156,48 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     }
                 });
             }
-            Dialog::ConfirmQuit(n) => {
+            Dialog::ConfirmQuit {
+                edits,
+                transactions,
+            } => {
                 ui.heading("Quitter ?");
-                ui.label(format!("{n} onglet(s) ont des modifications non envoyées."));
+                if *edits > 0 {
+                    ui.label(format!(
+                        "{edits} onglet(s) ont des modifications non envoyées."
+                    ));
+                }
+                for (name, n) in transactions.iter() {
+                    ui.label(format!(
+                        "{name} : transaction non validée ({n} instruction(s)), \
+                         elle sera annulée."
+                    ));
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("Fermer quand même").clicked() {
                         app.quit_confirmed = true;
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        keep = false;
+                    }
+                    if ui.button("Annuler").clicked() {
+                        keep = false;
+                    }
+                });
+            }
+            Dialog::EndTx(name) => {
+                ui.heading("Terminer la transaction ?");
+                let n = app.sessions.get(name).map_or(0, |s| s.pending_statements());
+                ui.label(format!(
+                    "La transaction de {name} contient {n} instruction(s) non validée(s)."
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Commit").clicked() {
+                        app.end_tx_then_auto(name, true);
+                        keep = false;
+                    }
+                    if ui.button("Rollback").clicked() {
+                        app.end_tx_then_auto(name, false);
                         keep = false;
                     }
                     if ui.button("Annuler").clicked() {

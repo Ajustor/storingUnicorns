@@ -177,6 +177,12 @@ impl App {
                 }
             }
             ev @ Event::TestFinished(_) => dialogs::handle_event(self, ev),
+            Event::TxOpened { name, outcome } => self.on_tx_opened(name, outcome),
+            Event::TxEnded {
+                name,
+                commit,
+                outcome,
+            } => self.on_tx_ended(name, commit, outcome),
         }
     }
 
@@ -201,15 +207,22 @@ impl App {
         };
         // Reported even when the result tab was closed or replaced meanwhile.
         let report = console::apply_submitted(c, outcome);
+        let note = match &report.refresh {
+            Some((_, _, connection)) => self.sessions.submit_note(connection),
+            None => "",
+        };
         match report.status {
             Ok(text) => {
+                let text = format!("{text}{note}");
                 tab.summary = Some(text.clone());
                 // A run in progress keeps going: the result refreshes on the next run.
                 if let Some((id, sql, connection)) = report.refresh {
-                    if let (None, Some(conn)) = (tab.runs.script, self.sessions.conn(&connection)) {
+                    if let (None, Some(runner)) =
+                        (tab.runs.script, self.sessions.runner(&connection))
+                    {
                         let run =
                             self.worker
-                                .run_script(tab.id, conn, sql, Some(console::MAX_ROWS));
+                                .run_script(tab.id, runner, sql, Some(console::MAX_ROWS));
                         tab.runs.script = Some(run);
                         c.refreshing = Some(id);
                         c.running_since = Some(std::time::Instant::now());

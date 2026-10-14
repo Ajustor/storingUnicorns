@@ -26,6 +26,10 @@ desktop GUI (egui) and a terminal UI (ratatui) sharing the same engine.
     highlighted, new rows green, deleted rows struck through in red), changes
     kept pending until **Submit** applies them in one transaction (or **Revert**)
   - console results read from a single table with a primary key are editable the same way
+  - transaction mode per connection, as in DataGrip: **Tx : Auto** commits each
+    statement, **Tx : Manuel** keeps console statements and Submits in one
+    transaction (on a dedicated session; grids show the pending changes) until
+    **Commit** or **Rollback**
   - value panel (indented JSON, editable), read-only DDL tab, structure dialog
     (add / modify / rename / drop column), quick table search
   - dark and light themes (follows the system by default)

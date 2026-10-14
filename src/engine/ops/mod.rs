@@ -4,6 +4,7 @@ pub mod query;
 pub mod rows;
 pub mod schema;
 pub mod transfer;
+pub mod tx;
 
 #[cfg(test)]
 mod integration_tests;

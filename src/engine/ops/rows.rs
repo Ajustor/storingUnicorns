@@ -93,8 +93,24 @@ pub async fn submit_changes(
     columns: &[Column],
     changes: &RowChanges,
 ) -> Result<usize> {
-    if changes.is_empty() {
+    let (statements, expected) = submit_statements(db, table, columns, changes)?;
+    if statements.is_empty() {
         return Ok(0);
+    }
+    conn.execute_checked_batch(&statements, &expected).await?;
+    Ok(statements.len())
+}
+
+/// The statements of `submit_changes`, each with the number of rows it must
+/// affect (`None`: any).
+pub fn submit_statements(
+    db: &DatabaseType,
+    table: &str,
+    columns: &[Column],
+    changes: &RowChanges,
+) -> Result<(Vec<String>, Vec<Option<u64>>)> {
+    if changes.is_empty() {
+        return Ok(Default::default());
     }
     if !columns.iter().any(|c| c.is_primary_key) {
         anyhow::bail!("{NO_PRIMARY_KEY}");
@@ -111,13 +127,7 @@ pub async fn submit_changes(
         .inserts
         .iter()
         .map(|values| (build_insert_query(table, columns, values, db), None));
-    let (statements, expected): (Vec<String>, Vec<Option<u64>>) =
-        deletes.chain(updates).chain(inserts).unzip();
-    if statements.is_empty() {
-        return Ok(0);
-    }
-    conn.execute_checked_batch(&statements, &expected).await?;
-    Ok(statements.len())
+    Ok(deletes.chain(updates).chain(inserts).unzip())
 }
 
 /// Result of an operation applied to several tables.

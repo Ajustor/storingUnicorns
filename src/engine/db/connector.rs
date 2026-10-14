@@ -1,5 +1,8 @@
 use anyhow::Result;
-use sqlx::{MySqlPool, PgPool, SqlitePool};
+use sqlx::pool::PoolOptions;
+use sqlx::{Database, MySqlPool, PgPool, SqlitePool};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::engine::models::{
@@ -19,6 +22,24 @@ fn explain_tls(e: anyhow::Error, config: &ConnectionConfig) -> anyhow::Error {
     }
 }
 
+/// Pool settings: the sqlx defaults, or with `opened` a single session kept
+/// for the pool's whole life (never closed for being idle or old) whose
+/// openings are counted in `opened`.
+fn pool_options<DB: Database>(opened: Option<&Arc<AtomicU64>>) -> PoolOptions<DB> {
+    let Some(opened) = opened else {
+        return PoolOptions::new();
+    };
+    let opened = opened.clone();
+    PoolOptions::new()
+        .max_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .after_connect(move |_, _| {
+            opened.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        })
+}
+
 /// Unified database connection handle
 pub enum DatabaseConnection {
     Postgres(PgPool),
@@ -31,11 +52,30 @@ pub enum DatabaseConnection {
 impl DatabaseConnection {
     /// Connect to a database using the provided configuration
     pub async fn connect(config: &ConnectionConfig) -> Result<Self> {
+        Self::connect_with(config, None).await
+    }
+
+    /// A connection that always runs on one same database session, as a
+    /// transaction left open between statements needs. `opened` counts the
+    /// sessions it opened: when it grows after the first one, the session
+    /// was lost and replaced (the server rolled back its transaction).
+    pub async fn connect_dedicated(
+        config: &ConnectionConfig,
+        opened: Arc<AtomicU64>,
+    ) -> Result<Self> {
+        Self::connect_with(config, Some(opened)).await
+    }
+
+    async fn connect_with(
+        config: &ConnectionConfig,
+        opened: Option<Arc<AtomicU64>>,
+    ) -> Result<Self> {
+        let opened = opened.as_ref();
         match config.db_type {
             DatabaseType::Postgres => {
                 tls::check_ca_for(config.effective_ssl_mode(), config.ssl_ca.as_deref())
                     .map_err(anyhow::Error::msg)?;
-                let pool = postgres::connect(config)
+                let pool = postgres::connect(config, pool_options(opened))
                     .await
                     .map_err(|e| explain_tls(e, config))?;
                 Ok(DatabaseConnection::Postgres(pool))
@@ -43,22 +83,31 @@ impl DatabaseConnection {
             DatabaseType::MySQL => {
                 tls::check_ca_for(config.effective_ssl_mode(), config.ssl_ca.as_deref())
                     .map_err(anyhow::Error::msg)?;
-                let pool = mysql::connect(config)
+                let pool = mysql::connect(config, pool_options(opened))
                     .await
                     .map_err(|e| explain_tls(e, config))?;
                 Ok(DatabaseConnection::MySQL(pool))
             }
             DatabaseType::SQLite => {
-                let pool = sqlite::connect(&config.to_connection_string()).await?;
+                let pool =
+                    sqlite::connect(&config.to_connection_string(), pool_options(opened)).await?;
                 Ok(DatabaseConnection::SQLite(pool))
             }
-            DatabaseType::SQLServer => {
-                let client = sqlserver::connect(config).await?;
-                Ok(DatabaseConnection::SQLServer(client))
-            }
-            DatabaseType::Azure => {
-                let client = azure::connect(config).await?;
-                Ok(DatabaseConnection::Azure(client))
+            // One client per connection: dedicated already.
+            DatabaseType::SQLServer | DatabaseType::Azure => {
+                let client = match opened {
+                    None if config.db_type == DatabaseType::Azure => azure::connect(config).await?,
+                    None => sqlserver::connect(config).await?,
+                    Some(opened) => SqlServerClient::counted(
+                        config.clone(),
+                        sqlserver::reopen(config).await?,
+                        opened.clone(),
+                    ),
+                };
+                Ok(match config.db_type {
+                    DatabaseType::Azure => DatabaseConnection::Azure(client),
+                    _ => DatabaseConnection::SQLServer(client),
+                })
             }
         }
     }
@@ -318,6 +367,17 @@ impl DatabaseConnection {
             DatabaseConnection::Azure(client) => {
                 sqlserver::get_foreign_keys(client, table_name).await
             }
+        }
+    }
+
+    /// Close the connection's sessions now (a pool shared by other handles
+    /// is closed for them too). SQL Server clients close when dropped.
+    pub async fn close_sessions(&self) {
+        match self {
+            DatabaseConnection::Postgres(pool) => pool.close().await,
+            DatabaseConnection::MySQL(pool) => pool.close().await,
+            DatabaseConnection::SQLite(pool) => pool.close().await,
+            DatabaseConnection::SQLServer(_) | DatabaseConnection::Azure(_) => {}
         }
     }
 

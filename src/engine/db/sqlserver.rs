@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures_util::TryStreamExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tiberius::{AuthMethod, Client, Config, QueryItem, QueryStream};
 use tokio::net::TcpStream;
@@ -38,6 +39,8 @@ pub struct SqlServerClient(Arc<Shared>);
 struct Shared {
     config: ConnectionConfig,
     slot: Mutex<Slot>,
+    /// Sessions opened so far (the first one and each reconnection).
+    opened: Arc<AtomicU64>,
 }
 
 struct Slot {
@@ -53,12 +56,20 @@ pub struct ClientGuard<'a> {
 
 impl SqlServerClient {
     pub fn new(config: ConnectionConfig, client: TdsClient) -> Self {
+        Self::counted(config, client, Arc::default())
+    }
+
+    /// A client adding its sessions (`client` and each reconnection) to
+    /// `opened`.
+    pub fn counted(config: ConnectionConfig, client: TdsClient, opened: Arc<AtomicU64>) -> Self {
+        opened.fetch_add(1, Ordering::SeqCst);
         Self(Arc::new(Shared {
             config,
             slot: Mutex::new(Slot {
                 client: Some(client),
                 dirty: false,
             }),
+            opened,
         }))
     }
 
@@ -73,6 +84,7 @@ impl SqlServerClient {
             // Closing the old connection makes the server roll back its work.
             slot.client = None;
             slot.client = Some(reopen(&self.0.config).await?);
+            self.0.opened.fetch_add(1, Ordering::SeqCst);
         }
         slot.dirty = true;
         Ok(ClientGuard { slot })
@@ -80,7 +92,7 @@ impl SqlServerClient {
 }
 
 /// A new client for `config`, with the authentication of its database type.
-async fn reopen(config: &ConnectionConfig) -> Result<TdsClient> {
+pub async fn reopen(config: &ConnectionConfig) -> Result<TdsClient> {
     match config.db_type {
         DatabaseType::Azure => super::azure::open(config).await,
         _ => open(config).await,

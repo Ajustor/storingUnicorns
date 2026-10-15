@@ -253,7 +253,7 @@ fn compute_panel_areas(size: Rect, state: &AppState) -> Vec<Rect> {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(10),
-            Constraint::Length(1),
+            Constraint::Length(super::widgets::status_bar_height(state, size.width)),
             Constraint::Length(1),
         ])
         .split(size);

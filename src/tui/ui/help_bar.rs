@@ -135,12 +135,16 @@ pub fn get_help_entries(state: &AppState) -> Vec<(&'static str, &'static str)> {
     } else if state.tables_filter_active || state.results_filter_active {
         filter_help()
     } else {
-        match state.active_panel {
+        let mut entries = match state.active_panel {
             ActivePanel::Connections => connections_help(),
             ActivePanel::Tables => tables_help(),
             ActivePanel::QueryEditor => query_editor_help(state),
             ActivePanel::Results => results_help(),
+        };
+        if state.pending_connect.is_some() {
+            entries.insert(0, ("Esc", "Annuler la connexion"));
         }
+        entries
     }
 }
 

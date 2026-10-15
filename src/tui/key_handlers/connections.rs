@@ -10,7 +10,7 @@ pub async fn handle_connections_keys(state: &mut AppState, key_code: KeyCode) ->
     match key_code {
         // Connect to selected database
         KeyCode::Enter => {
-            // handle_connect needs the terminal, so we signal back and the caller handles it
+            // The event loop opens it in the background (`connect::start`).
             KeyAction::NotHandled
         }
 
@@ -34,8 +34,16 @@ pub async fn handle_connections_keys(state: &mut AppState, key_code: KeyCode) ->
                 let name = state.config.connections[state.selected_connection]
                     .name
                     .clone();
+                if state
+                    .pending_connect
+                    .as_ref()
+                    .is_some_and(|p| p.config.name == name)
+                {
+                    crate::tui::connect::cancel(state);
+                }
                 let removed = state.config.connections.remove(state.selected_connection);
-                entra_interactive::forget(&removed);
+                // Unless another connection (another base of the server) uses it.
+                entra_interactive::forget_unless_used(&removed, &state.config.connections);
                 if state.selected_connection >= state.config.connections.len()
                     && state.selected_connection > 0
                 {

@@ -1,4 +1,5 @@
 pub mod app_state;
+mod connect;
 mod key_handlers;
 pub mod ui;
 
@@ -23,7 +24,6 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use config::AppConfig;
-use db::DatabaseConnection;
 use services::ColumnDefinition;
 use crate::engine::ops::{
     self,
@@ -78,6 +78,7 @@ pub async fn run(opts: crate::cli::TuiOptions) -> Result<()> {
 
     // Create app state
     let mut state = AppState::new(config, opts.debug, opts.no_animations);
+    connect::listen(&mut state);
 
     if opts.debug {
         state.set_status("Debug mode enabled - queries will be shown in editor");
@@ -88,6 +89,8 @@ pub async fn run(opts: crate::cli::TuiOptions) -> Result<()> {
 
     // Main loop
     let res = run_app(&mut terminal, &mut state).await;
+    // A connection still being opened (and its browser sign-in) is dropped.
+    connect::cancel(&mut state);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -162,6 +165,9 @@ async fn run_app<B: ratatui::backend::Backend>(
     let app_start = Instant::now();
 
     loop {
+        // Sign-in link, outcome of the connection being opened.
+        connect::poll(state).await;
+
         // Detect modal open transition
         if !state.no_animations
             && state.dialog_mode != DialogMode::None
@@ -267,11 +273,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                     let panel_result = match state.active_panel {
                         ActivePanel::Connections => {
                             let r = key_handlers::handle_connections_keys(state, key.code).await;
-                            // handle_connect needs terminal, so handle Enter here
+                            // Enter on a connection opens it in the background.
                             if r == key_handlers::KeyAction::NotHandled
                                 && key.code == KeyCode::Enter
                             {
-                                handle_connect(terminal, state).await;
+                                connect::start(state);
                                 key_handlers::KeyAction::Consumed
                             } else {
                                 r
@@ -289,7 +295,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                     };
 
                     // If panel didn't handle it, try global shortcuts
-                    if panel_result == key_handlers::KeyAction::NotHandled {
+                    if panel_result == key_handlers::KeyAction::NotHandled
+                        // An Esc no panel used cancels the connection being opened.
+                        && !(key.code == KeyCode::Esc && connect::cancel(state))
+                    {
                         key_handlers::handle_global_keys(state, key.code, key.modifiers).await;
                     }
                 }
@@ -298,7 +307,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                         handle_mouse_event(
                             state,
                             mouse,
-                            terminal,
                             &mut last_click,
                             DOUBLE_CLICK_THRESHOLD_MS,
                             &clickable_registry,
@@ -319,10 +327,9 @@ async fn run_app<B: ratatui::backend::Backend>(
 }
 
 /// Handle mouse click events
-async fn handle_mouse_event<B: ratatui::backend::Backend>(
+async fn handle_mouse_event(
     state: &mut AppState,
     mouse: crossterm::event::MouseEvent,
-    terminal: &mut Terminal<B>,
     last_click: &mut Option<(Instant, u16, u16)>,
     double_click_threshold_ms: u128,
     registry: &ClickableRegistry,
@@ -367,7 +374,7 @@ async fn handle_mouse_event<B: ratatui::backend::Backend>(
             Some(ClickableType::Connection(idx)) => {
                 state.active_panel = ActivePanel::Connections;
                 state.selected_connection = idx;
-                handle_connect(terminal, state).await;
+                connect::start(state);
             }
             Some(ClickableType::Schema(schema_idx)) => {
                 state.active_panel = ActivePanel::Tables;
@@ -735,7 +742,8 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
                 let previous = std::mem::replace(&mut state.config.connections[index], config);
                 if db::entra_interactive::needs_forget(&previous, &state.config.connections[index])
                 {
-                    db::entra_interactive::forget(&previous);
+                    // Unless another connection (another base of the server) uses it.
+                    db::entra_interactive::forget_unless_used(&previous, &state.config.connections);
                 }
                 state.close_dialog();
                 state.set_status(format!("Updated connection: {}", name));
@@ -1418,52 +1426,6 @@ fn update_schema_column(state: &mut AppState, new_column: services::ColumnDefini
             state.schema_action = other;
         }
     }
-}
-
-async fn handle_connect<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    state: &mut AppState,
-) {
-    if state.config.connections.is_empty() {
-        state.set_status("No connections configured. Press 'n' to add one.");
-        return;
-    }
-
-    let conn_config = state.config.connections[state.selected_connection].clone();
-    state.set_status(format!("Connecting to {}...", conn_config.name));
-    state.is_loading = true;
-    state.is_connecting = true;
-    state.connection_error = None;
-
-    // Redraw to show connecting state
-    let temp_registry = ClickableRegistry::new();
-    let _ = terminal.draw(|f| render_ui(f, state, &temp_registry));
-
-    let result = DatabaseConnection::connect(&conn_config).await;
-
-    match result {
-        Ok(conn) => {
-            // Close existing connection if any
-            if let Some(old_conn) = state.connection.take() {
-                old_conn.close().await;
-            }
-
-            state.connection = Some(conn);
-            state.current_connection_config = Some(conn_config.clone());
-            state.set_status(format!("Connected to {}", conn_config.name));
-
-            // Fetch tables
-            handle_refresh_tables(state).await;
-        }
-        Err(e) => {
-            let error_msg = format!("Connection failed: {}", e);
-            state.set_status(&error_msg);
-            state.connection_error = Some(error_msg);
-        }
-    }
-
-    state.is_loading = false;
-    state.is_connecting = false;
 }
 
 pub(crate) async fn handle_refresh_tables(state: &mut AppState) {

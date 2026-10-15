@@ -84,6 +84,8 @@ pub enum ConnectionField {
     DbType,
     AzureAuth,
     TenantId,
+    /// Entra ID application (client) ID of an interactive browser sign-in.
+    ClientId,
     Host,
     Port,
     Username,
@@ -102,7 +104,8 @@ impl ConnectionField {
             Self::Flavor => Self::DbType,
             Self::DbType => Self::AzureAuth,
             Self::AzureAuth => Self::TenantId,
-            Self::TenantId => Self::Host,
+            Self::TenantId => Self::ClientId,
+            Self::ClientId => Self::Host,
             Self::Host => Self::Port,
             Self::Port => Self::Username,
             Self::Username => Self::Password,
@@ -121,7 +124,8 @@ impl ConnectionField {
             Self::DbType => Self::Flavor,
             Self::AzureAuth => Self::DbType,
             Self::TenantId => Self::AzureAuth,
-            Self::Host => Self::TenantId,
+            Self::ClientId => Self::TenantId,
+            Self::Host => Self::ClientId,
             Self::Port => Self::Host,
             Self::Username => Self::Port,
             Self::Password => Self::Username,
@@ -154,11 +158,21 @@ impl ConnectionField {
     fn should_skip(field: &Self, db_type: &DatabaseType, auth_method: &AzureAuthMethod) -> bool {
         match field {
             Self::AzureAuth => *db_type != DatabaseType::Azure,
+            // Azure CLI and the browser sign-in.
             Self::TenantId => {
-                *db_type != DatabaseType::Azure || *auth_method != AzureAuthMethod::Interactive
+                *db_type != DatabaseType::Azure
+                    || !matches!(
+                        auth_method,
+                        AzureAuthMethod::Interactive | AzureAuthMethod::InteractiveBrowser
+                    )
             }
-            // Azure AD (CLI) needs neither; a managed identity only its
-            // client ID, kept in the username.
+            Self::ClientId => {
+                *db_type != DatabaseType::Azure
+                    || *auth_method != AzureAuthMethod::InteractiveBrowser
+            }
+            // Azure CLI needs neither; a managed identity only its client
+            // ID, kept in the username; the browser sign-in only the
+            // account (optional), kept in the username too.
             Self::Username => {
                 *db_type == DatabaseType::Azure && *auth_method == AzureAuthMethod::Interactive
             }
@@ -240,6 +254,14 @@ impl NewConnectionState {
         {
             crate::engine::db::azure::managed_identity_client_id(Some(&self.username))
                 .map_err(|e| e.to_string())?;
+        }
+        if self.db_type == DatabaseType::Azure
+            && self.azure_auth_method == AzureAuthMethod::InteractiveBrowser
+        {
+            crate::engine::db::entra_interactive::validate_interactive(
+                &self.tenant_id,
+                &self.azure_client_id,
+            )?;
         }
         Ok(())
     }
@@ -343,6 +365,7 @@ impl NewConnectionState {
             ConnectionField::DbType => "",    // handled separately
             ConnectionField::AzureAuth => "", // handled separately (cycle)
             ConnectionField::TenantId => &self.tenant_id,
+            ConnectionField::ClientId => &self.azure_client_id,
             ConnectionField::Host => &self.host,
             ConnectionField::Port => &self.port,
             ConnectionField::Username => &self.username,
@@ -361,6 +384,7 @@ impl NewConnectionState {
             ConnectionField::DbType => None,    // handled separately
             ConnectionField::AzureAuth => None, // handled separately (cycle)
             ConnectionField::TenantId => Some(&mut self.tenant_id),
+            ConnectionField::ClientId => Some(&mut self.azure_client_id),
             ConnectionField::Host => Some(&mut self.host),
             ConnectionField::Port => Some(&mut self.port),
             ConnectionField::Username => Some(&mut self.username),
@@ -372,10 +396,20 @@ impl NewConnectionState {
     pub fn cycle_azure_auth_method(&mut self) {
         self.azure_auth_method = match self.azure_auth_method {
             AzureAuthMethod::Credentials => AzureAuthMethod::Interactive,
-            AzureAuthMethod::Interactive => AzureAuthMethod::ManagedIdentity,
+            AzureAuthMethod::Interactive => AzureAuthMethod::InteractiveBrowser,
             AzureAuthMethod::InteractiveBrowser => AzureAuthMethod::ManagedIdentity,
             AzureAuthMethod::ManagedIdentity => AzureAuthMethod::Credentials,
         };
+        // The form's default tenant suits Azure CLI, not an organization's
+        // application: start the browser sign-in with an empty one.
+        if self.azure_auth_method == AzureAuthMethod::InteractiveBrowser
+            && matches!(
+                self.tenant_id.trim().to_ascii_lowercase().as_str(),
+                "common" | "organizations"
+            )
+        {
+            self.tenant_id.clear();
+        }
     }
 
     pub fn cycle_db_type(&mut self) {
@@ -611,6 +645,16 @@ pub struct AppState {
     pub is_loading: bool,
     pub is_connecting: bool,
     pub connection_error: Option<String>,
+    /// The connection being opened in the background (Esc cancels it).
+    pub pending_connect: Option<crate::tui::connect::PendingConnect>,
+    /// `(connection, url)` of the browser sign-in waiting for the user.
+    pub sign_in: Option<(String, String)>,
+    /// Keyring warning, shown with the outcome of the connection being
+    /// opened.
+    pub sign_in_warning: Option<String>,
+    /// The engine's sign-in interactions (`connect::listen`).
+    pub interactions:
+        Option<std::sync::mpsc::Receiver<crate::engine::db::entra_interactive::Interaction>>,
 
     // Debug mode
     pub debug_mode: bool,
@@ -684,6 +728,10 @@ impl AppState {
             is_loading: false,
             is_connecting: false,
             connection_error: None,
+            pending_connect: None,
+            sign_in: None,
+            sign_in_warning: None,
+            interactions: None,
             debug_mode,
             no_animations,
             should_quit: false,
@@ -1604,6 +1652,96 @@ mod tests {
         let mut nc = NewConnectionState::from_config(&conn);
         nc.azure_auth_method = AzureAuthMethod::Interactive;
         assert_eq!(nc.to_config().azure_client_id, None);
+    }
+
+    #[test]
+    fn interactive_browser_asks_for_tenant_app_and_account() {
+        let t = DatabaseType::Azure;
+        let browser = AzureAuthMethod::InteractiveBrowser;
+        let next = |f: ConnectionField| f.next_for(&t, &browser);
+        assert_eq!(next(ConnectionField::AzureAuth), ConnectionField::TenantId);
+        assert_eq!(next(ConnectionField::TenantId), ConnectionField::ClientId);
+        assert_eq!(next(ConnectionField::ClientId), ConnectionField::Host);
+        // The account (username), no password.
+        assert_eq!(next(ConnectionField::Port), ConnectionField::Username);
+        assert_eq!(next(ConnectionField::Username), ConnectionField::Database);
+        assert_eq!(
+            ConnectionField::Host.prev_for(&t, &browser),
+            ConnectionField::ClientId
+        );
+        // Azure CLI: the tenant only.
+        let cli = AzureAuthMethod::Interactive;
+        assert_eq!(
+            ConnectionField::TenantId.next_for(&t, &cli),
+            ConnectionField::Host
+        );
+        assert_eq!(
+            ConnectionField::Host.prev_for(&t, &cli),
+            ConnectionField::TenantId
+        );
+        // Other engines never stop there.
+        assert_eq!(
+            ConnectionField::DbType.next_for(&DatabaseType::SQLServer, &browser),
+            ConnectionField::Host
+        );
+    }
+
+    #[test]
+    fn every_azure_method_can_be_chosen() {
+        let mut nc = NewConnectionState::default();
+        nc.set_db_type(DatabaseType::Azure);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            nc.cycle_azure_auth_method();
+            seen.push(nc.azure_auth_method.clone());
+        }
+        assert_eq!(
+            seen,
+            [
+                AzureAuthMethod::Interactive,
+                AzureAuthMethod::InteractiveBrowser,
+                AzureAuthMethod::ManagedIdentity,
+                AzureAuthMethod::Credentials,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_browser_method_does_not_keep_the_common_tenant() {
+        let mut nc = NewConnectionState::default();
+        nc.set_db_type(DatabaseType::Azure);
+        assert_eq!(nc.tenant_id, "common");
+        nc.azure_auth_method = AzureAuthMethod::Interactive;
+        nc.cycle_azure_auth_method();
+        assert_eq!(nc.azure_auth_method, AzureAuthMethod::InteractiveBrowser);
+        assert_eq!(nc.tenant_id, "", "refused for this method");
+        nc.tenant_id = "contoso.com".into();
+        nc.azure_auth_method = AzureAuthMethod::Interactive;
+        nc.cycle_azure_auth_method();
+        assert_eq!(nc.tenant_id, "contoso.com");
+    }
+
+    #[test]
+    fn interactive_browser_is_checked_and_its_client_id_typed() {
+        let client = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
+        let mut nc = NewConnectionState::default();
+        nc.set_db_type(DatabaseType::Azure);
+        nc.azure_auth_method = AzureAuthMethod::InteractiveBrowser;
+        assert!(nc.check().unwrap_err().contains("pas « common »"));
+        nc.tenant_id = "contoso.com".into();
+        assert_eq!(
+            nc.check().unwrap_err(),
+            "L'ID client de l'application doit être un GUID"
+        );
+        nc.active_field = ConnectionField::ClientId;
+        nc.get_active_field_mut().unwrap().push_str(client);
+        assert_eq!(nc.get_active_field_value(), client);
+        assert!(nc.check().is_ok());
+        assert_eq!(nc.to_config().azure_client_id.as_deref(), Some(client));
+        // Other methods don't check it.
+        nc.azure_client_id.clear();
+        nc.azure_auth_method = AzureAuthMethod::Interactive;
+        assert!(nc.check().is_ok());
     }
 
     #[test]

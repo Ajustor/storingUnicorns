@@ -134,16 +134,21 @@ pub async fn poll(state: &mut AppState) {
     state.is_connecting = false;
 }
 
+/// The status while the browser sign-in of `connection` waits.
+fn waiting_status(connection: &str) -> String {
+    format!(
+        "Connexion Azure AD à {connection} : ouvre ce lien dans un navigateur \
+         (Échap pour annuler)"
+    )
+}
+
 /// One sign-in interaction: while a browser sign-in waits, the status line
 /// shows its whole link (the browser may not have opened, or be a text one
 /// that can't take over the terminal), to select and copy.
 fn apply(state: &mut AppState, interaction: Interaction) {
     match interaction {
         Interaction::Waiting { connection, url } => {
-            state.set_status(format!(
-                "Connexion Azure AD à {connection} : ouvre ce lien dans un navigateur \
-                 (Échap pour annuler)"
-            ));
+            state.set_status(waiting_status(&connection));
             state.sign_in = Some((connection, url));
         }
         Interaction::Done { connection } => {
@@ -156,6 +161,9 @@ fn apply(state: &mut AppState, interaction: Interaction) {
                 if let Some(pending) = &state.pending_connect {
                     let status = format!("Connecting to {}...", pending.config.name);
                     state.set_status(status);
+                } else if state.status_message == waiting_status(&connection) {
+                    // Nothing being opened any more: no stale invitation.
+                    state.set_status("");
                 }
             }
         }
@@ -371,6 +379,12 @@ mod tests {
             },
         );
         assert_eq!(state.sign_in, None);
+        // No connection being opened: the stale invitation goes too.
+        assert!(
+            !state.status_message.contains("ouvre ce lien"),
+            "{}",
+            state.status_message
+        );
     }
 
     #[test]

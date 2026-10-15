@@ -474,13 +474,26 @@ struct Deps<'a> {
     session: &'a Session,
     now: Box<dyn Fn() -> SystemTime + Send + Sync>,
     timeout: Duration,
+    /// Whether the browser may be opened (see `token`).
+    interactive: bool,
+}
+
+/// The error of a reconnection that would need the browser.
+pub fn session_expired(connection: &str) -> String {
+    format!("Session Azure AD expirée : reconnectez-vous à {connection}")
 }
 
 /// An access token for Azure SQL with the Entra ID account of `config`
 /// (`AzureAuthMethod::InteractiveBrowser`): the session's while it is valid,
 /// else renewed with the refresh token (memory, then OS keyring), else
 /// through the browser. The error is a French message for the user.
-pub async fn token(config: &ConnectionConfig) -> anyhow::Result<String> {
+///
+/// Only a connection the user opens (or tests) is `interactive`: a
+/// reconnection (a shared client replaced after an interrupted operation, a
+/// transaction's dedicated session) runs under other operations, where a
+/// browser wait could neither be shown nor cancelled; it fails with
+/// `session_expired` instead.
+pub async fn token(config: &ConnectionConfig, interactive: bool) -> anyhow::Result<String> {
     // The first use probes the OS keyring, which may block.
     let store = tokio::task::spawn_blocking(secrets::store).await?;
     let deps = Deps {
@@ -491,6 +504,7 @@ pub async fn token(config: &ConnectionConfig) -> anyhow::Result<String> {
         session: session(),
         now: Box::new(SystemTime::now),
         timeout: SIGN_IN_TIMEOUT,
+        interactive,
     };
     let access = token_with(config, &deps).await?;
     if let Some(message) = secrets::take_warning() {
@@ -548,6 +562,10 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
             Err(e) => return Err(e.into()),
         },
         Next::Interactive => {}
+    }
+    if !deps.interactive {
+        tracing::info!("Entra ID sign-in of {} needs the browser", config.name);
+        anyhow::bail!(session_expired(&config.name));
     }
     let tokens = sign_in(&config.name, &target, deps).await?;
     tracing::info!("Entra ID sign-in completed for {}", config.name);
@@ -1798,6 +1816,8 @@ mod flow_tests {
         store: &'static MemoryStore,
         session: &'static Session,
         timeout: Duration,
+        /// A connection (else a reconnection, which never opens the browser).
+        interactive: bool,
     }
 
     impl Harness {
@@ -1812,6 +1832,7 @@ mod flow_tests {
                 store: Box::leak(Box::default()),
                 session: Box::leak(Box::default()),
                 timeout: Duration::from_secs(20),
+                interactive: true,
             }
         }
 
@@ -1829,6 +1850,7 @@ mod flow_tests {
                     SystemTime::now() + Duration::from_secs(clock.load(Ordering::SeqCst))
                 }),
                 timeout: self.timeout,
+                interactive: self.interactive,
             }
         }
 
@@ -1930,6 +1952,35 @@ mod flow_tests {
         assert_eq!(h.browser.opened.load(Ordering::SeqCst), 0);
         assert!(h.events().is_empty());
         assert_eq!(h.stored().as_deref(), Some("RT-2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconnection_never_opens_the_browser() {
+        let mut h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        h.interactive = false;
+        // Nothing kept: the user has to connect again.
+        let e = h.token().await.unwrap_err().to_string();
+        assert_eq!(e, session_expired("Prod Azure"));
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 0);
+        assert!(h.grants().is_empty());
+        assert!(h.events().is_empty(), "no wait to show");
+        // A refresh token still renews it silently.
+        h.store.set(&key(), "RT-7").unwrap();
+        assert_eq!(h.token().await.unwrap(), "AT-2");
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_refresh_token_ends_a_reconnection() {
+        let mut h = Harness::new(entra(&["RT-old"]), Behaviour::SignIn).await;
+        h.interactive = false;
+        h.store.set(&key(), "RT-old").unwrap();
+        let e = h.token().await.unwrap_err().to_string();
+        assert_eq!(e, session_expired("Prod Azure"));
+        assert_eq!(h.grants(), ["refresh_token"]);
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 0);
+        assert_eq!(h.stored(), None, "the refused token is dropped");
+        assert!(h.events().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

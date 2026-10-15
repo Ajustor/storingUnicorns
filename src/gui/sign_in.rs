@@ -2,7 +2,7 @@
 //! from its worker threads (`entra_interactive::set_interaction_handler`),
 //! they are applied on the UI thread and shown as a banner with the link.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver};
 
 use egui_phosphor::regular as icon;
@@ -89,9 +89,16 @@ impl SignIns {
     }
 }
 
+/// Whether the wait of `connection` belongs to something « Annuler » can
+/// stop: the connection being opened, or the form's test.
+pub fn cancellable(connection: &str, connecting: &BTreeSet<String>, testing: bool) -> bool {
+    connecting.contains(connection) || testing
+}
+
 /// « Terminez la connexion à <connection> dans votre navigateur… » with
-/// « Copier le lien » and « Annuler »; whether « Annuler » was clicked.
-pub fn waiting_row(ui: &mut egui::Ui, connection: &str, url: &str) -> bool {
+/// « Copier le lien », and « Annuler » when `cancellable`; whether
+/// « Annuler » was clicked.
+pub fn waiting_row(ui: &mut egui::Ui, connection: &str, url: &str, cancellable: bool) -> bool {
     let mut cancel = false;
     ui.horizontal_wrapped(|ui| {
         ui.spinner();
@@ -107,7 +114,7 @@ pub fn waiting_row(ui: &mut egui::Ui, connection: &str, url: &str) -> bool {
         {
             ui.ctx().copy_text(url.to_string());
         }
-        cancel = ui.button("Annuler").clicked();
+        cancel = cancellable && ui.button("Annuler").clicked();
     });
     cancel
 }
@@ -172,6 +179,14 @@ mod tests {
         tx.send(done("Prod")).unwrap();
         s.poll();
         assert_eq!(s.current(), None);
+    }
+
+    #[test]
+    fn only_a_connection_or_a_test_waiting_can_be_cancelled() {
+        let connecting = BTreeSet::from(["Prod".to_string()]);
+        assert!(cancellable("Prod", &connecting, false));
+        assert!(cancellable("Dev", &connecting, true), "the form's test");
+        assert!(!cancellable("Dev", &connecting, false), "nothing to cancel");
     }
 
     #[test]

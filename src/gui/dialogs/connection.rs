@@ -417,7 +417,7 @@ impl ConnectionForm {
         });
         if let (true, Some(url)) = (self.testing, sign_in) {
             ui.add_space(6.0);
-            if sign_in::waiting_row(ui, self.name.trim(), url) {
+            if sign_in::waiting_row(ui, self.name.trim(), url, true) {
                 action = FormAction::CancelTest;
             }
         }

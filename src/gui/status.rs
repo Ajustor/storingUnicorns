@@ -160,9 +160,11 @@ pub fn sign_in_banner(app: &mut App, ctx: &egui::Context) {
         return;
     };
     let (connection, url) = (connection.to_string(), url.to_string());
+    let cancellable =
+        super::sign_in::cancellable(&connection, &app.sessions.connecting, app.worker.testing());
     let mut cancel = false;
     egui::TopBottomPanel::top("sign_in").show(ctx, |ui| {
-        cancel = super::sign_in::waiting_row(ui, &connection, &url);
+        cancel = super::sign_in::waiting_row(ui, &connection, &url, cancellable);
     });
     if cancel {
         app.cancel_sign_in(&connection);

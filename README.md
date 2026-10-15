@@ -276,7 +276,10 @@ trousseau du système (Gestionnaire d'identification Windows, Trousseau macOS,
 Secret Service sous Linux), sous le service `storingUnicorns` : les connexions
 suivantes, même après un redémarrage, se font sans navigateur tant qu'il est
 valable. Si le trousseau n'est pas disponible, il ne dure que la session (un
-avertissement le signale). Aucun jeton n'est écrit dans `config.toml` ni dans
+avertissement le signale). Les reconnexions automatiques (après une requête
+interrompue, ou pour la session d'une transaction manuelle) n'ouvrent jamais le
+navigateur : si le jeton de renouvellement ne suffit plus, l'opération échoue
+avec « Session Azure AD expirée » ; déconnectez puis reconnectez la connexion. Aucun jeton n'est écrit dans `config.toml` ni dans
 les journaux.
 
 Pour l'oublier : **Oublier la connexion Azure AD** dans le menu de la connexion

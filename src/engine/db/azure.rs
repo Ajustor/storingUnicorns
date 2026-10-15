@@ -108,14 +108,22 @@ fn cloud_of(config: &ConnectionConfig) -> AzureCloud {
 
 // ========== Connect Function ==========
 
-/// Connect to Azure SQL Database. The shared client reconnects through
-/// `open` (acquiring a fresh token) when an operation was interrupted.
+/// Connect to Azure SQL Database, as the user asked: an Entra ID account
+/// may sign in through the browser. The shared client reconnects through
+/// `open` (acquiring a fresh token, without the browser) when an operation
+/// was interrupted.
 pub async fn connect(config: &ConnectionConfig) -> Result<SqlServerClient> {
-    Ok(SqlServerClient::new(config.clone(), open(config).await?))
+    Ok(SqlServerClient::new(
+        config.clone(),
+        open(config, true).await?,
+    ))
 }
 
-/// Open a client with the configured Azure authentication method.
-pub async fn open(config: &ConnectionConfig) -> Result<TdsClient> {
+/// Open a client with the configured Azure authentication method. Only an
+/// `interactive` opening (the user connecting or testing) may sign in to an
+/// Entra ID account through the browser; reconnections renew silently or
+/// fail.
+pub async fn open(config: &ConnectionConfig, interactive: bool) -> Result<TdsClient> {
     let auth_method = config
         .azure_auth_method
         .as_ref()
@@ -126,14 +134,20 @@ pub async fn open(config: &ConnectionConfig) -> Result<TdsClient> {
         AzureAuthMethod::Credentials => connect_with_credentials(config).await,
         AzureAuthMethod::Interactive => connect_with_azure_cli(config).await,
         AzureAuthMethod::ManagedIdentity => connect_with_managed_identity(config).await,
-        AzureAuthMethod::InteractiveBrowser => connect_with_entra_account(config).await,
+        AzureAuthMethod::InteractiveBrowser => {
+            connect_with_entra_account(config, interactive).await
+        }
     }
 }
 
 /// Connect with the user's own Entra ID account, signed in through the
-/// browser (or silently while the session / refresh token lasts).
-async fn connect_with_entra_account(config: &ConnectionConfig) -> Result<TdsClient> {
-    let token = super::entra_interactive::token(config).await?;
+/// browser when `interactive` (else only silently, while the session /
+/// refresh token lasts).
+async fn connect_with_entra_account(
+    config: &ConnectionConfig,
+    interactive: bool,
+) -> Result<TdsClient> {
+    let token = super::entra_interactive::token(config, interactive).await?;
     connect_with_aad_token(config, &token).await.map_err(|e| {
         match token_login_hint(&e.to_string(), config.username.as_deref()) {
             Some(hint) => anyhow!("{hint}\n\nDétail : {e}"),

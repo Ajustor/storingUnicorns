@@ -864,6 +864,29 @@ pub fn needs_forget(old: &ConnectionConfig, new: &ConnectionConfig) -> bool {
     kept.is_some() && kept != kept_key(new)
 }
 
+/// Whether `a` and `b` share one sign-in: interactive browser connections
+/// with the same tenant, application and account (as in `secret_key`).
+fn same_sign_in(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
+    let key = kept_key(a);
+    key.is_some() && key == kept_key(b)
+}
+
+/// Whether one of `others` shares `config`'s sign-in.
+fn sign_in_used_by(config: &ConnectionConfig, others: &[ConnectionConfig]) -> bool {
+    others.iter().any(|other| same_sign_in(config, other))
+}
+
+/// `forget` `config`'s sign-in unless one of the `remaining` connections
+/// (those kept after a delete, or all of them, the edited one in its new
+/// form, after an edit) uses the same one: other databases of the same
+/// server keep it. The explicit "Oublier la connexion Azure AD" calls
+/// `forget`.
+pub fn forget_unless_used(config: &ConnectionConfig, remaining: &[ConnectionConfig]) {
+    if !sign_in_used_by(config, remaining) {
+        forget(config);
+    }
+}
+
 /// Forget the Entra ID sign-in of `config` (session token and refresh token
 /// in the OS keyring): when the connection is deleted, changes target
 /// (`needs_forget`) or on request. Nothing for other methods. Doesn't block:
@@ -1429,6 +1452,44 @@ mod tests {
             ..old.clone()
         };
         assert!(!needs_forget(&cli, &old));
+    }
+
+    #[test]
+    fn connections_of_one_account_share_their_sign_in() {
+        let prod = signed_in();
+        // Another database of the same server, the account written
+        // differently.
+        let reporting = ConnectionConfig {
+            name: "Reporting".into(),
+            database: "reports".into(),
+            tenant_id: Some(" CONTOSO.COM ".into()),
+            azure_client_id: Some(CLIENT.to_uppercase()),
+            username: Some(" Jane@Contoso.com ".into()),
+            ..prod.clone()
+        };
+        assert!(same_sign_in(&prod, &reporting));
+        let john = ConnectionConfig {
+            username: Some("john@contoso.com".into()),
+            ..prod.clone()
+        };
+        assert!(!same_sign_in(&prod, &john));
+        let other_app = ConnectionConfig {
+            azure_client_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            ..prod.clone()
+        };
+        assert!(!same_sign_in(&prod, &other_app));
+        // Other methods keep nothing, so share nothing.
+        let cli = ConnectionConfig {
+            azure_auth_method: Some(AzureAuthMethod::Interactive),
+            ..prod.clone()
+        };
+        assert!(!same_sign_in(&prod, &cli));
+        assert!(!same_sign_in(&cli, &cli.clone()));
+
+        // Deleting Prod keeps the sign-in Reporting still uses.
+        assert!(sign_in_used_by(&prod, &[john.clone(), reporting]));
+        assert!(!sign_in_used_by(&prod, &[john, other_app, cli]));
+        assert!(!sign_in_used_by(&prod, &[]));
     }
 
     #[test]

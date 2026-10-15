@@ -2207,10 +2207,23 @@ mod flow_tests {
         let h = Harness::new(entra(&[]), Behaviour::Idle).await;
         let deps = h.deps();
         let config = config();
-        let sign_in = token_with(&config, &deps);
-        // The app gives up after a moment (the future is dropped).
-        let r = tokio::time::timeout(Duration::from_millis(200), sign_in).await;
-        assert!(r.is_err());
+        let mut sign_in = Box::pin(token_with(&config, &deps));
+        // Run it until it waits for the browser (however slow the machine)…
+        let started = std::time::Instant::now();
+        while !h
+            .events()
+            .iter()
+            .any(|e| matches!(e, Interaction::Waiting { .. }))
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "never waited for the browser"
+            );
+            let step = tokio::time::timeout(Duration::from_millis(10), &mut sign_in).await;
+            assert!(step.is_err(), "ended without the browser: {step:?}");
+        }
+        // …then the app gives up: the future is dropped.
+        drop(sign_in);
         let events = h.events();
         assert_eq!(events.len(), 2, "{events:?}");
         assert!(matches!(events[1], Interaction::Done { .. }));

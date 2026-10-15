@@ -78,7 +78,7 @@ pub fn cancel(state: &mut AppState) -> bool {
 }
 
 /// Apply the sign-in interactions received, then take the outcome of the
-/// connection being opened once it is over.
+/// connection being opened once it is over and no dialog is open.
 pub async fn poll(state: &mut AppState) {
     let received: Vec<Interaction> = state
         .interactions
@@ -87,6 +87,11 @@ pub async fn poll(state: &mut AppState) {
         .unwrap_or_default();
     for interaction in received {
         apply(state, interaction);
+    }
+    // An open dialog (truncate, row edit, schema change…) acts on the
+    // current connection: it isn't replaced under it. The outcome waits.
+    if state.is_dialog_open() {
+        return;
     }
     if !state
         .pending_connect
@@ -176,6 +181,7 @@ mod tests {
     use super::*;
     use crate::engine::config::AppConfig;
     use crate::engine::models::DatabaseType;
+    use crate::tui::DialogMode;
 
     fn state_with(connections: Vec<ConnectionConfig>) -> AppState {
         AppState::new(
@@ -267,6 +273,36 @@ mod tests {
             Some("file")
         );
         assert!(state.pending_connect.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_open_dialog_keeps_the_current_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_with(vec![sqlite(&dir)]);
+        start(&mut state);
+        // A confirmation about the current connection is open: its action
+        // must not run on the one being opened.
+        state.dialog_mode = DialogMode::TruncateConfirm;
+        let started = Instant::now();
+        while !state
+            .pending_connect
+            .as_ref()
+            .is_some_and(|p| p.task.is_finished())
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "never connected"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        poll(&mut state).await;
+        assert!(state.connection.is_none(), "swapped under the dialog");
+        assert!(state.pending_connect.is_some() && state.is_connecting);
+
+        state.close_dialog();
+        poll(&mut state).await;
+        assert!(state.connection.is_some());
+        assert!(!state.is_connecting);
     }
 
     #[tokio::test(flavor = "multi_thread")]

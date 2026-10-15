@@ -854,8 +854,9 @@ pub fn render_results_panel(
         return;
     }
 
-    // Show connecting loader
-    if state.is_connecting {
+    // Show connecting loader (the current results stay while another
+    // connection opens in the background)
+    if state.is_connecting && state.query_result.is_none() {
         let paragraph = Paragraph::new("⏳ Connecting to database...")
             .style(Style::default().fg(Color::Yellow))
             .block(
@@ -1208,13 +1209,15 @@ pub fn status_bar_height(state: &AppState, width: u16) -> u16 {
 }
 
 pub fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
-    let connection_info = if state.is_connecting {
-        String::from("⏳ Connecting... | ")
-    } else if let Some(ref config) = state.current_connection_config {
-        format!("Connected: {} ({}) | ", config.name, config.display_type())
-    } else {
-        String::from("Disconnected | ")
+    // The connection the editor acts on stays shown while another opens.
+    let mut connection_info = match &state.current_connection_config {
+        Some(config) => format!("Connected: {} ({}) | ", config.name, config.display_type()),
+        None if state.is_connecting => String::new(),
+        None => String::from("Disconnected | "),
     };
+    if state.is_connecting {
+        connection_info.push_str("⏳ Connecting... | ");
+    }
 
     let status = Line::from(vec![
         Span::styled(
@@ -1307,6 +1310,33 @@ mod tests {
         assert!(rows[0].contains("Connexion Azure AD"), "{rows:?}");
         // Whole, from the first column: select the rows to copy it.
         assert_eq!(rows[1..].concat().trim_end(), url);
+    }
+
+    #[test]
+    fn the_current_connection_stays_shown_while_another_opens() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.current_connection_config = Some(ConnectionConfig {
+            name: "prod".into(),
+            ..Default::default()
+        });
+        state.is_connecting = true;
+        state.set_status("Connecting to dev...");
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|f| render_status_bar(f, f.area(), &state))
+            .unwrap();
+        // The hourglass takes two cells (the second one blank).
+        let bar: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            bar.contains("Connected: prod (PostgreSQL) | ⏳  Connecting... | Connecting to dev..."),
+            "{bar}"
+        );
     }
 
     #[test]

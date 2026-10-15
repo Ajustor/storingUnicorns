@@ -3,3 +3,6 @@ debug.log
 site/
 *.wixobj
 *.msi
+
+# Claude Code agent worktrees
+.claude/

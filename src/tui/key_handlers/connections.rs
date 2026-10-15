@@ -1,5 +1,6 @@
 use crossterm::event::KeyCode;
 
+use crate::engine::db::entra_interactive;
 use crate::tui::AppState;
 
 use super::KeyAction;
@@ -33,7 +34,8 @@ pub async fn handle_connections_keys(state: &mut AppState, key_code: KeyCode) ->
                 let name = state.config.connections[state.selected_connection]
                     .name
                     .clone();
-                state.config.connections.remove(state.selected_connection);
+                let removed = state.config.connections.remove(state.selected_connection);
+                entra_interactive::forget(&removed);
                 if state.selected_connection >= state.config.connections.len()
                     && state.selected_connection > 0
                 {

@@ -7,6 +7,7 @@ use std::time::Instant;
 use egui::{Color32, Key, KeyboardShortcut, Modifiers};
 
 use crate::engine::config::AppConfig;
+use crate::engine::db::entra_interactive;
 use crate::engine::models::ConnectionConfig;
 use crate::engine::services::history::History;
 use crate::engine::services::query_tabs::{QueryTab, QueryTabsState};
@@ -214,6 +215,9 @@ impl App {
             return;
         };
         let previous = std::mem::replace(&mut self.config.connections[index], config.clone());
+        if entra_interactive::needs_forget(&previous, &config) {
+            entra_interactive::forget(&previous);
+        }
         let keep_session = same_target(&previous, &config);
         let new = config.name.clone();
         if old != new {
@@ -261,6 +265,9 @@ impl App {
             self.worker.cancel(tab.id);
         }
         self.consoles_changed();
+        if let Some(config) = self.config.connections.iter().find(|c| c.name == name) {
+            entra_interactive::forget(config);
+        }
         self.config.connections.retain(|c| c.name != name);
         self.sessions.errors.remove(name);
         if self.config.last_connection.as_deref() == Some(name) {

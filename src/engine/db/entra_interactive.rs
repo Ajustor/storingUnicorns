@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
-use crate::engine::models::ConnectionConfig;
+use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType};
 use crate::engine::secrets::{self, SecretStore};
 
 use super::azure::{is_guid, AzureCloud};
@@ -692,12 +692,10 @@ fn open_in_browser(url: &str) {
 /// Sign in to `t` through the browser (authorization code + PKCE) for the
 /// connection named `connection`.
 async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Result<Tokens> {
-    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+    let (v4, v6) = bind_loopback()
         .await
         .map_err(|e| anyhow::anyhow!("Impossible d'attendre le retour du navigateur : {e}"))?;
     let port = v4.local_addr()?.port();
-    // `localhost` may resolve to ::1 first in the browser.
-    let v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await.ok();
     let redirect_uri = format!("http://localhost:{port}");
     let verifier = random_urlsafe(32)?;
     let state = random_urlsafe(16)?;
@@ -727,6 +725,25 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
         deps,
     )
     .await?)
+}
+
+/// Listen on a free port of 127.0.0.1 and the same port of ::1 when there
+/// is an IPv6 loopback: the browser may resolve `localhost` to ::1 first.
+async fn bind_loopback() -> std::io::Result<(TcpListener, Option<TcpListener>)> {
+    for _ in 0..5 {
+        let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = v4.local_addr()?.port();
+        match TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await {
+            Ok(v6) => return Ok((v4, Some(v6))),
+            // Another program has it on ::1, where the browser could go
+            // instead: another port.
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            // No IPv6 loopback.
+            Err(_) => return Ok((v4, None)),
+        }
+    }
+    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    Ok((v4, None))
 }
 
 async fn accept(v4: &TcpListener, v6: Option<&TcpListener>) -> std::io::Result<TcpStream> {
@@ -827,10 +844,53 @@ fn page(message: &str) -> String {
     )
 }
 
+// ========== Forgetting ==========
+
+/// Key of what an interactive browser connection keeps (session token and
+/// refresh token); `None` for other connections, which keep nothing.
+fn kept_key(config: &ConnectionConfig) -> Option<String> {
+    let interactive = config.db_type == DatabaseType::Azure
+        && config.azure_auth_method == Some(AzureAuthMethod::InteractiveBrowser);
+    interactive
+        .then(|| Target::for_config(config).ok())
+        .flatten()
+        .map(|t| secret_key(&t))
+}
+
+/// Whether saving `new` over `old` must forget `old`'s sign-in: another
+/// tenant, application, account or method (or no longer Azure).
+pub fn needs_forget(old: &ConnectionConfig, new: &ConnectionConfig) -> bool {
+    let kept = kept_key(old);
+    kept.is_some() && kept != kept_key(new)
+}
+
+/// Forget the Entra ID sign-in of `config` (session token and refresh token
+/// in the OS keyring): when the connection is deleted, changes target
+/// (`needs_forget`) or on request. Nothing for other methods. Doesn't block:
+/// the keyring is updated in the background.
+pub fn forget(config: &ConnectionConfig) {
+    forget_with(config, session(), |key| {
+        // The keyring may block (Secret Service, an unlock prompt): not on
+        // the interface's thread.
+        std::thread::spawn(move || {
+            if let Err(e) = secrets::store().delete(&key) {
+                tracing::warn!("Could not delete the Entra ID refresh token from the keyring: {e}");
+            }
+        });
+    });
+}
+
+fn forget_with(config: &ConnectionConfig, session: &Session, delete_secret: impl FnOnce(String)) {
+    let Some(key) = kept_key(config) else {
+        return;
+    };
+    session.tokens().remove(&key);
+    delete_secret(key);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::models::{AzureAuthMethod, DatabaseType};
 
     const CLIENT: &str = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
 
@@ -1300,6 +1360,118 @@ mod tests {
         assert!(matches!(next_step(None, None, now), Next::Interactive));
         assert!(matches!(next_step(None, Some(""), now), Next::Interactive));
     }
+
+    fn signed_in() -> ConnectionConfig {
+        ConnectionConfig {
+            name: "Prod".into(),
+            username: Some("jane@contoso.com".into()),
+            database: "app".into(),
+            ..azure("srv.database.windows.net")
+        }
+    }
+
+    #[test]
+    fn same_account_target_needs_no_forgetting() {
+        let old = signed_in();
+        assert!(!needs_forget(&old, &old.clone()));
+        let renamed = ConnectionConfig {
+            name: "Prod 2".into(),
+            database: "other".into(),
+            color: Some([1, 2, 3]),
+            ..old.clone()
+        };
+        assert!(!needs_forget(&old, &renamed));
+        // Same tenant / application / account, written differently.
+        let respelled = ConnectionConfig {
+            tenant_id: Some("CONTOSO.COM".into()),
+            azure_client_id: Some(CLIENT.to_uppercase()),
+            username: Some(" Jane@Contoso.com ".into()),
+            ..old.clone()
+        };
+        assert!(!needs_forget(&old, &respelled));
+    }
+
+    #[test]
+    fn another_account_target_needs_forgetting() {
+        let old = signed_in();
+        let changes = [
+            ConnectionConfig {
+                tenant_id: Some("fabrikam.com".into()),
+                ..old.clone()
+            },
+            ConnectionConfig {
+                azure_client_id: Some("11111111-2222-3333-4444-555555555555".into()),
+                ..old.clone()
+            },
+            ConnectionConfig {
+                username: Some("john@contoso.com".into()),
+                ..old.clone()
+            },
+            ConnectionConfig {
+                username: None,
+                ..old.clone()
+            },
+            ConnectionConfig {
+                azure_auth_method: Some(AzureAuthMethod::Interactive),
+                ..old.clone()
+            },
+            ConnectionConfig {
+                db_type: DatabaseType::SQLServer,
+                ..old.clone()
+            },
+        ];
+        for new in &changes {
+            assert!(needs_forget(&old, new), "{new:?}");
+        }
+        // Nothing was kept for other methods.
+        let cli = ConnectionConfig {
+            azure_auth_method: Some(AzureAuthMethod::Interactive),
+            ..old.clone()
+        };
+        assert!(!needs_forget(&cli, &old));
+    }
+
+    #[test]
+    fn interactions_reach_the_handler() {
+        // The only test using the global handler (`token` isn't called in
+        // tests).
+        static SEEN: Mutex<Vec<Interaction>> = Mutex::new(Vec::new());
+        emit(Interaction::Done {
+            connection: "before".into(),
+        });
+        set_interaction_handler(|i| SEEN.lock().unwrap().push(i));
+        let waiting = Interaction::Waiting {
+            connection: "Prod".into(),
+            url: "https://login.microsoftonline.com/x".into(),
+        };
+        emit(waiting.clone());
+        assert_eq!(*SEEN.lock().unwrap(), [waiting]);
+    }
+
+    #[test]
+    fn forget_clears_the_session_token_and_the_secret() {
+        let session = Session::default();
+        let store = crate::engine::secrets::MemoryStore::default();
+        let config = signed_in();
+        let key = secret_key(&Target::for_config(&config).unwrap());
+        session
+            .tokens()
+            .insert(key.clone(), tokens(at(0), Some("RT")));
+        store.set(&key, "RT").unwrap();
+        store.set("entra:other", "RT2").unwrap();
+
+        forget_with(&config, &session, |k| store.delete(&k).unwrap());
+        assert!(session.tokens().is_empty());
+        assert_eq!(store.get(&key).unwrap(), None);
+        assert_eq!(store.get("entra:other").unwrap().as_deref(), Some("RT2"));
+
+        // Other methods keep nothing: nothing to delete.
+        let cli = ConnectionConfig {
+            azure_auth_method: Some(AzureAuthMethod::Interactive),
+            ..config
+        };
+        forget_with(&cli, &session, |k| panic!("deleted {k}"));
+    }
 }
 
 /// The whole flow against a fake Entra ID: a local token endpoint and a
@@ -1309,7 +1481,6 @@ mod flow_tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use super::*;
-    use crate::engine::models::{AzureAuthMethod, DatabaseType};
     use crate::engine::secrets::MemoryStore;
 
     const CLIENT: &str = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
@@ -1769,6 +1940,18 @@ mod flow_tests {
         assert_eq!(b.unwrap(), "AT-code");
         assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
         assert_eq!(h.grants(), ["authorization_code"]);
+    }
+
+    #[tokio::test]
+    async fn redirect_listeners_share_one_loopback_port() {
+        let (v4, v6) = bind_loopback().await.unwrap();
+        let a = v4.local_addr().unwrap();
+        assert!(a.is_ipv4() && a.ip().is_loopback(), "{a}");
+        if let Some(v6) = v6 {
+            let b = v6.local_addr().unwrap();
+            assert!(b.is_ipv6() && b.ip().is_loopback(), "{b}");
+            assert_eq!(a.port(), b.port());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

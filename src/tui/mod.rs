@@ -732,7 +732,11 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
 
             if let Some(index) = state.editing_connection_index {
                 // Editing existing connection
-                state.config.connections[index] = config;
+                let previous = std::mem::replace(&mut state.config.connections[index], config);
+                if db::entra_interactive::needs_forget(&previous, &state.config.connections[index])
+                {
+                    db::entra_interactive::forget(&previous);
+                }
                 state.close_dialog();
                 state.set_status(format!("Updated connection: {}", name));
             } else {

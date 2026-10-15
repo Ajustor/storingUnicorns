@@ -126,10 +126,34 @@ pub async fn open(config: &ConnectionConfig) -> Result<TdsClient> {
         AzureAuthMethod::Credentials => connect_with_credentials(config).await,
         AzureAuthMethod::Interactive => connect_with_azure_cli(config).await,
         AzureAuthMethod::ManagedIdentity => connect_with_managed_identity(config).await,
-        AzureAuthMethod::InteractiveBrowser => {
-            bail!("La connexion Azure AD interactive n'est pas encore disponible")
-        }
+        AzureAuthMethod::InteractiveBrowser => connect_with_entra_account(config).await,
     }
+}
+
+/// Connect with the user's own Entra ID account, signed in through the
+/// browser (or silently while the session / refresh token lasts).
+async fn connect_with_entra_account(config: &ConnectionConfig) -> Result<TdsClient> {
+    let token = super::entra_interactive::token(config).await?;
+    connect_with_aad_token(config, &token).await.map_err(|e| {
+        match token_login_hint(&e.to_string(), config.username.as_deref()) {
+            Some(hint) => anyhow!("{hint}\n\nDétail : {e}"),
+            None => e,
+        }
+    })
+}
+
+/// What to do when the server refuses a valid token (login error 18456 in
+/// tiberius's error text `error`): the account has no user in the database.
+pub fn token_login_hint(error: &str, account: Option<&str>) -> Option<String> {
+    if !error.contains("(code: 18456,") {
+        return None;
+    }
+    let account = account.map(str::trim).filter(|a| !a.is_empty());
+    Some(format!(
+        "Le compte est authentifié mais n'a pas accès à la base : \
+         `CREATE USER [{}] FROM EXTERNAL PROVIDER`.",
+        account.unwrap_or("compte")
+    ))
 }
 
 /// Connect using SQL Server authentication (username/password) to Azure:
@@ -578,6 +602,32 @@ mod tests {
             "the requested identity has not been assigned to this resource",
         );
         assert!(managed_identity_error(&unassigned, Some("abc")).contains("ID client abc"));
+    }
+
+    #[test]
+    fn refused_login_with_a_token_suggests_creating_the_user() {
+        // tiberius's text for a server error token.
+        let refused = "Token error: 'Login failed for user '<token-identified principal>'.' \
+                       on server srv executing  on line 1 (code: 18456, state: 1, class: 14)";
+        assert_eq!(
+            token_login_hint(refused, Some(" jane@contoso.com ")).unwrap(),
+            "Le compte est authentifié mais n'a pas accès à la base : \
+             `CREATE USER [jane@contoso.com] FROM EXTERNAL PROVIDER`."
+        );
+        assert!(token_login_hint(refused, None)
+            .unwrap()
+            .ends_with("`CREATE USER [compte] FROM EXTERNAL PROVIDER`."));
+        assert!(token_login_hint(refused, Some(""))
+            .unwrap()
+            .contains("[compte]"));
+        // Other errors: no hint.
+        let other = "Token error: 'Cannot open database \"app\"' on server srv executing  \
+                     on line 1 (code: 4060, state: 1, class: 11)";
+        assert_eq!(token_login_hint(other, None), None);
+        assert_eq!(
+            token_login_hint("refused (code: 184560, state: 1)", None),
+            None
+        );
     }
 
     #[test]

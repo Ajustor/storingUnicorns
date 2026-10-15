@@ -705,7 +705,7 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
     let state = random_urlsafe(16)?;
     let url = authorize_url(t, &redirect_uri, &pkce_challenge(&verifier), &state);
 
-    let code = {
+    let (code, mut browser) = {
         (deps.notify)(Interaction::Waiting {
             connection: connection.to_string(),
             url: url.clone(),
@@ -720,16 +720,19 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
             .await
             .map_err(|_| AuthError::Timeout)??
     };
-    Ok(redeem(
-        t,
-        Grant::Code {
-            code: &code,
-            redirect_uri: &redirect_uri,
-            verifier: &verifier,
-        },
-        deps,
-    )
-    .await?)
+    let grant = Grant::Code {
+        code: &code,
+        redirect_uri: &redirect_uri,
+        verifier: &verifier,
+    };
+    // The browser's page waits for the exchange (bounded by the token
+    // request's timeout), so that it tells how the sign-in really ended.
+    let tokens = redeem(t, grant, deps).await;
+    match &tokens {
+        Ok(_) => respond(&mut browser, "200 OK", &page(SIGNED_IN)).await,
+        Err(e) => respond(&mut browser, "400 Bad Request", &page(&explain(e))).await,
+    }
+    Ok(tokens?)
 }
 
 /// Listen on a free port of 127.0.0.1 and the same port of ::1 when there
@@ -762,10 +765,11 @@ async fn accept(v4: &TcpListener, v6: Option<&TcpListener>) -> std::io::Result<T
 }
 
 /// Serve the connections `accept` gives (the redirect listener) until the
-/// sign-in comes back: the code, or why it failed. Other requests
-/// (`/favicon.ico`…) get a 404, redirects with another `state` (another
-/// tab, a forged request) a 400 while the wait goes on.
-async fn wait_for_code<A, F>(mut accept: A, state: &str) -> Result<String, AuthError>
+/// sign-in comes back: the code with the browser's connection, still to be
+/// answered, or why it failed. Other requests (`/favicon.ico`…) get a 404,
+/// redirects with another `state` (another tab, a forged request) a 400
+/// while the wait goes on.
+async fn wait_for_code<A, F>(mut accept: A, state: &str) -> Result<(String, TcpStream), AuthError>
 where
     A: FnMut() -> F,
     F: std::future::Future<Output = std::io::Result<TcpStream>>,
@@ -800,10 +804,8 @@ where
                     let message = explain(&AuthError::StateMismatch);
                     respond(&mut stream, "400 Bad Request", &page(&message)).await;
                 }
-                Ok(code) => {
-                    respond(&mut stream, "200 OK", &page(SIGNED_IN)).await;
-                    return Ok(code);
-                }
+                // Answered once the code is exchanged.
+                Ok(code) => return Ok((code, stream)),
                 Err(e) => {
                     respond(&mut stream, "400 Bad Request", &page(&explain(&e))).await;
                     return Err(e);
@@ -2036,6 +2038,14 @@ mod flow_tests {
             "{e}"
         );
         assert_eq!(h.stored(), None);
+        // The browser waited for the exchange: it says why it failed.
+        let (status, html) = h.browser.last_page();
+        assert_eq!(status, 400);
+        assert!(
+            html.contains("Active « Autoriser les flux clients publics » dans l'application."),
+            "{html}"
+        );
+        assert!(!html.contains("Connexion réussie"), "{html}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2116,7 +2126,9 @@ mod flow_tests {
         let waited = tokio::time::timeout(Duration::from_secs(10), wait_for_code(accept, "s"))
             .await
             .unwrap();
-        assert_eq!(waited.unwrap(), "c");
+        let (code, browser_connection) = waited.unwrap();
+        assert_eq!(code, "c");
+        drop(browser_connection);
         assert_eq!(failures.load(Ordering::SeqCst), 0);
         browser.join().unwrap();
     }

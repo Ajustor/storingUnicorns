@@ -169,6 +169,17 @@ impl ConnectionForm {
         self.tested.push(config);
     }
 
+    /// The tested configs whose sign-in none of the `remaining` (saved)
+    /// connections uses, once: a test of a connection then not saved, or
+    /// saved with another tenant / application / account, would otherwise
+    /// leave its refresh token in the keyring, with nothing to forget it.
+    pub fn orphaned_tests(&mut self, remaining: &[ConnectionConfig]) -> Vec<ConnectionConfig> {
+        std::mem::take(&mut self.tested)
+            .into_iter()
+            .filter(|c| entra_interactive::orphaned(c, remaining))
+            .collect()
+    }
+
     /// Name of the connection the running test opens: its browser sign-in
     /// is reported under that name, whatever the name field says since.
     pub fn testing_name(&self) -> Option<&str> {
@@ -819,6 +830,38 @@ mod tests {
         assert_eq!(f.testing_name(), Some("Az"));
         f.test_cancelled();
         assert_eq!(f.testing_name(), None);
+    }
+
+    #[test]
+    fn a_test_no_saved_connection_uses_leaves_no_sign_in() {
+        let browser = |tenant: &str| ConnectionConfig {
+            name: "Az".into(),
+            db_type: DatabaseType::Azure,
+            azure_auth_method: Some(AzureAuthMethod::InteractiveBrowser),
+            tenant_id: Some(tenant.into()),
+            azure_client_id: Some("8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f".into()),
+            database: "app".into(),
+            ..Default::default()
+        };
+        // A new connection tested, then not saved.
+        let mut f = ConnectionForm::new(None);
+        f.start_test(browser("contoso.com"));
+        assert_eq!(f.orphaned_tests(&[]).len(), 1);
+        assert!(f.orphaned_tests(&[]).is_empty(), "given once");
+
+        // An edit tested with its own sign-in: still used.
+        let saved = browser("contoso.com");
+        let mut f = ConnectionForm::new(Some(saved.clone()));
+        f.start_test(saved.clone());
+        assert!(f.orphaned_tests(std::slice::from_ref(&saved)).is_empty());
+        // Tested on another tenant, then cancelled: that sign-in goes.
+        f.start_test(browser("fabrikam.com"));
+        let orphans = f.orphaned_tests(std::slice::from_ref(&saved));
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].tenant_id.as_deref(), Some("fabrikam.com"));
+        // Other methods keep nothing.
+        f.start_test(ConnectionConfig::default());
+        assert!(f.orphaned_tests(&[]).is_empty());
     }
 
     #[test]

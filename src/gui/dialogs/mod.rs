@@ -10,6 +10,7 @@ use super::table_search::TableSearch;
 use super::tabs::console::RunKind;
 use super::tabs::{CloseRisk, TabId, TabKind};
 use super::worker::Event;
+use crate::engine::db::entra_interactive;
 use crate::engine::ops::transfer::qualified;
 use connection::{ConnectionForm, FormAction};
 use structure::StructureDialog;
@@ -268,11 +269,16 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         }
         keep = false;
     }
-    // Nobody waits for the test of a closed form any more: stop it (and the
-    // browser sign-in it may wait for).
-    if let (false, Dialog::Connection(form)) = (keep, &dialog) {
+    if let (false, Dialog::Connection(form)) = (keep, &mut dialog) {
+        // Nobody waits for the test of a closed form any more: stop it (and
+        // the browser sign-in it may wait for).
         if form.testing {
             app.worker.cancel_test();
+        }
+        // A sign-in only a test used (connection not saved, or saved with
+        // another account) is forgotten.
+        for config in form.orphaned_tests(&app.config.connections) {
+            entra_interactive::forget(&config);
         }
     }
     // A dialog may open another one in its place (batch → confirmation).

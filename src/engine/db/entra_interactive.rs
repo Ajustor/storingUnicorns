@@ -922,9 +922,15 @@ fn sign_in_used_by(config: &ConnectionConfig, others: &[ConnectionConfig]) -> bo
 /// server keep it. The explicit "Oublier la connexion Azure AD" calls
 /// `forget`.
 pub fn forget_unless_used(config: &ConnectionConfig, remaining: &[ConnectionConfig]) {
-    if !sign_in_used_by(config, remaining) {
+    if orphaned(config, remaining) {
         forget(config);
     }
+}
+
+/// Whether `config` keeps a sign-in (interactive browser connection) that
+/// none of the `remaining` connections uses: nothing would forget it later.
+pub fn orphaned(config: &ConnectionConfig, remaining: &[ConnectionConfig]) -> bool {
+    kept_key(config).is_some() && !sign_in_used_by(config, remaining)
 }
 
 /// Forget the Entra ID sign-in of `config` (session token and refresh token

@@ -2,9 +2,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AzureAuthMethod {
-    Credentials,     // SQL Server authentication (username/password)
-    Interactive,     // Azure AD Interactive login
+    Credentials, // SQL Server authentication (username/password)
+    /// Token of the Azure CLI (`az login`); serialized name kept from when
+    /// it was the only Entra ID method.
+    Interactive,
     ManagedIdentity, // Azure managed identity
+    /// The user's own Entra ID account through the browser (authorization
+    /// code + PKCE) with the organization's app (`azure_client_id`).
+    InteractiveBrowser,
 }
 
 impl Default for AzureAuthMethod {
@@ -17,8 +22,9 @@ impl std::fmt::Display for AzureAuthMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AzureAuthMethod::Credentials => write!(f, "SQL Auth"),
-            AzureAuthMethod::Interactive => write!(f, "Azure AD"),
+            AzureAuthMethod::Interactive => write!(f, "Azure CLI"),
             AzureAuthMethod::ManagedIdentity => write!(f, "Managed Identity"),
+            AzureAuthMethod::InteractiveBrowser => write!(f, "Azure AD interactif (navigateur)"),
         }
     }
 }
@@ -141,6 +147,10 @@ pub struct ConnectionConfig {
     pub azure_auth_method: Option<AzureAuthMethod>,
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// Application (client) ID registered by the organization in Entra ID
+    /// (`AzureAuthMethod::InteractiveBrowser`).
+    #[serde(default)]
+    pub azure_client_id: Option<String>,
     /// RGB colour used to tag the connection in the GUI.
     #[serde(default)]
     pub color: Option<[u8; 3]>,
@@ -230,6 +240,7 @@ impl Default for ConnectionConfig {
             database: String::from("postgres"),
             azure_auth_method: None,
             tenant_id: None,
+            azure_client_id: None,
             color: None,
             ssl_mode: None,
             ssl_ca: None,
@@ -441,6 +452,73 @@ mod tests {
         assert_eq!(display_cell(NULL_CELL), "NULL");
         assert_eq!(display_cell("NULL"), "NULL");
         assert_eq!(display_cell("x"), "x");
+    }
+
+    #[test]
+    fn azure_method_labels() {
+        assert_eq!(AzureAuthMethod::Credentials.to_string(), "SQL Auth");
+        assert_eq!(AzureAuthMethod::Interactive.to_string(), "Azure CLI");
+        assert_eq!(
+            AzureAuthMethod::InteractiveBrowser.to_string(),
+            "Azure AD interactif (navigateur)"
+        );
+        assert_eq!(
+            AzureAuthMethod::ManagedIdentity.to_string(),
+            "Managed Identity"
+        );
+    }
+
+    #[test]
+    fn interactive_browser_serializes_by_name() {
+        assert_eq!(
+            serde_json::to_string(&AzureAuthMethod::InteractiveBrowser).unwrap(),
+            "\"InteractiveBrowser\""
+        );
+        // The CLI method keeps its serialized name.
+        assert_eq!(
+            serde_json::to_string(&AzureAuthMethod::Interactive).unwrap(),
+            "\"Interactive\""
+        );
+    }
+
+    #[test]
+    fn config_without_client_id_loads() {
+        let c: ConnectionConfig = toml::from_str(
+            "name = \"x\"\ndb_type = \"Azure\"\ndatabase = \"d\"\n\
+             azure_auth_method = \"Interactive\"\ntenant_id = \"t\"",
+        )
+        .unwrap();
+        assert_eq!(c.azure_client_id, None);
+        assert_eq!(c.azure_auth_method, Some(AzureAuthMethod::Interactive));
+    }
+
+    #[test]
+    fn interactive_browser_config_round_trips() {
+        let c = ConnectionConfig {
+            db_type: DatabaseType::Azure,
+            host: Some("srv.database.windows.net".into()),
+            username: Some("jane@contoso.com".into()),
+            azure_auth_method: Some(AzureAuthMethod::InteractiveBrowser),
+            tenant_id: Some("contoso.com".into()),
+            azure_client_id: Some("8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f".into()),
+            ..Default::default()
+        };
+        let text = toml::to_string(&c).unwrap();
+        assert!(
+            text.contains("azure_auth_method = \"InteractiveBrowser\""),
+            "{text}"
+        );
+        let back: ConnectionConfig = toml::from_str(&text).unwrap();
+        assert_eq!(
+            back.azure_auth_method,
+            Some(AzureAuthMethod::InteractiveBrowser)
+        );
+        assert_eq!(back.tenant_id.as_deref(), Some("contoso.com"));
+        assert_eq!(
+            back.azure_client_id.as_deref(),
+            Some("8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f")
+        );
+        assert_eq!(back.username.as_deref(), Some("jane@contoso.com"));
     }
 
     #[test]

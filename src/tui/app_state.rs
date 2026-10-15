@@ -196,6 +196,8 @@ pub struct NewConnectionState {
     pub cursor_position: usize,
     pub azure_auth_method: AzureAuthMethod,
     pub tenant_id: String,
+    /// Entra ID application (client) ID of an interactive browser sign-in.
+    pub azure_client_id: String,
     pub url: String,
     /// Compatible product; `None` = the bare engine.
     pub flavor: Option<Flavor>,
@@ -220,6 +222,7 @@ impl Default for NewConnectionState {
             cursor_position: 14, // length of "New Connection"
             azure_auth_method: AzureAuthMethod::default(),
             tenant_id: String::from("common"),
+            azure_client_id: String::new(),
             url: String::new(),
             flavor: None,
             ssl_mode: SslMode::default(),
@@ -268,10 +271,21 @@ impl NewConnectionState {
                 None
             },
             tenant_id: if self.db_type == DatabaseType::Azure
-                && self.azure_auth_method == AzureAuthMethod::Interactive
+                && matches!(
+                    self.azure_auth_method,
+                    AzureAuthMethod::Interactive | AzureAuthMethod::InteractiveBrowser
+                )
                 && !self.tenant_id.is_empty()
             {
                 Some(self.tenant_id.clone())
+            } else {
+                None
+            },
+            azure_client_id: if self.db_type == DatabaseType::Azure
+                && self.azure_auth_method == AzureAuthMethod::InteractiveBrowser
+                && !self.azure_client_id.trim().is_empty()
+            {
+                Some(self.azure_client_id.trim().to_string())
             } else {
                 None
             },
@@ -304,6 +318,7 @@ impl NewConnectionState {
                 .tenant_id
                 .clone()
                 .unwrap_or_else(|| "common".to_string()),
+            azure_client_id: conn.azure_client_id.clone().unwrap_or_default(),
             active_field: ConnectionField::Name,
             cursor_position: conn.name.len(),
             url: String::new(),
@@ -358,6 +373,7 @@ impl NewConnectionState {
         self.azure_auth_method = match self.azure_auth_method {
             AzureAuthMethod::Credentials => AzureAuthMethod::Interactive,
             AzureAuthMethod::Interactive => AzureAuthMethod::ManagedIdentity,
+            AzureAuthMethod::InteractiveBrowser => AzureAuthMethod::ManagedIdentity,
             AzureAuthMethod::ManagedIdentity => AzureAuthMethod::Credentials,
         };
     }
@@ -1567,6 +1583,27 @@ mod tests {
         assert_eq!(c.ssl_ca, Some("/etc/ca.pem".into()));
         assert_eq!(c.flavor, Some(Flavor::Neon));
         assert_eq!(c.color, Some([1, 2, 3]));
+    }
+
+    #[test]
+    fn editing_keeps_the_interactive_browser_target() {
+        let conn = ConnectionConfig {
+            db_type: DatabaseType::Azure,
+            azure_auth_method: Some(AzureAuthMethod::InteractiveBrowser),
+            tenant_id: Some("contoso.com".into()),
+            azure_client_id: Some("8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f".into()),
+            username: Some("jane@contoso.com".into()),
+            ..Default::default()
+        };
+        let c = NewConnectionState::from_config(&conn).to_config();
+        assert_eq!(c.azure_auth_method, conn.azure_auth_method);
+        assert_eq!(c.tenant_id, conn.tenant_id);
+        assert_eq!(c.azure_client_id, conn.azure_client_id);
+        assert_eq!(c.username, conn.username);
+        // Only that method keeps the client ID.
+        let mut nc = NewConnectionState::from_config(&conn);
+        nc.azure_auth_method = AzureAuthMethod::Interactive;
+        assert_eq!(nc.to_config().azure_client_id, None);
     }
 
     #[test]

@@ -61,6 +61,8 @@ pub struct ConnectionForm {
     pub database: String,
     pub azure_auth: AzureAuthMethod,
     pub tenant_id: String,
+    /// Entra ID application (client) ID of an interactive browser sign-in.
+    pub azure_client_id: String,
     pub color: Option<[u8; 3]>,
     /// Compatible product; `None` = the bare engine.
     pub flavor: Option<Flavor>,
@@ -98,6 +100,7 @@ impl ConnectionForm {
             password: c.password.unwrap_or_default(),
             azure_auth: c.azure_auth_method.unwrap_or_default(),
             tenant_id: c.tenant_id.unwrap_or_default(),
+            azure_client_id: c.azure_client_id.unwrap_or_default(),
             name: c.name,
             db_type: c.db_type,
             database: c.database,
@@ -232,6 +235,11 @@ impl ConnectionForm {
             database: self.database.trim().to_string(),
             azure_auth_method: azure.then(|| self.azure_auth.clone()),
             tenant_id: if azure { opt(&self.tenant_id) } else { None },
+            azure_client_id: if azure {
+                opt(&self.azure_client_id)
+            } else {
+                None
+            },
             color: self.color,
             ssl_mode: self.uses_tls().then_some(self.ssl_mode),
             ssl_ca: if self.uses_tls() {
@@ -405,7 +413,7 @@ impl ConnectionForm {
                     );
                     ui.end_row();
                 }
-                AzureAuthMethod::Credentials => {}
+                AzureAuthMethod::Credentials | AzureAuthMethod::InteractiveBrowser => {}
             }
         }
         let needs_credentials = !azure || self.azure_auth == AzureAuthMethod::Credentials;
@@ -584,6 +592,25 @@ mod tests {
             .contains("n'est pas un ID client"));
         f.username.clear(); // system-assigned identity
         assert_eq!(f.validate(&[]).unwrap().username, None);
+    }
+
+    #[test]
+    fn editing_keeps_the_app_client_id() {
+        let saved = ConnectionConfig {
+            name: "Az".into(),
+            db_type: DatabaseType::Azure,
+            azure_auth_method: Some(AzureAuthMethod::InteractiveBrowser),
+            tenant_id: Some("contoso.com".into()),
+            azure_client_id: Some("8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f".into()),
+            database: "app".into(),
+            ..Default::default()
+        };
+        let mut f = ConnectionForm::new(Some(saved.clone()));
+        let c = f.validate(std::slice::from_ref(&saved)).unwrap();
+        assert_eq!(c.azure_client_id, saved.azure_client_id);
+        assert_eq!(c.tenant_id, saved.tenant_id);
+        f.set_db_type(DatabaseType::SQLServer);
+        assert_eq!(f.validate(&[saved]).unwrap().azure_client_id, None);
     }
 
     #[test]

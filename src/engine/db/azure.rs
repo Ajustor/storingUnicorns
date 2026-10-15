@@ -126,6 +126,9 @@ pub async fn open(config: &ConnectionConfig) -> Result<TdsClient> {
         AzureAuthMethod::Credentials => connect_with_credentials(config).await,
         AzureAuthMethod::Interactive => connect_with_azure_cli(config).await,
         AzureAuthMethod::ManagedIdentity => connect_with_managed_identity(config).await,
+        AzureAuthMethod::InteractiveBrowser => {
+            bail!("La connexion Azure AD interactive n'est pas encore disponible")
+        }
     }
 }
 
@@ -272,7 +275,7 @@ pub fn managed_identity_client_id(username: Option<&str>) -> Result<Option<Strin
 }
 
 /// `8-4-4-4-12` hexadecimal digits.
-fn is_guid(s: &str) -> bool {
+pub(crate) fn is_guid(s: &str) -> bool {
     let groups: Vec<&str> = s.split('-').collect();
     groups.len() == 5
         && groups

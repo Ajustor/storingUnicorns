@@ -217,6 +217,7 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
             AzureAuthMethod::Credentials => "SQL Credentials",
             AzureAuthMethod::Interactive => "Azure AD Interactive",
             AzureAuthMethod::ManagedIdentity => "Managed Identity",
+            AzureAuthMethod::InteractiveBrowser => "Azure AD (navigateur)",
         };
         let az_content = format!("Auth: {}{}", auth_label, az_hint);
         let az_paragraph = Paragraph::new(az_content).style(az_style).block(

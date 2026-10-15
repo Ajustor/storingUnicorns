@@ -106,7 +106,7 @@ Tout est testé sans réseau.
 - [ ] PKCE : `pub fn pkce_challenge(verifier: &str) -> String` (SHA-256,
   base64url sans padding) ; test RFC 7636 : verifier
   `dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk` → challenge
-  `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGF8cOM2cM`.
+  `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`.
   `fn random_urlsafe(bytes: usize) -> String` (getrandom + base64url).
 - [ ] `pub struct Target { pub authority: String /* https://login.microsoftonline.com */, pub tenant: String, pub client_id: String, pub scope: String /* "<resource>/.default offline_access openid profile" */, pub login_hint: Option<String> }`
   avec `Target::for_config(&ConnectionConfig) -> Result<Target, String>`

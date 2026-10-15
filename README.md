@@ -243,10 +243,12 @@ Type **Azure SQL**, authentification **Azure AD interactif (navigateur)**
 navigateur par défaut ; terminez-la (5 minutes au plus) puis revenez à l'app.
 Pendant l'attente, l'interface graphique affiche un bandeau avec **Copier le
 lien** (si le navigateur ne s'est pas ouvert) et **Annuler** ; l'interface
-terminal affiche le lien complet dans la barre d'état (à sélectionner pour le
-copier) et `Échap` annule. Avec certaines erreurs de configuration (URI de
-redirection absente, application ou tenant introuvable), Microsoft affiche
-l'erreur dans le navigateur sans revenir à l'app : annulez la connexion.
+terminal affiche le lien complet dans la barre d'état et `Échap` annule. Pour
+copier le lien, sélectionnez-le avec **Maj+glisser** (**Option+glisser** dans
+iTerm2) : l'interface capture la souris, un simple glisser ne sélectionne rien.
+Avec certaines erreurs de configuration (URI de redirection absente,
+application ou tenant introuvable), Microsoft affiche l'erreur dans le
+navigateur sans revenir à l'app : annulez la connexion.
 
 Interface terminal : le navigateur est ouvert comme le fait le système (sous
 Linux, `$BROWSER` d'abord). Un navigateur en mode texte (`lynx`, `w3m`…)

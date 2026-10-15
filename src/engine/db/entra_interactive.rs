@@ -892,23 +892,28 @@ pub fn forget_unless_used(config: &ConnectionConfig, remaining: &[ConnectionConf
 /// (`needs_forget`) or on request. Nothing for other methods. Doesn't block:
 /// the keyring is updated in the background.
 pub fn forget(config: &ConnectionConfig) {
-    forget_with(config, session(), |key| {
-        // The keyring may block (Secret Service, an unlock prompt): not on
-        // the interface's thread.
-        std::thread::spawn(move || {
-            if let Err(e) = secrets::store().delete(&key) {
-                tracing::warn!("Could not delete the Entra ID refresh token from the keyring: {e}");
-            }
-        });
-    });
-}
-
-fn forget_with(config: &ConnectionConfig, session: &Session, delete_secret: impl FnOnce(String)) {
     let Some(key) = kept_key(config) else {
         return;
     };
+    let session = session();
+    // At once, so that the next connection doesn't reuse it…
     session.tokens().remove(&key);
-    delete_secret(key);
+    // …and for good once an acquisition in progress is over. Waiting for it
+    // and the keyring (Secret Service, an unlock prompt) may block: not on
+    // the interface's thread.
+    std::thread::spawn(move || forget_key(session, secrets::store(), &key));
+}
+
+/// Drop `key`'s session token and refresh token once any acquisition in
+/// progress for it is over: it would keep its tokens after us otherwise.
+/// Blocks: never call it from async code.
+fn forget_key(session: &Session, store: &dyn SecretStore, key: &str) {
+    let lock = session.lock_for(key);
+    let _turn = lock.blocking_lock();
+    session.tokens().remove(key);
+    if let Err(e) = store.delete(key) {
+        tracing::warn!("Could not delete the Entra ID refresh token from the keyring: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -1521,17 +1526,17 @@ mod tests {
         store.set(&key, "RT").unwrap();
         store.set("entra:other", "RT2").unwrap();
 
-        forget_with(&config, &session, |k| store.delete(&k).unwrap());
+        forget_key(&session, &store, &key);
         assert!(session.tokens().is_empty());
         assert_eq!(store.get(&key).unwrap(), None);
         assert_eq!(store.get("entra:other").unwrap().as_deref(), Some("RT2"));
 
-        // Other methods keep nothing: nothing to delete.
+        // Other methods keep nothing: nothing to forget.
         let cli = ConnectionConfig {
             azure_auth_method: Some(AzureAuthMethod::Interactive),
             ..config
         };
-        forget_with(&cli, &session, |k| panic!("deleted {k}"));
+        assert_eq!(kept_key(&cli), None);
     }
 }
 
@@ -1682,6 +1687,8 @@ mod flow_tests {
         favicon: Mutex<Option<u16>>,
         /// Status and HTML of the page shown after the redirect.
         page: Mutex<Option<(u16, String)>>,
+        /// Run in the browser just before it follows the redirect.
+        before_redirect: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     }
 
@@ -1694,6 +1701,7 @@ mod flow_tests {
                 redirect_uri: Mutex::new(None),
                 favicon: Mutex::new(None),
                 page: Mutex::new(None),
+                before_redirect: Mutex::new(None),
                 thread: Mutex::new(None),
             })
         }
@@ -1716,7 +1724,11 @@ mod flow_tests {
             let redirect_uri = q["redirect_uri"].clone();
             let signs_in = matches!(self.behaviour, Behaviour::SignIn);
             let me = self.clone();
+            let before_redirect = self.before_redirect.lock().unwrap().take();
             let thread = std::thread::spawn(move || {
+                if let Some(f) = before_redirect {
+                    f();
+                }
                 let agent = ureq::Agent::config_builder()
                     .http_status_as_error(false)
                     .build()
@@ -1752,7 +1764,7 @@ mod flow_tests {
         /// Seconds added to the real clock.
         clock: Arc<AtomicU64>,
         store: &'static MemoryStore,
-        session: Session,
+        session: &'static Session,
         timeout: Duration,
     }
 
@@ -1766,7 +1778,7 @@ mod flow_tests {
                 events: Arc::default(),
                 clock: Arc::default(),
                 store: Box::leak(Box::default()),
-                session: Session::default(),
+                session: Box::leak(Box::default()),
                 timeout: Duration::from_secs(20),
             }
         }
@@ -1780,7 +1792,7 @@ mod flow_tests {
                 open_browser: Box::new(move |url| browser.open(url)),
                 notify: Box::new(move |i| events.lock().unwrap().push(i)),
                 store: self.store,
-                session: &self.session,
+                session: self.session,
                 now: Box::new(move || {
                     SystemTime::now() + Duration::from_secs(clock.load(Ordering::SeqCst))
                 }),
@@ -2001,6 +2013,34 @@ mod flow_tests {
         assert_eq!(b.unwrap(), "AT-code");
         assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
         assert_eq!(h.grants(), ["authorization_code"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forget_during_a_sign_in_wins() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        let (session, store) = (h.session, h.store);
+        let forgetting = Arc::new(Mutex::new(None));
+        let handle = forgetting.clone();
+        // The user forgets the connection while its sign-in is waiting for
+        // the browser.
+        *h.browser.before_redirect.lock().unwrap() = Some(Box::new(move || {
+            let (started, has_started) = std::sync::mpsc::channel();
+            let t = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                forget_key(session, store, &key());
+            });
+            has_started.recv().unwrap();
+            // Time for a forget that wouldn't wait to be over.
+            std::thread::sleep(Duration::from_millis(50));
+            *handle.lock().unwrap() = Some(t);
+        }));
+        assert_eq!(h.token().await.unwrap(), "AT-code");
+        h.browser.finish();
+        let forget = forgetting.lock().unwrap().take().unwrap();
+        forget.join().unwrap();
+        // The forget ran after the sign-in kept its tokens.
+        assert!(session.tokens().is_empty());
+        assert_eq!(h.stored(), None);
     }
 
     #[tokio::test]

@@ -64,31 +64,34 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
         ui.set_min_width(420.0);
         match &mut dialog {
-            Dialog::Connection(form) => match form.ui(ui, app.sign_ins.url_of(form.name.trim())) {
-                FormAction::None => {}
-                FormAction::CancelTest => {
-                    app.sign_ins.dismiss(form.name.trim());
-                    app.worker.cancel_test();
-                    form.test_cancelled();
+            Dialog::Connection(form) => {
+                let sign_in = form.testing_name().and_then(|n| app.sign_ins.url_of(n));
+                match form.ui(ui, sign_in) {
+                    FormAction::None => {}
+                    FormAction::CancelTest => {
+                        if let Some(name) = form.testing_name() {
+                            app.sign_ins.dismiss(name);
+                        }
+                        app.worker.cancel_test();
+                        form.test_cancelled();
+                    }
+                    FormAction::Cancel => keep = false,
+                    FormAction::Test => match form.validate(&app.config.connections) {
+                        Ok(cfg) => {
+                            form.start_test(cfg.clone());
+                            app.worker.test_connection(cfg);
+                        }
+                        Err(e) => form.error = Some(e),
+                    },
+                    FormAction::Save => match form.validate(&app.config.connections) {
+                        Ok(cfg) => {
+                            app.save_connection(form.original_name.clone(), cfg);
+                            keep = false;
+                        }
+                        Err(e) => form.error = Some(e),
+                    },
                 }
-                FormAction::Cancel => keep = false,
-                FormAction::Test => match form.validate(&app.config.connections) {
-                    Ok(cfg) => {
-                        form.error = None;
-                        form.testing = true;
-                        form.test_result = None;
-                        app.worker.test_connection(cfg);
-                    }
-                    Err(e) => form.error = Some(e),
-                },
-                FormAction::Save => match form.validate(&app.config.connections) {
-                    Ok(cfg) => {
-                        app.save_connection(form.original_name.clone(), cfg);
-                        keep = false;
-                    }
-                    Err(e) => form.error = Some(e),
-                },
-            },
+            }
             Dialog::History(popup) => {
                 ui.set_min_width(640.0);
                 if let HistoryAction::Insert(sql) = popup.ui(ui, &app.history) {

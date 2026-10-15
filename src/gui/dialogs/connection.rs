@@ -112,6 +112,8 @@ pub struct ConnectionForm {
     pub error: Option<String>,
     pub testing: bool,
     pub test_result: Option<Result<(), String>>,
+    /// The configs tested since the form opened, the running test's last.
+    tested: Vec<ConnectionConfig>,
 }
 
 pub enum FormAction {
@@ -155,7 +157,25 @@ impl ConnectionForm {
             error: None,
             testing: false,
             test_result: None,
+            tested: Vec::new(),
         }
+    }
+
+    /// `config` (this form's, validated) is being tested.
+    pub fn start_test(&mut self, config: ConnectionConfig) {
+        self.error = None;
+        self.testing = true;
+        self.test_result = None;
+        self.tested.push(config);
+    }
+
+    /// Name of the connection the running test opens: its browser sign-in
+    /// is reported under that name, whatever the name field says since.
+    pub fn testing_name(&self) -> Option<&str> {
+        self.tested
+            .last()
+            .filter(|_| self.testing)
+            .map(|c| c.name.as_str())
     }
 
     pub fn set_db_type(&mut self, t: DatabaseType) {
@@ -296,8 +316,8 @@ impl ConnectionForm {
     }
 
     /// Draw the form; `sign_in` is the URL of the browser sign-in the test
-    /// waits for (the modal hides the banner). Returns the action the user
-    /// took.
+    /// waits for (`testing_name`'s; the modal hides the banner). Returns the
+    /// action the user took.
     pub fn ui(&mut self, ui: &mut egui::Ui, sign_in: Option<&str>) -> FormAction {
         let mut action = FormAction::None;
         ui.heading(if self.original_name.is_some() {
@@ -415,9 +435,9 @@ impl ConnectionForm {
                 action = FormAction::Cancel;
             }
         });
-        if let (true, Some(url)) = (self.testing, sign_in) {
+        if let (Some(name), Some(url)) = (self.testing_name(), sign_in) {
             ui.add_space(6.0);
-            if sign_in::waiting_row(ui, self.name.trim(), url, true) {
+            if sign_in::waiting_row(ui, name, url, true) {
                 action = FormAction::CancelTest;
             }
         }
@@ -782,6 +802,23 @@ mod tests {
             ..a.clone()
         };
         assert!(!same_target(&a, &b));
+    }
+
+    #[test]
+    fn the_wait_shown_is_the_tested_connection_s() {
+        let mut f = ConnectionForm::new(None);
+        f.name = "Az".into();
+        assert_eq!(f.testing_name(), None);
+        f.start_test(ConnectionConfig {
+            name: "Az".into(),
+            ..Default::default()
+        });
+        assert!(f.testing && f.test_result.is_none());
+        // Typed while the test runs: the wait is still the tested name's.
+        f.name = "Azure prod".into();
+        assert_eq!(f.testing_name(), Some("Az"));
+        f.test_cancelled();
+        assert_eq!(f.testing_name(), None);
     }
 
     #[test]

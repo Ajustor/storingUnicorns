@@ -94,6 +94,10 @@ sha2 = "0.10"
 self-replace = "1"
 tempfile = "3"
 
+# OS credential store for Entra ID refresh tokens. Linux: Secret Service in
+# pure Rust with a vendored libdbus (no OpenSSL, no system library needed).
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+
 # Azure AD goes through reqwest + native-tls, which links OpenSSL on Linux;
 # its soname differs between distributions, so build it into the binary.
 # (macOS uses Security.framework and Windows SChannel: nothing to vendor.)

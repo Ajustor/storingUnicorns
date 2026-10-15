@@ -3,7 +3,7 @@
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
-use crate::updater::{UpdateEvent, UpdateState};
+use crate::updater::{UpdateEvent, UpdateState, Updater};
 
 use super::app::App;
 use super::theme::{self, ERROR, SUCCESS};
@@ -92,14 +92,19 @@ pub fn poll_updater(app: &mut App) {
     }
 }
 
+/// The banner shows an available (not dismissed), downloading or ready (not
+/// put off) update.
+fn banner_shown(updater: &Updater) -> bool {
+    match &updater.state {
+        UpdateState::Available(_) | UpdateState::Ready(_) => !updater.dismissed,
+        UpdateState::Downloading(_) => true,
+        _ => false,
+    }
+}
+
 /// Thin banner above everything while an update is available / downloading / ready.
 pub fn update_banner(app: &mut App, ctx: &egui::Context) {
-    let show = match &app.updater.state {
-        UpdateState::Available(_) => !app.updater.dismissed,
-        UpdateState::Downloading(_) | UpdateState::Ready(_) => true,
-        _ => false,
-    };
-    if !show {
+    if !banner_shown(&app.updater) {
         return;
     }
     let state = app.updater.state.clone();
@@ -128,14 +133,42 @@ pub fn update_banner(app: &mut App, ctx: &egui::Context) {
             UpdateState::Ready(info) => {
                 ui.label(RichText::new(icon::CHECK_CIRCLE).color(SUCCESS));
                 ui.label(format!("Version {} prête.", info.version));
+                // Goes through the normal close: cancelling its confirmation
+                // drops the relaunch (`cancel_restart`).
                 if ui.button("Redémarrer maintenant").clicked() {
                     app.updater.schedule_restart();
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if ui
+                    .button("Plus tard")
+                    .on_hover_text("La mise à jour s'appliquera à la fermeture")
+                    .clicked()
+                {
+                    app.updater.later();
                 }
             }
             _ => {}
         });
     });
+}
+
+/// Banner above everything while a connection waits for its browser
+/// sign-in: the link to copy (the browser may not have opened) and
+/// « Annuler ».
+pub fn sign_in_banner(app: &mut App, ctx: &egui::Context) {
+    let Some((connection, url)) = app.sign_ins.current() else {
+        return;
+    };
+    let (connection, url) = (connection.to_string(), url.to_string());
+    let cancellable =
+        super::sign_in::cancellable(&connection, &app.sessions.connecting, app.worker.testing());
+    let mut cancel = false;
+    egui::TopBottomPanel::top("sign_in").show(ctx, |ui| {
+        cancel = super::sign_in::waiting_row(ui, &connection, &url, cancellable);
+    });
+    if cancel {
+        app.cancel_sign_in(&connection);
+    }
 }
 
 pub fn status_bar(app: &mut App, ctx: &egui::Context) {
@@ -179,21 +212,41 @@ fn message(app: &App, ui: &mut egui::Ui) {
     }
 }
 
-/// The running version, at the far left; a click checks for updates.
+/// Text and hover of the version link for `current`: "v0.13.0 → 0.14.0"
+/// once an update is ready.
+fn version_label(state: &UpdateState, current: &str) -> (String, String) {
+    match state {
+        UpdateState::Ready(info) => (
+            format!("v{current} → {}", info.version),
+            "Mise à jour prête : cliquer pour redémarrer".into(),
+        ),
+        UpdateState::Failed(e) => (
+            format!("v{current}"),
+            format!("storingUnicorns {current} — dernière vérification en échec : {e}"),
+        ),
+        _ => (
+            format!("v{current}"),
+            format!("storingUnicorns {current} — vérifier les mises à jour"),
+        ),
+    }
+}
+
+/// The running version, at the far left; a click checks for updates, or
+/// shows the banner of a ready update again.
 fn version(app: &mut App, ui: &mut egui::Ui) {
-    let version = crate::updater::current_version();
-    let hover = match &app.updater.state {
-        UpdateState::Failed(e) => {
-            format!("storingUnicorns {version} — dernière vérification en échec : {e}")
-        }
-        _ => format!("storingUnicorns {version} — vérifier les mises à jour"),
+    let ready = matches!(app.updater.state, UpdateState::Ready(_));
+    let (text, hover) = version_label(&app.updater.state, crate::updater::current_version());
+    let text = if ready {
+        RichText::new(text).color(theme::ACCENT)
+    } else {
+        RichText::new(text).weak()
     };
-    if ui
-        .link(RichText::new(format!("v{version}")).weak())
-        .on_hover_text(hover)
-        .clicked()
-    {
-        app.updater.check(true, None);
+    if ui.link(text).on_hover_text(hover).clicked() {
+        if ready {
+            app.updater.show_ready();
+        } else {
+            app.updater.check(true, None);
+        }
     }
 }
 
@@ -257,6 +310,43 @@ mod tests {
         p.finish(2);
         p.finish(7);
         assert_eq!(p.current(), None);
+    }
+
+    fn ready_updater() -> Updater {
+        let json = r#"{"version":"99.0.0","notes":"","page_url":"p","assets":[{"name":"storingUnicorns-setup.msi","url":"u","sha256":"00"}]}"#;
+        let info = crate::updater::release_from_manifest_for_tests(json)
+            .unwrap()
+            .unwrap();
+        let mut u = Updater::new(|| {});
+        u.state = UpdateState::Ready(info);
+        u
+    }
+
+    #[test]
+    fn later_hides_the_ready_banner_and_the_version_shows_it_again() {
+        let mut u = ready_updater();
+        assert!(banner_shown(&u));
+        u.later();
+        assert!(!banner_shown(&u));
+        let (text, hover) = version_label(&u.state, "0.13.0");
+        assert_eq!(text, "v0.13.0 → 99.0.0");
+        assert_eq!(hover, "Mise à jour prête : cliquer pour redémarrer");
+        u.show_ready();
+        assert!(banner_shown(&u));
+    }
+
+    #[test]
+    fn version_label_without_ready_update() {
+        let u = Updater::new(|| {});
+        assert!(!banner_shown(&u));
+        let (text, hover) = version_label(&u.state, "0.13.0");
+        assert_eq!(text, "v0.13.0");
+        assert_eq!(hover, "storingUnicorns 0.13.0 — vérifier les mises à jour");
+        let (_, hover) = version_label(&UpdateState::Failed("boom".into()), "0.13.0");
+        assert_eq!(
+            hover,
+            "storingUnicorns 0.13.0 — dernière vérification en échec : boom"
+        );
     }
 
     #[test]

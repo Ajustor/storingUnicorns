@@ -10,6 +10,7 @@ use super::table_search::TableSearch;
 use super::tabs::console::RunKind;
 use super::tabs::{CloseRisk, TabId, TabKind};
 use super::worker::Event;
+use crate::engine::db::entra_interactive;
 use crate::engine::ops::transfer::qualified;
 use connection::{ConnectionForm, FormAction};
 use structure::StructureDialog;
@@ -64,26 +65,34 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
         ui.set_min_width(420.0);
         match &mut dialog {
-            Dialog::Connection(form) => match form.ui(ui) {
-                FormAction::None => {}
-                FormAction::Cancel => keep = false,
-                FormAction::Test => match form.validate(&app.config.connections) {
-                    Ok(cfg) => {
-                        form.error = None;
-                        form.testing = true;
-                        form.test_result = None;
-                        app.worker.test_connection(cfg);
+            Dialog::Connection(form) => {
+                let sign_in = form.testing_name().and_then(|n| app.sign_ins.url_of(n));
+                match form.ui(ui, sign_in) {
+                    FormAction::None => {}
+                    FormAction::CancelTest => {
+                        if let Some(name) = form.testing_name() {
+                            app.sign_ins.dismiss(name);
+                        }
+                        app.worker.cancel_test();
+                        form.test_cancelled();
                     }
-                    Err(e) => form.error = Some(e),
-                },
-                FormAction::Save => match form.validate(&app.config.connections) {
-                    Ok(cfg) => {
-                        app.save_connection(form.original_name.clone(), cfg);
-                        keep = false;
-                    }
-                    Err(e) => form.error = Some(e),
-                },
-            },
+                    FormAction::Cancel => keep = false,
+                    FormAction::Test => match form.validate(&app.config.connections) {
+                        Ok(cfg) => {
+                            form.start_test(cfg.clone());
+                            app.worker.test_connection(cfg);
+                        }
+                        Err(e) => form.error = Some(e),
+                    },
+                    FormAction::Save => match form.validate(&app.config.connections) {
+                        Ok(cfg) => {
+                            app.save_connection(form.original_name.clone(), cfg);
+                            keep = false;
+                        }
+                        Err(e) => form.error = Some(e),
+                    },
+                }
+            }
             Dialog::History(popup) => {
                 ui.set_min_width(640.0);
                 if let HistoryAction::Insert(sql) = popup.ui(ui, &app.history) {
@@ -180,6 +189,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         keep = false;
                     }
                     if ui.button("Annuler").clicked() {
+                        app.updater.cancel_restart();
                         keep = false;
                     }
                 });
@@ -251,10 +261,25 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     });
     // Escape or a click outside cancels the dialog.
     if modal.should_close() {
-        if let (true, Dialog::DiscardEdits(id)) = (keep, &dialog) {
-            answer_discard(app, *id, Discard::Cancel);
+        match (keep, &dialog) {
+            (true, Dialog::DiscardEdits(id)) => answer_discard(app, *id, Discard::Cancel),
+            // The quit (maybe "Redémarrer maintenant") is cancelled.
+            (true, Dialog::ConfirmQuit { .. }) => app.updater.cancel_restart(),
+            _ => {}
         }
         keep = false;
+    }
+    if let (false, Dialog::Connection(form)) = (keep, &mut dialog) {
+        // Nobody waits for the test of a closed form any more: stop it (and
+        // the browser sign-in it may wait for).
+        if form.testing {
+            app.worker.cancel_test();
+        }
+        // A sign-in only a test used (connection not saved, or saved with
+        // another account) is forgotten.
+        for config in form.orphaned_tests(&app.config.connections) {
+            entra_interactive::forget(&config);
+        }
     }
     // A dialog may open another one in its place (batch → confirmation).
     if keep && app.dialog.is_none() {

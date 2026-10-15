@@ -14,8 +14,8 @@ use crate::tui::ui::widgets::draw_cursor;
 
 /// Rows per field: the value line and its bottom rule.
 const FIELD_HEIGHT: u16 = 2;
-/// The most fields shown at once (PostgreSQL / MySQL with SSL), so the
-/// dialog never resizes while cycling the type.
+/// The most fields shown at once (PostgreSQL / MySQL with SSL, Azure with
+/// the browser sign-in), so the dialog never resizes while cycling the type.
 const MAX_FIELDS: u16 = 11;
 
 /// Where the connection dialog is drawn: 60 % wide, tall enough for every
@@ -65,9 +65,11 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
 
     let nc = &state.new_connection;
     let is_azure = nc.db_type == DatabaseType::Azure;
-    let show_tenant = is_azure && nc.azure_auth_method == AzureAuthMethod::Interactive;
+    let azure_cli = is_azure && nc.azure_auth_method == AzureAuthMethod::Interactive;
+    let browser = is_azure && nc.azure_auth_method == AzureAuthMethod::InteractiveBrowser;
+    let show_tenant = azure_cli || browser;
     let managed_identity = is_azure && nc.azure_auth_method == AzureAuthMethod::ManagedIdentity;
-    let show_username = !show_tenant;
+    let show_username = !azure_cli;
     let show_password = !is_azure || nc.azure_auth_method == AzureAuthMethod::Credentials;
     let show_ssl = uses_tls(&nc.db_type);
 
@@ -76,6 +78,7 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     let fields = 7
         + u16::from(is_azure)
         + u16::from(show_tenant)
+        + u16::from(browser)
         + u16::from(show_username)
         + u16::from(show_password)
         + 2 * u16::from(show_ssl);
@@ -215,8 +218,9 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
         };
         let auth_label = match nc.azure_auth_method {
             AzureAuthMethod::Credentials => "SQL Credentials",
-            AzureAuthMethod::Interactive => "Azure AD Interactive",
+            AzureAuthMethod::Interactive => "Azure CLI",
             AzureAuthMethod::ManagedIdentity => "Managed Identity",
+            AzureAuthMethod::InteractiveBrowser => "Azure AD (navigateur)",
         };
         let az_content = format!("Auth: {}{}", auth_label, az_hint);
         let az_paragraph = Paragraph::new(az_content).style(az_style).block(
@@ -227,16 +231,37 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
         frame.render_widget(az_paragraph, chunks[idx]);
         idx += 1;
 
-        // Tenant ID (only for Interactive)
+        // Azure CLI's tenant ID; the browser sign-in's tenant and
+        // application.
         if show_tenant {
+            let label = if browser { "Tenant" } else { "Tenant ID" };
             render_field(
                 frame,
                 chunks[idx],
-                "Tenant ID",
+                label,
                 &nc.tenant_id,
                 ConnectionField::TenantId,
                 false,
             );
+            if browser && nc.tenant_id.is_empty() {
+                render_placeholder(frame, chunks[idx], label, "GUID ou domaine");
+            }
+            idx += 1;
+        }
+        if browser {
+            // Short: the GUID fits on 80 columns.
+            const LABEL: &str = "ID app";
+            render_field(
+                frame,
+                chunks[idx],
+                LABEL,
+                &nc.azure_client_id,
+                ConnectionField::ClientId,
+                false,
+            );
+            if nc.azure_client_id.is_empty() {
+                render_placeholder(frame, chunks[idx], LABEL, "GUID de l'application");
+            }
             idx += 1;
         }
     }
@@ -294,6 +319,21 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
         );
         if nc.username.is_empty() {
             render_placeholder(frame, chunks[idx], LABEL, "vide = identité système");
+        }
+        idx += 1;
+    } else if browser {
+        // The Entra ID account (login hint), kept in the username.
+        const LABEL: &str = "Compte";
+        render_field(
+            frame,
+            chunks[idx],
+            LABEL,
+            &nc.username,
+            ConnectionField::Username,
+            false,
+        );
+        if nc.username.is_empty() {
+            render_placeholder(frame, chunks[idx], LABEL, "facultatif");
         }
         idx += 1;
     } else if show_username {
@@ -449,6 +489,51 @@ mod tests {
             "{all}"
         );
         assert!(all.contains(" Azure (cloud public) "), "{all}");
+    }
+
+    #[test]
+    fn interactive_browser_asks_for_the_tenant_the_app_and_the_account() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.open_new_connection_dialog();
+        let nc = &mut state.new_connection;
+        nc.set_db_type(DatabaseType::Azure);
+        nc.azure_auth_method = AzureAuthMethod::InteractiveBrowser;
+        nc.tenant_id.clear();
+        nc.username.clear();
+        let rows = screen(&state);
+        let all = rows.join("\n");
+        for label in [
+            "Auth: Azure AD (navigateur)",
+            "Tenant: GUID ou domaine",
+            "ID app: GUID de l'application",
+            "Compte: facultatif",
+            "Database:",
+        ] {
+            assert!(all.contains(label), "{label} missing:\n{all}");
+        }
+        assert!(
+            !all.contains("Password:") && !all.contains("Username:"),
+            "{all}"
+        );
+        // Every field fits: the bottom border is drawn.
+        assert!(rows[23].contains('└'), "{all}");
+
+        let nc = &mut state.new_connection;
+        nc.tenant_id = "contoso.com".into();
+        nc.azure_client_id = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f".into();
+        nc.username = "jane@contoso.com".into();
+        let all = screen(&state).join("\n");
+        assert!(all.contains("Tenant: contoso.com"), "{all}");
+        assert!(
+            all.contains("ID app: 8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"),
+            "{all}"
+        );
+        assert!(all.contains("Compte: jane@contoso.com"), "{all}");
+
+        state.new_connection.azure_auth_method = AzureAuthMethod::Interactive;
+        let all = screen(&state).join("\n");
+        assert!(all.contains("Auth: Azure CLI"), "{all}");
+        assert!(!all.contains("ID app"), "{all}");
     }
 
     #[test]

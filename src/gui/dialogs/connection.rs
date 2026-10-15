@@ -3,8 +3,10 @@
 use egui::{Sense, Stroke, StrokeKind};
 
 use crate::engine::db::azure::{self, AzureCloud};
+use crate::engine::db::entra_interactive;
 use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType, Flavor, SslMode};
 use crate::engine::presets;
+use crate::gui::sign_in;
 use crate::gui::theme::{self, CONNECTION_COLORS, ERROR, SUCCESS};
 
 const DB_TYPES: [DatabaseType; 5] = [
@@ -15,14 +17,48 @@ const DB_TYPES: [DatabaseType; 5] = [
     DatabaseType::Azure,
 ];
 
-const AZURE_METHODS: [AzureAuthMethod; 3] = [
+const AZURE_METHODS: [AzureAuthMethod; 4] = [
     AzureAuthMethod::Credentials,
     AzureAuthMethod::Interactive,
+    AzureAuthMethod::InteractiveBrowser,
     AzureAuthMethod::ManagedIdentity,
 ];
 
 /// The username field of an Azure managed identity connection.
 const MANAGED_IDENTITY_LABEL: &str = "ID client de l'identité (vide = identité système)";
+
+/// The README section on registering the application of an interactive
+/// browser sign-in.
+const ENTRA_APP_DOC: &str = "https://github.com/Ajustor/storingUnicorns#azure-ad-interactif";
+
+/// A field of the authentication part of the form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthField {
+    /// `tenant_id`.
+    Tenant,
+    /// `azure_client_id`: the organization's Entra ID application.
+    AppClientId,
+    /// `username` as the Entra ID account (login hint), optional.
+    Account,
+    /// `username` as the client ID of a user-assigned managed identity.
+    IdentityClientId,
+    User,
+    Password,
+}
+
+/// The authentication fields of `db_type` (and of Azure `method`), in order.
+fn auth_fields(db_type: &DatabaseType, method: &AzureAuthMethod) -> &'static [AuthField] {
+    use AuthField::*;
+    if *db_type != DatabaseType::Azure {
+        return &[User, Password];
+    }
+    match method {
+        AzureAuthMethod::Credentials => &[User, Password],
+        AzureAuthMethod::Interactive => &[Tenant],
+        AzureAuthMethod::InteractiveBrowser => &[Tenant, AppClientId, Account],
+        AzureAuthMethod::ManagedIdentity => &[IdentityClientId],
+    }
+}
 
 fn default_port(t: &DatabaseType) -> &'static str {
     match t {
@@ -45,6 +81,7 @@ pub fn same_target(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
         && a.database == b.database
         && a.azure_auth_method == b.azure_auth_method
         && a.tenant_id == b.tenant_id
+        && a.azure_client_id == b.azure_client_id
         && a.ssl_mode == b.ssl_mode
         && a.ssl_ca == b.ssl_ca
 }
@@ -61,6 +98,8 @@ pub struct ConnectionForm {
     pub database: String,
     pub azure_auth: AzureAuthMethod,
     pub tenant_id: String,
+    /// Entra ID application (client) ID of an interactive browser sign-in.
+    pub azure_client_id: String,
     pub color: Option<[u8; 3]>,
     /// Compatible product; `None` = the bare engine.
     pub flavor: Option<Flavor>,
@@ -73,12 +112,16 @@ pub struct ConnectionForm {
     pub error: Option<String>,
     pub testing: bool,
     pub test_result: Option<Result<(), String>>,
+    /// The configs tested since the form opened, the running test's last.
+    tested: Vec<ConnectionConfig>,
 }
 
 pub enum FormAction {
     None,
     Save,
     Test,
+    /// Stop the running test (its browser sign-in).
+    CancelTest,
     Cancel,
 }
 
@@ -98,6 +141,7 @@ impl ConnectionForm {
             password: c.password.unwrap_or_default(),
             azure_auth: c.azure_auth_method.unwrap_or_default(),
             tenant_id: c.tenant_id.unwrap_or_default(),
+            azure_client_id: c.azure_client_id.unwrap_or_default(),
             name: c.name,
             db_type: c.db_type,
             database: c.database,
@@ -113,7 +157,36 @@ impl ConnectionForm {
             error: None,
             testing: false,
             test_result: None,
+            tested: Vec::new(),
         }
+    }
+
+    /// `config` (this form's, validated) is being tested.
+    pub fn start_test(&mut self, config: ConnectionConfig) {
+        self.error = None;
+        self.testing = true;
+        self.test_result = None;
+        self.tested.push(config);
+    }
+
+    /// The tested configs whose sign-in none of the `remaining` (saved)
+    /// connections uses, once: a test of a connection then not saved, or
+    /// saved with another tenant / application / account, would otherwise
+    /// leave its refresh token in the keyring, with nothing to forget it.
+    pub fn orphaned_tests(&mut self, remaining: &[ConnectionConfig]) -> Vec<ConnectionConfig> {
+        std::mem::take(&mut self.tested)
+            .into_iter()
+            .filter(|c| entra_interactive::orphaned(c, remaining))
+            .collect()
+    }
+
+    /// Name of the connection the running test opens: its browser sign-in
+    /// is reported under that name, whatever the name field says since.
+    pub fn testing_name(&self) -> Option<&str> {
+        self.tested
+            .last()
+            .filter(|_| self.testing)
+            .map(|c| c.name.as_str())
     }
 
     pub fn set_db_type(&mut self, t: DatabaseType) {
@@ -215,8 +288,12 @@ impl ConnectionForm {
         };
         let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
         let azure = self.db_type == DatabaseType::Azure;
+        let browser = azure && self.azure_auth == AzureAuthMethod::InteractiveBrowser;
         if azure && self.azure_auth == AzureAuthMethod::ManagedIdentity {
             azure::managed_identity_client_id(Some(&self.username)).map_err(|e| e.to_string())?;
+        }
+        if browser {
+            entra_interactive::validate_interactive(&self.tenant_id, &self.azure_client_id)?;
         }
         Ok(ConnectionConfig {
             name: name.to_string(),
@@ -232,6 +309,12 @@ impl ConnectionForm {
             database: self.database.trim().to_string(),
             azure_auth_method: azure.then(|| self.azure_auth.clone()),
             tenant_id: if azure { opt(&self.tenant_id) } else { None },
+            // Only that method uses an application of its own.
+            azure_client_id: if browser {
+                opt(&self.azure_client_id)
+            } else {
+                None
+            },
             color: self.color,
             ssl_mode: self.uses_tls().then_some(self.ssl_mode),
             ssl_ca: if self.uses_tls() {
@@ -243,8 +326,10 @@ impl ConnectionForm {
         })
     }
 
-    /// Draw the form. Returns the action the user took.
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> FormAction {
+    /// Draw the form; `sign_in` is the URL of the browser sign-in the test
+    /// waits for (`testing_name`'s; the modal hides the banner). Returns the
+    /// action the user took.
+    pub fn ui(&mut self, ui: &mut egui::Ui, sign_in: Option<&str>) -> FormAction {
         let mut action = FormAction::None;
         ui.heading(if self.original_name.is_some() {
             "Modifier la connexion"
@@ -361,7 +446,19 @@ impl ConnectionForm {
                 action = FormAction::Cancel;
             }
         });
+        if let (Some(name), Some(url)) = (self.testing_name(), sign_in) {
+            ui.add_space(6.0);
+            if sign_in::waiting_row(ui, name, url, true) {
+                action = FormAction::CancelTest;
+            }
+        }
         action
+    }
+
+    /// The running test was cancelled.
+    pub fn test_cancelled(&mut self) {
+        self.testing = false;
+        self.test_result = Some(Err(sign_in::CANCELLED.into()));
     }
 
     fn server_fields(&mut self, ui: &mut egui::Ui) {
@@ -391,30 +488,62 @@ impl ConnectionForm {
                     }
                 });
             ui.end_row();
-            match self.azure_auth {
-                AzureAuthMethod::Interactive => {
+        }
+        const GUID_HINT: &str = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
+        let browser = self.azure_auth == AzureAuthMethod::InteractiveBrowser;
+        for field in auth_fields(&self.db_type, &self.azure_auth) {
+            match field {
+                AuthField::Tenant if browser => {
+                    ui.label("Tenant (ID ou domaine)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.tenant_id).hint_text("contoso.com"),
+                    );
+                }
+                AuthField::Tenant => {
                     ui.label("Tenant ID");
                     ui.text_edit_singleline(&mut self.tenant_id);
-                    ui.end_row();
                 }
-                AzureAuthMethod::ManagedIdentity => {
-                    ui.label(MANAGED_IDENTITY_LABEL);
+                AuthField::AppClientId => {
+                    ui.label("ID client de l'application");
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.azure_client_id)
+                                .hint_text(GUID_HINT),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.label(
+                                egui::RichText::new("Application à enregistrer dans Entra ID : ")
+                                    .weak()
+                                    .small(),
+                            );
+                            ui.hyperlink_to(
+                                egui::RichText::new("voir le README").small(),
+                                ENTRA_APP_DOC,
+                            );
+                        });
+                    });
+                }
+                AuthField::Account => {
+                    ui.label("Compte (facultatif)");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.username)
-                            .hint_text("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"),
+                            .hint_text("prenom.nom@contoso.com"),
                     );
-                    ui.end_row();
                 }
-                AzureAuthMethod::Credentials => {}
+                AuthField::IdentityClientId => {
+                    ui.label(MANAGED_IDENTITY_LABEL);
+                    ui.add(egui::TextEdit::singleline(&mut self.username).hint_text(GUID_HINT));
+                }
+                AuthField::User => {
+                    ui.label("Utilisateur");
+                    ui.text_edit_singleline(&mut self.username);
+                }
+                AuthField::Password => {
+                    ui.label("Mot de passe");
+                    ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                }
             }
-        }
-        let needs_credentials = !azure || self.azure_auth == AzureAuthMethod::Credentials;
-        if needs_credentials {
-            ui.label("Utilisateur");
-            ui.text_edit_singleline(&mut self.username);
-            ui.end_row();
-            ui.label("Mot de passe");
-            ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
             ui.end_row();
         }
         ui.label("Base");
@@ -584,6 +713,155 @@ mod tests {
             .contains("n'est pas un ID client"));
         f.username.clear(); // system-assigned identity
         assert_eq!(f.validate(&[]).unwrap().username, None);
+    }
+
+    #[test]
+    fn editing_keeps_the_app_client_id() {
+        let saved = ConnectionConfig {
+            name: "Az".into(),
+            db_type: DatabaseType::Azure,
+            azure_auth_method: Some(AzureAuthMethod::InteractiveBrowser),
+            tenant_id: Some("contoso.com".into()),
+            azure_client_id: Some("8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f".into()),
+            database: "app".into(),
+            ..Default::default()
+        };
+        let mut f = ConnectionForm::new(Some(saved.clone()));
+        let c = f.validate(std::slice::from_ref(&saved)).unwrap();
+        assert_eq!(c.azure_client_id, saved.azure_client_id);
+        assert_eq!(c.tenant_id, saved.tenant_id);
+        f.set_db_type(DatabaseType::SQLServer);
+        assert_eq!(f.validate(&[saved]).unwrap().azure_client_id, None);
+    }
+
+    #[test]
+    fn each_method_shows_its_own_fields() {
+        use AuthField::*;
+        assert!(AZURE_METHODS.contains(&AzureAuthMethod::InteractiveBrowser));
+        let azure = DatabaseType::Azure;
+        assert_eq!(
+            auth_fields(&azure, &AzureAuthMethod::InteractiveBrowser),
+            [Tenant, AppClientId, Account]
+        );
+        assert_eq!(auth_fields(&azure, &AzureAuthMethod::Interactive), [Tenant]);
+        assert_eq!(
+            auth_fields(&azure, &AzureAuthMethod::ManagedIdentity),
+            [IdentityClientId]
+        );
+        assert_eq!(
+            auth_fields(&azure, &AzureAuthMethod::Credentials),
+            [User, Password]
+        );
+        // Other engines ignore the (default) Azure method.
+        assert_eq!(
+            auth_fields(
+                &DatabaseType::Postgres,
+                &AzureAuthMethod::InteractiveBrowser
+            ),
+            [User, Password]
+        );
+    }
+
+    #[test]
+    fn interactive_browser_needs_a_tenant_and_an_app_client_id() {
+        let mut f = ConnectionForm::new(None);
+        f.name = "Az".into();
+        f.database = "app".into();
+        f.set_db_type(DatabaseType::Azure);
+        f.azure_auth = AzureAuthMethod::InteractiveBrowser;
+        assert_eq!(f.validate(&[]).unwrap_err(), "Le tenant est obligatoire");
+        f.tenant_id = "Common".into();
+        assert!(f.validate(&[]).unwrap_err().contains("pas « common »"));
+        f.tenant_id = "contoso.com".into();
+        f.azure_client_id = "my-app".into();
+        assert_eq!(
+            f.validate(&[]).unwrap_err(),
+            "L'ID client de l'application doit être un GUID"
+        );
+        f.azure_client_id = " 8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f ".into();
+        f.username = "jane@contoso.com".into();
+        let c = f.validate(&[]).unwrap();
+        assert_eq!(
+            c.azure_auth_method,
+            Some(AzureAuthMethod::InteractiveBrowser)
+        );
+        assert_eq!(c.tenant_id.as_deref(), Some("contoso.com"));
+        assert_eq!(
+            c.azure_client_id.as_deref(),
+            Some("8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f")
+        );
+        assert_eq!(c.username.as_deref(), Some("jane@contoso.com"));
+
+        // The account is optional.
+        f.username.clear();
+        assert_eq!(f.validate(&[]).unwrap().username, None);
+        // Other methods neither check nor keep the application.
+        f.azure_auth = AzureAuthMethod::Interactive;
+        f.tenant_id.clear();
+        let c = f.validate(&[]).unwrap();
+        assert_eq!(c.azure_client_id, None);
+    }
+
+    #[test]
+    fn the_app_client_id_is_part_of_the_target() {
+        let a = ConnectionConfig {
+            azure_client_id: Some("8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f".into()),
+            ..existing()[0].clone()
+        };
+        let b = ConnectionConfig {
+            azure_client_id: Some("00000000-4a5b-6c7d-8e9f-0a1b2c3d4e5f".into()),
+            ..a.clone()
+        };
+        assert!(!same_target(&a, &b));
+    }
+
+    #[test]
+    fn the_wait_shown_is_the_tested_connection_s() {
+        let mut f = ConnectionForm::new(None);
+        f.name = "Az".into();
+        assert_eq!(f.testing_name(), None);
+        f.start_test(ConnectionConfig {
+            name: "Az".into(),
+            ..Default::default()
+        });
+        assert!(f.testing && f.test_result.is_none());
+        // Typed while the test runs: the wait is still the tested name's.
+        f.name = "Azure prod".into();
+        assert_eq!(f.testing_name(), Some("Az"));
+        f.test_cancelled();
+        assert_eq!(f.testing_name(), None);
+    }
+
+    #[test]
+    fn a_test_no_saved_connection_uses_leaves_no_sign_in() {
+        let browser = |tenant: &str| ConnectionConfig {
+            name: "Az".into(),
+            db_type: DatabaseType::Azure,
+            azure_auth_method: Some(AzureAuthMethod::InteractiveBrowser),
+            tenant_id: Some(tenant.into()),
+            azure_client_id: Some("8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f".into()),
+            database: "app".into(),
+            ..Default::default()
+        };
+        // A new connection tested, then not saved.
+        let mut f = ConnectionForm::new(None);
+        f.start_test(browser("contoso.com"));
+        assert_eq!(f.orphaned_tests(&[]).len(), 1);
+        assert!(f.orphaned_tests(&[]).is_empty(), "given once");
+
+        // An edit tested with its own sign-in: still used.
+        let saved = browser("contoso.com");
+        let mut f = ConnectionForm::new(Some(saved.clone()));
+        f.start_test(saved.clone());
+        assert!(f.orphaned_tests(std::slice::from_ref(&saved)).is_empty());
+        // Tested on another tenant, then cancelled: that sign-in goes.
+        f.start_test(browser("fabrikam.com"));
+        let orphans = f.orphaned_tests(std::slice::from_ref(&saved));
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].tenant_id.as_deref(), Some("fabrikam.com"));
+        // Other methods keep nothing.
+        f.start_test(ConnectionConfig::default());
+        assert!(f.orphaned_tests(&[]).is_empty());
     }
 
     #[test]

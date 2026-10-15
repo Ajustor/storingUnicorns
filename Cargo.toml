@@ -1,6 +1,6 @@
 [package]
 name = "storingUnicorns"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 description = "A terminal-based database client inspired by DataGrip"
 license = "MIT"
@@ -93,6 +93,16 @@ semver = "1"
 sha2 = "0.10"
 self-replace = "1"
 tempfile = "3"
+
+# Entra ID interactive sign-in: PKCE (sha2 above), random state, and the
+# default browser (already in the tree through eframe).
+base64 = "0.22"
+getrandom = "0.3"
+webbrowser = "1.2"
+
+# OS credential store for Entra ID refresh tokens. Linux: Secret Service in
+# pure Rust with a vendored libdbus (no OpenSSL, no system library needed).
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 
 # Azure AD goes through reqwest + native-tls, which links OpenSSL on Linux;
 # its soname differs between distributions, so build it into the binary.

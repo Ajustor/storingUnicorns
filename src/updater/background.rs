@@ -140,6 +140,31 @@ impl Updater {
         }
     }
 
+    /// "Later" on a ready update: hide its banner; it applies on quit.
+    pub fn later(&mut self) {
+        if matches!(self.state, UpdateState::Ready(_)) {
+            self.dismissed = true;
+            self.schedule_on_quit();
+        }
+    }
+
+    /// Show the banner of a ready update again (after `later`).
+    pub fn show_ready(&mut self) {
+        if matches!(self.state, UpdateState::Ready(_)) {
+            self.dismissed = false;
+        }
+    }
+
+    /// The close that `schedule_restart` was for got cancelled: keep
+    /// installing on exit, but don't relaunch.
+    pub fn cancel_restart(&mut self) {
+        self.exit_action = match self.exit_action.take() {
+            Some(ExitAction::Relaunch) => None,
+            Some(ExitAction::RunMsiThenRelaunch(msi)) => Some(ExitAction::RunMsi(msi)),
+            other => other,
+        };
+    }
+
     pub fn poll(&mut self) -> Option<UpdateEvent> {
         match self.rx.try_recv().ok()? {
             Msg::Checked(Ok(Some(info))) => {
@@ -255,6 +280,81 @@ mod tests {
         u.tx.send(Msg::Installed(Ok(None))).unwrap();
         assert!(u.poll().is_none());
         assert!(matches!(u.state, UpdateState::Available(_)));
+    }
+
+    /// An updater whose update is ready, staged as `msi` when given.
+    fn ready(msi: Option<&str>) -> Updater {
+        let mut u = Updater::new(|| {});
+        u.state = UpdateState::Ready(info("99.0.0"));
+        u.staged_msi = msi.map(PathBuf::from);
+        u
+    }
+
+    #[test]
+    fn later_hides_the_ready_banner_and_installs_on_quit() {
+        let mut u = ready(Some("x.msi"));
+        u.later();
+        assert!(u.dismissed);
+        assert!(
+            matches!(&u.exit_action, Some(ExitAction::RunMsi(m)) if m == &PathBuf::from("x.msi"))
+        );
+
+        // A replaced binary needs nothing at exit.
+        let mut u = ready(None);
+        u.later();
+        assert!(u.dismissed);
+        assert!(u.exit_action.is_none());
+
+        // Only a ready update can be put off.
+        let mut u = Updater::new(|| {});
+        u.state = UpdateState::Available(info("99.0.0"));
+        u.later();
+        assert!(!u.dismissed);
+    }
+
+    #[test]
+    fn show_ready_shows_the_banner_again() {
+        let mut u = ready(Some("x.msi"));
+        u.later();
+        u.show_ready();
+        assert!(!u.dismissed);
+
+        let mut u = Updater::new(|| {});
+        u.state = UpdateState::Available(info("99.0.0"));
+        u.dismissed = true;
+        u.show_ready();
+        assert!(u.dismissed, "only a ready update is shown again");
+    }
+
+    #[test]
+    fn cancel_restart_drops_the_relaunch_only() {
+        let mut u = ready(None);
+        u.schedule_restart();
+        assert!(matches!(u.exit_action, Some(ExitAction::Relaunch)));
+        u.cancel_restart();
+        assert!(u.exit_action.is_none());
+
+        let mut u = ready(Some("x.msi"));
+        u.schedule_restart();
+        u.cancel_restart();
+        assert!(
+            matches!(&u.exit_action, Some(ExitAction::RunMsi(m)) if m == &PathBuf::from("x.msi"))
+        );
+        // A later plain quit still installs, without relaunching.
+        u.schedule_on_quit();
+        assert!(matches!(u.exit_action, Some(ExitAction::RunMsi(_))));
+
+        let mut u = ready(Some("x.msi"));
+        u.later();
+        u.cancel_restart();
+        assert!(
+            matches!(u.exit_action, Some(ExitAction::RunMsi(_))),
+            "unchanged"
+        );
+
+        let mut u = ready(None);
+        u.cancel_restart();
+        assert!(u.exit_action.is_none(), "unchanged");
     }
 
     #[test]

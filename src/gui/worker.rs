@@ -191,6 +191,11 @@ pub struct Worker {
     repaint: Arc<dyn Fn() + Send + Sync>,
     /// Cancellable work per tab (console executions, data pages).
     running: HashMap<TabId, JoinHandle<()>>,
+    /// Connections being opened, by name: cancellable while they wait (for
+    /// a browser sign-in, a slow server…).
+    connecting: HashMap<String, JoinHandle<()>>,
+    /// The connection test of the connection form.
+    test: Option<JoinHandle<()>>,
     /// Column metadata cache per connection name.
     caches: HashMap<String, Arc<TableCache>>,
     /// Last run id handed out (monotonic).
@@ -222,6 +227,8 @@ impl Worker {
             rx,
             repaint: Arc::new(repaint),
             running: HashMap::new(),
+            connecting: HashMap::new(),
+            test: None,
             caches: HashMap::new(),
             last_run: 0,
         }
@@ -230,6 +237,7 @@ impl Worker {
     /// Events ready since the last call.
     pub fn poll(&mut self) -> Vec<Event> {
         self.running.retain(|_, h| !h.is_finished());
+        self.connecting.retain(|_, h| !h.is_finished());
         self.rx.try_iter().collect()
     }
 
@@ -253,6 +261,42 @@ impl Worker {
     /// dirty and reconnected before its next use.
     pub fn cancel(&mut self, tab: TabId) -> bool {
         match self.running.remove(&tab) {
+            Some(h) if !h.is_finished() => {
+                h.abort();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether connection `name` is being opened.
+    #[cfg(test)]
+    pub fn is_connecting(&self, name: &str) -> bool {
+        self.connecting.get(name).is_some_and(|h| !h.is_finished())
+    }
+
+    /// Stop opening connection `name`: no event will come for it. Returns
+    /// whether an attempt was cancelled. Dropping the attempt also ends a
+    /// browser sign-in it waits for (its listener closes).
+    pub fn cancel_connect(&mut self, name: &str) -> bool {
+        match self.connecting.remove(name) {
+            Some(h) if !h.is_finished() => {
+                h.abort();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the connection test is running.
+    pub fn testing(&self) -> bool {
+        self.test.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// Stop the connection test: no `TestFinished` will come. Returns
+    /// whether a test was cancelled.
+    pub fn cancel_test(&mut self) -> bool {
+        match self.test.take() {
             Some(h) if !h.is_finished() => {
                 h.abort();
                 true
@@ -322,8 +366,10 @@ impl Worker {
 
     pub fn connect(&mut self, config: ConnectionConfig) {
         self.forget(&config.name);
+        self.cancel_connect(&config.name);
+        let name = config.name.clone();
         let tx = self.tx.clone();
-        self.spawn(async move {
+        let handle = self.spawn(async move {
             let name = config.name.clone();
             match DatabaseConnection::connect(&config).await {
                 Ok(conn) => {
@@ -350,10 +396,13 @@ impl Worker {
                 },
             }
         });
+        self.connecting.insert(name, handle);
     }
 
-    pub fn test_connection(&self, config: ConnectionConfig) {
-        self.spawn(async move {
+    /// Test `config` (connect, check, close), replacing a running test.
+    pub fn test_connection(&mut self, config: ConnectionConfig) {
+        self.cancel_test();
+        let handle = self.spawn(async move {
             let outcome = match DatabaseConnection::connect(&config).await {
                 Ok(conn) => {
                     let r = conn.test().await.map_err(err);
@@ -364,6 +413,7 @@ impl Worker {
             };
             Event::TestFinished(outcome)
         });
+        self.test = Some(handle);
     }
 
     pub fn refresh_schemas(&self, name: String, conn: Conn) {
@@ -810,6 +860,49 @@ mod tests {
         };
         assert_eq!(name, "bad");
         assert!(!error.is_empty());
+    }
+
+    /// A PostgreSQL connection to a server that never answers: it hangs
+    /// (like one waiting for a browser sign-in) while `_server` lives.
+    fn hanging_config(name: &str) -> (ConnectionConfig, std::net::TcpListener) {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = ConnectionConfig {
+            name: name.into(),
+            db_type: DatabaseType::Postgres,
+            host: Some("127.0.0.1".into()),
+            port: Some(server.local_addr().unwrap().port()),
+            username: Some("u".into()),
+            database: "d".into(),
+            ..Default::default()
+        };
+        (config, server)
+    }
+
+    #[test]
+    fn cancel_connect_aborts_the_attempt() {
+        let (config, _server) = hanging_config("slow");
+        let mut w = Worker::new(|| {});
+        w.connect(config);
+        assert!(w.is_connecting("slow"));
+        assert!(!w.cancel_connect("other"), "nothing opens it");
+        assert!(w.cancel_connect("slow"));
+        assert!(!w.is_connecting("slow"));
+        assert!(!w.cancel_connect("slow"), "already cancelled");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(w.poll().is_empty(), "an aborted attempt reports nothing");
+    }
+
+    #[test]
+    fn cancel_test_aborts_the_connection_test() {
+        let (config, _server) = hanging_config("slow");
+        let mut w = Worker::new(|| {});
+        assert!(!w.cancel_test(), "no test running");
+        w.test_connection(config);
+        assert!(w.testing());
+        assert!(w.cancel_test());
+        assert!(!w.testing());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(w.poll().is_empty(), "an aborted test reports nothing");
     }
 
     #[test]

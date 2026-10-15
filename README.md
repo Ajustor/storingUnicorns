@@ -13,6 +13,9 @@ desktop GUI (egui) and a terminal UI (ratatui) sharing the same engine.
     system's certificates are trusted
   - paste a connection URL (`postgresql://user:pass@host/db?sslmode=require`)
     to fill in the connection form
+  - Azure SQL: SQL login, Azure CLI token, managed identity, or your own Entra
+    ID account through the browser (MFA included, see
+    [Azure AD interactif](#azure-ad-interactif))
 - **GUI** (default) with DataGrip ergonomics:
   - several connections open at once, each with its own colour (dot on its tabs)
   - database explorer: connection → schemas → tables → columns / keys / indexes,
@@ -107,6 +110,7 @@ From the sources: `cargo run` (GUI) or `cargo run -- tui`.
 | `↑/k`       | Lists          | Select previous item           |
 | `↓/j`       | Lists          | Select next item               |
 | `Enter`     | Connections    | Connect to database            |
+| `Esc`       | Connecting     | Cancel the connection          |
 | `Enter`     | Tables         | Generate SELECT query          |
 | `n`         | Connections    | New connection dialog          |
 | `d`         | Connections    | Delete selected connection     |
@@ -122,7 +126,7 @@ From the sources: `cargo run` (GUI) or `cargo run -- tui`.
 |-------------|-------------------------------------|
 | `Tab/↓`     | Next field                          |
 | `Shift+Tab/↑` | Previous field                    |
-| `←/→`       | Cycle database type (on Type field) |
+| `←/→`       | Cycle the value (type, model, Azure auth, SSL) |
 | `Enter`     | Save connection                     |
 | `Esc`       | Cancel                              |
 
@@ -187,7 +191,106 @@ ssl_ca = "C:/certs/ca.pem"  # optional extra trusted CA (PEM)
 name = "SQLite DB"
 db_type = "SQLite"
 database = "./data.db"
+
+[[connections]]
+name = "Azure SQL"
+db_type = "Azure"
+host = "myserver.database.windows.net"
+port = 1433
+database = "app"
+azure_auth_method = "InteractiveBrowser" # Credentials, Interactive (Azure CLI), InteractiveBrowser, ManagedIdentity
+tenant_id = "contoso.com"               # GUID or domain
+azure_client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # InteractiveBrowser: the organization's app
+username = "jane.doe@contoso.com"       # optional: the account to sign in with
 ```
+
+## Azure AD interactif
+
+Connexion à Azure SQL avec **votre propre compte Entra ID** (MFA comprise), par
+le navigateur, comme le mode *Active Directory Interactive* de SSMS, sans
+installer Azure CLI. Chaque organisation enregistre une fois sa propre
+application dans Entra ID.
+
+### Enregistrer l'application (une fois, administrateur Entra ID)
+
+1. Portail Azure → **Microsoft Entra ID** → **Inscriptions d'applications** →
+   **Nouvelle inscription** : un nom (par exemple `storingUnicorns`), comptes de
+   **cet annuaire organisationnel uniquement**, sans URI de redirection pour
+   l'instant.
+2. **Authentification** → **Ajouter une plateforme** → **Applications mobiles et
+   de bureau** → URI de redirection personnalisée `http://localhost` (sans port :
+   l'app écoute sur un port libre de `127.0.0.1`).
+3. Toujours dans **Authentification**, **Autoriser les flux clients publics** :
+   **Oui** (application publique, sans secret).
+4. **Autorisations d'API** → **Ajouter une autorisation** → **API utilisées par
+   mon organisation** → **Azure SQL Database** → **Autorisations déléguées** →
+   `user_impersonation`, puis **Accorder un consentement d'administrateur**.
+5. Notez l'**ID d'application (client)** et l'**ID de l'annuaire (locataire)**
+   de la page **Vue d'ensemble**.
+
+### Dans storingUnicorns
+
+Type **Azure SQL**, authentification **Azure AD interactif (navigateur)**
+(interface terminal : `←/→` sur `Auth` jusqu'à `Azure AD (navigateur)`) :
+
+| Champ | Valeur |
+|---|---|
+| Tenant | ID de l'annuaire ou domaine (`contoso.com`) ; pas `common` ni `organizations` |
+| ID client de l'application | l'ID d'application noté plus haut |
+| Compte (facultatif) | `prenom.nom@contoso.com`, pré-rempli sur la page de connexion |
+
+À la première connexion, la page de connexion Microsoft s'ouvre dans le
+navigateur par défaut ; terminez-la (5 minutes au plus) puis revenez à l'app.
+Pendant l'attente, l'interface graphique affiche un bandeau avec **Copier le
+lien** (si le navigateur ne s'est pas ouvert) et **Annuler** ; l'interface
+terminal affiche le lien complet dans la barre d'état et `Échap` annule. Pour
+copier le lien, sélectionnez-le avec **Maj+glisser** (**Option+glisser** dans
+iTerm2) : l'interface capture la souris, un simple glisser ne sélectionne rien.
+Avec certaines erreurs de configuration (URI de redirection absente,
+application ou tenant introuvable), Microsoft affiche l'erreur dans le
+navigateur sans revenir à l'app : annulez la connexion.
+
+Interface terminal : le navigateur est ouvert comme le fait le système (sous
+Linux, `$BROWSER` d'abord). Un navigateur en mode texte (`lynx`, `w3m`…)
+prendrait la place de l'interface dans le terminal : faites pointer `$BROWSER`
+vers un navigateur graphique, ou ouvrez vous-même le lien de la barre d'état
+dans un navigateur de la même machine (la page de connexion revient sur
+`http://localhost`).
+
+### Créer l'utilisateur dans la base
+
+Le compte doit exister dans la base. Un administrateur Entra ID du serveur
+lance, connecté à **cette base** :
+
+```sql
+CREATE USER [prenom.nom@contoso.com] FROM EXTERNAL PROVIDER;
+ALTER ROLE db_datareader ADD MEMBER [prenom.nom@contoso.com];
+ALTER ROLE db_datawriter ADD MEMBER [prenom.nom@contoso.com];
+```
+
+Sans cela, la connexion échoue (erreur 18456) bien que le compte soit
+authentifié ; le message de l'app le rappelle.
+
+### Jetons
+
+Le jeton d'accès reste en mémoire. Le jeton de renouvellement est gardé dans le
+trousseau du système (Gestionnaire d'identification Windows, Trousseau macOS,
+Secret Service sous Linux), sous le service `storingUnicorns` : les connexions
+suivantes, même après un redémarrage, se font sans navigateur tant qu'il est
+valable. Si le trousseau n'est pas disponible, il ne dure que la session (un
+avertissement le signale). Les reconnexions automatiques (après une requête
+interrompue, ou pour la session d'une transaction manuelle) n'ouvrent jamais le
+navigateur : si le jeton de renouvellement ne suffit plus, l'opération échoue
+avec « Session Azure AD expirée » ; déconnectez puis reconnectez la connexion.
+Aucun jeton n'est écrit dans `config.toml` ni dans les journaux.
+
+Pour l'oublier : **Oublier la connexion Azure AD** dans le menu de la connexion
+(interface graphique). Supprimer la connexion, ou changer son tenant, son
+application ou son compte, l'oublie aussi, sauf si une autre connexion utilise
+le même compte (une autre base du même serveur, par exemple). Le trousseau est
+celui du compte du système : tous les profils de storingUnicorns
+(`STORINGUNICORNS_CONFIG_DIR`) partagent ces jetons, et oublier une connexion
+dans un profil l'oublie aussi pour les autres.
 
 ## Building
 

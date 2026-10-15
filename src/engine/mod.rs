@@ -5,5 +5,6 @@ pub mod db;
 pub mod models;
 pub mod ops;
 pub mod presets;
+pub mod secrets;
 pub mod services;
 pub mod sql;

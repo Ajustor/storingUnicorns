@@ -91,10 +91,13 @@ impl SqlServerClient {
     }
 }
 
-/// A new client for `config`, with the authentication of its database type.
+/// A new client for `config`, with the authentication of its database type,
+/// for a reconnection or a dedicated session: never a browser sign-in (it
+/// would block the operations waiting for the client, with no way to
+/// cancel it).
 pub async fn reopen(config: &ConnectionConfig) -> Result<TdsClient> {
     match config.db_type {
-        DatabaseType::Azure => super::azure::open(config).await,
+        DatabaseType::Azure => super::azure::open(config, false).await,
         _ => open(config).await,
     }
 }

@@ -14,7 +14,7 @@ use super::modals::{
 };
 use super::widgets::{
     render_connections_panel, render_query_editor, render_results_panel, render_status_bar,
-    render_tables_panel,
+    render_tables_panel, status_bar_height,
 };
 
 /// Panel types for click detection
@@ -50,9 +50,9 @@ pub fn render_ui(frame: &mut Frame, state: &AppState, clickable_registry: &Click
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(10),   // Content
-            Constraint::Length(1), // Status bar
-            Constraint::Length(1), // Help bar
+            Constraint::Min(10),                                      // Content
+            Constraint::Length(status_bar_height(state, size.width)), // Status bar
+            Constraint::Length(1),                                    // Help bar
         ])
         .split(size);
 

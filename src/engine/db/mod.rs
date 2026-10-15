@@ -1,4 +1,5 @@
 pub mod azure;
+pub mod entra_interactive;
 mod mysql;
 mod postgres;
 mod sqlite;

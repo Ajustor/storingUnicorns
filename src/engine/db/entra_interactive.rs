@@ -222,7 +222,9 @@ pub fn explain(err: &AuthError) -> String {
         }
         AuthError::Timeout => "Connexion non terminée dans le navigateur après 5 minutes.".into(),
         AuthError::StateMismatch => {
-            "Réponse de connexion inattendue (state différent) : relance la connexion.".into()
+            "Réponse de connexion inattendue (state différent), ignorée : termine la connexion \
+             dans l'onglet ouvert par storingUnicorns."
+                .into()
         }
         AuthError::NotACallback => "Réponse de connexion inattendue.".into(),
         AuthError::Network(e) => format!("Impossible de joindre Entra ID ({e})"),
@@ -425,6 +427,8 @@ impl Drop for DoneOnDrop<'_> {
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Reading one request on the redirect listener.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause after the redirect listener failed to accept a connection.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 /// Largest request accepted on the redirect listener.
 const MAX_REQUEST: usize = 32 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -711,7 +715,8 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
             connection,
         };
         (deps.open_browser)(&url);
-        tokio::time::timeout(deps.timeout, wait_for_code(&v4, v6.as_ref(), &state))
+        let (v4, v6) = (&v4, v6.as_ref());
+        tokio::time::timeout(deps.timeout, wait_for_code(move || accept(v4, v6), &state))
             .await
             .map_err(|_| AuthError::Timeout)??
     };
@@ -756,30 +761,45 @@ async fn accept(v4: &TcpListener, v6: Option<&TcpListener>) -> std::io::Result<T
     }
 }
 
-/// Serve the redirect listener until the sign-in comes back: the code, or
-/// why it failed. Other requests (`/favicon.ico`…) get a 404.
-async fn wait_for_code(
-    v4: &TcpListener,
-    v6: Option<&TcpListener>,
-    state: &str,
-) -> Result<String, AuthError> {
+/// Serve the connections `accept` gives (the redirect listener) until the
+/// sign-in comes back: the code, or why it failed. Other requests
+/// (`/favicon.ico`…) get a 404, redirects with another `state` (another
+/// tab, a forged request) a 400 while the wait goes on.
+async fn wait_for_code<A, F>(mut accept: A, state: &str) -> Result<String, AuthError>
+where
+    A: FnMut() -> F,
+    F: std::future::Future<Output = std::io::Result<TcpStream>>,
+{
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, TcpStream)>(4);
     loop {
         tokio::select! {
-            accepted = accept(v4, v6) => {
-                let mut stream = accepted.map_err(|e| AuthError::Network(e.to_string()))?;
-                let tx = tx.clone();
-                // Each request on its own: a browser's speculative connection
-                // that sends nothing mustn't hold up the redirect.
-                tokio::spawn(async move {
-                    let read = tokio::time::timeout(REQUEST_TIMEOUT, read_request_target(&mut stream));
-                    if let Ok(Ok(Some(target))) = read.await {
-                        let _ = tx.send((target, stream)).await;
-                    }
-                });
-            }
+            accepted = accept() => match accepted {
+                Ok(mut stream) => {
+                    let tx = tx.clone();
+                    // Each request on its own: a browser's speculative
+                    // connection that sends nothing mustn't hold up the
+                    // redirect.
+                    tokio::spawn(async move {
+                        let read =
+                            tokio::time::timeout(REQUEST_TIMEOUT, read_request_target(&mut stream));
+                        if let Ok(Ok(Some(target))) = read.await {
+                            let _ = tx.send((target, stream)).await;
+                        }
+                    });
+                }
+                // E.g. out of file descriptors for a moment: the redirect
+                // may still come.
+                Err(e) => {
+                    tracing::warn!("Sign-in redirect listener could not accept a connection: {e}");
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                }
+            },
             Some((target, mut stream)) = rx.recv() => match parse_callback(&target, state) {
                 Err(AuthError::NotACallback) => respond(&mut stream, "404 Not Found", "").await,
+                Err(AuthError::StateMismatch) => {
+                    let message = explain(&AuthError::StateMismatch);
+                    respond(&mut stream, "400 Bad Request", &page(&message)).await;
+                }
                 Ok(code) => {
                     respond(&mut stream, "200 OK", &page(SIGNED_IN)).await;
                     return Ok(code);
@@ -1672,8 +1692,9 @@ mod flow_tests {
     enum Behaviour {
         /// Signs in: favicon, then the redirect with the code and the state.
         SignIn,
-        /// Calls the redirect URI with this query (`{state}` = the real one).
-        Redirect(&'static str),
+        /// Calls the redirect URI with these queries in turn (`{state}` =
+        /// the real one).
+        Redirects(&'static [&'static str]),
         /// Never comes back.
         Idle,
     }
@@ -1685,8 +1706,8 @@ mod flow_tests {
         challenge: Mutex<Option<String>>,
         redirect_uri: Mutex<Option<String>>,
         favicon: Mutex<Option<u16>>,
-        /// Status and HTML of the page shown after the redirect.
-        page: Mutex<Option<(u16, String)>>,
+        /// Status and HTML of the pages shown after each redirect.
+        pages: Mutex<Vec<(u16, String)>>,
         /// Run in the browser just before it follows the redirect.
         before_redirect: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -1700,7 +1721,7 @@ mod flow_tests {
                 challenge: Mutex::new(None),
                 redirect_uri: Mutex::new(None),
                 favicon: Mutex::new(None),
-                page: Mutex::new(None),
+                pages: Mutex::new(Vec::new()),
                 before_redirect: Mutex::new(None),
                 thread: Mutex::new(None),
             })
@@ -1715,12 +1736,12 @@ mod flow_tests {
                 .collect();
             *self.challenge.lock().unwrap() = Some(q["code_challenge"].clone());
             *self.redirect_uri.lock().unwrap() = Some(q["redirect_uri"].clone());
-            let query = match self.behaviour {
-                Behaviour::SignIn => "code=the-code&state={state}",
-                Behaviour::Redirect(query) => query,
+            let queries: Vec<String> = match self.behaviour {
+                Behaviour::SignIn => vec!["code=the-code&state={state}".into()],
+                Behaviour::Redirects(queries) => queries.iter().map(|q| q.to_string()).collect(),
                 Behaviour::Idle => return,
             };
-            let query = query.replace("{state}", &q["state"]);
+            let state = q["state"].clone();
             let redirect_uri = q["redirect_uri"].clone();
             let signs_in = matches!(self.behaviour, Behaviour::SignIn);
             let me = self.clone();
@@ -1741,12 +1762,21 @@ mod flow_tests {
                     *me.favicon.lock().unwrap() =
                         Some(get(format!("{redirect_uri}/favicon.ico")).0);
                 }
-                *me.page.lock().unwrap() = Some(get(format!("{redirect_uri}/?{query}")));
+                for query in queries {
+                    let query = query.replace("{state}", &state);
+                    let page = get(format!("{redirect_uri}/?{query}"));
+                    me.pages.lock().unwrap().push(page);
+                }
             });
             *self.thread.lock().unwrap() = Some(thread);
         }
 
-        /// Wait for the simulated browser to have read its page.
+        /// The last page shown.
+        fn last_page(&self) -> (u16, String) {
+            self.pages.lock().unwrap().last().cloned().unwrap()
+        }
+
+        /// Wait for the simulated browser to have read its pages.
         fn finish(&self) {
             if let Some(t) = self.thread.lock().unwrap().take() {
                 t.join().unwrap();
@@ -1854,7 +1884,7 @@ mod flow_tests {
         // The refresh token is kept; the browser got its pages.
         assert_eq!(h.stored().as_deref(), Some("RT-1"));
         assert_eq!(*h.browser.favicon.lock().unwrap(), Some(404));
-        let (status, html) = h.browser.page.lock().unwrap().clone().unwrap();
+        let (status, html) = h.browser.last_page();
         assert_eq!(status, 200);
         assert!(
             html.contains("Connexion réussie, vous pouvez fermer cet onglet."),
@@ -1912,17 +1942,19 @@ mod flow_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn wrong_state_is_rejected() {
-        let h = Harness::new(
+    async fn wrong_state_is_refused_and_the_wait_goes_on() {
+        let mut h = Harness::new(
             entra(&[]),
-            Behaviour::Redirect("code=the-code&state=forged"),
+            Behaviour::Redirects(&["code=the-code&state=forged"]),
         )
         .await;
+        h.timeout = Duration::from_millis(500);
         let e = h.token().await.unwrap_err().to_string();
         h.browser.finish();
-        assert_eq!(e, explain(&AuthError::StateMismatch));
+        // Refused, then still waiting for the real redirect until the end.
+        assert_eq!(e, explain(&AuthError::Timeout));
         assert!(h.grants().is_empty(), "the code must not be exchanged");
-        let (status, html) = h.browser.page.lock().unwrap().clone().unwrap();
+        let (status, html) = h.browser.last_page();
         assert_eq!(status, 400);
         assert!(html.contains("state"), "{html}");
         assert!(matches!(h.events().last(), Some(Interaction::Done { .. })));
@@ -1930,12 +1962,29 @@ mod flow_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn forged_redirect_then_the_real_one_signs_in() {
+        let h = Harness::new(
+            entra(&[]),
+            Behaviour::Redirects(&["code=stolen&state=forged", "code=the-code&state={state}"]),
+        )
+        .await;
+        assert_eq!(h.token().await.unwrap(), "AT-code");
+        h.browser.finish();
+        let pages = h.browser.pages.lock().unwrap().clone();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].0, 400);
+        assert_eq!(pages[1].0, 200);
+        assert_eq!(h.grants(), ["authorization_code"]);
+        assert_eq!(h.requests.lock().unwrap()[0].form["code"], "the-code");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn cancelled_in_the_browser() {
         let h = Harness::new(
             entra(&[]),
-            Behaviour::Redirect(
+            Behaviour::Redirects(&[
                 "error=access_denied&error_description=AADSTS65004%3A+User+declined&state={state}",
-            ),
+            ]),
         )
         .await;
         let e = h.token().await.unwrap_err().to_string();
@@ -1944,7 +1993,7 @@ mod flow_tests {
             e,
             "Connexion annulée dans le navigateur. (AADSTS65004: User declined)"
         );
-        let (_, html) = h.browser.page.lock().unwrap().clone().unwrap();
+        let (_, html) = h.browser.last_page();
         assert!(
             html.contains("Connexion annulée dans le navigateur."),
             "{html}"
@@ -2041,6 +2090,35 @@ mod flow_tests {
         // The forget ran after the sign-in kept its tokens.
         assert!(session.tokens().is_empty());
         assert_eq!(h.stored(), None);
+    }
+
+    #[tokio::test]
+    async fn accept_errors_do_not_end_the_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let failures = AtomicUsize::new(2);
+        let (listener, failures) = (&listener, &failures);
+        let accept = move || {
+            let fail = failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            async move {
+                if fail {
+                    Err(std::io::Error::other("too many open files"))
+                } else {
+                    listener.accept().await.map(|(s, _)| s)
+                }
+            }
+        };
+        let browser = std::thread::spawn(move || {
+            let _ = ureq::get(&format!("http://127.0.0.1:{port}/?code=c&state=s")).call();
+        });
+        let waited = tokio::time::timeout(Duration::from_secs(10), wait_for_code(accept, "s"))
+            .await
+            .unwrap();
+        assert_eq!(waited.unwrap(), "c");
+        assert_eq!(failures.load(Ordering::SeqCst), 0);
+        browser.join().unwrap();
     }
 
     #[tokio::test]

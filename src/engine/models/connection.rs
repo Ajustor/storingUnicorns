@@ -134,7 +134,7 @@ impl std::fmt::Display for Flavor {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub name: String,
     pub db_type: DatabaseType,

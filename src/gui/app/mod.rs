@@ -250,6 +250,12 @@ impl App {
         }
         let keep_session = same_target(&previous, &config);
         let new = config.name.clone();
+        // Still opening with the old settings: start over at the next
+        // connect.
+        if self.sessions.edited(&old, keep_session, old != new) {
+            self.worker.cancel_connect(&old);
+            self.sign_ins.dismiss(&old);
+        }
         if old != new {
             for tab in &mut self.tabs.list {
                 if tab.connection == old {

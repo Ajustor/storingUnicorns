@@ -31,7 +31,8 @@ pub fn listen(state: &mut AppState) {
 }
 
 /// Open the selected connection in the background; `poll` picks up the
-/// outcome. Another attempt still running is dropped; the same one goes on.
+/// outcome. Another attempt still running is dropped (another connection,
+/// or this one edited since); the same one goes on.
 pub fn start(state: &mut AppState) {
     let Some(config) = state
         .config
@@ -43,7 +44,7 @@ pub fn start(state: &mut AppState) {
         return;
     };
     if let Some(pending) = state.pending_connect.take() {
-        if pending.config.name == config.name {
+        if pending.config == config {
             state.pending_connect = Some(pending);
             return;
         }
@@ -351,6 +352,27 @@ mod tests {
                 .pending_connect
                 .as_ref()
                 .map(|p| p.config.name.as_str()),
+            Some("other")
+        );
+        cancel(&mut state);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_an_edited_connection_starts_over() {
+        let (slow, _server) = hanging("slow");
+        let mut state = state_with(vec![slow]);
+        start(&mut state);
+        apply(&mut state, waiting("slow", "https://login/x"));
+        // Edited while it opens (another base): opening it again uses the
+        // new settings.
+        state.config.connections[0].database = "other".into();
+        start(&mut state);
+        assert_eq!(state.sign_in, None, "the first attempt was dropped");
+        assert_eq!(
+            state
+                .pending_connect
+                .as_ref()
+                .map(|p| p.config.database.as_str()),
             Some("other")
         );
         cancel(&mut state);

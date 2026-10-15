@@ -143,6 +143,14 @@ impl Sessions {
         self.generation
     }
 
+    /// Connection `name` was edited (`same_target` or not, `renamed` or
+    /// not) while it may be opening: whether that attempt is outdated and no
+    /// longer awaited (the caller aborts it). A renamed connection's outcome
+    /// would be dropped anyway.
+    pub fn edited(&mut self, name: &str, same_target: bool, renamed: bool) -> bool {
+        (!same_target || renamed) && self.connecting.remove(name)
+    }
+
     /// An attempt to open `name` ended: whether it was still awaited (else
     /// it was cancelled, and its late outcome is dropped).
     pub fn connect_finished(&mut self, name: &str) -> bool {
@@ -294,6 +302,23 @@ mod tests {
         s.connecting.insert("prod".into());
         assert!(s.connect_finished("prod"));
         assert!(s.connecting.is_empty());
+    }
+
+    #[test]
+    fn editing_a_connection_being_opened_drops_the_attempt() {
+        let mut s = Sessions::default();
+        s.connecting.insert("prod".into());
+        // Same target, same name: the attempt goes on.
+        assert!(!s.edited("prod", true, false));
+        assert!(s.connecting.contains("prod"));
+        // Renamed: its outcome would be dropped anyway.
+        assert!(s.edited("prod", true, true));
+        assert!(s.connecting.is_empty());
+        // Another target.
+        s.connecting.insert("prod".into());
+        assert!(s.edited("prod", false, false));
+        // Nothing being opened.
+        assert!(!s.edited("prod", false, false));
     }
 
     #[test]

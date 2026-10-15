@@ -8,6 +8,7 @@ mod persist;
 mod rows;
 mod grid;
 mod sessions;
+mod sign_in;
 mod status;
 mod table_search;
 mod tabs;

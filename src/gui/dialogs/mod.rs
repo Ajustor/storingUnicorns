@@ -64,8 +64,13 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
         ui.set_min_width(420.0);
         match &mut dialog {
-            Dialog::Connection(form) => match form.ui(ui) {
+            Dialog::Connection(form) => match form.ui(ui, app.sign_ins.url_of(form.name.trim())) {
                 FormAction::None => {}
+                FormAction::CancelTest => {
+                    app.sign_ins.dismiss(form.name.trim());
+                    app.worker.cancel_test();
+                    form.test_cancelled();
+                }
                 FormAction::Cancel => keep = false,
                 FormAction::Test => match form.validate(&app.config.connections) {
                     Ok(cfg) => {
@@ -259,6 +264,13 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             _ => {}
         }
         keep = false;
+    }
+    // Nobody waits for the test of a closed form any more: stop it (and the
+    // browser sign-in it may wait for).
+    if let (false, Dialog::Connection(form)) = (keep, &dialog) {
+        if form.testing {
+            app.worker.cancel_test();
+        }
     }
     // A dialog may open another one in its place (batch → confirmation).
     if keep && app.dialog.is_none() {

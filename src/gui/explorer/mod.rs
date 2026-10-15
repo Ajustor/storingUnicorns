@@ -13,7 +13,7 @@ use egui::collapsing_header::paint_default_icon;
 use egui::{Id, Label, Response, RichText, Sense};
 use egui_phosphor::regular as icon;
 
-use crate::engine::models::{ConnectionConfig, TableDetails};
+use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType, TableDetails};
 use crate::engine::ops::transfer::qualified;
 
 use super::app::App;
@@ -40,6 +40,8 @@ enum Action {
     Refresh(String),
     Edit(String),
     Delete(String),
+    /// Forget the Entra ID sign-in of this connection.
+    ForgetSignIn(String),
     NewConsole {
         connection: String,
         query: String,
@@ -192,6 +194,7 @@ fn apply(app: &mut App, ctx: &egui::Context, action: Action) {
             }
         }
         Action::Delete(name) => app.dialog = Some(Dialog::ConfirmDeleteConnection(name)),
+        Action::ForgetSignIn(name) => app.forget_sign_in(&name),
         Action::NewConsole { connection, query } => {
             app.new_console(&connection, query);
         }
@@ -478,6 +481,15 @@ fn connection_row(
             actions.push(Action::Edit(name.clone()));
             ui.close_menu();
         }
+        if keeps_sign_in(config)
+            && ui
+                .button(format!("{} Oublier la connexion Azure AD", icon::SIGN_OUT))
+                .on_hover_text("La prochaine connexion repassera par le navigateur")
+                .clicked()
+        {
+            actions.push(Action::ForgetSignIn(name.clone()));
+            ui.close_menu();
+        }
         if ui
             .add_enabled(
                 session.is_none() && !connecting,
@@ -508,6 +520,13 @@ fn connection_row(
             }
         }
     });
+}
+
+/// Whether `config` signs in with the user's Entra ID account, whose tokens
+/// are kept (and can be forgotten).
+fn keeps_sign_in(config: &ConnectionConfig) -> bool {
+    config.db_type == DatabaseType::Azure
+        && config.azure_auth_method == Some(AzureAuthMethod::InteractiveBrowser)
 }
 
 fn table_row(ui: &mut egui::Ui, t: &TableRef, open: bool, actions: &mut Vec<Action>) {
@@ -663,6 +682,26 @@ fn item_row(ui: &mut egui::Ui, d: &TableDetails, group: Group, index: usize) {
 mod tests {
     use super::*;
     use crate::engine::models::SchemaInfo;
+
+    #[test]
+    fn only_browser_sign_ins_can_be_forgotten() {
+        let browser = ConnectionConfig {
+            db_type: DatabaseType::Azure,
+            azure_auth_method: Some(AzureAuthMethod::InteractiveBrowser),
+            ..Default::default()
+        };
+        assert!(keeps_sign_in(&browser));
+        let cli = ConnectionConfig {
+            azure_auth_method: Some(AzureAuthMethod::Interactive),
+            ..browser.clone()
+        };
+        assert!(!keeps_sign_in(&cli));
+        let sql_server = ConnectionConfig {
+            db_type: DatabaseType::SQLServer,
+            ..browser
+        };
+        assert!(!keeps_sign_in(&sql_server));
+    }
 
     /// 3 connections × 5 000 tables, all open.
     /// `cargo test --release -- --ignored bench_explorer --nocapture`

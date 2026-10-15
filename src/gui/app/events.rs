@@ -18,10 +18,12 @@ use super::{App, CLOSE_TAB, NEW_CONSOLE, REFRESH, SAVE_CONSOLES, TABLE_SEARCH};
 impl App {
     fn on_connected(&mut self, session: Session) {
         let name = session.config.name.clone();
-        self.sessions.connecting.remove(&name);
         self.sessions.errors.remove(&name);
         self.sessions.open.insert(name.clone(), session);
-        self.success(format!("Connecté à {name}"));
+        match self.sign_ins.take_warning() {
+            Some(warning) => self.info(format!("Connecté à {name}. {warning}")),
+            None => self.success(format!("Connecté à {name}")),
+        }
         if self.config.last_connection.as_deref() != Some(name.as_str()) {
             self.config.last_connection = Some(name.clone());
             self.save_config();
@@ -49,6 +51,9 @@ impl App {
                 conn,
                 schemas,
             } => {
+                if !self.sessions.connect_finished(&name) {
+                    return; // Cancelled: the connection is dropped.
+                }
                 let Some(config) = self
                     .config
                     .connections
@@ -57,13 +62,16 @@ impl App {
                     .cloned()
                 else {
                     // Deleted or renamed while connecting.
-                    self.sessions.connecting.remove(&name);
                     return;
                 };
                 self.on_connected(Session::new(config, conn, schemas));
             }
             Event::ConnectFailed { name, error } => {
-                self.sessions.connecting.remove(&name);
+                if !self.sessions.connect_finished(&name) {
+                    return; // Cancelled.
+                }
+                // The failure matters more than a keyring warning (logged).
+                self.sign_ins.take_warning();
                 self.error(format!("Connexion à {name} impossible : {error}"));
                 self.sessions.errors.insert(name, error);
             }

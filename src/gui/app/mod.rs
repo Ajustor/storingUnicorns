@@ -16,6 +16,7 @@ use crate::updater::{ExitAction, Updater};
 use super::dialogs::{self, connection::same_target, Dialog};
 use super::persist::{self, Saver, CONSOLES_DELAY};
 use super::sessions::Sessions;
+use super::sign_in::{self, SignIns};
 use super::status::{self, Status, StatusKind};
 use super::table_search::TableSearch;
 use super::tabs::console::ConsoleTab;
@@ -45,6 +46,8 @@ pub struct App {
     pub worker: Worker,
     pub updater: Updater,
     pub sessions: Sessions,
+    /// Entra ID browser sign-ins waiting for the user.
+    pub sign_ins: SignIns,
     pub tabs: Tabs,
     pub history: History,
     pub explorer_filter: String,
@@ -86,6 +89,8 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         let worker = Worker::new(move || ctx.request_repaint());
         let ctx = cc.egui_ctx.clone();
+        let sign_ins = SignIns::install(move || ctx.request_repaint());
+        let ctx = cc.egui_ctx.clone();
         let mut updater = Updater::new(move || ctx.request_repaint());
         updater.check(false, config.skipped_version.as_deref());
 
@@ -115,6 +120,7 @@ impl App {
             worker,
             updater,
             sessions: Sessions::default(),
+            sign_ins,
             tabs: Tabs::default(),
             history: History::load_from(history_path),
             explorer_filter: String::new(),
@@ -202,6 +208,29 @@ impl App {
         self.worker.connect(config);
     }
 
+    /// « Annuler » of the banner while `name` waits for a browser sign-in:
+    /// stop opening it (or a connection test waiting for it). Dropping the
+    /// attempt closes the sign-in's listener.
+    pub fn cancel_sign_in(&mut self, name: &str) {
+        self.sign_ins.dismiss(name);
+        if self.sessions.connecting.remove(name) {
+            self.worker.cancel_connect(name);
+        } else {
+            self.worker.cancel_test();
+        }
+        self.info(sign_in::CANCELLED);
+    }
+
+    /// Show the sign-in warning (OS keyring unavailable) once no connection
+    /// is being opened or tested: their outcome would hide it at once.
+    fn show_sign_in_warning(&mut self) {
+        if self.sessions.connecting.is_empty() && !self.worker.testing() {
+            if let Some(warning) = self.sign_ins.take_warning() {
+                self.info(warning);
+            }
+        }
+    }
+
     /// Store a new (`original == None`) or edited connection. A rename moves
     /// its tabs and saved consoles along; a change of target (host, base…)
     /// drops its open session.
@@ -216,7 +245,8 @@ impl App {
         };
         let previous = std::mem::replace(&mut self.config.connections[index], config.clone());
         if entra_interactive::needs_forget(&previous, &config) {
-            entra_interactive::forget(&previous);
+            // Unless another connection (another base of the server) uses it.
+            entra_interactive::forget_unless_used(&previous, &self.config.connections);
         }
         let keep_session = same_target(&previous, &config);
         let new = config.name.clone();
@@ -265,16 +295,26 @@ impl App {
             self.worker.cancel(tab.id);
         }
         self.consoles_changed();
-        if let Some(config) = self.config.connections.iter().find(|c| c.name == name) {
-            entra_interactive::forget(config);
+        if let Some(index) = self.config.connections.iter().position(|c| c.name == name) {
+            let config = self.config.connections.remove(index);
+            entra_interactive::forget_unless_used(&config, &self.config.connections);
         }
-        self.config.connections.retain(|c| c.name != name);
         self.sessions.errors.remove(name);
         if self.config.last_connection.as_deref() == Some(name) {
             self.config.last_connection = None;
         }
         self.save_config();
         self.info(format!("Connexion « {name} » supprimée"));
+    }
+
+    /// Forget the Entra ID sign-in of connection `name` (session token and
+    /// refresh token in the OS keyring): the next connection goes through
+    /// the browser again. An open session stays open.
+    pub fn forget_sign_in(&mut self, name: &str) {
+        if let Some(config) = self.config.connections.iter().find(|c| c.name == name) {
+            entra_interactive::forget(config);
+            self.info(format!("Connexion Azure AD de {name} oubliée"));
+        }
     }
 
     /// Drop the session of `name`; its tabs stay open, marked disconnected.
@@ -509,13 +549,18 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Before the worker's events: a sign-in warning precedes the
+        // connection's outcome.
+        self.sign_ins.poll();
         for ev in self.worker.poll() {
             self.handle_event(ev);
         }
+        self.show_sign_in_warning();
         status::poll_updater(self);
         self.shortcuts(ctx);
 
         status::update_banner(self, ctx);
+        status::sign_in_banner(self, ctx);
         status::status_bar(self, ctx);
         egui::SidePanel::left("explorer")
             .resizable(true)

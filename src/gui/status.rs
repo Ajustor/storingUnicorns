@@ -152,6 +152,23 @@ pub fn update_banner(app: &mut App, ctx: &egui::Context) {
     });
 }
 
+/// Banner above everything while a connection waits for its browser
+/// sign-in: the link to copy (the browser may not have opened) and
+/// « Annuler ».
+pub fn sign_in_banner(app: &mut App, ctx: &egui::Context) {
+    let Some((connection, url)) = app.sign_ins.current() else {
+        return;
+    };
+    let (connection, url) = (connection.to_string(), url.to_string());
+    let mut cancel = false;
+    egui::TopBottomPanel::top("sign_in").show(ctx, |ui| {
+        cancel = super::sign_in::waiting_row(ui, &connection, &url);
+    });
+    if cancel {
+        app.cancel_sign_in(&connection);
+    }
+}
+
 pub fn status_bar(app: &mut App, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
         ui.horizontal(|ui| {

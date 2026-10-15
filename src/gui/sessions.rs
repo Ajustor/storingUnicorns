@@ -143,6 +143,12 @@ impl Sessions {
         self.generation
     }
 
+    /// An attempt to open `name` ended: whether it was still awaited (else
+    /// it was cancelled, and its late outcome is dropped).
+    pub fn connect_finished(&mut self, name: &str) -> bool {
+        self.connecting.remove(name)
+    }
+
     pub fn conn(&self, name: &str) -> Option<Conn> {
         self.open.get(name).map(|s| s.conn.clone())
     }
@@ -276,6 +282,18 @@ mod tests {
             ok()
         ));
         assert!(details.is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_attempt_is_no_longer_awaited() {
+        let mut s = Sessions::default();
+        s.connecting.insert("prod".into());
+        // « Annuler »: the outcome may already be on its way.
+        s.connecting.remove("prod");
+        assert!(!s.connect_finished("prod"));
+        s.connecting.insert("prod".into());
+        assert!(s.connect_finished("prod"));
+        assert!(s.connecting.is_empty());
     }
 
     #[test]

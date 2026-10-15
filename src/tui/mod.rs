@@ -739,14 +739,19 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
 
             if let Some(index) = state.editing_connection_index {
                 // Editing existing connection
-                let previous = std::mem::replace(&mut state.config.connections[index], config);
-                if db::entra_interactive::needs_forget(&previous, &state.config.connections[index])
-                {
+                let previous =
+                    std::mem::replace(&mut state.config.connections[index], config.clone());
+                if db::entra_interactive::needs_forget(&previous, &config) {
                     // Unless another connection (another base of the server) uses it.
                     db::entra_interactive::forget_unless_used(&previous, &state.config.connections);
                 }
+                let dropped = connect::edited(state, &previous, &config);
                 state.close_dialog();
-                state.set_status(format!("Updated connection: {}", name));
+                state.set_status(if dropped {
+                    format!("Updated connection: {name} (connexion en cours annulée)")
+                } else {
+                    format!("Updated connection: {name}")
+                });
             } else {
                 // Adding new connection
                 state.config.add_connection(config);
@@ -3200,6 +3205,43 @@ mod tests {
     use super::*;
     use crate::engine::models::{Column, QueryResult};
     use crate::engine::ops::test_support::{count, sqlite_mem};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_an_edit_drops_the_attempt_still_opening() {
+        // A server that never answers: the connection stays opening.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = crate::engine::models::ConnectionConfig {
+            name: "slow".into(),
+            db_type: crate::engine::models::DatabaseType::Postgres,
+            host: Some("127.0.0.1".into()),
+            port: Some(server.local_addr().unwrap().port()),
+            username: Some("u".into()),
+            database: "d".into(),
+            ssl_mode: Some(Default::default()),
+            ..Default::default()
+        };
+        let mut state = AppState::new(
+            AppConfig {
+                connections: vec![config],
+                ..Default::default()
+            },
+            false,
+            true,
+        );
+        // Saved unchanged: the attempt goes on.
+        connect::start(&mut state);
+        state.open_edit_connection_dialog(0);
+        handle_connection_dialog(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(state.pending_connect.is_some() && state.is_connecting);
+
+        // Another base: finishing would connect with the old settings.
+        state.open_edit_connection_dialog(0);
+        state.new_connection.database = "other".into();
+        handle_connection_dialog(&mut state, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(state.pending_connect.is_none());
+        assert!(!state.is_connecting);
+        assert_eq!(state.config.connections[0].database, "other");
+    }
 
     fn cols() -> Vec<Column> {
         ["id", "name"]

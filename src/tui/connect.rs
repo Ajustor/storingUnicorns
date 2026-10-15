@@ -62,6 +62,17 @@ pub fn start(state: &mut AppState) {
     state.pending_connect = Some(PendingConnect { config, task });
 }
 
+/// Connection `previous` was saved as `saved`: an attempt still opening it
+/// with the old settings is dropped (finishing it, a browser sign-in
+/// included, would connect with them). Returns whether one was.
+pub fn edited(state: &mut AppState, previous: &ConnectionConfig, saved: &ConnectionConfig) -> bool {
+    let outdated = state
+        .pending_connect
+        .as_ref()
+        .is_some_and(|p| p.config.name == previous.name && p.config != *saved);
+    outdated && cancel(state)
+}
+
 /// Esc while a connection is being opened: drop the attempt, which also
 /// closes the listener of a browser sign-in it waits for. Returns whether
 /// an attempt was cancelled.

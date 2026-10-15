@@ -22,9 +22,16 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
   suivantes, même après un redémarrage, se font sans navigateur tant que le
   jeton de renouvellement, gardé dans le trousseau du système, reste valable.
   « Oublier la connexion Azure AD » dans le menu de la connexion l'efface. Voir
-  [Azure AD interactif](https://github.com/Ajustor/storingUnicorns#azure-ad-interactif) pour enregistrer
-  l'application et créer l'utilisateur dans la base. Dans l'interface
-  terminal, le lien s'affiche dans la barre d'état et `Échap` annule.
+  [Azure AD interactif](https://github.com/Ajustor/storingUnicorns#azure-ad-interactif)
+  pour enregistrer l'application et créer l'utilisateur dans la base. Dans
+  l'interface terminal, le lien s'affiche dans la barre d'état et `Échap`
+  annule.
+
+- Les reconnexions automatiques d'une connexion Azure AD interactive (après
+  une requête interrompue, ou pour la session d'une transaction manuelle)
+  n'ouvrent jamais le navigateur : quand le jeton ne peut plus être renouvelé,
+  elles échouent avec « Session Azure AD expirée » jusqu'à ce que vous vous
+  reconnectiez.
 
 - **Redémarrer plus tard après une mise à jour.** Le bandeau « Version x
   prête » propose **Redémarrer maintenant** et **Plus tard** : la mise à jour

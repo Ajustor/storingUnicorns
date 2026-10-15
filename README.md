@@ -281,13 +281,16 @@ valable. Si le trousseau n'est pas disponible, il ne dure que la session (un
 avertissement le signale). Les reconnexions automatiques (après une requête
 interrompue, ou pour la session d'une transaction manuelle) n'ouvrent jamais le
 navigateur : si le jeton de renouvellement ne suffit plus, l'opération échoue
-avec « Session Azure AD expirée » ; déconnectez puis reconnectez la connexion. Aucun jeton n'est écrit dans `config.toml` ni dans
-les journaux.
+avec « Session Azure AD expirée » ; déconnectez puis reconnectez la connexion.
+Aucun jeton n'est écrit dans `config.toml` ni dans les journaux.
 
 Pour l'oublier : **Oublier la connexion Azure AD** dans le menu de la connexion
 (interface graphique). Supprimer la connexion, ou changer son tenant, son
 application ou son compte, l'oublie aussi, sauf si une autre connexion utilise
-le même compte (une autre base du même serveur, par exemple).
+le même compte (une autre base du même serveur, par exemple). Le trousseau est
+celui du compte du système : tous les profils de storingUnicorns
+(`STORINGUNICORNS_CONFIG_DIR`) partagent ces jetons, et oublier une connexion
+dans un profil l'oublie aussi pour les autres.
 
 ## Building
 

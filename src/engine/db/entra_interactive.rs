@@ -2,15 +2,21 @@
 //! browser (OAuth 2.0 authorization code + PKCE), like SSMS's "Active
 //! Directory Interactive".
 
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
 use crate::engine::models::ConnectionConfig;
+use crate::engine::secrets::{self, SecretStore};
 
 use super::azure::{is_guid, AzureCloud};
 
@@ -365,6 +371,460 @@ pub fn next_step(cached: Option<&Tokens>, refresh: Option<&str>, now: SystemTime
         Some(r) if !r.is_empty() => Next::Refresh(r.to_string()),
         _ => Next::Interactive,
     }
+}
+
+// ========== Interaction with the interface ==========
+
+/// What the interface is told about a browser sign-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Interaction {
+    /// The sign-in to `connection` waits for the browser, opened at `url`
+    /// (show it as a link to copy: the browser may not have opened).
+    Waiting { connection: String, url: String },
+    /// The wait for `connection` is over: signed in, failed or cancelled.
+    Done { connection: String },
+    /// To tell the user once, e.g. `secrets::UNAVAILABLE_WARNING` when the
+    /// refresh token can't outlive the session.
+    Warning { connection: String, message: String },
+}
+
+type Handler = Box<dyn Fn(Interaction) + Send + Sync>;
+
+static HANDLER: RwLock<Option<Handler>> = RwLock::new(None);
+
+/// Send sign-in interactions to `f` (replaces the previous handler). Without
+/// a handler, nothing is reported.
+pub fn set_interaction_handler(f: impl Fn(Interaction) + Send + Sync + 'static) {
+    *HANDLER.write().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
+}
+
+fn emit(interaction: Interaction) {
+    if let Some(handler) = HANDLER.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        handler(interaction);
+    }
+}
+
+/// Reports the end of the wait however it ends, cancellation included (the
+/// connection's future dropped).
+struct DoneOnDrop<'a> {
+    notify: &'a (dyn Fn(Interaction) + Send + Sync),
+    connection: &'a str,
+}
+
+impl Drop for DoneOnDrop<'_> {
+    fn drop(&mut self) {
+        (self.notify)(Interaction::Done {
+            connection: self.connection.to_string(),
+        });
+    }
+}
+
+// ========== Flow ==========
+
+/// How long the user has to sign in in the browser.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Reading one request on the redirect listener.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest request accepted on the redirect listener.
+const MAX_REQUEST: usize = 32 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole token request.
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+const SIGNED_IN: &str = "Connexion réussie, vous pouvez fermer cet onglet.";
+
+/// Access tokens of the session and one lock per target.
+#[derive(Default)]
+struct Session {
+    tokens: Mutex<HashMap<String, Tokens>>,
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl Session {
+    fn tokens(&self) -> MutexGuard<'_, HashMap<String, Tokens>> {
+        self.tokens.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_for(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_default()
+            .clone()
+    }
+}
+
+fn session() -> &'static Session {
+    static SESSION: OnceLock<Session> = OnceLock::new();
+    SESSION.get_or_init(Session::default)
+}
+
+/// What the flow talks to, replaced in tests.
+struct Deps<'a> {
+    /// Replaces the cloud's authority.
+    authority: Option<String>,
+    open_browser: Box<dyn Fn(&str) + Send + Sync>,
+    notify: Box<dyn Fn(Interaction) + Send + Sync>,
+    store: &'static dyn SecretStore,
+    session: &'a Session,
+    now: Box<dyn Fn() -> SystemTime + Send + Sync>,
+    timeout: Duration,
+}
+
+/// An access token for Azure SQL with the Entra ID account of `config`
+/// (`AzureAuthMethod::InteractiveBrowser`): the session's while it is valid,
+/// else renewed with the refresh token (memory, then OS keyring), else
+/// through the browser. The error is a French message for the user.
+pub async fn token(config: &ConnectionConfig) -> anyhow::Result<String> {
+    // The first use probes the OS keyring, which may block.
+    let store = tokio::task::spawn_blocking(secrets::store).await?;
+    let deps = Deps {
+        authority: None,
+        open_browser: Box::new(open_in_browser),
+        notify: Box::new(emit),
+        store,
+        session: session(),
+        now: Box::new(SystemTime::now),
+        timeout: SIGN_IN_TIMEOUT,
+    };
+    let access = token_with(config, &deps).await?;
+    if let Some(message) = secrets::take_warning() {
+        emit(Interaction::Warning {
+            connection: config.name.clone(),
+            message: message.to_string(),
+        });
+    }
+    Ok(access)
+}
+
+async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Result<String> {
+    let mut target = Target::for_config(config).map_err(anyhow::Error::msg)?;
+    if let Some(authority) = &deps.authority {
+        target.authority = authority.clone();
+    }
+    let key = secret_key(&target);
+    // One acquisition at a time per target: simultaneous reconnections
+    // share one browser sign-in and one refresh-token rotation.
+    let lock = deps.session.lock_for(&key);
+    let _turn = lock.lock().await;
+
+    let now = (deps.now)();
+    let cached = deps.session.tokens().get(&key).cloned();
+    let mut step = next_step(
+        cached.as_ref(),
+        cached.as_ref().and_then(|t| t.refresh.as_deref()),
+        now,
+    );
+    if matches!(step, Next::Interactive) {
+        // Nothing in memory (first connection of the session): the refresh
+        // token kept in the OS keyring.
+        let stored = load_secret(deps.store, &key).await;
+        step = next_step(None, stored.as_deref(), now);
+    }
+    match step {
+        Next::UseCached => {
+            if let Some(t) = cached {
+                return Ok(t.access);
+            }
+        }
+        Next::Refresh(refresh) => match redeem(&target, Grant::Refresh(&refresh), deps).await {
+            Ok(tokens) => {
+                tracing::info!("Entra ID token renewed for {}", config.name);
+                return Ok(keep(deps, &key, tokens, Some(refresh)).await);
+            }
+            Err(e) if needs_interaction(&e) => {
+                tracing::info!(
+                    "Entra ID refresh token of {} refused, signing in again",
+                    config.name
+                );
+                deps.session.tokens().remove(&key);
+                delete_secret(deps.store, &key).await;
+            }
+            Err(e) => return Err(e.into()),
+        },
+        Next::Interactive => {}
+    }
+    let tokens = sign_in(&config.name, &target, deps).await?;
+    tracing::info!("Entra ID sign-in completed for {}", config.name);
+    Ok(keep(deps, &key, tokens, None).await)
+}
+
+/// Whether a refused refresh token calls for a new browser sign-in.
+fn needs_interaction(err: &AuthError) -> bool {
+    matches!(err, AuthError::Server { code, .. }
+        if code == "invalid_grant" || code == "interaction_required")
+}
+
+/// Keep `tokens` for the session and their refresh token in the store (or
+/// `previous` when none came back); the access token.
+async fn keep(deps: &Deps<'_>, key: &str, mut tokens: Tokens, previous: Option<String>) -> String {
+    match &tokens.refresh {
+        Some(refresh) => save_secret(deps.store, key, refresh.clone()).await,
+        None => tokens.refresh = previous,
+    }
+    let access = tokens.access.clone();
+    deps.session.tokens().insert(key.to_string(), tokens);
+    access
+}
+
+// ----- Secret store (may block: off the executor) -----
+
+async fn load_secret(store: &'static dyn SecretStore, key: &str) -> Option<String> {
+    let key = key.to_string();
+    match tokio::task::spawn_blocking(move || store.get(&key)).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) => {
+            tracing::warn!("Could not read the Entra ID refresh token from the keyring: {e}");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Could not read the Entra ID refresh token from the keyring: {e}");
+            None
+        }
+    }
+}
+
+async fn save_secret(store: &'static dyn SecretStore, key: &str, value: String) {
+    let key = key.to_string();
+    let saved = tokio::task::spawn_blocking(move || store.set(&key, &value)).await;
+    if let Some(e) = blocking_error(saved) {
+        tracing::warn!("Could not keep the Entra ID refresh token in the keyring: {e}");
+    }
+}
+
+async fn delete_secret(store: &'static dyn SecretStore, key: &str) {
+    let key = key.to_string();
+    let deleted = tokio::task::spawn_blocking(move || store.delete(&key)).await;
+    if let Some(e) = blocking_error(deleted) {
+        tracing::warn!("Could not delete the Entra ID refresh token from the keyring: {e}");
+    }
+}
+
+fn blocking_error(r: Result<Result<(), String>, tokio::task::JoinError>) -> Option<String> {
+    match r {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e),
+        Err(e) => Some(e.to_string()),
+    }
+}
+
+// ----- Token endpoint -----
+
+enum Grant<'a> {
+    Refresh(&'a str),
+    Code {
+        code: &'a str,
+        redirect_uri: &'a str,
+        verifier: &'a str,
+    },
+}
+
+/// Redeem `grant` at the token endpoint of `t`.
+async fn redeem(t: &Target, grant: Grant<'_>, deps: &Deps<'_>) -> Result<Tokens, AuthError> {
+    let mut form: Vec<(&'static str, String)> = vec![
+        ("client_id", t.client_id.clone()),
+        ("scope", t.scope.clone()),
+    ];
+    match grant {
+        Grant::Refresh(refresh) => {
+            form.push(("grant_type", "refresh_token".into()));
+            form.push(("refresh_token", refresh.into()));
+        }
+        Grant::Code {
+            code,
+            redirect_uri,
+            verifier,
+        } => {
+            form.push(("grant_type", "authorization_code".into()));
+            form.push(("code", code.into()));
+            form.push(("redirect_uri", redirect_uri.into()));
+            form.push(("code_verifier", verifier.into()));
+        }
+    }
+    let url = t.endpoint("token").to_string();
+    let (status, body) = tokio::task::spawn_blocking(move || post_form(&url, &form))
+        .await
+        .map_err(|e| AuthError::Network(e.to_string()))??;
+    parse_token_response(status, &body, (deps.now)())
+}
+
+/// POST `form` to `url`: status and body, whatever the status.
+fn post_form(url: &str, form: &[(&str, String)]) -> Result<(u16, String), AuthError> {
+    // The system's certificates, like the updater: HTTPS works behind a
+    // corporate proxy inspecting it.
+    let tls = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    let agent = ureq::Agent::config_builder()
+        .tls_config(tls)
+        .http_status_as_error(false)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_global(Some(TOKEN_TIMEOUT))
+        .build()
+        .new_agent();
+    // ureq's errors never include the request body (the secrets).
+    let mut response = agent
+        .post(url)
+        .send_form(form.iter().map(|(k, v)| (*k, v.as_str())))
+        .map_err(|e| AuthError::Network(e.to_string()))?;
+    let status = response.status().as_u16();
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| AuthError::Network(e.to_string()))?;
+    Ok((status, body))
+}
+
+// ----- Browser sign-in -----
+
+/// Open `url` in the default browser, off the async executor (some
+/// launchers wait). A failure is only logged: the interface shows the link.
+fn open_in_browser(url: &str) {
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        if let Err(e) = webbrowser::open(&url) {
+            tracing::warn!("Could not open the browser for the Entra ID sign-in: {e}");
+        }
+    });
+}
+
+/// Sign in to `t` through the browser (authorization code + PKCE) for the
+/// connection named `connection`.
+async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Result<Tokens> {
+    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|e| anyhow::anyhow!("Impossible d'attendre le retour du navigateur : {e}"))?;
+    let port = v4.local_addr()?.port();
+    // `localhost` may resolve to ::1 first in the browser.
+    let v6 = TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await.ok();
+    let redirect_uri = format!("http://localhost:{port}");
+    let verifier = random_urlsafe(32)?;
+    let state = random_urlsafe(16)?;
+    let url = authorize_url(t, &redirect_uri, &pkce_challenge(&verifier), &state);
+
+    let code = {
+        (deps.notify)(Interaction::Waiting {
+            connection: connection.to_string(),
+            url: url.clone(),
+        });
+        let _done = DoneOnDrop {
+            notify: deps.notify.as_ref(),
+            connection,
+        };
+        (deps.open_browser)(&url);
+        tokio::time::timeout(deps.timeout, wait_for_code(&v4, v6.as_ref(), &state))
+            .await
+            .map_err(|_| AuthError::Timeout)??
+    };
+    Ok(redeem(
+        t,
+        Grant::Code {
+            code: &code,
+            redirect_uri: &redirect_uri,
+            verifier: &verifier,
+        },
+        deps,
+    )
+    .await?)
+}
+
+async fn accept(v4: &TcpListener, v6: Option<&TcpListener>) -> std::io::Result<TcpStream> {
+    match v6 {
+        Some(v6) => tokio::select! {
+            r = v4.accept() => r.map(|(s, _)| s),
+            r = v6.accept() => r.map(|(s, _)| s),
+        },
+        None => v4.accept().await.map(|(s, _)| s),
+    }
+}
+
+/// Serve the redirect listener until the sign-in comes back: the code, or
+/// why it failed. Other requests (`/favicon.ico`…) get a 404.
+async fn wait_for_code(
+    v4: &TcpListener,
+    v6: Option<&TcpListener>,
+    state: &str,
+) -> Result<String, AuthError> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, TcpStream)>(4);
+    loop {
+        tokio::select! {
+            accepted = accept(v4, v6) => {
+                let mut stream = accepted.map_err(|e| AuthError::Network(e.to_string()))?;
+                let tx = tx.clone();
+                // Each request on its own: a browser's speculative connection
+                // that sends nothing mustn't hold up the redirect.
+                tokio::spawn(async move {
+                    let read = tokio::time::timeout(REQUEST_TIMEOUT, read_request_target(&mut stream));
+                    if let Ok(Ok(Some(target))) = read.await {
+                        let _ = tx.send((target, stream)).await;
+                    }
+                });
+            }
+            Some((target, mut stream)) = rx.recv() => match parse_callback(&target, state) {
+                Err(AuthError::NotACallback) => respond(&mut stream, "404 Not Found", "").await,
+                Ok(code) => {
+                    respond(&mut stream, "200 OK", &page(SIGNED_IN)).await;
+                    return Ok(code);
+                }
+                Err(e) => {
+                    respond(&mut stream, "400 Bad Request", &page(&explain(&e))).await;
+                    return Err(e);
+                }
+            },
+        }
+    }
+}
+
+/// The target (`/?code=…`) of the GET request on `stream`, once its headers
+/// are read (so that closing doesn't reset the connection); `None` for
+/// anything else.
+async fn read_request_target(stream: &mut TcpStream) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        if buf.len() > MAX_REQUEST {
+            return Ok(None);
+        }
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut request_line = text.lines().next().unwrap_or_default().split_whitespace();
+    Ok(match (request_line.next(), request_line.next()) {
+        (Some("GET"), Some(target)) => Some(target.to_string()),
+        _ => None,
+    })
+}
+
+async fn respond(stream: &mut TcpStream, status: &str, html: &str) {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        html.len()
+    );
+    // The browser may be gone: nothing to do about it.
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(html.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+/// The page shown in the browser at the end of the sign-in.
+fn page(message: &str) -> String {
+    let message = message
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    format!(
+        "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\">\
+         <title>storingUnicorns</title></head>\
+         <body style=\"font-family: sans-serif; margin: 3em\">\
+         <h1>storingUnicorns</h1><p>{message}</p></body></html>"
+    )
 }
 
 #[cfg(test)]
@@ -839,5 +1299,493 @@ mod tests {
         assert!(matches!(next_step(Some(&t), None, now), Next::Interactive));
         assert!(matches!(next_step(None, None, now), Next::Interactive));
         assert!(matches!(next_step(None, Some(""), now), Next::Interactive));
+    }
+}
+
+/// The whole flow against a fake Entra ID: a local token endpoint and a
+/// simulated browser calling the redirect URI.
+#[cfg(test)]
+mod flow_tests {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::engine::models::{AzureAuthMethod, DatabaseType};
+    use crate::engine::secrets::MemoryStore;
+
+    const CLIENT: &str = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
+
+    fn config() -> ConnectionConfig {
+        ConnectionConfig {
+            name: "Prod Azure".into(),
+            db_type: DatabaseType::Azure,
+            host: Some("srv.database.windows.net".into()),
+            azure_auth_method: Some(AzureAuthMethod::InteractiveBrowser),
+            tenant_id: Some("contoso.com".into()),
+            azure_client_id: Some(CLIENT.into()),
+            database: "app".into(),
+            ..Default::default()
+        }
+    }
+
+    fn key() -> String {
+        secret_key(&Target::for_config(&config()).unwrap())
+    }
+
+    // ----- Fake token endpoint -----
+
+    /// A request received by the fake token endpoint.
+    struct TokenRequest {
+        path: String,
+        form: HashMap<String, String>,
+    }
+
+    type Answer = dyn Fn(&HashMap<String, String>) -> (u16, String) + Send + Sync;
+
+    /// Serve `answer` on a local port; its URL and the requests it got.
+    async fn fake_authority(answer: Box<Answer>) -> (String, Arc<Mutex<Vec<TokenRequest>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let requests = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (path, body) = read_http_request(&mut stream).await;
+                let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+                    .into_owned()
+                    .collect();
+                let (status, json) = answer(&form);
+                requests.lock().unwrap().push(TokenRequest { path, form });
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (url, seen)
+    }
+
+    /// Path and body of the HTTP request on `stream`.
+    async fn read_http_request(stream: &mut TcpStream) -> (String, String) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                let length = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < end + 4 + length {
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let path = head.split_whitespace().nth(1).unwrap().to_string();
+                return (path, String::from_utf8_lossy(&buf[end + 4..]).to_string());
+            }
+            assert!(n > 0, "connection closed before the headers");
+        }
+    }
+
+    fn tokens_json(access: &str, refresh: &str) -> String {
+        format!(
+            r#"{{"token_type":"Bearer","expires_in":3599,"access_token":"{access}","refresh_token":"{refresh}"}}"#
+        )
+    }
+
+    /// Entra ID as it should behave: the code gives `AT-code` / `RT-1`, each
+    /// refresh `AT-<n>` / `RT-<n>` (rotation); `refused` refresh tokens get
+    /// `invalid_grant`.
+    fn entra(refused: &'static [&'static str]) -> Box<Answer> {
+        let rotation = AtomicUsize::new(1);
+        Box::new(move |form| {
+            match form["grant_type"].as_str() {
+            "authorization_code" if form["code"] == "the-code" => {
+                (200, tokens_json("AT-code", "RT-1"))
+            }
+            "refresh_token" if !refused.contains(&form["refresh_token"].as_str()) => {
+                let n = rotation.fetch_add(1, Ordering::SeqCst) + 1;
+                (200, tokens_json(&format!("AT-{n}"), &format!("RT-{n}")))
+            }
+            _ => (
+                400,
+                r#"{"error":"invalid_grant","error_description":"AADSTS70008: expired","error_codes":[70008]}"#
+                    .into(),
+            ),
+        }
+        })
+    }
+
+    // ----- Simulated browser -----
+
+    enum Behaviour {
+        /// Signs in: favicon, then the redirect with the code and the state.
+        SignIn,
+        /// Calls the redirect URI with this query (`{state}` = the real one).
+        Redirect(&'static str),
+        /// Never comes back.
+        Idle,
+    }
+
+    struct Browser {
+        behaviour: Behaviour,
+        opened: AtomicUsize,
+        /// `code_challenge` of the last authorization URL.
+        challenge: Mutex<Option<String>>,
+        redirect_uri: Mutex<Option<String>>,
+        favicon: Mutex<Option<u16>>,
+        /// Status and HTML of the page shown after the redirect.
+        page: Mutex<Option<(u16, String)>>,
+        thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    }
+
+    impl Browser {
+        fn new(behaviour: Behaviour) -> Arc<Self> {
+            Arc::new(Self {
+                behaviour,
+                opened: AtomicUsize::new(0),
+                challenge: Mutex::new(None),
+                redirect_uri: Mutex::new(None),
+                favicon: Mutex::new(None),
+                page: Mutex::new(None),
+                thread: Mutex::new(None),
+            })
+        }
+
+        fn open(self: &Arc<Self>, url: &str) {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            let q: HashMap<String, String> = Url::parse(url)
+                .unwrap()
+                .query_pairs()
+                .into_owned()
+                .collect();
+            *self.challenge.lock().unwrap() = Some(q["code_challenge"].clone());
+            *self.redirect_uri.lock().unwrap() = Some(q["redirect_uri"].clone());
+            let query = match self.behaviour {
+                Behaviour::SignIn => "code=the-code&state={state}",
+                Behaviour::Redirect(query) => query,
+                Behaviour::Idle => return,
+            };
+            let query = query.replace("{state}", &q["state"]);
+            let redirect_uri = q["redirect_uri"].clone();
+            let signs_in = matches!(self.behaviour, Behaviour::SignIn);
+            let me = self.clone();
+            let thread = std::thread::spawn(move || {
+                let agent = ureq::Agent::config_builder()
+                    .http_status_as_error(false)
+                    .build()
+                    .new_agent();
+                let get = |url: String| {
+                    let mut r = agent.get(&url).call().unwrap();
+                    (r.status().as_u16(), r.body_mut().read_to_string().unwrap())
+                };
+                if signs_in {
+                    *me.favicon.lock().unwrap() =
+                        Some(get(format!("{redirect_uri}/favicon.ico")).0);
+                }
+                *me.page.lock().unwrap() = Some(get(format!("{redirect_uri}/?{query}")));
+            });
+            *self.thread.lock().unwrap() = Some(thread);
+        }
+
+        /// Wait for the simulated browser to have read its page.
+        fn finish(&self) {
+            if let Some(t) = self.thread.lock().unwrap().take() {
+                t.join().unwrap();
+            }
+        }
+    }
+
+    // ----- Harness -----
+
+    struct Harness {
+        authority: String,
+        requests: Arc<Mutex<Vec<TokenRequest>>>,
+        browser: Arc<Browser>,
+        events: Arc<Mutex<Vec<Interaction>>>,
+        /// Seconds added to the real clock.
+        clock: Arc<AtomicU64>,
+        store: &'static MemoryStore,
+        session: Session,
+        timeout: Duration,
+    }
+
+    impl Harness {
+        async fn new(answer: Box<Answer>, behaviour: Behaviour) -> Self {
+            let (authority, requests) = fake_authority(answer).await;
+            Self {
+                authority,
+                requests,
+                browser: Browser::new(behaviour),
+                events: Arc::default(),
+                clock: Arc::default(),
+                store: Box::leak(Box::default()),
+                session: Session::default(),
+                timeout: Duration::from_secs(20),
+            }
+        }
+
+        fn deps(&self) -> Deps<'_> {
+            let browser = self.browser.clone();
+            let events = self.events.clone();
+            let clock = self.clock.clone();
+            Deps {
+                authority: Some(self.authority.clone()),
+                open_browser: Box::new(move |url| browser.open(url)),
+                notify: Box::new(move |i| events.lock().unwrap().push(i)),
+                store: self.store,
+                session: &self.session,
+                now: Box::new(move || {
+                    SystemTime::now() + Duration::from_secs(clock.load(Ordering::SeqCst))
+                }),
+                timeout: self.timeout,
+            }
+        }
+
+        async fn token(&self) -> anyhow::Result<String> {
+            token_with(&config(), &self.deps()).await
+        }
+
+        fn grants(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.form["grant_type"].clone())
+                .collect()
+        }
+
+        fn stored(&self) -> Option<String> {
+            self.store.get(&key()).unwrap()
+        }
+
+        fn events(&self) -> Vec<Interaction> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_sign_in_then_cached_then_silent_refresh() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        assert_eq!(h.token().await.unwrap(), "AT-code");
+        h.browser.finish();
+
+        // The code was exchanged with the verifier of the challenge sent.
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+        {
+            let requests = h.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let r = &requests[0];
+            assert_eq!(r.path, "/contoso.com/oauth2/v2.0/token");
+            assert_eq!(r.form["grant_type"], "authorization_code");
+            assert_eq!(r.form["code"], "the-code");
+            assert_eq!(r.form["client_id"], CLIENT);
+            assert_eq!(
+                r.form["scope"],
+                "https://database.windows.net/.default offline_access openid profile"
+            );
+            let redirect_uri = h.browser.redirect_uri.lock().unwrap().clone().unwrap();
+            assert!(
+                redirect_uri.starts_with("http://localhost:"),
+                "{redirect_uri}"
+            );
+            assert_eq!(r.form["redirect_uri"], redirect_uri);
+            let challenge = h.browser.challenge.lock().unwrap().clone().unwrap();
+            assert_eq!(pkce_challenge(&r.form["code_verifier"]), challenge);
+        }
+        // The refresh token is kept; the browser got its pages.
+        assert_eq!(h.stored().as_deref(), Some("RT-1"));
+        assert_eq!(*h.browser.favicon.lock().unwrap(), Some(404));
+        let (status, html) = h.browser.page.lock().unwrap().clone().unwrap();
+        assert_eq!(status, 200);
+        assert!(
+            html.contains("Connexion réussie, vous pouvez fermer cet onglet."),
+            "{html}"
+        );
+        // The interface was told when the wait started and ended.
+        let events = h.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            matches!(&events[0], Interaction::Waiting { connection, url }
+            if connection == "Prod Azure" && url.starts_with(&format!("{}/contoso.com/oauth2/v2.0/authorize?", h.authority)))
+        );
+        assert_eq!(
+            events[1],
+            Interaction::Done {
+                connection: "Prod Azure".into()
+            }
+        );
+
+        // Still valid: reused, no request.
+        assert_eq!(h.token().await.unwrap(), "AT-code");
+        assert_eq!(h.grants().len(), 1);
+
+        // Expired: renewed silently, the refresh token rotated.
+        h.clock.store(2 * 3600, Ordering::SeqCst);
+        assert_eq!(h.token().await.unwrap(), "AT-2");
+        assert_eq!(h.grants(), ["authorization_code", "refresh_token"]);
+        assert_eq!(h.requests.lock().unwrap()[1].form["refresh_token"], "RT-1");
+        assert_eq!(h.stored().as_deref(), Some("RT-2"));
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+        assert_eq!(h.events().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_token_from_the_keyring_needs_no_browser() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        h.store.set(&key(), "RT-7").unwrap();
+        assert_eq!(h.token().await.unwrap(), "AT-2");
+        assert_eq!(h.grants(), ["refresh_token"]);
+        assert_eq!(h.requests.lock().unwrap()[0].form["refresh_token"], "RT-7");
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 0);
+        assert!(h.events().is_empty());
+        assert_eq!(h.stored().as_deref(), Some("RT-2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refused_refresh_token_goes_back_to_the_browser() {
+        let h = Harness::new(entra(&["RT-old"]), Behaviour::SignIn).await;
+        h.store.set(&key(), "RT-old").unwrap();
+        assert_eq!(h.token().await.unwrap(), "AT-code");
+        h.browser.finish();
+        assert_eq!(h.grants(), ["refresh_token", "authorization_code"]);
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+        assert_eq!(h.stored().as_deref(), Some("RT-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wrong_state_is_rejected() {
+        let h = Harness::new(
+            entra(&[]),
+            Behaviour::Redirect("code=the-code&state=forged"),
+        )
+        .await;
+        let e = h.token().await.unwrap_err().to_string();
+        h.browser.finish();
+        assert_eq!(e, explain(&AuthError::StateMismatch));
+        assert!(h.grants().is_empty(), "the code must not be exchanged");
+        let (status, html) = h.browser.page.lock().unwrap().clone().unwrap();
+        assert_eq!(status, 400);
+        assert!(html.contains("state"), "{html}");
+        assert!(matches!(h.events().last(), Some(Interaction::Done { .. })));
+        assert_eq!(h.stored(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_in_the_browser() {
+        let h = Harness::new(
+            entra(&[]),
+            Behaviour::Redirect(
+                "error=access_denied&error_description=AADSTS65004%3A+User+declined&state={state}",
+            ),
+        )
+        .await;
+        let e = h.token().await.unwrap_err().to_string();
+        h.browser.finish();
+        assert_eq!(
+            e,
+            "Connexion annulée dans le navigateur. (AADSTS65004: User declined)"
+        );
+        let (_, html) = h.browser.page.lock().unwrap().clone().unwrap();
+        assert!(
+            html.contains("Connexion annulée dans le navigateur."),
+            "{html}"
+        );
+        assert!(h.grants().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unfinished_sign_in_times_out() {
+        let mut h = Harness::new(entra(&[]), Behaviour::Idle).await;
+        h.timeout = Duration::from_millis(300);
+        let e = h.token().await.unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "Connexion non terminée dans le navigateur après 5 minutes."
+        );
+        let events = h.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(events[0], Interaction::Waiting { .. }));
+        assert!(matches!(events[1], Interaction::Done { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_endpoint_errors_are_explained() {
+        let h = Harness::new(
+            Box::new(|_| {
+                (
+                    400,
+                    r#"{"error":"invalid_client","error_description":"AADSTS7000218: The request body must contain client_assertion or client_secret.","error_codes":[7000218]}"#
+                        .into(),
+                )
+            }),
+            Behaviour::SignIn,
+        )
+        .await;
+        let e = h.token().await.unwrap_err().to_string();
+        h.browser.finish();
+        assert!(
+            e.starts_with("Active « Autoriser les flux clients publics » dans l'application."),
+            "{e}"
+        );
+        assert_eq!(h.stored(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreachable_entra_id_does_not_open_the_browser() {
+        let mut h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        // Nothing listens there.
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        h.authority = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        h.store.set(&key(), "RT-1").unwrap();
+        let e = h.token().await.unwrap_err().to_string();
+        assert!(e.starts_with("Impossible de joindre Entra ID"), "{e}");
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 0);
+        // A network failure isn't a refused token: it is kept.
+        assert_eq!(h.stored().as_deref(), Some("RT-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simultaneous_connections_share_one_sign_in() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        let (a, b) = tokio::join!(h.token(), h.token());
+        h.browser.finish();
+        assert_eq!(a.unwrap(), "AT-code");
+        assert_eq!(b.unwrap(), "AT-code");
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+        assert_eq!(h.grants(), ["authorization_code"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_the_connection_ends_the_wait() {
+        let h = Harness::new(entra(&[]), Behaviour::Idle).await;
+        let deps = h.deps();
+        let config = config();
+        let sign_in = token_with(&config, &deps);
+        // The app gives up after a moment (the future is dropped).
+        let r = tokio::time::timeout(Duration::from_millis(200), sign_in).await;
+        assert!(r.is_err());
+        let events = h.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(events[1], Interaction::Done { .. }));
+        // The listener is closed.
+        let redirect_uri = h.browser.redirect_uri.lock().unwrap().clone().unwrap();
+        let port = redirect_uri.rsplit(':').next().unwrap();
+        assert!(std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_err());
     }
 }

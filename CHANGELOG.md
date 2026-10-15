@@ -7,6 +7,38 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Nouveautés
+
+- **Azure SQL : connexion avec votre propre compte Entra ID, par le
+  navigateur**, comme le mode *Active Directory Interactive* de SSMS, MFA
+  comprise et sans installer Azure CLI. Choisissez l'authentification
+  **Azure AD interactif (navigateur)**, puis saisissez le tenant de votre
+  organisation (GUID ou domaine), l'ID client de l'application qu'elle a
+  enregistrée dans Entra ID et, si vous le souhaitez, votre compte. La page de
+  connexion s'ouvre dans le navigateur ; un bandeau permet d'en copier le lien
+  (si le navigateur ne s'est pas ouvert) ou d'annuler. Les connexions
+  suivantes, même après un redémarrage, se font sans navigateur tant que le
+  jeton de renouvellement, gardé dans le trousseau du système, reste valable.
+  « Oublier la connexion Azure AD » dans le menu de la connexion l'efface. Voir
+  [Azure AD interactif](https://github.com/Ajustor/storingUnicorns#azure-ad-interactif) pour enregistrer
+  l'application et créer l'utilisateur dans la base. Dans l'interface
+  terminal, le lien s'affiche dans la barre d'état et `Échap` annule.
+
+- **Redémarrer plus tard après une mise à jour.** Le bandeau « Version x
+  prête » propose **Redémarrer maintenant** et **Plus tard** : la mise à jour
+  s'applique alors à la fermeture. En attendant, la version de la barre d'état
+  affiche `v0.13.0 → x` ; un clic réaffiche le bandeau. Annuler la fermeture
+  (modifications ou transaction en attente) annule aussi le redémarrage.
+
+### Modifications
+
+- L'authentification Azure « Azure AD », qui utilise le jeton d'Azure CLI,
+  s'appelle désormais **Azure CLI**. Les connexions existantes ne changent pas.
+- Interface terminal : une connexion s'ouvre en arrière-plan, l'interface reste
+  utilisable pendant ce temps et `Échap` l'annule.
+
 ## [0.13.0] - 2026-10-14
 
 ### Nouveautés

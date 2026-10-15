@@ -180,6 +180,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         keep = false;
                     }
                     if ui.button("Annuler").clicked() {
+                        app.updater.cancel_restart();
                         keep = false;
                     }
                 });
@@ -251,8 +252,11 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     });
     // Escape or a click outside cancels the dialog.
     if modal.should_close() {
-        if let (true, Dialog::DiscardEdits(id)) = (keep, &dialog) {
-            answer_discard(app, *id, Discard::Cancel);
+        match (keep, &dialog) {
+            (true, Dialog::DiscardEdits(id)) => answer_discard(app, *id, Discard::Cancel),
+            // The quit (maybe "Redémarrer maintenant") is cancelled.
+            (true, Dialog::ConfirmQuit { .. }) => app.updater.cancel_restart(),
+            _ => {}
         }
         keep = false;
     }

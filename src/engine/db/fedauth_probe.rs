@@ -39,7 +39,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Ask the server where its Entra ID users sign in (MS-TDS FEDAUTHINFO).
 /// Ok(None): the server doesn't do Entra ID federated auth (on-prem SQL Server…).
 pub async fn probe(host: &str, port: u16) -> Result<Option<FedAuthInfo>> {
-    probe_with(host, port, Trust::System, PROBE_TIMEOUT).await
+    probe_with(host, port, Trust::System, Login::WhenAsked, PROBE_TIMEOUT).await
 }
 
 /// How the server's certificate is checked.
@@ -53,12 +53,36 @@ enum Trust {
     AnyCertificate,
 }
 
-/// `probe`, with the certificate checked as `trust` says and given up after
-/// `timeout`.
+/// When LOGIN7 is sent.
+#[derive(Debug, Clone, Copy)]
+enum Login {
+    /// Only when the server's PRELOGIN asks for Entra ID (FEDAUTHREQUIRED),
+    /// as mssql-jdbc does: other servers never log a failed login.
+    WhenAsked,
+    /// Always: the tests' check of TLS and LOGIN7 against servers that don't
+    /// ask. Only in test builds.
+    #[cfg(test)]
+    Always,
+}
+
+impl Login {
+    /// Whether LOGIN7 goes to a server whose PRELOGIN `asked` for Entra ID.
+    fn sent(self, asked: bool) -> bool {
+        match self {
+            Login::WhenAsked => asked,
+            #[cfg(test)]
+            Login::Always => true,
+        }
+    }
+}
+
+/// `probe`, with the certificate checked as `trust` says, LOGIN7 sent as
+/// `login` says, given up after `timeout`.
 async fn probe_with(
     host: &str,
     port: u16,
     trust: Trust,
+    login: Login,
     timeout: Duration,
 ) -> Result<Option<FedAuthInfo>> {
     let run = async {
@@ -70,7 +94,7 @@ async fn probe_with(
         .map_err(|_| anyhow!("Le serveur {host}:{port} ne répond pas"))?
         .with_context(|| format!("Connexion à {host}:{port} impossible"))?;
         tcp.set_nodelay(true)?;
-        exchange(tcp, host, trust).await
+        exchange(tcp, host, trust, login).await
     };
     tokio::time::timeout(timeout, run)
         .await
@@ -83,12 +107,18 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     host: &str,
     trust: Trust,
+    login: Login,
 ) -> Result<Option<FedAuthInfo>> {
     // 1. PRELOGIN, in clear.
     let mut incoming = Packets::default();
     send(&mut stream, &framed(PRELOGIN, &prelogin_request())).await?;
     let answer = receive(&mut stream, &mut incoming, |p| p.message(REPLY)).await?;
     let prelogin = parse_prelogin_reply(&answer)?;
+    if !login.sent(prelogin.fed_auth_required) {
+        // No Entra ID here (on-premises SQL Server…): don't make it log a
+        // failed login.
+        return Ok(None);
+    }
     if !matches!(prelogin.encryption, ENCRYPT_ON | ENCRYPT_REQ) {
         bail!("Le serveur ne propose pas de connexion chiffrée");
     }
@@ -102,8 +132,8 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
 
     // 3. LOGIN7 and its answer, inside TLS. Bytes already received after the
     // handshake are TLS records.
-    let login = login7(&client_host_name(), host, prelogin.fed_auth_required);
-    tls.writer().write_all(&framed(LOGIN7, &login))?;
+    let message = login7(&client_host_name(), host, prelogin.fed_auth_required);
+    tls.writer().write_all(&framed(LOGIN7, &message))?;
     send(&mut stream, &drain_tls(&mut tls)?).await?;
     let mut plain = Packets::default();
     let mut received = incoming.take_rest();
@@ -1353,10 +1383,11 @@ mod tests {
         reply: Vec<u8>,
         tls12_only: bool,
         trust: Trust,
+        login: Login,
     ) -> (Result<Option<FedAuthInfo>>, Result<Received>) {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(fake_server(server, prelogin, reply, tls12_only));
-        let probed = exchange(client, "localhost", trust).await;
+        let probed = exchange(client, "localhost", trust, login).await;
         (probed, server.await.unwrap())
     }
 
@@ -1368,6 +1399,7 @@ mod tests {
                 azure_reply(),
                 tls12_only,
                 Trust::AnyCertificate,
+                Login::WhenAsked,
             )
             .await;
             assert_eq!(
@@ -1391,7 +1423,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_premises_server_gives_none() {
+    async fn servers_that_dont_ask_for_entra_id_never_see_a_login() {
+        for fed_auth in [None, Some(0)] {
+            for encryption in [ENCRYPT_ON, ENCRYPT_NOT_SUP] {
+                let (client, mut server) = tokio::io::duplex(64 * 1024);
+                let server = tokio::spawn(async move {
+                    let mut incoming = Packets::default();
+                    receive(&mut server, &mut incoming, |p| p.message(PRELOGIN)).await?;
+                    let answer = prelogin_reply(encryption, fed_auth);
+                    send(&mut server, &framed(REPLY, &answer)).await?;
+                    let mut rest = incoming.take_rest();
+                    server.read_to_end(&mut rest).await?;
+                    anyhow::Ok(rest)
+                });
+                let probe = exchange(client, "localhost", Trust::System, Login::WhenAsked);
+                let probed = tokio::time::timeout(Duration::from_secs(5), probe).await;
+                assert_eq!(
+                    probed.expect("answered after PRELOGIN").unwrap(),
+                    None,
+                    "{fed_auth:?} {encryption}"
+                );
+                let after_prelogin = server.await.unwrap().unwrap();
+                assert!(after_prelogin.is_empty(), "{after_prelogin:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_login_gives_none() {
+        // A server that doesn't ask for Entra ID, logged in anyway.
         let mut reply = token16(
             TOKEN_ERROR,
             &message_body(18456, "Login failed for user ''."),
@@ -1402,6 +1462,7 @@ mod tests {
             reply,
             true,
             Trust::AnyCertificate,
+            Login::Always,
         )
         .await;
         assert_eq!(probed.unwrap(), None);
@@ -1416,6 +1477,7 @@ mod tests {
             azure_reply(),
             true,
             Trust::System,
+            Login::WhenAsked,
         )
         .await;
         let e = probed.unwrap_err().to_string();
@@ -1468,7 +1530,7 @@ mod tests {
                 let server = tokio::spawn(closing_server(server));
                 let probed = tokio::time::timeout(
                     Duration::from_secs(5),
-                    exchange(client, "localhost", Trust::AnyCertificate),
+                    exchange(client, "localhost", Trust::AnyCertificate, Login::WhenAsked),
                 )
                 .await;
                 server.abort();
@@ -1493,12 +1555,12 @@ mod tests {
             let _ = server.write_all(&answer).await;
             let _ = server.shutdown().await;
         });
-        exchange(client, "localhost", Trust::AnyCertificate).await
+        exchange(client, "localhost", Trust::AnyCertificate, Login::WhenAsked).await
     }
 
     #[tokio::test]
     async fn servers_that_are_not_azure_sql_are_errors() {
-        let refused = probe_answered(framed(REPLY, &prelogin_reply(ENCRYPT_NOT_SUP, None)))
+        let refused = probe_answered(framed(REPLY, &prelogin_reply(ENCRYPT_NOT_SUP, Some(1))))
             .await
             .unwrap_err()
             .to_string();
@@ -1525,10 +1587,16 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         let started = std::time::Instant::now();
-        let e = probe_with("127.0.0.1", port, Trust::System, Duration::from_millis(300))
-            .await
-            .unwrap_err()
-            .to_string();
+        let e = probe_with(
+            "127.0.0.1",
+            port,
+            Trust::System,
+            Login::WhenAsked,
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("à temps"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(5));
         server.abort();
@@ -1539,14 +1607,21 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        assert!(probe_with("127.0.0.1", port, Trust::System, PROBE_TIMEOUT)
-            .await
-            .is_err());
+        assert!(probe_with(
+            "127.0.0.1",
+            port,
+            Trust::System,
+            Login::WhenAsked,
+            PROBE_TIMEOUT
+        )
+        .await
+        .is_err());
     }
 
     /// Against the local SQL Server container (`SU_IT_MSSQL`, see
-    /// `ops::integration_tests`): TLS and LOGIN7 go through, and it has no
-    /// Entra ID.
+    /// `ops::integration_tests`): it doesn't ask for Entra ID, so it never
+    /// sees a login; logged in anyway, TLS and LOGIN7 go through, and it has
+    /// no Entra ID.
     #[tokio::test]
     #[ignore]
     async fn integration_mssql_fedauth_probe() {
@@ -1562,15 +1637,25 @@ mod tests {
         };
         let host = value("host").unwrap_or_else(|| "127.0.0.1".into());
         let port = value("port").map_or(1433, |p| p.parse().unwrap());
+        // As in production: answered after PRELOGIN, before TLS.
+        let probed = probe(&host, port).await;
+        assert_eq!(probed.unwrap(), None);
         // Its certificate is self-signed: refused, as it would be outside
         // tests…
-        let e = probe_with(&host, port, Trust::System, PROBE_TIMEOUT)
+        let e = probe_with(&host, port, Trust::System, Login::Always, PROBE_TIMEOUT)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("Certificat du serveur refusé"), "{e}");
         // …and once accepted, the login gets an answer without FEDAUTHINFO.
-        let probed = probe_with(&host, port, Trust::AnyCertificate, PROBE_TIMEOUT).await;
+        let probed = probe_with(
+            &host,
+            port,
+            Trust::AnyCertificate,
+            Login::Always,
+            PROBE_TIMEOUT,
+        )
+        .await;
         assert_eq!(probed.unwrap(), None);
     }
 }

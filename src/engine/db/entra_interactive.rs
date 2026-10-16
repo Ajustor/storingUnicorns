@@ -722,14 +722,33 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
     let resolved = resolve_target(config, deps)
         .await
         .map_err(anyhow::Error::msg)?;
+    let override_authority = |mut t: Target| {
+        if let Some(authority) = &deps.authority {
+            t.authority = authority.clone();
+        }
+        t
+    };
     let mut target = resolved.clone();
     if typed_tenant(config).is_none() {
         target = with_kept_sign_in(config, target, deps).await;
     }
-    if let Some(authority) = &deps.authority {
-        target.authority = authority.clone();
-    }
-    let access = acquire(config, &target, deps).await?;
+    // A borrowed organizations sign-in never goes back to the browser…
+    let borrowed = !target.tenant.eq_ignore_ascii_case(&resolved.tenant);
+    let mut target = override_authority(target);
+    let access = match acquire(config, &target, deps, !borrowed).await? {
+        Some(access) => access,
+        // …the server's tenant does.
+        None => {
+            tracing::info!(
+                "Entra ID: the borrowed sign-in of {} is gone, signing in to its server's tenant",
+                config.name
+            );
+            target = override_authority(resolved.clone());
+            acquire(config, &target, deps, true)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!(session_expired(&config.name)))?
+        }
+    };
     // The server's tenant, even when the organizations sign-in that landed
     // there serves it.
     note_tenant(config, &resolved, deps).await;
@@ -738,12 +757,14 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
 }
 
 /// An access token for `target`: the session's, renewed, or through the
-/// browser (see `token`).
+/// browser (see `token`); `None` when the browser is needed but not
+/// `browser`.
 async fn acquire(
     config: &ConnectionConfig,
     target: &Target,
     deps: &Deps<'_>,
-) -> anyhow::Result<String> {
+    browser: bool,
+) -> anyhow::Result<Option<String>> {
     let key = secret_key(target);
     // One acquisition at a time per target: simultaneous reconnections
     // share one browser sign-in and one refresh-token rotation.
@@ -766,13 +787,13 @@ async fn acquire(
     match step {
         Next::UseCached => {
             if let Some(t) = cached {
-                return Ok(t.access);
+                return Ok(Some(t.access));
             }
         }
         Next::Refresh(refresh) => match redeem(target, Grant::Refresh(&refresh), deps).await {
             Ok(tokens) => {
                 tracing::info!("Entra ID token renewed for {}", config.name);
-                return Ok(keep(deps, &key, tokens, Some(refresh)).await);
+                return Ok(Some(keep(deps, &key, tokens, Some(refresh)).await));
             }
             Err(e) if needs_interaction(&e) => {
                 tracing::info!(
@@ -790,9 +811,12 @@ async fn acquire(
         tracing::info!("Entra ID sign-in of {} needs the browser", config.name);
         anyhow::bail!(session_expired(&config.name));
     }
+    if !browser {
+        return Ok(None);
+    }
     let tokens = sign_in(&config.name, target, deps).await?;
     tracing::info!("Entra ID sign-in completed for {}", config.name);
-    Ok(keep(deps, &key, tokens, None).await)
+    Ok(Some(keep(deps, &key, tokens, None).await))
 }
 
 /// For a connection without a typed tenant, note in the keyring, under
@@ -4050,5 +4074,39 @@ mod flow_tests {
         .unwrap();
         assert_eq!(asked, 1);
         assert_eq!(store.get(&zero_config_key(TENANT)).unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_borrowed_sign_in_signs_in_to_the_servers_tenant() {
+        // The organizations sign-in landed in TENANT; its refresh token
+        // will be refused.
+        let h = Harness::new(entra_in(&["RT-1"], Some(TENANT)), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        // Restarted, the server names TENANT: the organizations sign-in is
+        // borrowed, refused, and the browser signs in to the server's
+        // tenant, not to organizations.
+        restart(&h);
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        assert_eq!(
+            h.grants(),
+            ["authorization_code", "refresh_token", "authorization_code"]
+        );
+        {
+            let requests = h.requests.lock().unwrap();
+            assert_eq!(requests[1].path, "/organizations/oauth2/v2.0/token");
+            assert_eq!(requests[2].path, format!("/{TENANT}/oauth2/v2.0/token"));
+        }
+        assert_eq!(
+            h.store.get(&zero_config_key(TENANT)).unwrap().as_deref(),
+            Some("RT-1")
+        );
+        assert_eq!(
+            h.store.get(&zero_config_key("organizations")).unwrap(),
+            None
+        );
     }
 }

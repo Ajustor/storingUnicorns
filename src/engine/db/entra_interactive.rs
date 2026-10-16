@@ -797,8 +797,9 @@ async fn acquire(
 
 /// For a connection without a typed tenant, note in the keyring, under
 /// `kept_key`, its server's tenant (`organizations` while the server didn't
-/// answer; not a secret): `forget` finds its refresh token without asking
-/// the server.
+/// answer; not a secret, see `note_value`): `forget` finds its refresh token
+/// without asking the server, and a sign-in goes on when the server stops
+/// answering (`noted_server_answer`).
 async fn note_tenant(config: &ConnectionConfig, target: &Target, deps: &Deps<'_>) {
     if typed_tenant(config).is_some() {
         return;
@@ -806,12 +807,81 @@ async fn note_tenant(config: &ConnectionConfig, target: &Target, deps: &Deps<'_>
     let Some(note) = kept_key(config) else {
         return;
     };
-    let tenant = target.tenant.to_lowercase();
-    if deps.session.noted().get(&note) == Some(&tenant) {
+    let value = note_value(config, target);
+    if deps.session.noted().get(&note) == Some(&value) {
         return;
     }
-    save_secret(deps.store, &note, tenant.clone()).await;
-    deps.session.noted().insert(note, tenant);
+    save_secret(deps.store, &note, value.clone()).await;
+    deps.session.noted().insert(note, value);
+}
+
+/// What a connection's note says of `target`: its tenant, with
+/// `@<authority host>` when the authority isn't the one of the cloud the
+/// connection's host names (a custom DNS name of a sovereign-cloud server).
+fn note_value(config: &ConnectionConfig, target: &Target) -> String {
+    let tenant = target.tenant.to_lowercase();
+    let cloud = AzureCloud::from_host(config.host.as_deref().unwrap_or_default());
+    let host = target
+        .authority
+        .strip_prefix("https://")
+        .unwrap_or(&target.authority);
+    if tenant == ORGANIZATIONS || host.eq_ignore_ascii_case(cloud.authority_host()) {
+        tenant
+    } else {
+        format!("{tenant}@{}", host.to_ascii_lowercase())
+    }
+}
+
+/// The server's answer a note (`note_value`) stands for; `None` for
+/// `organizations`, which names no tenant.
+fn noted_answer(config: &ConnectionConfig, value: &str) -> Option<FedAuthInfo> {
+    let cloud = AzureCloud::from_host(config.host.as_deref().unwrap_or_default());
+    let (tenant, host) = value
+        .split_once('@')
+        .unwrap_or((value, cloud.authority_host()));
+    if tenant.is_empty() || tenant.eq_ignore_ascii_case(ORGANIZATIONS) {
+        return None;
+    }
+    Some(FedAuthInfo {
+        sts_url: format!("https://{host}/{tenant}"),
+        spn: format!("{}/", cloud_of_authority(host).sql_resource()),
+    })
+}
+
+/// The target a note (`note_value`) stands for, checked as a server's
+/// answer: `organizations` for one that names no tenant or doesn't read.
+fn noted_target(config: &ConnectionConfig, value: &str) -> Option<Target> {
+    Target::for_config(config, noted_answer(config, value).as_ref()).ok()
+}
+
+/// The cloud of an Entra ID authority host (`KNOWN_AUTHORITIES`).
+fn cloud_of_authority(host: &str) -> AzureCloud {
+    let is = |name: &str| host.eq_ignore_ascii_case(name);
+    if is(AzureCloud::UsGovernment.authority_host()) {
+        AzureCloud::UsGovernment
+    } else if is(AzureCloud::China.authority_host()) || is("login.partner.microsoftonline.cn") {
+        AzureCloud::China
+    } else {
+        AzureCloud::Public
+    }
+}
+
+/// The answer `config`'s server gave before, as noted, for when it doesn't
+/// answer now: its tenant rather than `organizations`, so that its refresh
+/// token keeps working.
+async fn noted_server_answer(config: &ConnectionConfig, deps: &Deps<'_>) -> Option<FedAuthInfo> {
+    let note = kept_key(config)?;
+    let in_session = deps.session.noted().get(&note).cloned();
+    let value = match in_session {
+        Some(value) => value,
+        None => load_secret(deps.store, &note).await?,
+    };
+    let answer = noted_answer(config, &value)?;
+    tracing::info!(
+        "Entra ID: the server of {} didn't answer, signing in to its noted tenant",
+        config.name
+    );
+    Some(answer)
 }
 
 /// The target of `config`, its server asked for its tenant (FEDAUTHINFO)
@@ -823,7 +893,10 @@ async fn resolve_target(config: &ConnectionConfig, deps: &Deps<'_>) -> Result<Ta
         return Ok(without_server);
     }
     let (host, port) = server_of(config);
-    let answer = server_answer(&host, port, deps).await;
+    let answer = match server_answer(&host, port, deps).await {
+        Some(answer) => Some(answer),
+        None => noted_server_answer(config, deps).await,
+    };
     Target::for_config(config, answer.as_ref())
 }
 
@@ -991,11 +1064,11 @@ async fn load_secret(store: &'static dyn SecretStore, key: &str) -> Option<Strin
     match tokio::task::spawn_blocking(move || store.get(&key)).await {
         Ok(Ok(value)) => value,
         Ok(Err(e)) => {
-            tracing::warn!("Could not read the Entra ID refresh token from the keyring: {e}");
+            tracing::warn!("Could not read the Entra ID sign-in from the keyring: {e}");
             None
         }
         Err(e) => {
-            tracing::warn!("Could not read the Entra ID refresh token from the keyring: {e}");
+            tracing::warn!("Could not read the Entra ID sign-in from the keyring: {e}");
             None
         }
     }
@@ -1338,11 +1411,8 @@ fn known_keys(config: &ConnectionConfig, session: &Session) -> Vec<String> {
         keys.push(secret_key(&t));
     }
     let noted = kept_key(config).and_then(|note| session.noted().get(&note).cloned());
-    if let Some(tenant) = noted {
-        keys.push(secret_key(&Target {
-            tenant,
-            ..target.clone()
-        }));
+    if let Some(t) = noted.and_then(|value| noted_target(config, &value)) {
+        keys.push(secret_key(&t));
     }
     let mut unique = Vec::new();
     for key in keys {
@@ -1369,30 +1439,23 @@ fn used_keys(
     if typed_tenant(config).is_some() {
         return vec![secret_key(&target)];
     }
-    let mut tenants = Vec::new();
+    let mut targets = Vec::new();
     let (host, port) = server_of(config);
     let probed = session.servers().get(&server_key(&host, port)).cloned();
     if let Some(probed) = probed {
-        let t = Target::for_config(config, probed.info.as_ref());
-        tenants.extend(t.ok().map(|t| t.tenant));
+        targets.extend(Target::for_config(config, probed.info.as_ref()).ok());
     }
     let note = kept_key(config);
-    let noted = note
+    let mut values: Vec<String> = note
         .as_ref()
-        .and_then(|note| session.noted().get(note).cloned());
-    tenants.extend(noted);
-    if let (Some(note), Some(store)) = (&note, store) {
-        tenants.extend(store.get(note).ok().flatten());
-    }
-    let mut keys: Vec<String> = tenants
-        .iter()
-        .map(|tenant| {
-            secret_key(&Target {
-                tenant: tenant.clone(),
-                ..target.clone()
-            })
-        })
+        .and_then(|note| session.noted().get(note).cloned())
+        .into_iter()
         .collect();
+    if let (Some(note), Some(store)) = (&note, store) {
+        values.extend(store.get(note).ok().flatten());
+    }
+    targets.extend(values.iter().filter_map(|v| noted_target(config, v)));
+    let mut keys: Vec<String> = targets.iter().map(secret_key).collect();
     // The organizations sign-in, when it landed in one of these tenants
     // (`with_kept_sign_in`).
     let organizations = secret_key(&target);
@@ -1400,7 +1463,10 @@ fn used_keys(
     if let (None, Some(store)) = (&tid, store) {
         tid = store.get(&tid_note(&organizations)).ok().flatten();
     }
-    if tenants.iter().any(|t| same_tenant(t, tid.as_deref())) {
+    if targets
+        .iter()
+        .any(|t| same_tenant(&t.tenant, tid.as_deref()))
+    {
         keys.push(organizations);
     }
     keys
@@ -1419,9 +1485,9 @@ fn forget_sign_in(
     store: &dyn SecretStore,
     ask: &dyn Fn(&str, u16) -> Option<FedAuthInfo>,
 ) {
-    let Some(target) = interactive_target(config) else {
+    if interactive_target(config).is_none() {
         return;
-    };
+    }
     let used: Vec<String> = remaining
         .iter()
         .flat_map(|other| used_keys(other, session, Some(store)))
@@ -1443,14 +1509,15 @@ fn forget_sign_in(
             .get(&server_key(&host, port))
             .is_some_and(|p| p.info.is_some());
         match store.get(note) {
-            Ok(Some(tenant)) => {
-                tenant_known = true;
-                let key = secret_key(&Target {
-                    tenant,
-                    ..target.clone()
-                });
-                if !keys.contains(&key) {
-                    keys.push(key);
+            Ok(Some(value)) => {
+                if let Some(t) = noted_target(config, &value) {
+                    // An organizations note doesn't tell the server's tenant:
+                    // a sign-in kept under it before may be left.
+                    tenant_known |= !t.tenant.eq_ignore_ascii_case(ORGANIZATIONS);
+                    let key = secret_key(&t);
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
                 }
             }
             Ok(None) => {}
@@ -3891,5 +3958,97 @@ mod flow_tests {
             .get(&tid_note(&zero_config_key("organizations")))
             .unwrap()
             .is_some());
+    }
+
+    // ----- The noted tenant when the server doesn't answer -----
+
+    /// Memory of a restarted app: only the keyring is left.
+    fn restart(h: &Harness) {
+        h.session.tokens().clear();
+        h.session.servers().clear();
+        h.session.noted().clear();
+        h.session.tids().clear();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_no_longer_answers_keeps_its_noted_tenant() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        h.browser.finish();
+        // Restarted, the server doesn't answer: its tenant is the noted one,
+        // its refresh token renews the sign-in, no browser.
+        restart(&h);
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
+        assert_eq!(h.probes(), 2);
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            h.requests.lock().unwrap()[1].path,
+            format!("/{TENANT}/oauth2/v2.0/token")
+        );
+        // The note stays.
+        assert_eq!(
+            h.store.get(&note_of(&zero_config())).unwrap().as_deref(),
+            Some(TENANT)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sovereign_tenant_is_noted_with_its_authority() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        // A custom DNS name of a US Government server.
+        *h.probed.lock().unwrap() = Ok(Some(FedAuthInfo {
+            sts_url: format!("https://login.microsoftonline.us/{TENANT}"),
+            spn: "https://database.usgovcloudapi.net/".into(),
+        }));
+        let c = on_server("sql.contoso.internal");
+        h.token_for(&c).await.unwrap();
+        h.browser.finish();
+        let note = h.store.get(&note_of(&c)).unwrap().unwrap();
+        assert_eq!(note, format!("{TENANT}@login.microsoftonline.us"));
+        // What it stands for when the server doesn't answer.
+        let t = noted_target(&c, &note).unwrap();
+        assert_eq!(t.authority, "https://login.microsoftonline.us");
+        assert_eq!(t.tenant, TENANT);
+        assert!(t
+            .scope
+            .starts_with("https://database.usgovcloudapi.net/.default "));
+        assert_eq!(
+            noted_target(&c, "organizations").unwrap().tenant,
+            "organizations"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_organizations_note_still_asks_the_server_last() {
+        let store: &'static MemoryStore = Box::leak(Box::default());
+        let session: &'static Session = Box::leak(Box::default());
+        store
+            .set(&note_of(&zero_config()), "organizations")
+            .unwrap();
+        store
+            .set(&zero_config_key("organizations"), "RT-1")
+            .unwrap();
+        store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        // Unreachable: the tenant's refresh token can't be found.
+        let asked =
+            tokio::task::spawn_blocking(move || forget_with(&zero_config(), session, store, None))
+                .await
+                .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(store.get(&zero_config_key("organizations")).unwrap(), None);
+        assert!(store.get(&zero_config_key(TENANT)).unwrap().is_some());
+        // Reachable: it goes too.
+        store
+            .set(&note_of(&zero_config()), "organizations")
+            .unwrap();
+        let asked = tokio::task::spawn_blocking(move || {
+            forget_with(&zero_config(), session, store, azure_sql().unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(store.get(&zero_config_key(TENANT)).unwrap(), None);
     }
 }

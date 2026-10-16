@@ -591,12 +591,15 @@ fn server_key(host: &str, port: u16) -> String {
 }
 
 /// Access tokens of the session, one lock per target (or server probed),
-/// and the servers' answers to the FEDAUTHINFO probe.
+/// the servers' answers to the FEDAUTHINFO probe, and the tenants noted in
+/// the keyring (`note_tenant`).
 #[derive(Default)]
 struct Session {
     tokens: Mutex<HashMap<String, Tokens>>,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     servers: Mutex<HashMap<String, Probed>>,
+    /// `kept_key` → tenant written under it.
+    noted: Mutex<HashMap<String, String>>,
 }
 
 impl Session {
@@ -606,6 +609,10 @@ impl Session {
 
     fn servers(&self) -> MutexGuard<'_, HashMap<String, Probed>> {
         self.servers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn noted(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.noted.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lock_for(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -725,7 +732,9 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
         Next::Refresh(refresh) => match redeem(&target, Grant::Refresh(&refresh), deps).await {
             Ok(tokens) => {
                 tracing::info!("Entra ID token renewed for {}", config.name);
-                return Ok(keep(deps, &key, tokens, Some(refresh)).await);
+                let access = keep(deps, &key, tokens, Some(refresh)).await;
+                note_tenant(config, &target, deps).await;
+                return Ok(access);
             }
             Err(e) if needs_interaction(&e) => {
                 tracing::info!(
@@ -745,7 +754,27 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
     }
     let tokens = sign_in(&config.name, &target, deps).await?;
     tracing::info!("Entra ID sign-in completed for {}", config.name);
-    Ok(keep(deps, &key, tokens, None).await)
+    let access = keep(deps, &key, tokens, None).await;
+    note_tenant(config, &target, deps).await;
+    Ok(access)
+}
+
+/// For a connection without a typed tenant, note in the keyring, under
+/// `kept_key`, the tenant its sign-in is kept under (not a secret): `forget`
+/// finds its refresh token without asking the server.
+async fn note_tenant(config: &ConnectionConfig, target: &Target, deps: &Deps<'_>) {
+    if typed_tenant(config).is_some() {
+        return;
+    }
+    let Some(note) = kept_key(config) else {
+        return;
+    };
+    let tenant = target.tenant.to_lowercase();
+    if deps.session.noted().get(&note) == Some(&tenant) {
+        return;
+    }
+    save_secret(deps.store, &note, tenant.clone()).await;
+    deps.session.noted().insert(note, tenant);
 }
 
 /// The target of `config`, its server asked for its tenant (FEDAUTHINFO)
@@ -875,7 +904,7 @@ async fn save_secret(store: &'static dyn SecretStore, key: &str, value: String) 
     let key = key.to_string();
     let saved = tokio::task::spawn_blocking(move || store.set(&key, &value)).await;
     if let Some(e) = blocking_error(saved) {
-        tracing::warn!("Could not keep the Entra ID refresh token in the keyring: {e}");
+        tracing::warn!("Could not keep the Entra ID sign-in in the keyring: {e}");
     }
 }
 
@@ -1187,59 +1216,125 @@ fn kept_key(config: &ConnectionConfig) -> Option<String> {
     })
 }
 
-/// Where a sign-in to forget is kept.
-#[derive(Debug, PartialEq, Eq)]
-struct ToForget {
-    /// Keyring keys known without the network.
-    keys: Vec<String>,
-    /// The server to ask for the last one: its tenant, when none is typed
-    /// and the server didn't answer in this session.
-    ask: Option<(String, u16)>,
-}
-
-/// Where `config`'s sign-in may be kept; `None` when it keeps nothing.
-fn keys_to_forget(config: &ConnectionConfig, session: &Session) -> Option<ToForget> {
-    let target = interactive_target(config)?;
+/// The keyring keys `config`'s sign-in may be under, known without the
+/// network nor the keyring: its typed tenant's; else `organizations`, the
+/// server's tenant if it answered in this session, and the tenant noted in
+/// this session. Empty for connections that keep nothing.
+fn known_keys(config: &ConnectionConfig, session: &Session) -> Vec<String> {
+    let Some(target) = interactive_target(config) else {
+        return Vec::new();
+    };
     let mut keys = vec![secret_key(&target)];
     if typed_tenant(config).is_some() {
-        return Some(ToForget { keys, ask: None });
+        return keys;
     }
-    // `organizations` while the server didn't answer, its tenant once it did.
     let (host, port) = server_of(config);
     let answer = session
         .servers()
         .get(&server_key(&host, port))
         .and_then(|p| p.info.clone());
-    let Some(answer) = answer else {
-        let ask = Some((host, port));
-        return Some(ToForget { keys, ask });
-    };
-    if let Ok(t) = Target::for_config(config, Some(&answer)) {
-        let key = secret_key(&t);
-        if !keys.contains(&key) {
-            keys.push(key);
+    if let Some(t) = answer.and_then(|info| Target::for_config(config, Some(&info)).ok()) {
+        keys.push(secret_key(&t));
+    }
+    let noted = kept_key(config).and_then(|note| session.noted().get(&note).cloned());
+    if let Some(tenant) = noted {
+        keys.push(secret_key(&Target {
+            tenant,
+            ..target.clone()
+        }));
+    }
+    let mut unique = Vec::new();
+    for key in keys {
+        if !unique.contains(&key) {
+            unique.push(key);
         }
     }
-    Some(ToForget { keys, ask: None })
+    unique
 }
 
-/// The keyring key of `config`'s sign-in under its server's tenant, asking
-/// the server (FEDAUTHINFO). Blocks: `forget`'s thread only.
-fn asked_key(config: &ConnectionConfig, host: &str, port: u16) -> Option<String> {
+/// Forget `config`'s sign-in for good: every key known offline
+/// (`known_keys`, and the tenant noted in the keyring), then the note;
+/// `ask` (the server's FEDAUTHINFO) only as a last resort, when its tenant
+/// is known neither way. Blocks (keyring, maybe the server): never call it
+/// from async code.
+fn forget_sign_in(
+    config: &ConnectionConfig,
+    session: &Session,
+    store: &dyn SecretStore,
+    ask: &dyn Fn(&str, u16) -> Option<FedAuthInfo>,
+) {
+    let Some(target) = interactive_target(config) else {
+        return;
+    };
+    let mut keys = known_keys(config, session);
+    let note = kept_key(config).filter(|_| typed_tenant(config).is_none());
+    let mut tenant_known = note.is_none();
+    if let Some(note) = &note {
+        let (host, port) = server_of(config);
+        tenant_known |= session
+            .servers()
+            .get(&server_key(&host, port))
+            .is_some_and(|p| p.info.is_some());
+        match store.get(note) {
+            Ok(Some(tenant)) => {
+                tenant_known = true;
+                let key = secret_key(&Target {
+                    tenant,
+                    ..target.clone()
+                });
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Could not read the Entra ID sign-in's tenant: {e}"),
+        }
+    }
+    for key in &keys {
+        forget_key(session, store, key);
+    }
+    let Some(note) = note else {
+        return;
+    };
+    if let Err(e) = store.delete(&note) {
+        tracing::warn!("Could not delete the Entra ID sign-in's tenant from the keyring: {e}");
+    }
+    session.noted().remove(&note);
+    if tenant_known {
+        return;
+    }
+    let (host, port) = server_of(config);
+    match ask(&host, port).and_then(|info| Target::for_config(config, Some(&info)).ok()) {
+        Some(t) => forget_key(session, store, &secret_key(&t)),
+        None => tracing::warn!(
+            "Entra ID tenant of {host} unknown: a sign-in kept under it may stay in the keyring"
+        ),
+    }
+}
+
+/// The FEDAUTHINFO of `host:port`, waited for on this thread (`forget`'s).
+fn ask_blocking(host: &str, port: u16) -> Option<FedAuthInfo> {
+    match run_bounded(fedauth_probe::probe(host, port)) {
+        Some(Ok(info)) => info,
+        Some(Err(e)) => {
+            tracing::warn!("Could not ask {host}:{port} for its Entra ID tenant: {e:#}");
+            None
+        }
+        None => None,
+    }
+}
+
+/// Run `future` on a runtime of this thread, shut down without waiting for
+/// blocking work it left (a name resolution stuck in getaddrinfo): the
+/// thread stays bounded by the future's own timeouts.
+fn run_bounded<F: Future>(future: F) -> Option<F::Output> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .ok()?;
-    match runtime.block_on(fedauth_probe::probe(host, port)) {
-        Ok(Some(info)) => Target::for_config(config, Some(&info))
-            .ok()
-            .map(|t| secret_key(&t)),
-        Ok(None) => None,
-        Err(e) => {
-            tracing::warn!("Could not ask {host}:{port} for its Entra ID tenant to forget: {e:#}");
-            None
-        }
-    }
+    let output = runtime.block_on(future);
+    runtime.shutdown_background();
+    Some(output)
 }
 
 /// Whether saving `new` over `old` must forget `old`'s sign-in: another
@@ -1286,25 +1381,16 @@ pub fn orphaned(config: &ConnectionConfig, remaining: &[ConnectionConfig]) -> bo
 /// the keyring is updated in the background.
 pub fn forget(config: &ConnectionConfig) {
     let session = session();
-    let Some(ToForget { mut keys, ask }) = keys_to_forget(config, session) else {
-        return;
-    };
     // At once, so that the next connection doesn't reuse it…
-    for key in &keys {
-        session.tokens().remove(key);
+    for key in known_keys(config, session) {
+        session.tokens().remove(&key);
     }
     // …and for good once an acquisition in progress is over. Waiting for it,
-    // the keyring (Secret Service, an unlock prompt) and the server may
-    // block: not on the interface's thread.
+    // the keyring (Secret Service, an unlock prompt) and maybe the server
+    // may block: not on the interface's thread.
     let config = config.clone();
     std::thread::spawn(move || {
-        if let Some((host, port)) = ask {
-            keys.extend(asked_key(&config, &host, port));
-        }
-        let store = secrets::store();
-        for key in &keys {
-            forget_key(session, store, key);
-        }
+        forget_sign_in(&config, session, secrets::store(), &ask_blocking);
     });
 }
 
@@ -1702,20 +1788,14 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_a_zero_config_sign_in() {
+    fn keys_of_a_zero_config_sign_in_known_offline() {
         let session = Session::default();
         let mut c = zero_config("srv.database.windows.net");
         c.port = Some(1444);
         let organizations = secret_key(&Target::for_config(&c, None).unwrap());
-        // The server's tenant is unknown: it has to be asked.
-        assert_eq!(
-            keys_to_forget(&c, &session).unwrap(),
-            ToForget {
-                keys: vec![organizations.clone()],
-                ask: Some(("srv.database.windows.net".to_string(), 1444)),
-            }
-        );
-        // Known from this session: both keys it may have used.
+        // The server's tenant is unknown.
+        assert_eq!(known_keys(&c, &session), vec![organizations.clone()]);
+        // Answered in this session: both keys it may have used.
         session.servers().insert(
             server_key("srv.database.windows.net", 1444),
             Probed {
@@ -1725,26 +1805,26 @@ mod tests {
         );
         let tenant = secret_key(&Target::for_config(&c, Some(&azure_sql_answer())).unwrap());
         assert_eq!(
-            keys_to_forget(&c, &session).unwrap(),
-            ToForget {
-                keys: vec![organizations, tenant],
-                ask: None,
-            }
+            known_keys(&c, &session),
+            [organizations.clone(), tenant.clone()]
         );
+        // Or noted when its sign-in was kept.
+        let session = Session::default();
+        session
+            .noted()
+            .insert(kept_key(&c).unwrap(), GUID.to_string());
+        assert_eq!(known_keys(&c, &session), [organizations, tenant]);
         // Typed tenant: its key only.
         assert_eq!(
-            keys_to_forget(&azure("srv.database.windows.net"), &session).unwrap(),
-            ToForget {
-                keys: vec![secret_key(&target())],
-                ask: None,
-            }
+            known_keys(&azure("srv.database.windows.net"), &session),
+            [secret_key(&target())]
         );
         // Other methods keep nothing.
         let cli = ConnectionConfig {
             azure_auth_method: Some(AzureAuthMethod::Interactive),
             ..c
         };
-        assert_eq!(keys_to_forget(&cli, &session), None);
+        assert!(known_keys(&cli, &session).is_empty());
     }
 
     fn query(url: &str) -> std::collections::HashMap<String, String> {
@@ -3175,5 +3255,150 @@ mod flow_tests {
         assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
         assert_eq!(h.browser.opened.load(Ordering::SeqCst), 0);
         assert_eq!(h.probes(), 1);
+    }
+
+    // ----- Forgetting without a typed tenant -----
+
+    /// The keyring entry noting the tenant of `config`'s sign-in.
+    fn note_of(config: &ConnectionConfig) -> String {
+        kept_key(config).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tenant_of_a_sign_in_is_noted() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        assert_eq!(
+            note_of(&zero_config()),
+            "entra:auto:srv.database.windows.net:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:\
+             jane@contoso.com"
+        );
+        assert_eq!(
+            h.store.get(&note_of(&zero_config())).unwrap().as_deref(),
+            Some(TENANT)
+        );
+        // Without the server's answer: organizations.
+        let h = signed_in_without_the_server().await;
+        assert_eq!(
+            h.store.get(&note_of(&zero_config())).unwrap().as_deref(),
+            Some("organizations")
+        );
+        // A typed tenant needs no note.
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        h.token().await.unwrap();
+        h.browser.finish();
+        let c = ConnectionConfig {
+            tenant_id: None,
+            ..config()
+        };
+        assert_eq!(h.store.get(&note_of(&c)).unwrap(), None);
+    }
+
+    /// `forget_sign_in` with a server asked `asked` times, answering
+    /// `answer`.
+    fn forget_with(
+        config: &ConnectionConfig,
+        session: &Session,
+        store: &MemoryStore,
+        answer: Option<FedAuthInfo>,
+    ) -> usize {
+        let asked = AtomicUsize::new(0);
+        forget_sign_in(config, session, store, &|_, _| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            answer.clone()
+        });
+        asked.into_inner()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_finds_the_noted_tenant_without_the_server() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        assert!(h.store.get(&zero_config_key(TENANT)).unwrap().is_some());
+        // The app was restarted: the server's answer is gone, and the
+        // server is unreachable.
+        let restarted = Session::default();
+        let store = h.store;
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(forget_with(&zero_config(), &restarted, store, None), 0);
+        })
+        .await
+        .unwrap();
+        assert_eq!(h.store.get(&zero_config_key(TENANT)).unwrap(), None);
+        assert_eq!(h.store.get(&note_of(&zero_config())).unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_drops_every_key_known_offline() {
+        let h = signed_in_without_the_server().await;
+        // Also kept under the server's tenant, from an earlier sign-in.
+        h.store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        h.session.servers().insert(
+            server_key("srv.database.windows.net", 1433),
+            Probed {
+                at: SystemTime::UNIX_EPOCH,
+                info: azure_sql().unwrap(),
+            },
+        );
+        let (session, store) = (h.session, h.store);
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(forget_with(&zero_config(), session, store, None), 0);
+        })
+        .await
+        .unwrap();
+        for key in [
+            zero_config_key("organizations"),
+            zero_config_key(TENANT),
+            note_of(&zero_config()),
+        ] {
+            assert_eq!(h.store.get(&key).unwrap(), None, "{key}");
+        }
+        assert!(h.session.tokens().is_empty());
+        assert!(h.session.noted().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_note_the_server_is_asked_last() {
+        let store: &'static MemoryStore = Box::leak(Box::default());
+        let session: &'static Session = Box::leak(Box::default());
+        store
+            .set(&zero_config_key("organizations"), "RT-1")
+            .unwrap();
+        store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        // Unreachable: the organizations key goes, the tenant's can't be
+        // found.
+        let asked =
+            tokio::task::spawn_blocking(move || forget_with(&zero_config(), session, store, None))
+                .await
+                .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(store.get(&zero_config_key("organizations")).unwrap(), None);
+        assert!(store.get(&zero_config_key(TENANT)).unwrap().is_some());
+        // Reachable: its tenant's goes too.
+        let asked = tokio::task::spawn_blocking(move || {
+            forget_with(&zero_config(), session, store, azure_sql().unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(store.get(&zero_config_key(TENANT)).unwrap(), None);
+    }
+
+    #[test]
+    fn work_left_behind_does_not_hold_forgets_thread() {
+        let started = std::time::Instant::now();
+        let out = run_bounded(async {
+            // A name resolution stuck in getaddrinfo, say.
+            drop(tokio::task::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_secs(3))
+            }));
+            7
+        });
+        assert_eq!(out, Some(7));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

@@ -16,6 +16,9 @@ desktop GUI (egui) and a terminal UI (ratatui) sharing the same engine.
   - Azure SQL: SQL login, Azure CLI token, managed identity, or your own Entra
     ID account through the browser (MFA included, nothing to set up, see
     [Azure AD interactif](#azure-ad-interactif))
+  - Cloud SQL PostgreSQL / MySQL: your Google account through `gcloud`, no
+    password, tokens renewed by themselves (see
+    [IAM Google Cloud](#iam-google-cloud-cloud-sql))
 - **GUI** (default) with DataGrip ergonomics:
   - several connections open at once, each with its own colour (dot on its tabs)
   - database explorer: connection → schemas → tables → columns / keys / indexes,
@@ -126,7 +129,7 @@ From the sources: `cargo run` (GUI) or `cargo run -- tui`.
 |-------------|-------------------------------------|
 | `Tab/↓`     | Next field                          |
 | `Shift+Tab/↑` | Previous field                    |
-| `←/→`       | Cycle the value (type, model, Azure auth, SSL) |
+| `←/→`       | Cycle the value (type, model, Azure auth, PostgreSQL / MySQL auth, SSL) |
 | `Enter`     | Save connection                     |
 | `Esc`       | Cancel                              |
 
@@ -186,6 +189,16 @@ database = "postgres"
 flavor = "Supabase"     # optional: MariaDb, PlanetScale, CockroachDb, TimescaleDb, Supabase, Neon, Redshift
 ssl_mode = "VerifyFull" # Postgres / MySQL: Disable, Prefer (default), Require, VerifyCa, VerifyFull
 ssl_ca = "C:/certs/ca.pem"  # optional extra trusted CA (PEM)
+
+[[connections]]
+name = "Cloud SQL"
+db_type = "Postgres"
+host = "34.12.34.56"
+port = 5432
+username = "jane.doe@example.com" # the Google account (no password stored)
+database = "app"
+db_auth = "GcpIam"      # Postgres / MySQL: Password (default) or GcpIam
+ssl_mode = "Require"    # GcpIam connects with at least Require
 
 [[connections]]
 name = "SQLite DB"
@@ -340,6 +353,85 @@ qu'elles décrivent.
 Le trousseau est celui du compte du système : tous les profils de
 storingUnicorns (`STORINGUNICORNS_CONFIG_DIR`) partagent ces jetons, et oublier
 une connexion dans un profil l'oublie aussi pour les autres.
+
+## IAM Google Cloud (Cloud SQL)
+
+Connexion à Cloud SQL **PostgreSQL** ou **MySQL** avec **votre compte Google**
+(authentification IAM de base de données), sans mot de passe ni proxy. L'app
+demande un jeton à `gcloud` à la connexion, l'envoie à la place du mot de
+passe et le renouvelle avant son expiration (environ une heure). Le jeton reste
+en mémoire : il n'est écrit ni dans `config.toml` ni dans les journaux.
+
+### Dans storingUnicorns
+
+Type **PostgreSQL** ou **MySQL**, **Authentification** : **IAM Google Cloud**
+(interface terminal : `←/→` sur `Auth`, à côté du port). Indiquez l'adresse IP
+(ou le nom) de l'instance dans **Hôte** et votre **Compte Google**
+(`prenom.nom@domaine.com`) : le formulaire affiche en dessous l'**utilisateur
+base** correspondant. Il n'y a pas de mot de passe.
+
+Le SSL est **au moins Obligatoire** : en mode Désactivé ou Préféré, l'app se
+connecte quand même en TLS (le formulaire le rappelle). Choisissez *Vérifier
+l'autorité (CA)* avec le certificat du serveur de l'instance (`server-ca.pem`,
+onglet **Connexions → Sécurité** de la console) pour le vérifier.
+
+### Prérequis
+
+1. Le [SDK Google Cloud](https://cloud.google.com/sdk/docs/install) installé
+   (`gcloud` dans le `PATH`) et votre compte connecté :
+
+   ```sh
+   gcloud auth login prenom.nom@domaine.com
+   ```
+
+   Si la session expire, l'app demande de relancer `gcloud auth login`.
+2. L'authentification IAM activée sur l'instance (option
+   `cloudsql.iam_authentication` pour PostgreSQL, `cloudsql_iam_authentication`
+   pour MySQL), une adresse IP joignable (réseau autorisé, ou IP privée depuis
+   le même réseau) et, pour votre compte, le rôle **Utilisateur d'instance
+   Cloud SQL** (`roles/cloudsql.instanceUser`).
+3. L'utilisateur IAM créé sur l'instance, puis ses droits dans la base :
+
+   ```sh
+   gcloud sql users create prenom.nom@domaine.com --instance=mon-instance --type=cloud_iam_user
+   # compte de service :
+   gcloud sql users create sa@mon-projet.iam.gserviceaccount.com --instance=mon-instance --type=cloud_iam_service_account
+   ```
+
+   ```sql
+   -- PostgreSQL (connecté avec un administrateur)
+   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "prenom.nom@domaine.com";
+   -- MySQL
+   GRANT SELECT, INSERT, UPDATE, DELETE ON app.* TO 'prenom.nom'@'%';
+   ```
+
+   Sans utilisateur ou sans droits, la connexion est refusée bien que le compte
+   soit authentifié ; le message de l'app le rappelle.
+
+### Noms d'utilisateur
+
+| Moteur | Compte utilisateur | Compte de service |
+|---|---|---|
+| PostgreSQL | l'adresse complète : `prenom.nom@domaine.com` | sans `.gserviceaccount.com` : `sa@mon-projet.iam` |
+| MySQL | la partie avant `@` : `prenom.nom` | la partie avant `@` : `sa` |
+
+Dans le formulaire, saisissez toujours le compte Google ; l'indice
+**utilisateur base** montre le nom que la base attend.
+
+### Alternative : le proxy Cloud SQL
+
+Si l'instance n'est joignable que par le connecteur (pas d'IP autorisée,
+certificats clients exigés), lancez le
+[proxy Cloud SQL](https://cloud.google.com/sql/docs/postgres/sql-proxy) avec
+l'authentification IAM automatique :
+
+```sh
+cloud-sql-proxy --auto-iam-authn mon-projet:europe-west1:mon-instance
+```
+
+puis connectez-vous à `127.0.0.1` (port 5432 ou 3306) en **Mot de passe**,
+avec l'utilisateur base ci-dessus, **sans mot de passe** et SSL **Désactivé** ou
+**Préféré** : le proxy chiffre la liaison et ajoute le jeton lui-même.
 
 ## Building
 

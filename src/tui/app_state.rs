@@ -8,7 +8,8 @@ use crate::engine::services::table_cache::{FetchQueue, TableCache};
 use crate::engine::config::AppConfig;
 use crate::engine::db::DatabaseConnection;
 use crate::engine::models::{
-    AzureAuthMethod, ConnectionConfig, DatabaseType, Flavor, QueryResult, SchemaInfo, SslMode,
+    AzureAuthMethod, ConnectionConfig, DatabaseType, DbAuthMethod, Flavor, QueryResult, SchemaInfo,
+    SslMode,
 };
 use crate::engine::presets;
 use crate::engine::models::{display_cell, NULL_CELL};
@@ -88,6 +89,8 @@ pub enum ConnectionField {
     ClientId,
     Host,
     Port,
+    /// PostgreSQL / MySQL sign-in (`DbAuthMethod`), cycled.
+    DbAuth,
     Username,
     Password,
     Database,
@@ -107,7 +110,8 @@ impl ConnectionField {
             Self::TenantId => Self::ClientId,
             Self::ClientId => Self::Host,
             Self::Host => Self::Port,
-            Self::Port => Self::Username,
+            Self::Port => Self::DbAuth,
+            Self::DbAuth => Self::Username,
             Self::Username => Self::Password,
             Self::Password => Self::Database,
             Self::Database => Self::SslMode,
@@ -127,7 +131,8 @@ impl ConnectionField {
             Self::ClientId => Self::TenantId,
             Self::Host => Self::ClientId,
             Self::Port => Self::Host,
-            Self::Username => Self::Port,
+            Self::DbAuth => Self::Port,
+            Self::Username => Self::DbAuth,
             Self::Password => Self::Username,
             Self::Database => Self::Password,
             Self::SslMode => Self::Database,
@@ -135,28 +140,46 @@ impl ConnectionField {
         }
     }
 
-    /// Get next field, skipping Azure-only fields when not relevant
-    pub fn next_for(self, db_type: &DatabaseType, auth_method: &AzureAuthMethod) -> Self {
+    /// Get next field, skipping the fields the engine and its sign-in
+    /// (Azure `auth_method`, PostgreSQL / MySQL `db_auth`) don't use.
+    pub fn next_for(
+        self,
+        db_type: &DatabaseType,
+        auth_method: &AzureAuthMethod,
+        db_auth: DbAuthMethod,
+    ) -> Self {
         let mut field = self.next();
-        // Skip Azure-only fields when not Azure type
-        while Self::should_skip(&field, db_type, auth_method) {
+        while Self::should_skip(&field, db_type, auth_method, db_auth) {
             field = field.next();
         }
         field
     }
 
-    /// Get previous field, skipping Azure-only fields when not relevant
-    pub fn prev_for(self, db_type: &DatabaseType, auth_method: &AzureAuthMethod) -> Self {
+    /// Get previous field, skipping the fields not used (see `next_for`).
+    pub fn prev_for(
+        self,
+        db_type: &DatabaseType,
+        auth_method: &AzureAuthMethod,
+        db_auth: DbAuthMethod,
+    ) -> Self {
         let mut field = self.prev();
-        while Self::should_skip(&field, db_type, auth_method) {
+        while Self::should_skip(&field, db_type, auth_method, db_auth) {
             field = field.prev();
         }
         field
     }
 
     /// Whether this field should be skipped based on context
-    fn should_skip(field: &Self, db_type: &DatabaseType, auth_method: &AzureAuthMethod) -> bool {
+    fn should_skip(
+        field: &Self,
+        db_type: &DatabaseType,
+        auth_method: &AzureAuthMethod,
+        db_auth: DbAuthMethod,
+    ) -> bool {
         match field {
+            Self::DbAuth => !uses_tls(db_type),
+            // The IAM sign-in's password is a token fetched when connecting.
+            Self::Password if uses_tls(db_type) => db_auth == DbAuthMethod::GcpIam,
             Self::AzureAuth => *db_type != DatabaseType::Azure,
             // Azure CLI and the browser sign-in.
             Self::TenantId => {
@@ -223,6 +246,8 @@ pub struct NewConnectionState {
     pub ssl_ca: String,
     /// Kept so that editing a connection doesn't drop its GUI colour.
     pub color: Option<[u8; 3]>,
+    /// PostgreSQL / MySQL sign-in; kept while another engine is chosen.
+    pub db_auth: DbAuthMethod,
 }
 
 impl Default for NewConnectionState {
@@ -245,13 +270,35 @@ impl Default for NewConnectionState {
             ssl_mode: SslMode::default(),
             ssl_ca: String::new(),
             color: None,
+            db_auth: DbAuthMethod::default(),
         }
     }
 }
 
 impl NewConnectionState {
+    /// Whether the connection signs in with Google Cloud IAM.
+    pub fn gcp_iam(&self) -> bool {
+        uses_tls(&self.db_type) && self.db_auth == DbAuthMethod::GcpIam
+    }
+
+    /// Switch between the password and the Google Cloud IAM sign-in; a
+    /// driver's default user (no Google account) is cleared for the latter.
+    pub fn cycle_db_auth(&mut self) {
+        self.db_auth = match self.db_auth {
+            DbAuthMethod::Password => DbAuthMethod::GcpIam,
+            DbAuthMethod::GcpIam => DbAuthMethod::Password,
+        };
+        let u = self.username.trim();
+        if self.db_auth == DbAuthMethod::GcpIam && (u == "postgres" || u == "root") {
+            self.username.clear();
+        }
+    }
+
     /// Whether the form can be saved, else a French message.
     pub fn check(&self) -> Result<(), String> {
+        if self.gcp_iam() {
+            crate::engine::db::gcp_iam::validate(&self.db_type, &self.username)?;
+        }
         if self.db_type == DatabaseType::Azure
             && self.azure_auth_method == AzureAuthMethod::ManagedIdentity
         {
@@ -284,7 +331,8 @@ impl NewConnectionState {
             } else {
                 Some(self.username.clone())
             },
-            password: if self.password.is_empty() {
+            // The IAM sign-in's password is a token, fetched when connecting.
+            password: if self.password.is_empty() || self.gcp_iam() {
                 None
             } else {
                 Some(self.password.clone())
@@ -324,7 +372,8 @@ impl NewConnectionState {
                 None
             },
             flavor: self.flavor.filter(|f| f.driver() == self.db_type),
-            db_auth: None,
+            // The default method is left out, as in older files.
+            db_auth: self.gcp_iam().then_some(DbAuthMethod::GcpIam),
         }
     }
 
@@ -365,6 +414,7 @@ impl NewConnectionState {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             color: conn.color,
+            db_auth: conn.effective_db_auth(),
         }
     }
 
@@ -374,7 +424,7 @@ impl NewConnectionState {
             ConnectionField::Url => &self.url,
             ConnectionField::SslCa => &self.ssl_ca,
             // Cycled with ←/→, like the type.
-            ConnectionField::Flavor | ConnectionField::SslMode => "",
+            ConnectionField::Flavor | ConnectionField::SslMode | ConnectionField::DbAuth => "",
             ConnectionField::DbType => "",    // handled separately
             ConnectionField::AzureAuth => "", // handled separately (cycle)
             ConnectionField::TenantId => &self.tenant_id,
@@ -393,7 +443,7 @@ impl NewConnectionState {
             ConnectionField::Url => Some(&mut self.url),
             ConnectionField::SslCa => Some(&mut self.ssl_ca),
             // Cycled with ←/→, like the type.
-            ConnectionField::Flavor | ConnectionField::SslMode => None,
+            ConnectionField::Flavor | ConnectionField::SslMode | ConnectionField::DbAuth => None,
             ConnectionField::DbType => None,    // handled separately
             ConnectionField::AzureAuth => None, // handled separately (cycle)
             ConnectionField::TenantId => Some(&mut self.tenant_id),
@@ -1562,11 +1612,11 @@ mod tests {
         let t = DatabaseType::SQLServer;
         let a = AzureAuthMethod::Credentials;
         assert_ne!(
-            ConnectionField::Database.next_for(&t, &a),
+            ConnectionField::Database.next_for(&t, &a, DbAuthMethod::Password),
             ConnectionField::SslMode
         );
         assert_eq!(
-            ConnectionField::Database.next_for(&DatabaseType::Postgres, &a),
+            ConnectionField::Database.next_for(&DatabaseType::Postgres, &a, DbAuthMethod::Password),
             ConnectionField::SslMode
         );
     }
@@ -1574,7 +1624,7 @@ mod tests {
     #[test]
     fn azure_fields_follow_the_auth_method() {
         let t = DatabaseType::Azure;
-        let next = |f: ConnectionField, a| f.next_for(&t, &a);
+        let next = |f: ConnectionField, a| f.next_for(&t, &a, DbAuthMethod::Password);
         // Managed identity: client ID (username), no password.
         let mi = AzureAuthMethod::ManagedIdentity;
         assert_eq!(
@@ -1596,7 +1646,11 @@ mod tests {
         );
         // Other engines are untouched.
         assert_eq!(
-            ConnectionField::Port.next_for(&DatabaseType::SQLServer, &AzureAuthMethod::Interactive),
+            ConnectionField::Port.next_for(
+                &DatabaseType::SQLServer,
+                &AzureAuthMethod::Interactive,
+                DbAuthMethod::Password
+            ),
             ConnectionField::Username
         );
     }
@@ -1692,7 +1746,7 @@ mod tests {
     fn interactive_browser_asks_for_tenant_app_and_account() {
         let t = DatabaseType::Azure;
         let browser = AzureAuthMethod::InteractiveBrowser;
-        let next = |f: ConnectionField| f.next_for(&t, &browser);
+        let next = |f: ConnectionField| f.next_for(&t, &browser, DbAuthMethod::Password);
         assert_eq!(next(ConnectionField::AzureAuth), ConnectionField::TenantId);
         assert_eq!(next(ConnectionField::TenantId), ConnectionField::ClientId);
         assert_eq!(next(ConnectionField::ClientId), ConnectionField::Host);
@@ -1700,22 +1754,26 @@ mod tests {
         assert_eq!(next(ConnectionField::Port), ConnectionField::Username);
         assert_eq!(next(ConnectionField::Username), ConnectionField::Database);
         assert_eq!(
-            ConnectionField::Host.prev_for(&t, &browser),
+            ConnectionField::Host.prev_for(&t, &browser, DbAuthMethod::Password),
             ConnectionField::ClientId
         );
         // Azure CLI: the tenant only.
         let cli = AzureAuthMethod::Interactive;
         assert_eq!(
-            ConnectionField::TenantId.next_for(&t, &cli),
+            ConnectionField::TenantId.next_for(&t, &cli, DbAuthMethod::Password),
             ConnectionField::Host
         );
         assert_eq!(
-            ConnectionField::Host.prev_for(&t, &cli),
+            ConnectionField::Host.prev_for(&t, &cli, DbAuthMethod::Password),
             ConnectionField::TenantId
         );
         // Other engines never stop there.
         assert_eq!(
-            ConnectionField::DbType.next_for(&DatabaseType::SQLServer, &browser),
+            ConnectionField::DbType.next_for(
+                &DatabaseType::SQLServer,
+                &browser,
+                DbAuthMethod::Password
+            ),
             ConnectionField::Host
         );
     }
@@ -1792,6 +1850,97 @@ mod tests {
         nc.azure_client_id.clear();
         nc.azure_auth_method = AzureAuthMethod::Interactive;
         assert!(nc.check().is_ok());
+    }
+
+    #[test]
+    fn gcp_iam_fields_follow_the_db_auth() {
+        let a = AzureAuthMethod::Credentials;
+        let iam = DbAuthMethod::GcpIam;
+        for t in [DatabaseType::Postgres, DatabaseType::MySQL] {
+            let pw = DbAuthMethod::Password;
+            // The choice comes after the port, before the user.
+            assert_eq!(
+                ConnectionField::Port.next_for(&t, &a, pw),
+                ConnectionField::DbAuth
+            );
+            assert_eq!(
+                ConnectionField::DbAuth.next_for(&t, &a, pw),
+                ConnectionField::Username
+            );
+            assert_eq!(
+                ConnectionField::Username.next_for(&t, &a, pw),
+                ConnectionField::Password
+            );
+            // IAM: the Google account (username), no password.
+            assert_eq!(
+                ConnectionField::Username.next_for(&t, &a, iam),
+                ConnectionField::Database
+            );
+            assert_eq!(
+                ConnectionField::Database.prev_for(&t, &a, iam),
+                ConnectionField::Username
+            );
+        }
+        // Other engines never stop there, whatever the form holds.
+        for t in [DatabaseType::SQLServer, DatabaseType::SQLite] {
+            assert_eq!(
+                ConnectionField::Port.next_for(&t, &a, iam),
+                ConnectionField::Username
+            );
+        }
+        assert_eq!(
+            ConnectionField::Username.next_for(&DatabaseType::SQLServer, &a, iam),
+            ConnectionField::Password
+        );
+    }
+
+    #[test]
+    fn gcp_iam_needs_an_account_and_keeps_no_password() {
+        let mut nc = NewConnectionState {
+            password: "old secret".into(),
+            ..Default::default()
+        };
+        nc.cycle_db_auth();
+        assert_eq!(nc.db_auth, DbAuthMethod::GcpIam);
+        // The driver's default user is no Google account.
+        assert_eq!(nc.username, "");
+        assert_eq!(nc.check().unwrap_err(), "Indique ton compte Google");
+        nc.username = "jane@example.com".into();
+        assert!(nc.check().is_ok());
+        let c = nc.to_config();
+        assert_eq!(c.db_auth, Some(DbAuthMethod::GcpIam));
+        assert_eq!(c.username.as_deref(), Some("jane@example.com"));
+        assert_eq!(c.password, None);
+
+        // Editing keeps it.
+        let back = NewConnectionState::from_config(&c);
+        assert_eq!(back.db_auth, DbAuthMethod::GcpIam);
+        assert_eq!(back.to_config(), c);
+
+        // The password again: nothing checked, the default method left out.
+        nc.cycle_db_auth();
+        assert_eq!(nc.db_auth, DbAuthMethod::Password);
+        assert_eq!(nc.username, "jane@example.com", "a typed user stays");
+        nc.username.clear();
+        assert!(nc.check().is_ok());
+        let c = nc.to_config();
+        assert_eq!(c.db_auth, None);
+        assert_eq!(c.password.as_deref(), Some("old secret"));
+    }
+
+    #[test]
+    fn gcp_iam_is_kept_for_postgres_and_mysql_only() {
+        let mut nc = NewConnectionState::default();
+        nc.set_db_type(DatabaseType::MySQL);
+        nc.username = "root".into();
+        nc.cycle_db_auth();
+        assert_eq!(nc.username, "");
+        nc.username = "jane@example.com".into();
+        assert_eq!(nc.to_config().db_auth, Some(DbAuthMethod::GcpIam));
+        nc.set_db_type(DatabaseType::SQLServer);
+        nc.username.clear();
+        assert!(nc.check().is_ok());
+        assert_eq!(nc.to_config().db_auth, None);
     }
 
     #[test]

@@ -390,8 +390,11 @@ pub(crate) struct Timing {
     pub renew_before: Duration,
     /// …but never sooner than this after the last renewal.
     pub min_delay: Duration,
-    /// Wait before trying again after a failed renewal.
+    /// Wait before trying again after a first failed renewal, doubled
+    /// after each further failure…
     pub retry: Duration,
+    /// …up to this.
+    pub max_retry: Duration,
 }
 
 impl Timing {
@@ -399,7 +402,16 @@ impl Timing {
         renew_before: RENEW_BEFORE,
         min_delay: Duration::from_secs(30),
         retry: Duration::from_secs(30),
+        max_retry: Duration::from_secs(5 * 60),
     };
+
+    /// The wait after `failures` failed renewals in a row (at least 1).
+    fn retry_after(&self, failures: u32) -> Duration {
+        let factor = 1u32
+            .checked_shl(failures.saturating_sub(1))
+            .unwrap_or(u32::MAX);
+        self.retry.saturating_mul(factor).min(self.max_retry)
+    }
 
     fn delay(&self, expires_at: Instant, now: Instant) -> Duration {
         expires_at
@@ -452,6 +464,7 @@ async fn renew<DB, F>(
     F: Fn(&Token) -> ConnectOptionsOf<DB> + Send + Sync + 'static,
 {
     let mut wait = timing.delay(expires_at, Instant::now());
+    let mut failures = 0u32;
     loop {
         tokio::select! {
             biased;
@@ -468,17 +481,27 @@ async fn renew<DB, F>(
         };
         wait = match renewed {
             Ok(token) => {
+                failures = 0;
                 pool.set_connect_options(options(&token));
                 tracing::debug!("Cloud SQL IAM token renewed for {account}");
                 timing.delay(token.expires_at, Instant::now())
             }
             Err(e) => {
-                tracing::warn!(
-                    "Renewing the Cloud SQL IAM token for {account} failed ({e:#}); \
-                     retrying in {:?}",
-                    timing.retry
-                );
-                timing.retry
+                failures = failures.saturating_add(1);
+                let wait = timing.retry_after(failures);
+                // Warn once; the repeats of a lasting failure are noise.
+                if failures == 1 {
+                    tracing::warn!(
+                        "Renewing the Cloud SQL IAM token for {account} failed ({e:#}); \
+                         retrying in {wait:?}"
+                    );
+                } else {
+                    tracing::debug!(
+                        "Renewing the Cloud SQL IAM token for {account} failed again \
+                         ({failures} times: {e:#}); retrying in {wait:?}"
+                    );
+                }
+                wait
             }
         };
     }
@@ -697,6 +720,18 @@ mod tests {
         // A cached token is not handed out within those 5 minutes.
         assert!(usable(&Token::new("t", now + 6 * min), now));
         assert!(!usable(&Token::new("t", now + 5 * min), now));
+    }
+
+    #[test]
+    fn failed_renewals_back_off_up_to_5_minutes() {
+        let t = Timing::DEFAULT;
+        let s = Duration::from_secs;
+        let waits: Vec<_> = (1..=7).map(|n| t.retry_after(n)).collect();
+        assert_eq!(
+            waits,
+            [s(30), s(60), s(120), s(240), s(300), s(300), s(300)]
+        );
+        assert_eq!(t.retry_after(u32::MAX), s(300));
     }
 
     fn ok(stdout: &str) -> CmdOutput {

@@ -1136,6 +1136,7 @@ async fn integration_gcp_iam_token_renewal() {
         renew_before: Duration::ZERO,
         min_delay: Duration::from_millis(200),
         retry: Duration::from_millis(100),
+        max_retry: Duration::from_millis(100),
     };
     let base: sqlx::postgres::PgConnectOptions = dsn.parse().unwrap();
     let base = base.username("su_iam_it");

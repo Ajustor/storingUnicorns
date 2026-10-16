@@ -203,8 +203,14 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin, D>(
 fn feed<D>(tls: &mut ConnectionCommon<D>, mut received: &[u8]) -> Result<Vec<u8>> {
     let mut plain = Vec::new();
     while !received.is_empty() {
-        tls.read_tls(&mut received)
+        let taken = tls
+            .read_tls(&mut received)
             .context("Réception TLS impossible")?;
+        // After the peer's close_notify rustls takes nothing more: looping
+        // would spin forever, out of reach of the probe's timeout.
+        if taken == 0 {
+            bail!("Le serveur a fermé la connexion");
+        }
         let state = tls.process_new_packets().map_err(|e| match e {
             rustls::Error::InvalidCertificate(_) => anyhow!("Certificat du serveur refusé : {e}"),
             _ => anyhow!("Échec de la négociation TLS : {e}"),
@@ -1415,6 +1421,66 @@ mod tests {
         let e = probed.unwrap_err().to_string();
         assert!(e.contains("Certificat du serveur refusé"), "{e}");
         assert!(received.is_err(), "{received:?}");
+    }
+
+    /// A server that closes TLS (close_notify) instead of answering LOGIN7,
+    /// then sends more bytes and stays connected.
+    async fn closing_server<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) -> Result<()> {
+        let mut incoming = Packets::default();
+        receive(&mut stream, &mut incoming, |p| p.message(PRELOGIN)).await?;
+        let answer = prelogin_reply(ENCRYPT_ON, Some(1));
+        send(&mut stream, &framed(REPLY, &answer)).await?;
+        let mut tls = server_tls(true);
+        handshake(&mut stream, &mut tls, &mut incoming).await?;
+        let mut plain = Packets::default();
+        let mut raw = incoming.take_rest();
+        let mut chunk = vec![0; 8192];
+        loop {
+            plain.push(&feed(&mut tls, &raw)?)?;
+            if plain.message(LOGIN7)?.is_some() {
+                break;
+            }
+            let n = stream.read(&mut chunk).await?;
+            anyhow::ensure!(n > 0, "client gone before LOGIN7");
+            raw = chunk[..n].to_vec();
+        }
+        tls.send_close_notify();
+        send(&mut stream, &drain_tls(&mut tls)?).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // An application data record after the close.
+        send(&mut stream, &[0x17, 0x03, 0x03, 0x00, 0x01, 0x00]).await?;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(())
+    }
+
+    #[test]
+    fn bytes_after_close_notify_end_the_probe() {
+        // On its own runtime and thread: a probe spinning in `feed` would
+        // keep its timeout from ever firing.
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let probed = runtime.block_on(async {
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let server = tokio::spawn(closing_server(server));
+                let probed = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    exchange(client, "localhost", Trust::AnyCertificate),
+                )
+                .await;
+                server.abort();
+                probed.map(|r| r.map_err(|e| e.to_string()))
+            });
+            let _ = done.send(probed);
+        });
+        let probed = outcome
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the probe spins after close_notify");
+        let e = probed.expect("no timeout").unwrap_err();
+        assert!(e.contains("fermé"), "{e}");
     }
 
     /// The probe against a server that reads PRELOGIN then sends `answer`

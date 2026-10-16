@@ -57,7 +57,11 @@ enum Trust {
 #[derive(Debug, Clone, Copy)]
 enum Login {
     /// Only when the server's PRELOGIN asks for Entra ID (FEDAUTHREQUIRED),
-    /// as mssql-jdbc does: other servers never log a failed login.
+    /// as mssql-jdbc does for ActiveDirectoryInteractive: its
+    /// `SQLServerConnection.logon` asks for the ADAL feature, which
+    /// `sendLogon` writes into LOGIN7, only when
+    /// `fedAuthRequiredPreLoginResponse` is true. Other servers never log a
+    /// failed login.
     WhenAsked,
     /// Always: the tests' check of TLS and LOGIN7 against servers that don't
     /// ask. Only in test builds.
@@ -1378,6 +1382,9 @@ mod tests {
         Ok(received)
     }
 
+    /// A probe test that hangs fails instead.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
     async fn run_against(
         prelogin: Vec<u8>,
         reply: Vec<u8>,
@@ -1387,8 +1394,14 @@ mod tests {
     ) -> (Result<Option<FedAuthInfo>>, Result<Received>) {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(fake_server(server, prelogin, reply, tls12_only));
-        let probed = exchange(client, "localhost", trust, login).await;
-        (probed, server.await.unwrap())
+        let probe = exchange(client, "localhost", trust, login);
+        let probed = tokio::time::timeout(TEST_TIMEOUT, probe)
+            .await
+            .expect("the probe hangs");
+        let received = tokio::time::timeout(TEST_TIMEOUT, server)
+            .await
+            .expect("the fake server hangs");
+        (probed, received.unwrap())
     }
 
     #[tokio::test]
@@ -1555,7 +1568,10 @@ mod tests {
             let _ = server.write_all(&answer).await;
             let _ = server.shutdown().await;
         });
-        exchange(client, "localhost", Trust::AnyCertificate, Login::WhenAsked).await
+        let probe = exchange(client, "localhost", Trust::AnyCertificate, Login::WhenAsked);
+        tokio::time::timeout(TEST_TIMEOUT, probe)
+            .await
+            .expect("the probe hangs")
     }
 
     #[tokio::test]

@@ -50,6 +50,24 @@ impl std::fmt::Display for DatabaseType {
     }
 }
 
+/// How a PostgreSQL / MySQL connection authenticates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum DbAuthMethod {
+    #[default]
+    Password,
+    /// Google Cloud IAM database authentication (Cloud SQL).
+    GcpIam,
+}
+
+impl std::fmt::Display for DbAuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DbAuthMethod::Password => "Mot de passe",
+            DbAuthMethod::GcpIam => "IAM Google Cloud",
+        })
+    }
+}
+
 /// TLS policy for PostgreSQL / MySQL (ignored by the other drivers).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SslMode {
@@ -163,11 +181,18 @@ pub struct ConnectionConfig {
     /// Compatible product shown instead of the bare engine.
     #[serde(default)]
     pub flavor: Option<Flavor>,
+    /// PostgreSQL / MySQL only; `None` = `DbAuthMethod::Password`.
+    #[serde(default)]
+    pub db_auth: Option<DbAuthMethod>,
 }
 
 impl ConnectionConfig {
     pub fn effective_ssl_mode(&self) -> SslMode {
         self.ssl_mode.unwrap_or_default()
+    }
+
+    pub fn effective_db_auth(&self) -> DbAuthMethod {
+        self.db_auth.unwrap_or_default()
     }
 
     /// The flavor when it matches the driver, else the engine name.
@@ -245,6 +270,7 @@ impl Default for ConnectionConfig {
             ssl_mode: None,
             ssl_ca: None,
             flavor: None,
+            db_auth: None,
         }
     }
 }

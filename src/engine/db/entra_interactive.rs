@@ -880,7 +880,7 @@ fn note_value(config: &ConnectionConfig, target: &Target) -> String {
 
 /// The server's answer a note (`note_value`) stands for; `None` for
 /// `organizations`, which names no tenant, and for a note naming no known
-/// authority.
+/// authority or no tenant name (`../x` would read as `x` in a URL).
 fn noted_answer(config: &ConnectionConfig, value: &str) -> Option<FedAuthInfo> {
     let cloud = AzureCloud::from_host(config.host.as_deref().unwrap_or_default());
     let (tenant, host) = value
@@ -892,7 +892,7 @@ fn noted_answer(config: &ConnectionConfig, value: &str) -> Option<FedAuthInfo> {
     let (host, _) = KNOWN_AUTHORITIES
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(host))?;
-    if tenant.is_empty() || tenant.eq_ignore_ascii_case(ORGANIZATIONS) {
+    if !is_tenant_name(tenant) || tenant.eq_ignore_ascii_case(ORGANIZATIONS) {
         return None;
     }
     Some(FedAuthInfo {
@@ -2085,6 +2085,45 @@ mod tests {
         let note = format!("{GUID}@%6Cogin.microsoftonline.us");
         assert!(noted_answer(&c, &note).is_none());
         assert_eq!(noted_target(&c, &note), Target::for_config(&c, None).ok());
+    }
+
+    #[test]
+    fn a_corrupt_note_stands_for_no_note() {
+        for host in [
+            "srv.database.windows.net",
+            "srv.database.usgovcloudapi.net",
+            "srv.database.chinacloudapi.cn",
+            "sql.contoso.internal",
+        ] {
+            let c = zero_config(host);
+            let cloud = AzureCloud::from_host(host);
+            for note in [
+                "t@evil.example",
+                "t@login.microsoftonline.com@evil.example",
+                "t@login.microsoftonline.us:444",
+                "@x",
+                "organizations@login.microsoftonline.us",
+                "common@login.microsoftonline.us",
+                "consumers",
+                "../x",
+                "x#",
+                "x?y",
+                "",
+            ] {
+                let t = noted_target(&c, note).unwrap();
+                assert_eq!(
+                    t.authority,
+                    format!("https://{}", cloud.authority_host()),
+                    "{host} {note:?}"
+                );
+                assert_eq!(t.tenant, ORGANIZATIONS, "{host} {note:?}");
+                assert!(
+                    t.scope.starts_with(&format!("{} ", cloud.sql_scope())),
+                    "{host} {note:?}: {}",
+                    t.scope
+                );
+            }
+        }
     }
 
     #[test]

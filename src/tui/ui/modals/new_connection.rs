@@ -17,6 +17,8 @@ const FIELD_HEIGHT: u16 = 2;
 /// The most fields shown at once (PostgreSQL / MySQL with SSL, Azure with
 /// the browser sign-in), so the dialog never resizes while cycling the type.
 const MAX_FIELDS: u16 = 11;
+/// Placeholder of an optional field the app fills in by itself.
+const AUTO: &str = "auto";
 
 /// Where the connection dialog is drawn: 60 % wide, tall enough for every
 /// field (24 rows), clamped to the terminal.
@@ -232,7 +234,9 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
         idx += 1;
 
         // Azure CLI's tenant ID; the browser sign-in's tenant and
-        // application.
+        // application, both optional: "auto" while empty (the server's
+        // tenant, Microsoft's drivers' application). Short labels: a GUID
+        // fits on 80 columns.
         if show_tenant {
             let label = if browser { "Tenant" } else { "Tenant ID" };
             render_field(
@@ -244,12 +248,11 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
                 false,
             );
             if browser && nc.tenant_id.is_empty() {
-                render_placeholder(frame, chunks[idx], label, "GUID ou domaine");
+                render_placeholder(frame, chunks[idx], label, AUTO);
             }
             idx += 1;
         }
         if browser {
-            // Short: the GUID fits on 80 columns.
             const LABEL: &str = "ID app";
             render_field(
                 frame,
@@ -260,7 +263,7 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
                 false,
             );
             if nc.azure_client_id.is_empty() {
-                render_placeholder(frame, chunks[idx], LABEL, "GUID de l'application");
+                render_placeholder(frame, chunks[idx], LABEL, AUTO);
             }
             idx += 1;
         }
@@ -497,15 +500,17 @@ mod tests {
         state.open_new_connection_dialog();
         let nc = &mut state.new_connection;
         nc.set_db_type(DatabaseType::Azure);
-        nc.azure_auth_method = AzureAuthMethod::InteractiveBrowser;
-        nc.tenant_id.clear();
+        nc.azure_auth_method = AzureAuthMethod::Interactive;
+        nc.cycle_azure_auth_method(); // the browser sign-in, from Azure CLI
         nc.username.clear();
         let rows = screen(&state);
         let all = rows.join("\n");
+        // All optional: the tenant and the application are found by
+        // themselves.
         for label in [
             "Auth: Azure AD (navigateur)",
-            "Tenant: GUID ou domaine",
-            "ID app: GUID de l'application",
+            "Tenant: auto",
+            "ID app: auto",
             "Compte: facultatif",
             "Database:",
         ] {
@@ -529,6 +534,7 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("Compte: jane@contoso.com"), "{all}");
+        assert!(!all.contains("auto"), "{all}");
 
         state.new_connection.azure_auth_method = AzureAuthMethod::Interactive;
         let all = screen(&state).join("\n");

@@ -879,12 +879,19 @@ fn note_value(config: &ConnectionConfig, target: &Target) -> String {
 }
 
 /// The server's answer a note (`note_value`) stands for; `None` for
-/// `organizations`, which names no tenant.
+/// `organizations`, which names no tenant, and for a note naming no known
+/// authority.
 fn noted_answer(config: &ConnectionConfig, value: &str) -> Option<FedAuthInfo> {
     let cloud = AzureCloud::from_host(config.host.as_deref().unwrap_or_default());
     let (tenant, host) = value
         .split_once('@')
         .unwrap_or((value, cloud.authority_host()));
+    // The cloud is read from the note's text, the authority from the URL
+    // built with it: both must name the same host, so only a known one,
+    // exactly (`%6Cogin.microsoftonline.us` would only read as one in a URL).
+    let (host, _) = KNOWN_AUTHORITIES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(host))?;
     if tenant.is_empty() || tenant.eq_ignore_ascii_case(ORGANIZATIONS) {
         return None;
     }
@@ -2056,6 +2063,28 @@ mod tests {
                 t.scope
             );
         }
+    }
+
+    #[test]
+    fn a_note_names_a_known_authority_exactly() {
+        let c = zero_config("srv.database.usgovcloudapi.net");
+        // As `note_value` writes it, in any case.
+        for note in [
+            format!("{GUID}@login.microsoftonline.us"),
+            format!("{GUID}@LOGIN.MicrosoftOnline.US"),
+        ] {
+            let info = noted_answer(&c, &note).unwrap();
+            assert_eq!(
+                info.sts_url,
+                format!("https://login.microsoftonline.us/{GUID}"),
+                "{note}"
+            );
+            assert_eq!(info.spn, "https://database.usgovcloudapi.net/", "{note}");
+        }
+        // A host that only a URL would read as a known one: no note.
+        let note = format!("{GUID}@%6Cogin.microsoftonline.us");
+        assert!(noted_answer(&c, &note).is_none());
+        assert_eq!(noted_target(&c, &note), Target::for_config(&c, None).ok());
     }
 
     #[test]

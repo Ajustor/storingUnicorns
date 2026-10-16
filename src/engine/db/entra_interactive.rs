@@ -223,10 +223,11 @@ fn sts_authority(sts_url: &str) -> Option<(String, String)> {
 }
 
 /// Whether `tenant` reads as a GUID or a domain: letters, digits, `.` and
-/// `-`, at most 253 characters (nothing that could leave its path segment).
+/// `-`, at least one letter or digit (never `.` or `..`, which would move
+/// the token request up the URL path), at most 253 characters.
 fn is_tenant_name(tenant: &str) -> bool {
-    !tenant.is_empty()
-        && tenant.len() <= 253
+    tenant.len() <= 253
+        && tenant.bytes().any(|b| b.is_ascii_alphanumeric())
         && tenant
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
@@ -366,7 +367,8 @@ pub fn explain(err: &AuthError, app: SignInApp) -> String {
             } else if has(65001) || code == "consent_required" {
                 "Ton organisation n'autorise pas l'application des drivers Microsoft pour Azure \
                  SQL : demande à un administrateur d'accorder son consentement, ou indique \
-                 l'ID client de l'application de ton organisation dans la connexion."
+                 l'ID client de l'application de ton organisation dans les options avancées \
+                 de la connexion (champ ID app dans le terminal)."
             } else if has(50011) && own {
                 "L'URI de redirection `http://localhost` n'est pas déclarée : ajoute-la dans la \
                  plateforme « Applications mobiles et de bureau » de l'application."
@@ -376,8 +378,8 @@ pub fn explain(err: &AuthError, app: SignInApp) -> String {
                 "Application introuvable dans ce tenant : vérifie l'ID client et le tenant."
             } else if has(700016) {
                 "Ce tenant ne connaît pas l'application des drivers Microsoft : vérifie le \
-                 champ Tenant de la connexion, ou laisse-le vide pour utiliser celui du \
-                 serveur."
+                 tenant dans les options avancées de la connexion (champ Tenant dans le \
+                 terminal), ou laisse-le vide pour utiliser celui du serveur."
             } else if has(90002) {
                 "Tenant introuvable : vérifie le tenant."
             } else {
@@ -1760,6 +1762,10 @@ mod tests {
         }
         let long = "a".repeat(254);
         for bad in [
+            ".",
+            "..",
+            "-",
+            "-.-",
             "contoso.com/evil",
             "con toso",
             "contoso.com?x=1",
@@ -2007,6 +2013,8 @@ mod tests {
             "https://login.microsoftonline.com/consumers".into(),
             "https://login.microsoftonline.com/a%2Fb".into(),
             "https://login.microsoftonline.com/con toso".into(),
+            "https://login.microsoftonline.com/-".into(),
+            "https://login.microsoftonline.com/.-.".into(),
             "not a url".into(),
         ] {
             let info = answer(&sts, "https://database.windows.net/");
@@ -2484,7 +2492,8 @@ mod tests {
             consent,
             "Ton organisation n'autorise pas l'application des drivers Microsoft pour Azure SQL \
              : demande à un administrateur d'accorder son consentement, ou indique \
-             l'ID client de l'application de ton organisation dans la connexion. \
+             l'ID client de l'application de ton organisation dans les options avancées de \
+             la connexion (champ ID app dans le terminal). \
              (AADSTS65001: The user or administrator has not consented.)"
         );
         assert!(microsoft(&server("consent_required", "", &[]))
@@ -2496,8 +2505,9 @@ mod tests {
             &[700016]
         ))
         .starts_with(
-            "Ce tenant ne connaît pas l'application des drivers Microsoft : vérifie le champ \
-             Tenant de la connexion, ou laisse-le vide pour utiliser celui du serveur."
+            "Ce tenant ne connaît pas l'application des drivers Microsoft : vérifie le tenant \
+             dans les options avancées de la connexion (champ Tenant dans le terminal), ou \
+             laisse-le vide pour utiliser celui du serveur."
         ));
         // Settings of one's own application: nothing for the user to fix.
         for (code, n) in [
@@ -4166,5 +4176,40 @@ mod flow_tests {
             h.store.get(&zero_config_key("organizations")).unwrap(),
             None
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_connection_does_not_keep_the_home_sign_in() {
+        const HOME: &str = "11111111-2222-3333-4444-555555555555";
+        let h = Harness::new(entra_in(&[], Some(HOME)), Behaviour::SignIn).await;
+        // `a` signed in under organizations (home tenant)…
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        let a = on_server("a.database.windows.net");
+        h.token_for(&a).await.unwrap();
+        h.browser.finish();
+        // …`x` in TENANT, where the account is a guest.
+        *h.probed.lock().unwrap() = azure_sql();
+        let x = on_server("x.database.windows.net");
+        h.token_for(&x).await.unwrap();
+        h.browser.finish();
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 2);
+        // Deleting `a` forgets the home sign-in: `x` doesn't use it.
+        let (session, store) = (h.session, h.store);
+        tokio::task::spawn_blocking(move || {
+            forget_beside(&a, &[x], session, store, None);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            h.store.get(&zero_config_key("organizations")).unwrap(),
+            None
+        );
+        assert_eq!(
+            h.store
+                .get(&tid_note(&zero_config_key("organizations")))
+                .unwrap(),
+            None
+        );
+        assert!(h.store.get(&zero_config_key(TENANT)).unwrap().is_some());
     }
 }

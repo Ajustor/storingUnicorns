@@ -691,6 +691,9 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
     let mut target = resolve_target(config, deps)
         .await
         .map_err(anyhow::Error::msg)?;
+    if typed_tenant(config).is_none() {
+        target = with_kept_sign_in(config, target, deps).await;
+    }
     if let Some(authority) = &deps.authority {
         target.authority = authority.clone();
     }
@@ -758,8 +761,40 @@ async fn resolve_target(config: &ConnectionConfig, deps: &Deps<'_>) -> Result<Ta
     Target::for_config(config, answer.as_ref())
 }
 
+/// `target`, unless it holds no sign-in while the `organizations` one of the
+/// same application and account does: a connection that signed in while its
+/// server didn't answer keeps that sign-in once the server answers.
+async fn with_kept_sign_in(config: &ConnectionConfig, target: Target, deps: &Deps<'_>) -> Target {
+    let Ok(fallback) = Target::for_config(config, None) else {
+        return target;
+    };
+    if target.tenant.eq_ignore_ascii_case(&fallback.tenant)
+        || holds_sign_in(&secret_key(&target), deps).await
+        || !holds_sign_in(&secret_key(&fallback), deps).await
+    {
+        return target;
+    }
+    tracing::info!(
+        "Entra ID: {} keeps the sign-in made while its server didn't answer",
+        config.name
+    );
+    fallback
+}
+
+/// Whether `key` holds a session token or a refresh token.
+async fn holds_sign_in(key: &str, deps: &Deps<'_>) -> bool {
+    if deps.session.tokens().contains_key(key) {
+        return true;
+    }
+    load_secret(deps.store, key)
+        .await
+        .is_some_and(|refresh| !refresh.is_empty())
+}
+
 /// The FEDAUTHINFO of `host:port`: remembered (an answer for the session, a
 /// failure for `PROBE_RETRY`), else asked, one probe at a time per server.
+/// A reconnection (`!deps.interactive`) never asks again: what the server
+/// said when the user connected decided where the sign-in is.
 async fn server_answer(host: &str, port: u16, deps: &Deps<'_>) -> Option<FedAuthInfo> {
     if host.is_empty() {
         return None;
@@ -770,7 +805,7 @@ async fn server_answer(host: &str, port: u16, deps: &Deps<'_>) -> Option<FedAuth
     let now = (deps.now)();
     if let Some(known) = deps.session.servers().get(&key) {
         let stale = matches!(now.duration_since(known.at), Ok(age) if age >= PROBE_RETRY);
-        if known.info.is_some() || !stale {
+        if known.info.is_some() || !stale || !deps.interactive {
             return known.info.clone();
         }
     }
@@ -3049,16 +3084,76 @@ mod flow_tests {
         // The failure is remembered for a while…
         h.token_for(&zero_config()).await.unwrap();
         assert_eq!(h.probes(), 1);
-        // …then the server is asked again.
+        // …then the server is asked again; its tenant holds no sign-in, so
+        // the one made meanwhile stays.
         h.clock.store(11 * 60, Ordering::SeqCst);
         *h.probed.lock().unwrap() = azure_sql();
-        h.token_for(&zero_config()).await.unwrap();
-        h.browser.finish();
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
         assert_eq!(h.probes(), 2);
+        assert_eq!(h.grants(), ["authorization_code"]);
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+    }
+
+    /// Signed in under `organizations` while the server didn't answer.
+    async fn signed_in_without_the_server() -> Harness {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        h.browser.finish();
+        // Later on, the server answers.
+        h.clock.store(11 * 60, Ordering::SeqCst);
+        *h.probed.lock().unwrap() = azure_sql();
+        h
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconnection_keeps_the_servers_last_answer() {
+        let mut h = signed_in_without_the_server().await;
+        h.interactive = false;
+        // Not asked again under other operations: the sign-in still works.
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        assert_eq!(h.probes(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sign_in_made_without_the_server_outlives_its_answer() {
+        for interactive in [true, false] {
+            let mut h = signed_in_without_the_server().await;
+            h.interactive = interactive;
+            // Only the refresh token is left (the app was restarted)…
+            h.session.tokens().clear();
+            h.session.servers().clear();
+            // …and the server, asked again, names its tenant, which holds
+            // nothing: the organizations sign-in is renewed, no browser.
+            assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
+            assert_eq!(h.probes(), 2);
+            assert_eq!(h.grants(), ["authorization_code", "refresh_token"]);
+            assert_eq!(
+                h.requests.lock().unwrap()[1].path,
+                "/organizations/oauth2/v2.0/token"
+            );
+            assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                h.store
+                    .get(&zero_config_key("organizations"))
+                    .unwrap()
+                    .as_deref(),
+                Some("RT-2")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_servers_tenant_wins_once_it_holds_a_sign_in() {
+        let h = signed_in_without_the_server().await;
+        h.session.tokens().clear();
+        h.store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
         assert_eq!(
-            h.requests.lock().unwrap().last().unwrap().path,
+            h.requests.lock().unwrap()[1].path,
             format!("/{TENANT}/oauth2/v2.0/token")
         );
+        assert_eq!(h.requests.lock().unwrap()[1].form["refresh_token"], "RT-7");
     }
 
     #[tokio::test(flavor = "multi_thread")]

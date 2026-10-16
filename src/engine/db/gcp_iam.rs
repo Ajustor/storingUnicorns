@@ -148,15 +148,11 @@ struct CmdOutput {
     stderr: Vec<u8>,
 }
 
-/// `gcloud` arguments for a Cloud SQL login token, `fallback` for the plain
-/// access token (older SDKs without `sql generate-login-token`).
-fn token_args(account: &str, fallback: bool) -> Vec<String> {
-    let command: &[&str] = if fallback {
-        &["auth", "print-access-token"]
-    } else {
-        &["sql", "generate-login-token"]
-    };
-    command
+/// `gcloud` arguments for a Cloud SQL login token. Never `auth
+/// print-access-token` instead: that token opens all of Google Cloud, and
+/// `Require` TLS doesn't verify who receives it.
+fn token_args(account: &str) -> Vec<String> {
+    ["sql", "generate-login-token"]
         .iter()
         .map(|s| s.to_string())
         .chain([format!("--account={account}"), "--quiet".to_string()])
@@ -335,8 +331,8 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// A fresh token for `account` from `gcloud`, run by `run`; falls back to
-/// `auth print-access-token` on SDKs without `sql generate-login-token`.
+/// A fresh token for `account` from `gcloud`, run by `run` (an SDK without
+/// `sql generate-login-token` must be updated).
 async fn fetch_with<R, F>(account: &str, run: R) -> Result<Token>
 where
     R: Fn(Vec<String>) -> F,
@@ -346,13 +342,7 @@ where
         bail!("Le compte Google contient des caractères non autorisés.");
     }
     tracing::info!("Requesting a Cloud SQL IAM token from gcloud for {account}");
-    let mut out = run(token_args(account, false))
-        .await
-        .map_err(launch_error)?;
-    if !out.success && classify(&out) == Failure::UnknownCommand {
-        tracing::info!("gcloud has no `sql generate-login-token`; using `auth print-access-token`");
-        out = run(token_args(account, true)).await.map_err(launch_error)?;
-    }
+    let out = run(token_args(account)).await.map_err(launch_error)?;
     if !out.success {
         return Err(explain(classify(&out), account));
     }
@@ -567,7 +557,7 @@ mod tests {
     #[test]
     fn command_asks_for_a_login_token_for_the_account() {
         assert_eq!(
-            token_args("jane@example.com", false),
+            token_args("jane@example.com"),
             [
                 "sql",
                 "generate-login-token",
@@ -575,16 +565,7 @@ mod tests {
                 "--quiet"
             ]
         );
-        assert_eq!(
-            token_args("jane@example.com", true),
-            [
-                "auth",
-                "print-access-token",
-                "--account=jane@example.com",
-                "--quiet"
-            ]
-        );
-        let args = token_args("j@x.c", false);
+        let args = token_args("j@x.c");
         let (program, all) = command_line(&args, true);
         assert_eq!(program, "cmd");
         assert_eq!(all[..2], ["/C", "gcloud"]);
@@ -728,27 +709,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_falls_back_to_the_access_token() {
+    async fn an_sdk_without_login_tokens_must_be_updated() {
+        // No fallback to `auth print-access-token`: a general Google Cloud
+        // token must not travel over TLS that doesn't verify the server.
         let calls = Mutex::new(Vec::new());
-        let token = fetch_with("jane@example.com", |args: Vec<String>| {
+        let e = fetch_with("jane@example.com", |args: Vec<String>| {
             calls.lock().unwrap().push(args[..2].join(" "));
-            let out = if args[0] == "sql" {
-                failed(
+            async {
+                Ok(failed(
                     2,
                     "ERROR: (gcloud.sql) Invalid choice: 'generate-login-token'.",
-                )
-            } else {
-                ok("ya29.fallback\n")
-            };
-            async move { Ok(out) }
+                ))
+            }
         })
         .await
-        .unwrap();
-        assert_eq!(token.secret(), "ya29.fallback");
-        assert_eq!(
-            *calls.lock().unwrap(),
-            ["sql generate-login-token", "auth print-access-token"]
-        );
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("mets à jour le SDK Google Cloud"), "{e}");
+        assert_eq!(*calls.lock().unwrap(), ["sql generate-login-token"]);
     }
 
     #[tokio::test]

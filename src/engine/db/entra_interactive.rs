@@ -143,6 +143,15 @@ impl Target {
         })
     }
 
+    /// Whose application the sign-in uses.
+    pub fn app(&self) -> SignInApp {
+        if self.client_id == DEFAULT_CLIENT_ID {
+            SignInApp::Microsoft
+        } else {
+            SignInApp::Own
+        }
+    }
+
     /// `<authority>/<tenant>/oauth2/v2.0/<endpoint>`, the tenant kept in
     /// one path segment.
     fn endpoint(&self, endpoint: &str) -> Url {
@@ -274,16 +283,28 @@ pub enum AuthError {
     InvalidResponse(String),
 }
 
-impl std::fmt::Display for AuthError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&explain(self))
-    }
+/// Whose application a sign-in uses (`Target::app`): Entra ID's errors
+/// don't call for the same fix with Microsoft's drivers' application, which
+/// nobody here registered, as with the organization's own.
+///
+/// `AuthError` has no `Display`: every message shown is worded for the
+/// sign-in's application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInApp {
+    /// `DEFAULT_CLIENT_ID`.
+    Microsoft,
+    /// The application typed in the connection.
+    Own,
 }
 
-impl std::error::Error for AuthError {}
+/// `err` as the user's message (`explain`).
+fn failure(err: &AuthError, app: SignInApp) -> anyhow::Error {
+    anyhow::Error::msg(explain(err, app))
+}
 
-/// French message for `err`, Entra ID's own message in parentheses.
-pub fn explain(err: &AuthError) -> String {
+/// French message for `err` in a sign-in with `app`, Entra ID's own message
+/// in parentheses.
+pub fn explain(err: &AuthError, app: SignInApp) -> String {
     match err {
         AuthError::Server {
             code,
@@ -298,16 +319,27 @@ pub fn explain(err: &AuthError) -> String {
                 first_line
             };
             let has = |n: u64| codes.contains(&n) || aadsts_codes(description).contains(&n);
-            let message = if has(65001) || code == "consent_required" {
+            let own = app == SignInApp::Own;
+            // The redirect URI and the public client flows are settings of
+            // the organization's application: Microsoft's has them right.
+            let message = if (has(65001) || code == "consent_required") && own {
                 "L'application n'a pas l'autorisation d'accéder à Azure SQL : un administrateur \
                  doit accorder la permission déléguée « Azure SQL Database / user_impersonation »."
-            } else if has(50011) {
+            } else if has(65001) || code == "consent_required" {
+                "Ton organisation n'autorise pas l'application des drivers Microsoft pour Azure \
+                 SQL : demande à un administrateur d'accorder son consentement, ou indique \
+                 l'application de ton organisation dans les options avancées."
+            } else if has(50011) && own {
                 "L'URI de redirection `http://localhost` n'est pas déclarée : ajoute-la dans la \
                  plateforme « Applications mobiles et de bureau » de l'application."
-            } else if has(7000218) {
+            } else if has(7000218) && own {
                 "Active « Autoriser les flux clients publics » dans l'application."
-            } else if has(700016) {
+            } else if has(700016) && own {
                 "Application introuvable dans ce tenant : vérifie l'ID client et le tenant."
+            } else if has(700016) {
+                "Ce tenant ne connaît pas l'application des drivers Microsoft : vérifie le \
+                 tenant dans les options avancées, ou laisse-le vide pour utiliser celui du \
+                 serveur."
             } else if has(90002) {
                 "Tenant introuvable : vérifie le tenant."
             } else {
@@ -700,7 +732,7 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
                 deps.session.tokens().remove(&key);
                 delete_secret(deps.store, &key).await;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(failure(&e, target.app())),
         },
         Next::Interactive => {}
     }
@@ -919,6 +951,7 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
     let verifier = random_urlsafe(32)?;
     let state = random_urlsafe(16)?;
     let url = authorize_url(t, &redirect_uri, &pkce_challenge(&verifier), &state);
+    let app = t.app();
 
     let (code, mut browser) = {
         (deps.notify)(Interaction::Waiting {
@@ -931,9 +964,11 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
         };
         (deps.open_browser)(&url);
         let (v4, v6) = (&v4, v6.as_ref());
-        tokio::time::timeout(deps.timeout, wait_for_code(move || accept(v4, v6), &state))
+        let wait = wait_for_code(move || accept(v4, v6), &state, app);
+        tokio::time::timeout(deps.timeout, wait)
             .await
-            .map_err(|_| AuthError::Timeout)??
+            .unwrap_or(Err(AuthError::Timeout))
+            .map_err(|e| failure(&e, app))?
     };
     let grant = Grant::Code {
         code: &code,
@@ -945,9 +980,9 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
     let tokens = redeem(t, grant, deps).await;
     match &tokens {
         Ok(_) => respond(&mut browser, "200 OK", &page(SIGNED_IN)).await,
-        Err(e) => respond(&mut browser, "400 Bad Request", &page(&explain(e))).await,
+        Err(e) => respond(&mut browser, "400 Bad Request", &page(&explain(e, app))).await,
     }
-    Ok(tokens?)
+    tokens.map_err(|e| failure(&e, app))
 }
 
 /// Listen on a free port of 127.0.0.1 and the same port of ::1 when there
@@ -983,8 +1018,12 @@ async fn accept(v4: &TcpListener, v6: Option<&TcpListener>) -> std::io::Result<T
 /// sign-in comes back: the code with the browser's connection, still to be
 /// answered, or why it failed. Other requests (`/favicon.ico`…) get a 404,
 /// redirects with another `state` (another tab, a forged request) a 400
-/// while the wait goes on.
-async fn wait_for_code<A, F>(mut accept: A, state: &str) -> Result<(String, TcpStream), AuthError>
+/// while the wait goes on. Errors are worded for `app` in the browser.
+async fn wait_for_code<A, F>(
+    mut accept: A,
+    state: &str,
+    app: SignInApp,
+) -> Result<(String, TcpStream), AuthError>
 where
     A: FnMut() -> F,
     F: std::future::Future<Output = std::io::Result<TcpStream>>,
@@ -1016,13 +1055,13 @@ where
             Some((target, mut stream)) = rx.recv() => match parse_callback(&target, state) {
                 Err(AuthError::NotACallback) => respond(&mut stream, "404 Not Found", "").await,
                 Err(AuthError::StateMismatch) => {
-                    let message = explain(&AuthError::StateMismatch);
+                    let message = explain(&AuthError::StateMismatch, app);
                     respond(&mut stream, "400 Bad Request", &page(&message)).await;
                 }
                 // Answered once the code is exchanged.
                 Ok(code) => return Ok((code, stream)),
                 Err(e) => {
-                    respond(&mut stream, "400 Bad Request", &page(&explain(&e))).await;
+                    respond(&mut stream, "400 Bad Request", &page(&explain(&e, app))).await;
                     return Err(e);
                 }
             },
@@ -1872,9 +1911,65 @@ mod tests {
         }
     }
 
+    /// `err` explained for a sign-in with the organization's application.
+    fn explain_own(err: &AuthError) -> String {
+        explain(err, SignInApp::Own)
+    }
+
+    #[test]
+    fn the_application_of_a_target_is_known() {
+        let mut t = target();
+        assert_eq!(t.app(), SignInApp::Own);
+        t.client_id = DEFAULT_CLIENT_ID.into();
+        assert_eq!(t.app(), SignInApp::Microsoft);
+        let zero = Target::for_config(&zero_config("srv.database.windows.net"), None).unwrap();
+        assert_eq!(zero.app(), SignInApp::Microsoft);
+    }
+
+    #[test]
+    fn errors_with_microsofts_application_are_worded_for_it() {
+        let microsoft = |e: &AuthError| explain(e, SignInApp::Microsoft);
+        // Consent: the organization blocks it, or names its own.
+        let consent = microsoft(&server(
+            "invalid_grant",
+            "AADSTS65001: The user or administrator has not consented.\r\nTrace ID: 1",
+            &[65001],
+        ));
+        assert_eq!(
+            consent,
+            "Ton organisation n'autorise pas l'application des drivers Microsoft pour Azure SQL \
+             : demande à un administrateur d'accorder son consentement, ou indique \
+             l'application de ton organisation dans les options avancées. \
+             (AADSTS65001: The user or administrator has not consented.)"
+        );
+        assert!(microsoft(&server("consent_required", "", &[]))
+            .starts_with("Ton organisation n'autorise pas l'application des drivers Microsoft"));
+        // Not found: the tenant is the one to check.
+        assert!(microsoft(&server(
+            "unauthorized_client",
+            "AADSTS700016: Application not found",
+            &[700016]
+        ))
+        .starts_with(
+            "Ce tenant ne connaît pas l'application des drivers Microsoft : vérifie le tenant \
+             dans les options avancées, ou laisse-le vide pour utiliser celui du serveur."
+        ));
+        // Settings of one's own application: nothing for the user to fix.
+        for (code, n) in [
+            ("AADSTS50011: The redirect URI does not match", 50011),
+            ("AADSTS7000218: client_assertion or client_secret", 7000218),
+        ] {
+            let e = microsoft(&server("invalid_client", code, &[n]));
+            assert_eq!(e, format!("Échec de la connexion Azure AD. ({code})"));
+        }
+        // The same for both.
+        let tenant = server("invalid_request", "AADSTS90002: Tenant not found", &[90002]);
+        assert_eq!(microsoft(&tenant), explain_own(&tenant));
+    }
+
     #[test]
     fn known_entra_errors_are_explained() {
-        let consent = explain(&server(
+        let consent = explain_own(&server(
             "invalid_grant",
             "AADSTS65001: The user or administrator has not consented.\r\nTrace ID: 1",
             &[65001],
@@ -1890,9 +1985,9 @@ mod tests {
             consent.ends_with("(AADSTS65001: The user or administrator has not consented.)"),
             "{consent}"
         );
-        assert!(explain(&server("consent_required", "", &[]))
+        assert!(explain_own(&server("consent_required", "", &[]))
             .starts_with("L'application n'a pas l'autorisation"));
-        assert!(explain(&server(
+        assert!(explain_own(&server(
             "invalid_request",
             "AADSTS50011: The redirect URI does not match",
             &[]
@@ -1901,19 +1996,19 @@ mod tests {
             "L'URI de redirection `http://localhost` n'est pas déclarée : ajoute-la dans la \
              plateforme « Applications mobiles et de bureau » de l'application."
         ));
-        assert!(explain(&server(
+        assert!(explain_own(&server(
             "invalid_client",
             "AADSTS7000218: client_assertion or client_secret",
             &[7000218]
         ))
         .starts_with("Active « Autoriser les flux clients publics » dans l'application."));
-        assert!(explain(&server(
+        assert!(explain_own(&server(
             "unauthorized_client",
             "AADSTS700016: Application not found",
             &[700016]
         ))
         .starts_with("Application introuvable dans ce tenant : vérifie l'ID client et le tenant."));
-        assert!(explain(&server(
+        assert!(explain_own(&server(
             "invalid_request",
             "AADSTS90002: Tenant not found",
             &[90002]
@@ -1924,41 +2019,44 @@ mod tests {
     #[test]
     fn codes_are_matched_exactly() {
         // 70001 is none of the known codes (700016, 7000218…).
-        let e = explain(&server("x", "AADSTS70001: other", &[70001]));
+        let e = explain_own(&server("x", "AADSTS70001: other", &[70001]));
         assert!(e.starts_with("Échec de la connexion Azure AD"), "{e}");
         assert!(e.ends_with("(AADSTS70001: other)"), "{e}");
         // Without a description, the OAuth error code.
         assert_eq!(
-            explain(&server("invalid_scope", "", &[])),
+            explain_own(&server("invalid_scope", "", &[])),
             "Échec de la connexion Azure AD. (invalid_scope)"
         );
         // A code only in error_codes is enough.
-        assert!(
-            explain(&server("invalid_client", "", &[7000218])).starts_with("Active « Autoriser")
-        );
+        assert!(explain_own(&server("invalid_client", "", &[7000218]))
+            .starts_with("Active « Autoriser"));
     }
 
     #[test]
     fn cancel_timeout_and_other_failures_are_explained() {
         assert_eq!(
-            explain(&AuthError::Denied {
+            explain_own(&AuthError::Denied {
                 description: "AADSTS65004: User declined".into()
             }),
             "Connexion annulée dans le navigateur. (AADSTS65004: User declined)"
         );
         assert_eq!(
-            explain(&AuthError::Denied {
+            explain_own(&AuthError::Denied {
                 description: String::new()
             }),
             "Connexion annulée dans le navigateur."
         );
         assert_eq!(
-            explain(&AuthError::Timeout),
+            explain_own(&AuthError::Timeout),
             "Connexion non terminée dans le navigateur après 5 minutes."
         );
-        assert!(explain(&AuthError::StateMismatch).contains("state"));
-        assert!(explain(&AuthError::Network("refused".into())).contains("(refused)"));
-        assert_eq!(AuthError::Timeout.to_string(), explain(&AuthError::Timeout));
+        assert!(explain_own(&AuthError::StateMismatch).contains("state"));
+        assert!(explain_own(&AuthError::Network("refused".into())).contains("(refused)"));
+        // Whatever the application.
+        assert_eq!(
+            explain(&AuthError::Timeout, SignInApp::Microsoft),
+            explain_own(&AuthError::Timeout)
+        );
     }
 
     fn tokens(expires_at: SystemTime, refresh: Option<&str>) -> Tokens {
@@ -2594,7 +2692,7 @@ mod flow_tests {
         let e = h.token().await.unwrap_err().to_string();
         h.browser.finish();
         // Refused, then still waiting for the real redirect until the end.
-        assert_eq!(e, explain(&AuthError::Timeout));
+        assert_eq!(e, explain(&AuthError::Timeout, SignInApp::Own));
         assert!(h.grants().is_empty(), "the code must not be exchanged");
         let (status, html) = h.browser.last_page();
         assert_eq!(status, 400);
@@ -2763,9 +2861,12 @@ mod flow_tests {
         let browser = std::thread::spawn(move || {
             let _ = ureq::get(&format!("http://127.0.0.1:{port}/?code=c&state=s")).call();
         });
-        let waited = tokio::time::timeout(Duration::from_secs(10), wait_for_code(accept, "s"))
-            .await
-            .unwrap();
+        let waited = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_code(accept, "s", SignInApp::Own),
+        )
+        .await
+        .unwrap();
         let (code, browser_connection) = waited.unwrap();
         assert_eq!(code, "c");
         drop(browser_connection);
@@ -2868,6 +2969,46 @@ mod flow_tests {
             h.store.get(&zero_config_key(TENANT)).unwrap().as_deref(),
             Some("RT-1")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn errors_of_microsofts_application_are_worded_for_it() {
+        const BLOCKED: &str = "Ton organisation n'autorise pas l'application des drivers Microsoft";
+        // Refused at the token endpoint…
+        let h = Harness::new(
+            Box::new(|_| {
+                (
+                    400,
+                    r#"{"error":"invalid_grant","error_description":"AADSTS65001: The user or administrator has not consented.","error_codes":[65001]}"#
+                        .into(),
+                )
+            }),
+            Behaviour::SignIn,
+        )
+        .await;
+        *h.probed.lock().unwrap() = azure_sql();
+        let e = h.token_for(&zero_config()).await.unwrap_err().to_string();
+        h.browser.finish();
+        assert!(e.starts_with(BLOCKED), "{e}");
+        let (status, html) = h.browser.last_page();
+        assert_eq!(status, 400);
+        assert!(html.contains(BLOCKED), "{html}");
+
+        // …or in the redirect.
+        let h = Harness::new(
+            entra(&[]),
+            Behaviour::Redirects(&[
+                "error=consent_required&error_description=AADSTS65001%3A+no+consent&state={state}",
+            ]),
+        )
+        .await;
+        *h.probed.lock().unwrap() = azure_sql();
+        let e = h.token_for(&zero_config()).await.unwrap_err().to_string();
+        h.browser.finish();
+        assert!(e.starts_with(BLOCKED), "{e}");
+        let (_, html) = h.browser.last_page();
+        assert!(html.contains(BLOCKED), "{html}");
+        assert!(h.grants().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

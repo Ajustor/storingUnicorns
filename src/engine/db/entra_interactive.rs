@@ -223,8 +223,10 @@ fn sts_authority(sts_url: &str) -> Option<(String, String)> {
 }
 
 /// Whether `tenant` reads as a GUID or a domain: letters, digits, `.` and
-/// `-`, at least one letter or digit (never `.` or `..`, which would move
-/// the token request up the URL path), at most 253 characters.
+/// `-`, at least one letter or digit, at most 253 characters. Never `.` or
+/// `..`: `url`'s `PathSegmentsMut::extend` drops such segments, so the
+/// tenant would vanish from `Target::endpoint`'s path, and `oauth2` would
+/// be read as the tenant.
 fn is_tenant_name(tenant: &str) -> bool {
     tenant.len() <= 253
         && tenant.bytes().any(|b| b.is_ascii_alphanumeric())
@@ -2423,6 +2425,17 @@ mod tests {
             "/contoso.com%2Fevil%3Fx=1/oauth2/v2.0/authorize"
         );
         assert!(!url.query_pairs().any(|(k, _)| k == "x"));
+    }
+
+    #[test]
+    fn a_dot_tenant_would_vanish_from_the_path() {
+        // Why `is_tenant_name` refuses them.
+        for dots in [".", ".."] {
+            let mut t = target();
+            t.tenant = dots.into();
+            assert_eq!(t.endpoint("token").path(), "/oauth2/v2.0/token");
+            assert!(!is_tenant_name(dots));
+        }
     }
 
     #[test]

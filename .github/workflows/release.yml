@@ -41,6 +41,8 @@ jobs:
     name: Build ${{ matrix.artifact }}
     needs: verify-version
     runs-on: ${{ matrix.os }}
+    # Tests, release build and packaging: about 15 minutes.
+    timeout-minutes: 60
     env:
       # Authenticode signing is opt-in: it runs only when both secrets are set.
       HAS_CERT: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}

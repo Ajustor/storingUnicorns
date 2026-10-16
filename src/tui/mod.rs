@@ -686,12 +686,16 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
         }
         KeyCode::Tab | KeyCode::Down => {
             // Move to next field (skip Azure-specific fields if not Azure)
-            nc.active_field = nc.active_field.next_for(&nc.db_type, &nc.azure_auth_method);
+            nc.active_field =
+                nc.active_field
+                    .next_for(&nc.db_type, &nc.azure_auth_method, nc.db_auth);
             nc.cursor_position = nc.get_active_field_value().len();
         }
         KeyCode::BackTab | KeyCode::Up => {
             // Move to previous field (skip Azure-specific fields if not Azure)
-            nc.active_field = nc.active_field.prev_for(&nc.db_type, &nc.azure_auth_method);
+            nc.active_field =
+                nc.active_field
+                    .prev_for(&nc.db_type, &nc.azure_auth_method, nc.db_auth);
             nc.cursor_position = nc.get_active_field_value().len();
         }
         KeyCode::Left if nc.active_field == ConnectionField::DbType => {
@@ -705,6 +709,10 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
         }
         KeyCode::Right if nc.active_field == ConnectionField::AzureAuth => {
             nc.cycle_azure_auth_method();
+        }
+        // Two methods: either key switches.
+        KeyCode::Left | KeyCode::Right if nc.active_field == ConnectionField::DbAuth => {
+            nc.cycle_db_auth();
         }
         KeyCode::Left if nc.active_field == ConnectionField::Flavor => {
             nc.cycle_flavor_back();
@@ -3435,6 +3443,51 @@ mod tests {
         assert_eq!(saved.ssl_mode, Some(SslMode::Require));
         assert_eq!(saved.color, Some([9, 9, 9]));
         assert_eq!(saved.host.as_deref(), Some("db.abc.supabase.co"));
+    }
+
+    #[test]
+    fn connection_dialog_saves_a_gcp_iam_sign_in() {
+        use crate::engine::models::DbAuthMethod;
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        let key = |state: &mut AppState, k: KeyCode| {
+            handle_dialog_input(state, k, KeyModifiers::NONE);
+        };
+        state.open_new_connection_dialog();
+        while state.new_connection.active_field != ConnectionField::Port {
+            key(&mut state, KeyCode::Tab);
+        }
+        key(&mut state, KeyCode::Tab);
+        assert_eq!(state.new_connection.active_field, ConnectionField::DbAuth);
+        key(&mut state, KeyCode::Char('x')); // ignored
+        key(&mut state, KeyCode::Right);
+        assert_eq!(state.new_connection.db_auth, DbAuthMethod::GcpIam);
+        assert_eq!(state.new_connection.port, "5432");
+        // Saving without an account says what is missing.
+        key(&mut state, KeyCode::Enter);
+        assert!(state.config.connections.is_empty());
+        key(&mut state, KeyCode::Tab); // the Google account
+        assert_eq!(state.new_connection.active_field, ConnectionField::Username);
+        for c in "jane@example.com".chars() {
+            key(&mut state, KeyCode::Char(c));
+        }
+        key(&mut state, KeyCode::Tab); // no password: the database
+        assert_eq!(state.new_connection.active_field, ConnectionField::Database);
+        key(&mut state, KeyCode::BackTab);
+        key(&mut state, KeyCode::BackTab);
+        assert_eq!(state.new_connection.active_field, ConnectionField::DbAuth);
+        key(&mut state, KeyCode::Enter);
+        let saved = &state.config.connections[0];
+        assert_eq!(saved.db_auth, Some(DbAuthMethod::GcpIam));
+        assert_eq!(saved.username.as_deref(), Some("jane@example.com"));
+        assert_eq!(saved.password, None);
+
+        state.open_edit_connection_dialog(0);
+        assert_eq!(state.new_connection.db_auth, DbAuthMethod::GcpIam);
+        key(&mut state, KeyCode::Enter);
+        assert_eq!(
+            state.config.connections[0].db_auth,
+            Some(DbAuthMethod::GcpIam)
+        );
     }
 
     #[test]

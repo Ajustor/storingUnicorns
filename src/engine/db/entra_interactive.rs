@@ -232,6 +232,16 @@ fn is_tenant_name(tenant: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
+/// The host of `authority` when it is a known Entra ID authority other than
+/// the public cloud's.
+fn sovereign_authority(authority: &str) -> Option<&'static str> {
+    let host = authority.strip_prefix("https://")?;
+    KNOWN_AUTHORITIES
+        .iter()
+        .map(|(_, authority)| *authority)
+        .find(|a| *a != AzureCloud::Public.authority_host() && a.eq_ignore_ascii_case(host))
+}
+
 /// Whether `tenant` names Entra ID's multi-tenant endpoints that let
 /// personal Microsoft accounts in.
 fn is_personal_tenant(tenant: &str) -> bool {
@@ -241,10 +251,20 @@ fn is_personal_tenant(tenant: &str) -> bool {
 }
 
 /// Key of `t`'s refresh token in the memory cache and the OS keyring.
+///
+/// `organizations` names no tenant: its sign-ins differ per cloud, so a
+/// sovereign cloud's carries its authority, `organizations@<host>`. The
+/// public cloud's keeps its form, and the sign-ins kept under it.
 pub fn secret_key(t: &Target) -> String {
+    let mut tenant = t.tenant.to_lowercase();
+    if tenant == ORGANIZATIONS {
+        if let Some(host) = sovereign_authority(&t.authority) {
+            tenant = format!("{ORGANIZATIONS}@{host}");
+        }
+    }
     format!(
         "entra:{}:{}:{}",
-        t.tenant.to_lowercase(),
+        tenant,
         t.client_id.to_lowercase(),
         t.login_hint
             .as_deref()
@@ -970,9 +990,10 @@ fn tid_note(key: &str) -> String {
     format!("entra:tid:{}", key.strip_prefix("entra:").unwrap_or(key))
 }
 
-/// Whether `key` is an `organizations` sign-in's.
+/// Whether `key` is an `organizations` sign-in's (`secret_key`).
 fn is_organizations_key(key: &str) -> bool {
     key.starts_with(&format!("entra:{ORGANIZATIONS}:"))
+        || key.starts_with(&format!("entra:{ORGANIZATIONS}@"))
 }
 
 /// Whether a sign-in that landed in tenant `tid` serves a server naming
@@ -2157,6 +2178,43 @@ mod tests {
             tid_note("entra:organizations:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com"),
             "entra:tid:organizations:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com"
         );
+    }
+
+    #[test]
+    fn organizations_sign_ins_differ_per_cloud() {
+        let key = |host: &str, tenant: Option<&str>| {
+            let c = ConnectionConfig {
+                tenant_id: tenant.map(Into::into),
+                ..zero_config(host)
+            };
+            secret_key(&Target::for_config(&c, None).unwrap())
+        };
+        let app = DEFAULT_CLIENT_ID;
+        // The public cloud's keeps its key.
+        let public = key("srv.database.windows.net", None);
+        assert_eq!(public, format!("entra:organizations:{app}:-"));
+        let gov = key("srv.database.usgovcloudapi.net", None);
+        assert_eq!(
+            gov,
+            format!("entra:organizations@login.microsoftonline.us:{app}:-")
+        );
+        assert_eq!(
+            key("srv.database.chinacloudapi.cn", Some("Organizations")),
+            format!("entra:organizations@login.chinacloudapi.cn:{app}:-")
+        );
+        for k in [&public, &gov] {
+            assert!(is_organizations_key(k), "{k}");
+        }
+        assert_eq!(
+            tid_note(&gov),
+            format!("entra:tid:organizations@login.microsoftonline.us:{app}:-")
+        );
+        // A tenant's key doesn't change.
+        assert_eq!(
+            key("srv.database.usgovcloudapi.net", Some(GUID)),
+            format!("entra:{GUID}:{app}:-")
+        );
+        assert!(!is_organizations_key(&format!("entra:{GUID}:{app}:-")));
     }
 
     #[test]

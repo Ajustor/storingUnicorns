@@ -763,13 +763,15 @@ mod tests {
     }
 
     #[test]
-    fn interactive_browser_needs_a_tenant_and_an_app_client_id() {
+    fn interactive_browser_checks_a_typed_tenant_and_app_client_id() {
         let mut f = ConnectionForm::new(None);
         f.name = "Az".into();
         f.database = "app".into();
         f.set_db_type(DatabaseType::Azure);
         f.azure_auth = AzureAuthMethod::InteractiveBrowser;
-        assert_eq!(f.validate(&[]).unwrap_err(), "Le tenant est obligatoire");
+        // Both optional: the server's tenant, Microsoft's application.
+        let c = f.validate(&[]).unwrap();
+        assert_eq!((c.tenant_id, c.azure_client_id), (None, None));
         f.tenant_id = "Common".into();
         assert!(f.validate(&[]).unwrap_err().contains("pas « common »"));
         f.tenant_id = "contoso.com".into();

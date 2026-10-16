@@ -1729,10 +1729,14 @@ mod tests {
         nc.azure_auth_method = AzureAuthMethod::InteractiveBrowser;
         assert!(nc.check().unwrap_err().contains("pas « common »"));
         nc.tenant_id = "contoso.com".into();
+        // The application is optional (Microsoft's), a typed one a GUID.
+        assert!(nc.check().is_ok());
+        nc.azure_client_id = "my-app".into();
         assert_eq!(
             nc.check().unwrap_err(),
             "L'ID client de l'application doit être un GUID"
         );
+        nc.azure_client_id.clear();
         nc.active_field = ConnectionField::ClientId;
         nc.get_active_field_mut().unwrap().push_str(client);
         assert_eq!(nc.get_active_field_value(), client);

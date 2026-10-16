@@ -1,9 +1,13 @@
 //! Azure SQL sign-in with the user's own Entra ID account through the
 //! browser (OAuth 2.0 authorization code + PKCE), like SSMS's "Active
-//! Directory Interactive".
+//! Directory Interactive". Nothing to set up: without a typed tenant the
+//! server tells its own (`fedauth_probe`), without an application
+//! Microsoft's drivers' is used, as DataGrip does.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -19,24 +23,35 @@ use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType};
 use crate::engine::secrets::{self, SecretStore};
 
 use super::azure::{is_guid, AzureCloud};
+use super::fedauth_probe::{self, FedAuthInfo};
+
+/// Application (client) ID of Microsoft's SQL Server drivers: the one the
+/// JDBC driver (so DataGrip) signs in with for `ActiveDirectoryInteractive`,
+/// public and preauthorized for Azure SQL. Used when a connection names no
+/// application.
+pub const DEFAULT_CLIENT_ID: &str = "7f98cb04-cd1e-40df-9140-3bf7e2cea4db";
+
+/// Tenant of a connection that typed none and whose server didn't tell: the
+/// account's own organization.
+const ORGANIZATIONS: &str = "organizations";
 
 /// Check the tenant and application (client) ID of an interactive
 /// connection; a French message for the form otherwise.
 ///
-/// The tenant is a GUID or a domain; `common` / `organizations` are refused
-/// since an organization's application is bound to its own tenant.
+/// Both are optional: without a tenant, the server's (FEDAUTHINFO) is used,
+/// else `organizations`; without an application, `DEFAULT_CLIENT_ID`. A
+/// typed tenant is a GUID, a domain or `organizations`; `common` is refused,
+/// as it lets personal Microsoft accounts in, which Azure SQL doesn't take.
 pub fn validate_interactive(tenant: &str, client_id: &str) -> Result<(), String> {
-    let tenant = tenant.trim();
-    if tenant.is_empty() {
-        return Err("Le tenant est obligatoire".into());
+    if tenant.trim().eq_ignore_ascii_case("common") {
+        return Err(
+            "Indique le tenant de ton organisation (GUID ou domaine) ou laisse-le vide, \
+             pas « common »"
+                .into(),
+        );
     }
-    let lower = tenant.to_ascii_lowercase();
-    if lower == "common" || lower == "organizations" {
-        return Err(format!(
-            "Indique le tenant de ton organisation (GUID ou domaine), pas « {lower} »"
-        ));
-    }
-    if !is_guid(client_id.trim()) {
+    let client_id = client_id.trim();
+    if !client_id.is_empty() && !is_guid(client_id) {
         return Err("L'ID client de l'application doit être un GUID".into());
     }
     Ok(())
@@ -75,14 +90,44 @@ pub struct Target {
 }
 
 impl Target {
-    /// The target of an interactive connection: cloud from its host, tenant
-    /// and application checked (`validate_interactive`), account from its
-    /// username.
-    pub fn for_config(config: &ConnectionConfig) -> Result<Target, String> {
+    /// The target of an interactive connection (checked by
+    /// `validate_interactive`): cloud from its host, account from its
+    /// username, application typed or `DEFAULT_CLIENT_ID`, and tenant typed,
+    /// else its server's (`probed`, its FEDAUTHINFO answer: ignored unless
+    /// it names a known Entra ID authority), else `organizations`.
+    pub fn for_config(
+        config: &ConnectionConfig,
+        probed: Option<&FedAuthInfo>,
+    ) -> Result<Target, String> {
         let tenant = config.tenant_id.as_deref().unwrap_or_default().trim();
         let client_id = config.azure_client_id.as_deref().unwrap_or_default().trim();
         validate_interactive(tenant, client_id)?;
         let cloud = AzureCloud::from_host(config.host.as_deref().unwrap_or_default());
+        let from_server = probed.filter(|_| tenant.is_empty()).and_then(|info| {
+            let (authority, tenant) = sts_authority(&info.sts_url)?;
+            // The SPN only switches to another cloud's Azure SQL (a custom
+            // DNS name of a sovereign-cloud server): a token for any other
+            // resource would still be handed to the server.
+            let resource = AzureCloud::from_sql_resource(&info.spn).unwrap_or(cloud);
+            Some((authority, tenant, resource))
+        });
+        let (authority, tenant, resource) = from_server.unwrap_or_else(|| {
+            let tenant = if tenant.is_empty() {
+                ORGANIZATIONS
+            } else {
+                tenant
+            };
+            (
+                cloud.authority_host().to_string(),
+                tenant.to_string(),
+                cloud,
+            )
+        });
+        let client_id = if client_id.is_empty() {
+            DEFAULT_CLIENT_ID.to_string()
+        } else {
+            client_id.to_ascii_lowercase()
+        };
         let login_hint = config
             .username
             .as_deref()
@@ -90,10 +135,10 @@ impl Target {
             .filter(|u| !u.is_empty())
             .map(str::to_string);
         Ok(Target {
-            authority: format!("https://{}", cloud.authority_host()),
-            tenant: tenant.to_string(),
-            client_id: client_id.to_ascii_lowercase(),
-            scope: format!("{} offline_access openid profile", cloud.sql_scope()),
+            authority: format!("https://{authority}"),
+            tenant,
+            client_id,
+            scope: format!("{} offline_access openid profile", resource.sql_scope()),
             login_hint,
         })
     }
@@ -108,6 +153,64 @@ impl Target {
             .extend([self.tenant.as_str(), "oauth2", "v2.0", endpoint]);
         url
     }
+}
+
+/// The tenant typed in `config`, if any.
+fn typed_tenant(config: &ConnectionConfig) -> Option<&str> {
+    config
+        .tenant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// Server of `config` (host as compared and asked: trimmed, lowercase,
+/// without a trailing dot) and port.
+fn server_of(config: &ConnectionConfig) -> (String, u16) {
+    let host = config.host.as_deref().unwrap_or_default().trim();
+    let host = host.strip_suffix('.').unwrap_or(host);
+    (host.to_ascii_lowercase(), config.port.unwrap_or(1433))
+}
+
+/// Entra ID authorities a server's STS URL may name, and the host to use
+/// for each (`login.windows.net` is the public cloud's old name).
+const KNOWN_AUTHORITIES: [(&str, &str); 5] = [
+    ("login.windows.net", "login.microsoftonline.com"),
+    ("login.microsoftonline.com", "login.microsoftonline.com"),
+    ("login.microsoftonline.us", "login.microsoftonline.us"),
+    ("login.chinacloudapi.cn", "login.chinacloudapi.cn"),
+    (
+        "login.partner.microsoftonline.cn",
+        "login.partner.microsoftonline.cn",
+    ),
+];
+
+/// Authority host and tenant of a server's STS URL
+/// (`https://login.windows.net/<tenant>`): only a known Entra ID authority
+/// over HTTPS, and an organization's tenant (a GUID or a domain).
+fn sts_authority(sts_url: &str) -> Option<(String, String)> {
+    let url = Url::parse(sts_url.trim()).ok()?;
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    let (_, authority) = KNOWN_AUTHORITIES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(host))?;
+    let tenant = url.path_segments()?.next()?;
+    let is_name = !tenant.is_empty()
+        && tenant.len() <= 253
+        && tenant
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    let personal = ["common", "consumers"]
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(tenant));
+    (is_name && !personal).then(|| (authority.to_string(), tenant.to_string()))
 }
 
 /// Key of `t`'s refresh token in the memory cache and the OS keyring.
@@ -437,16 +540,40 @@ const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SIGNED_IN: &str = "Connexion réussie, vous pouvez fermer cet onglet.";
 
-/// Access tokens of the session and one lock per target.
+/// How long a server isn't asked again after its FEDAUTHINFO probe failed
+/// or gave nothing (meanwhile: `organizations`). An answer is kept for the
+/// session.
+const PROBE_RETRY: Duration = Duration::from_secs(10 * 60);
+
+/// A server's answer to the FEDAUTHINFO probe (`None`: it failed or gave
+/// none) and when it came.
+#[derive(Clone)]
+struct Probed {
+    at: SystemTime,
+    info: Option<FedAuthInfo>,
+}
+
+/// Key of a server in `Session::servers`.
+fn server_key(host: &str, port: u16) -> String {
+    format!("{}:{port}", host.to_ascii_lowercase())
+}
+
+/// Access tokens of the session, one lock per target (or server probed),
+/// and the servers' answers to the FEDAUTHINFO probe.
 #[derive(Default)]
 struct Session {
     tokens: Mutex<HashMap<String, Tokens>>,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    servers: Mutex<HashMap<String, Probed>>,
 }
 
 impl Session {
     fn tokens(&self) -> MutexGuard<'_, HashMap<String, Tokens>> {
         self.tokens.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn servers(&self) -> MutexGuard<'_, HashMap<String, Probed>> {
+        self.servers.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lock_for(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -464,10 +591,19 @@ fn session() -> &'static Session {
     SESSION.get_or_init(Session::default)
 }
 
+/// The FEDAUTHINFO probe of a server (`fedauth_probe::probe`).
+type Probe = Box<
+    dyn Fn(String, u16) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<FedAuthInfo>>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// What the flow talks to, replaced in tests.
 struct Deps<'a> {
-    /// Replaces the cloud's authority.
+    /// Replaces the target's authority (its tenant stays).
     authority: Option<String>,
+    /// Asks a server for its tenant.
+    probe: Probe,
     open_browser: Box<dyn Fn(&str) + Send + Sync>,
     notify: Box<dyn Fn(Interaction) + Send + Sync>,
     store: &'static dyn SecretStore,
@@ -498,6 +634,9 @@ pub async fn token(config: &ConnectionConfig, interactive: bool) -> anyhow::Resu
     let store = tokio::task::spawn_blocking(secrets::store).await?;
     let deps = Deps {
         authority: None,
+        probe: Box::new(|host, port| {
+            Box::pin(async move { fedauth_probe::probe(&host, port).await })
+        }),
         open_browser: Box::new(open_in_browser),
         notify: Box::new(emit),
         store,
@@ -517,7 +656,9 @@ pub async fn token(config: &ConnectionConfig, interactive: bool) -> anyhow::Resu
 }
 
 async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Result<String> {
-    let mut target = Target::for_config(config).map_err(anyhow::Error::msg)?;
+    let mut target = resolve_target(config, deps)
+        .await
+        .map_err(anyhow::Error::msg)?;
     if let Some(authority) = &deps.authority {
         target.authority = authority.clone();
     }
@@ -570,6 +711,62 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
     let tokens = sign_in(&config.name, &target, deps).await?;
     tracing::info!("Entra ID sign-in completed for {}", config.name);
     Ok(keep(deps, &key, tokens, None).await)
+}
+
+/// The target of `config`, its server asked for its tenant (FEDAUTHINFO)
+/// when none is typed.
+async fn resolve_target(config: &ConnectionConfig, deps: &Deps<'_>) -> Result<Target, String> {
+    // Checked first: an invalid connection asks nothing.
+    let without_server = Target::for_config(config, None)?;
+    if typed_tenant(config).is_some() {
+        return Ok(without_server);
+    }
+    let (host, port) = server_of(config);
+    let answer = server_answer(&host, port, deps).await;
+    Target::for_config(config, answer.as_ref())
+}
+
+/// The FEDAUTHINFO of `host:port`: remembered (an answer for the session, a
+/// failure for `PROBE_RETRY`), else asked, one probe at a time per server.
+async fn server_answer(host: &str, port: u16, deps: &Deps<'_>) -> Option<FedAuthInfo> {
+    if host.is_empty() {
+        return None;
+    }
+    let key = server_key(host, port);
+    let lock = deps.session.lock_for(&format!("probe:{key}"));
+    let _turn = lock.lock().await;
+    let now = (deps.now)();
+    if let Some(known) = deps.session.servers().get(&key) {
+        let stale = matches!(now.duration_since(known.at), Ok(age) if age >= PROBE_RETRY);
+        if known.info.is_some() || !stale {
+            return known.info.clone();
+        }
+    }
+    let info = match (deps.probe)(host.to_string(), port).await {
+        Ok(Some(info)) => {
+            tracing::info!("Entra ID authority of {host}: {}", info.sts_url);
+            Some(info)
+        }
+        Ok(None) => {
+            tracing::info!("{host} named no Entra ID authority: signing in with organizations");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Could not ask {host}:{port} for its Entra ID authority ({e:#}): \
+                 signing in with organizations"
+            );
+            None
+        }
+    };
+    deps.session.servers().insert(
+        key,
+        Probed {
+            at: now,
+            info: info.clone(),
+        },
+    );
+    info
 }
 
 /// Whether a refused refresh token calls for a new browser sign-in.
@@ -886,26 +1083,102 @@ fn page(message: &str) -> String {
 
 // ========== Forgetting ==========
 
-/// Key of what an interactive browser connection keeps (session token and
-/// refresh token); `None` for other connections, which keep nothing.
-fn kept_key(config: &ConnectionConfig) -> Option<String> {
+/// The target of an interactive browser connection, its server not asked;
+/// `None` for other connections, which keep nothing.
+fn interactive_target(config: &ConnectionConfig) -> Option<Target> {
     let interactive = config.db_type == DatabaseType::Azure
         && config.azure_auth_method == Some(AzureAuthMethod::InteractiveBrowser);
     interactive
-        .then(|| Target::for_config(config).ok())
+        .then(|| Target::for_config(config, None).ok())
         .flatten()
-        .map(|t| secret_key(&t))
+}
+
+/// Which sign-in an interactive browser connection keeps (session token and
+/// refresh token), known without the network; `None` for other
+/// connections, which keep nothing.
+///
+/// With a typed tenant it is the keyring key, as in 0.14.0. Without, the
+/// tenant comes from the server (FEDAUTHINFO), which isn't asked here: the
+/// server stands for it, `entra:auto:<host>:<application>:<account>`. So
+/// connections share a sign-in only when they surely do; two servers of one
+/// tenant look distinct, and deleting one may forget the refresh token the
+/// other also uses: one more browser sign-in, never a token left behind.
+fn kept_key(config: &ConnectionConfig) -> Option<String> {
+    let target = interactive_target(config)?;
+    Some(if typed_tenant(config).is_some() {
+        secret_key(&target)
+    } else {
+        let tenant = format!("auto:{}", server_of(config).0);
+        secret_key(&Target { tenant, ..target })
+    })
+}
+
+/// Where a sign-in to forget is kept.
+#[derive(Debug, PartialEq, Eq)]
+struct ToForget {
+    /// Keyring keys known without the network.
+    keys: Vec<String>,
+    /// The server to ask for the last one: its tenant, when none is typed
+    /// and the server didn't answer in this session.
+    ask: Option<(String, u16)>,
+}
+
+/// Where `config`'s sign-in may be kept; `None` when it keeps nothing.
+fn keys_to_forget(config: &ConnectionConfig, session: &Session) -> Option<ToForget> {
+    let target = interactive_target(config)?;
+    let mut keys = vec![secret_key(&target)];
+    if typed_tenant(config).is_some() {
+        return Some(ToForget { keys, ask: None });
+    }
+    // `organizations` while the server didn't answer, its tenant once it did.
+    let (host, port) = server_of(config);
+    let answer = session
+        .servers()
+        .get(&server_key(&host, port))
+        .and_then(|p| p.info.clone());
+    let Some(answer) = answer else {
+        let ask = Some((host, port));
+        return Some(ToForget { keys, ask });
+    };
+    if let Ok(t) = Target::for_config(config, Some(&answer)) {
+        let key = secret_key(&t);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    Some(ToForget { keys, ask: None })
+}
+
+/// The keyring key of `config`'s sign-in under its server's tenant, asking
+/// the server (FEDAUTHINFO). Blocks: `forget`'s thread only.
+fn asked_key(config: &ConnectionConfig, host: &str, port: u16) -> Option<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    match runtime.block_on(fedauth_probe::probe(host, port)) {
+        Ok(Some(info)) => Target::for_config(config, Some(&info))
+            .ok()
+            .map(|t| secret_key(&t)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("Could not ask {host}:{port} for its Entra ID tenant to forget: {e:#}");
+            None
+        }
+    }
 }
 
 /// Whether saving `new` over `old` must forget `old`'s sign-in: another
-/// tenant, application, account or method (or no longer Azure).
+/// tenant (or server, when none is typed), application, account or method
+/// (or no longer Azure).
 pub fn needs_forget(old: &ConnectionConfig, new: &ConnectionConfig) -> bool {
     let kept = kept_key(old);
     kept.is_some() && kept != kept_key(new)
 }
 
 /// Whether `a` and `b` share one sign-in: interactive browser connections
-/// with the same tenant, application and account (as in `secret_key`).
+/// with the same tenant (or server, when none is typed), application and
+/// account (`kept_key`).
 fn same_sign_in(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
     let key = kept_key(a);
     key.is_some() && key == kept_key(b)
@@ -938,16 +1211,27 @@ pub fn orphaned(config: &ConnectionConfig, remaining: &[ConnectionConfig]) -> bo
 /// (`needs_forget`) or on request. Nothing for other methods. Doesn't block:
 /// the keyring is updated in the background.
 pub fn forget(config: &ConnectionConfig) {
-    let Some(key) = kept_key(config) else {
+    let session = session();
+    let Some(ToForget { mut keys, ask }) = keys_to_forget(config, session) else {
         return;
     };
-    let session = session();
     // At once, so that the next connection doesn't reuse it…
-    session.tokens().remove(&key);
-    // …and for good once an acquisition in progress is over. Waiting for it
-    // and the keyring (Secret Service, an unlock prompt) may block: not on
-    // the interface's thread.
-    std::thread::spawn(move || forget_key(session, secrets::store(), &key));
+    for key in &keys {
+        session.tokens().remove(key);
+    }
+    // …and for good once an acquisition in progress is over. Waiting for it,
+    // the keyring (Secret Service, an unlock prompt) and the server may
+    // block: not on the interface's thread.
+    let config = config.clone();
+    std::thread::spawn(move || {
+        if let Some((host, port)) = ask {
+            keys.extend(asked_key(&config, &host, port));
+        }
+        let store = secrets::store();
+        for key in &keys {
+            forget_key(session, store, key);
+        }
+    });
 }
 
 /// Drop `key`'s session token and refresh token once any acquisition in
@@ -969,38 +1253,40 @@ mod tests {
     const CLIENT: &str = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
 
     #[test]
-    fn tenant_is_required() {
-        assert_eq!(
-            validate_interactive("", CLIENT).unwrap_err(),
-            "Le tenant est obligatoire"
-        );
-        assert_eq!(
-            validate_interactive("   ", CLIENT).unwrap_err(),
-            "Le tenant est obligatoire"
-        );
+    fn tenant_and_client_id_are_optional() {
+        for (tenant, client) in [
+            ("", ""),
+            ("  ", "  "),
+            ("", CLIENT),
+            ("contoso.com", ""),
+            (" Organizations ", ""),
+        ] {
+            assert!(
+                validate_interactive(tenant, client).is_ok(),
+                "{tenant:?} {client:?}"
+            );
+        }
     }
 
     #[test]
-    fn multi_tenant_endpoints_are_refused() {
+    fn common_tenant_is_refused() {
         assert_eq!(
             validate_interactive("common", CLIENT).unwrap_err(),
-            "Indique le tenant de ton organisation (GUID ou domaine), pas « common »"
+            "Indique le tenant de ton organisation (GUID ou domaine) ou laisse-le vide, \
+             pas « common »"
         );
-        assert_eq!(
-            validate_interactive(" Organizations ", CLIENT).unwrap_err(),
-            "Indique le tenant de ton organisation (GUID ou domaine), pas « organizations »"
-        );
-        assert!(validate_interactive("COMMON", CLIENT).is_err());
+        assert!(validate_interactive(" COMMON ", "").is_err());
     }
 
     #[test]
-    fn client_id_must_be_a_guid() {
-        for bad in ["", "  ", "my-app", "8f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f"] {
+    fn a_typed_client_id_must_be_a_guid() {
+        for bad in ["my-app", "8f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f"] {
             assert_eq!(
                 validate_interactive("contoso.com", bad).unwrap_err(),
                 "L'ID client de l'application doit être un GUID",
                 "{bad:?}"
             );
+            assert!(validate_interactive("", bad).is_err());
         }
     }
 
@@ -1047,7 +1333,7 @@ mod tests {
     }
 
     fn target() -> Target {
-        Target::for_config(&azure("srv.database.windows.net")).unwrap()
+        Target::for_config(&azure("srv.database.windows.net"), None).unwrap()
     }
 
     #[test]
@@ -1067,33 +1353,203 @@ mod tests {
     fn target_follows_the_cloud_and_the_account() {
         let mut c = azure("srv.database.usgovcloudapi.net");
         c.username = Some(" jane@contoso.com ".into());
-        let t = Target::for_config(&c).unwrap();
+        let t = Target::for_config(&c, None).unwrap();
         assert_eq!(t.authority, "https://login.microsoftonline.us");
         assert!(t
             .scope
             .starts_with("https://database.usgovcloudapi.net/.default "));
         assert_eq!(t.login_hint.as_deref(), Some("jane@contoso.com"));
 
-        let t = Target::for_config(&azure("srv.database.chinacloudapi.cn")).unwrap();
+        let t = Target::for_config(&azure("srv.database.chinacloudapi.cn"), None).unwrap();
         assert_eq!(t.authority, "https://login.chinacloudapi.cn");
 
         c.username = Some("  ".into());
-        assert_eq!(Target::for_config(&c).unwrap().login_hint, None);
+        assert_eq!(Target::for_config(&c, None).unwrap().login_hint, None);
     }
 
     #[test]
     fn target_is_validated() {
         let mut c = azure("srv.database.windows.net");
         c.tenant_id = Some("common".into());
-        assert!(Target::for_config(&c).unwrap_err().contains("« common »"));
-        c.tenant_id = None;
-        assert_eq!(
-            Target::for_config(&c).unwrap_err(),
-            "Le tenant est obligatoire"
-        );
+        assert!(Target::for_config(&c, None)
+            .unwrap_err()
+            .contains("« common »"));
         let mut c = azure("srv.database.windows.net");
-        c.azure_client_id = None;
-        assert!(Target::for_config(&c).unwrap_err().contains("GUID"));
+        c.azure_client_id = Some("my-app".into());
+        assert!(Target::for_config(&c, None).unwrap_err().contains("GUID"));
+    }
+
+    const GUID: &str = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+
+    /// A connection with neither tenant nor application.
+    fn zero_config(host: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            tenant_id: None,
+            azure_client_id: Some("  ".into()),
+            ..azure(host)
+        }
+    }
+
+    fn answer(sts_url: &str, spn: &str) -> FedAuthInfo {
+        FedAuthInfo {
+            sts_url: sts_url.into(),
+            spn: spn.into(),
+        }
+    }
+
+    fn azure_sql_answer() -> FedAuthInfo {
+        answer(
+            &format!("https://login.windows.net/{GUID}"),
+            "https://database.windows.net/",
+        )
+    }
+
+    #[test]
+    fn zero_config_target_uses_the_servers_tenant_and_microsofts_app() {
+        let t = Target::for_config(
+            &zero_config("srv.database.windows.net"),
+            Some(&azure_sql_answer()),
+        )
+        .unwrap();
+        // login.windows.net is the public cloud's old name.
+        assert_eq!(t.authority, "https://login.microsoftonline.com");
+        assert_eq!(t.tenant, GUID);
+        assert_eq!(t.client_id, DEFAULT_CLIENT_ID);
+        assert_eq!(
+            t.scope,
+            "https://database.windows.net/.default offline_access openid profile"
+        );
+        // A typed application with the server's tenant.
+        let c = ConnectionConfig {
+            azure_client_id: Some(CLIENT.to_uppercase()),
+            ..zero_config("srv.database.windows.net")
+        };
+        let t = Target::for_config(&c, Some(&azure_sql_answer())).unwrap();
+        assert_eq!((t.tenant.as_str(), t.client_id.as_str()), (GUID, CLIENT));
+    }
+
+    #[test]
+    fn a_typed_tenant_wins_over_the_server() {
+        let t = Target::for_config(
+            &azure("srv.database.windows.net"),
+            Some(&azure_sql_answer()),
+        )
+        .unwrap();
+        assert_eq!(t, target());
+        let c = ConnectionConfig {
+            tenant_id: Some("organizations".into()),
+            ..zero_config("srv.database.usgovcloudapi.net")
+        };
+        let t = Target::for_config(&c, Some(&azure_sql_answer())).unwrap();
+        assert_eq!(t.tenant, "organizations");
+        assert_eq!(t.authority, "https://login.microsoftonline.us");
+    }
+
+    #[test]
+    fn without_the_servers_answer_the_tenant_is_organizations() {
+        let t = Target::for_config(&zero_config("srv.database.usgovcloudapi.net"), None).unwrap();
+        assert_eq!(t.authority, "https://login.microsoftonline.us");
+        assert_eq!(t.tenant, "organizations");
+        assert_eq!(t.client_id, DEFAULT_CLIENT_ID);
+        assert!(t
+            .scope
+            .starts_with("https://database.usgovcloudapi.net/.default "));
+    }
+
+    #[test]
+    fn known_authorities_of_the_server_are_kept() {
+        for (sts, authority, tenant) in [
+            (
+                format!("https://login.microsoftonline.us/{GUID}"),
+                "https://login.microsoftonline.us",
+                GUID,
+            ),
+            (
+                format!("https://login.chinacloudapi.cn/{GUID}/"),
+                "https://login.chinacloudapi.cn",
+                GUID,
+            ),
+            (
+                format!("https://login.partner.microsoftonline.cn/{GUID}"),
+                "https://login.partner.microsoftonline.cn",
+                GUID,
+            ),
+            (
+                "HTTPS://LOGIN.WINDOWS.NET/contoso.onmicrosoft.com".to_string(),
+                "https://login.microsoftonline.com",
+                "contoso.onmicrosoft.com",
+            ),
+            (
+                format!("https://login.microsoftonline.com/{GUID}/oauth2/authorize"),
+                "https://login.microsoftonline.com",
+                GUID,
+            ),
+        ] {
+            let info = answer(&sts, "https://database.windows.net/");
+            let t =
+                Target::for_config(&zero_config("srv.database.windows.net"), Some(&info)).unwrap();
+            assert_eq!(
+                (t.authority.as_str(), t.tenant.as_str()),
+                (authority, tenant),
+                "{sts}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_authorities_of_the_server_are_ignored() {
+        for sts in [
+            format!("https://evil.example.com/{GUID}"),
+            format!("https://login.microsoftonline.com.evil.com/{GUID}"),
+            format!("http://login.microsoftonline.com/{GUID}"),
+            format!("https://login.microsoftonline.com:8443/{GUID}"),
+            format!("https://user@login.microsoftonline.com/{GUID}"),
+            "https://login.microsoftonline.com/".into(),
+            "https://login.microsoftonline.com/common".into(),
+            "https://login.microsoftonline.com/consumers".into(),
+            "https://login.microsoftonline.com/a%2Fb".into(),
+            "https://login.microsoftonline.com/con toso".into(),
+            "not a url".into(),
+        ] {
+            let info = answer(&sts, "https://database.windows.net/");
+            let t =
+                Target::for_config(&zero_config("srv.database.windows.net"), Some(&info)).unwrap();
+            assert_eq!(
+                (t.authority.as_str(), t.tenant.as_str()),
+                ("https://login.microsoftonline.com", "organizations"),
+                "{sts}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_servers_spn_only_names_another_clouds_azure_sql() {
+        let sts = format!("https://login.microsoftonline.us/{GUID}");
+        // A custom DNS name of a US Government server.
+        let gov = answer(&sts, "https://database.usgovcloudapi.net/");
+        let t = Target::for_config(&zero_config("sql.contoso.internal"), Some(&gov)).unwrap();
+        assert!(
+            t.scope
+                .starts_with("https://database.usgovcloudapi.net/.default "),
+            "{}",
+            t.scope
+        );
+        // Any other resource is ignored: its token would go to the server.
+        for spn in [
+            "https://graph.microsoft.com/",
+            "https://management.azure.com",
+            "",
+        ] {
+            let info = answer(&sts, spn);
+            let t =
+                Target::for_config(&zero_config("srv.database.windows.net"), Some(&info)).unwrap();
+            assert!(
+                t.scope
+                    .starts_with("https://database.windows.net/.default "),
+                "{spn}: {}",
+                t.scope
+            );
+        }
     }
 
     #[test]
@@ -1108,6 +1564,113 @@ mod tests {
             secret_key(&t),
             "entra:contoso.com:8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f:jane@contoso.com"
         );
+    }
+
+    #[test]
+    fn secret_keys_use_the_effective_tenant_and_application() {
+        // 0.14.0's connections keep their key.
+        assert_eq!(
+            secret_key(&target()),
+            "entra:contoso.com:8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f:-"
+        );
+        let mut c = zero_config("srv.database.windows.net");
+        c.username = Some(" Jane@Contoso.com ".into());
+        assert_eq!(
+            secret_key(&Target::for_config(&c, Some(&azure_sql_answer())).unwrap()),
+            format!("entra:{GUID}:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com")
+        );
+        assert_eq!(
+            secret_key(&Target::for_config(&c, None).unwrap()),
+            "entra:organizations:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com"
+        );
+    }
+
+    #[test]
+    fn kept_sign_ins_are_known_without_the_network() {
+        // Typed tenant: the keyring key, as in 0.14.0.
+        assert_eq!(
+            kept_key(&azure("srv.database.windows.net")).unwrap(),
+            "entra:contoso.com:8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f:-"
+        );
+        // Else the server stands for the tenant it will give.
+        let mut c = zero_config(" SRV.database.windows.net. ");
+        c.username = Some("jane@contoso.com".into());
+        assert_eq!(
+            kept_key(&c).unwrap(),
+            "entra:auto:srv.database.windows.net:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:\
+             jane@contoso.com"
+        );
+        // Other databases of the server share it, other servers don't (even
+        // of the same tenant: unknown without asking them).
+        let other_db = ConnectionConfig {
+            name: "Reporting".into(),
+            database: "reports".into(),
+            host: Some("srv.database.windows.net".into()),
+            ..c.clone()
+        };
+        assert!(same_sign_in(&c, &other_db));
+        assert!(!needs_forget(&c, &other_db));
+        let other_server = ConnectionConfig {
+            host: Some("srv2.database.windows.net".into()),
+            ..c.clone()
+        };
+        assert!(!same_sign_in(&c, &other_server));
+        assert!(needs_forget(&c, &other_server));
+        // Typing the tenant changes the sign-in.
+        let typed = ConnectionConfig {
+            tenant_id: Some(GUID.into()),
+            ..c.clone()
+        };
+        assert!(!same_sign_in(&c, &typed));
+        assert!(needs_forget(&c, &typed));
+        assert!(orphaned(&c, &[other_server, typed]));
+        assert!(!orphaned(&c, &[other_db]));
+    }
+
+    #[test]
+    fn forgetting_a_zero_config_sign_in() {
+        let session = Session::default();
+        let mut c = zero_config("srv.database.windows.net");
+        c.port = Some(1444);
+        let organizations = secret_key(&Target::for_config(&c, None).unwrap());
+        // The server's tenant is unknown: it has to be asked.
+        assert_eq!(
+            keys_to_forget(&c, &session).unwrap(),
+            ToForget {
+                keys: vec![organizations.clone()],
+                ask: Some(("srv.database.windows.net".to_string(), 1444)),
+            }
+        );
+        // Known from this session: both keys it may have used.
+        session.servers().insert(
+            server_key("srv.database.windows.net", 1444),
+            Probed {
+                at: SystemTime::UNIX_EPOCH,
+                info: Some(azure_sql_answer()),
+            },
+        );
+        let tenant = secret_key(&Target::for_config(&c, Some(&azure_sql_answer())).unwrap());
+        assert_eq!(
+            keys_to_forget(&c, &session).unwrap(),
+            ToForget {
+                keys: vec![organizations, tenant],
+                ask: None,
+            }
+        );
+        // Typed tenant: its key only.
+        assert_eq!(
+            keys_to_forget(&azure("srv.database.windows.net"), &session).unwrap(),
+            ToForget {
+                keys: vec![secret_key(&target())],
+                ask: None,
+            }
+        );
+        // Other methods keep nothing.
+        let cli = ConnectionConfig {
+            azure_auth_method: Some(AzureAuthMethod::Interactive),
+            ..c
+        };
+        assert_eq!(keys_to_forget(&cli, &session), None);
     }
 
     fn query(url: &str) -> std::collections::HashMap<String, String> {
@@ -1158,14 +1721,14 @@ mod tests {
     #[test]
     fn authorize_url_uses_the_cloud_authority() {
         let mut c = azure("srv.database.usgovcloudapi.net");
-        let t = Target::for_config(&c).unwrap();
+        let t = Target::for_config(&c, None).unwrap();
         let url = authorize_url(&t, "http://localhost:1", "c", "s");
         assert!(
             url.starts_with("https://login.microsoftonline.us/Contoso.com/oauth2/v2.0/authorize?")
         );
         assert!(query(&url)["scope"].starts_with("https://database.usgovcloudapi.net/.default"));
         c.host = Some("srv.database.chinacloudapi.cn".into());
-        let t = Target::for_config(&c).unwrap();
+        let t = Target::for_config(&c, None).unwrap();
         let url = authorize_url(&t, "http://localhost:1", "c", "s");
         assert!(
             url.starts_with("https://login.chinacloudapi.cn/Contoso.com/oauth2/v2.0/authorize?")
@@ -1565,7 +2128,7 @@ mod tests {
         let session = Session::default();
         let store = crate::engine::secrets::MemoryStore::default();
         let config = signed_in();
-        let key = secret_key(&Target::for_config(&config).unwrap());
+        let key = secret_key(&Target::for_config(&config, None).unwrap());
         session
             .tokens()
             .insert(key.clone(), tokens(at(0), Some("RT")));
@@ -1611,7 +2174,7 @@ mod flow_tests {
     }
 
     fn key() -> String {
-        secret_key(&Target::for_config(&config()).unwrap())
+        secret_key(&Target::for_config(&config(), None).unwrap())
     }
 
     // ----- Fake token endpoint -----
@@ -1824,6 +2387,10 @@ mod flow_tests {
         timeout: Duration,
         /// A connection (else a reconnection, which never opens the browser).
         interactive: bool,
+        /// The server's answer to the FEDAUTHINFO probe…
+        probed: Arc<Mutex<Result<Option<FedAuthInfo>, String>>>,
+        /// …and the servers it was asked of.
+        asked: Arc<Mutex<Vec<(String, u16)>>>,
     }
 
     impl Harness {
@@ -1839,6 +2406,8 @@ mod flow_tests {
                 session: Box::leak(Box::default()),
                 timeout: Duration::from_secs(20),
                 interactive: true,
+                probed: Arc::new(Mutex::new(Ok(None))),
+                asked: Arc::default(),
             }
         }
 
@@ -1846,8 +2415,14 @@ mod flow_tests {
             let browser = self.browser.clone();
             let events = self.events.clone();
             let clock = self.clock.clone();
+            let (probed, asked) = (self.probed.clone(), self.asked.clone());
             Deps {
                 authority: Some(self.authority.clone()),
+                probe: Box::new(move |host, port| {
+                    asked.lock().unwrap().push((host, port));
+                    let answer = probed.lock().unwrap().clone();
+                    Box::pin(async move { answer.map_err(anyhow::Error::msg) })
+                }),
                 open_browser: Box::new(move |url| browser.open(url)),
                 notify: Box::new(move |i| events.lock().unwrap().push(i)),
                 store: self.store,
@@ -1861,7 +2436,15 @@ mod flow_tests {
         }
 
         async fn token(&self) -> anyhow::Result<String> {
-            token_with(&config(), &self.deps()).await
+            self.token_for(&config()).await
+        }
+
+        async fn token_for(&self, config: &ConnectionConfig) -> anyhow::Result<String> {
+            token_with(config, &self.deps()).await
+        }
+
+        fn probes(&self) -> usize {
+            self.asked.lock().unwrap().len()
         }
 
         fn grants(&self) -> Vec<String> {
@@ -2231,5 +2814,130 @@ mod flow_tests {
         let redirect_uri = h.browser.redirect_uri.lock().unwrap().clone().unwrap();
         let port = redirect_uri.rsplit(':').next().unwrap();
         assert!(std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_err());
+    }
+
+    // ----- Without tenant nor application -----
+
+    const TENANT: &str = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+
+    fn zero_config() -> ConnectionConfig {
+        ConnectionConfig {
+            tenant_id: None,
+            azure_client_id: None,
+            username: Some("jane@contoso.com".into()),
+            port: Some(1433),
+            ..config()
+        }
+    }
+
+    fn azure_sql() -> Result<Option<FedAuthInfo>, String> {
+        Ok(Some(FedAuthInfo {
+            sts_url: format!("https://login.windows.net/{TENANT}"),
+            spn: "https://database.windows.net/".into(),
+        }))
+    }
+
+    fn zero_config_key(tenant: &str) -> String {
+        format!("entra:{tenant}:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_config_signs_in_with_the_servers_tenant_and_microsofts_app() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        h.browser.finish();
+        assert_eq!(
+            *h.asked.lock().unwrap(),
+            [("srv.database.windows.net".to_string(), 1433)]
+        );
+        let events = h.events();
+        let authorize = format!("{}/{TENANT}/oauth2/v2.0/authorize?", h.authority);
+        assert!(
+            matches!(&events[0], Interaction::Waiting { url, .. }
+                if url.starts_with(&authorize)
+                    && url.contains("client_id=7f98cb04-cd1e-40df-9140-3bf7e2cea4db")),
+            "{events:?}"
+        );
+        {
+            let requests = h.requests.lock().unwrap();
+            assert_eq!(requests[0].path, format!("/{TENANT}/oauth2/v2.0/token"));
+            assert_eq!(requests[0].form["client_id"], DEFAULT_CLIENT_ID);
+        }
+        assert_eq!(
+            h.store.get(&zero_config_key(TENANT)).unwrap().as_deref(),
+            Some("RT-1")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_servers_answer_is_remembered() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        // Expired: renewed silently, without asking the server again.
+        h.clock.store(2 * 3600, Ordering::SeqCst);
+        *h.probed.lock().unwrap() = Err("unreachable".into());
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
+        assert_eq!(h.probes(), 1);
+        assert_eq!(
+            h.requests.lock().unwrap()[1].path,
+            format!("/{TENANT}/oauth2/v2.0/token")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_the_servers_answer_organizations_signs_in() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        h.browser.finish();
+        {
+            let requests = h.requests.lock().unwrap();
+            assert_eq!(requests[0].path, "/organizations/oauth2/v2.0/token");
+            assert_eq!(requests[0].form["client_id"], DEFAULT_CLIENT_ID);
+        }
+        assert_eq!(
+            h.store
+                .get(&zero_config_key("organizations"))
+                .unwrap()
+                .as_deref(),
+            Some("RT-1")
+        );
+        // The failure is remembered for a while…
+        h.token_for(&zero_config()).await.unwrap();
+        assert_eq!(h.probes(), 1);
+        // …then the server is asked again.
+        h.clock.store(11 * 60, Ordering::SeqCst);
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        assert_eq!(h.probes(), 2);
+        assert_eq!(
+            h.requests.lock().unwrap().last().unwrap().path,
+            format!("/{TENANT}/oauth2/v2.0/token")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_typed_tenant_never_asks_the_server() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token().await.unwrap();
+        h.browser.finish();
+        assert_eq!(h.probes(), 0);
+        assert_eq!(h.stored().as_deref(), Some("RT-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconnection_asks_the_server_too() {
+        let mut h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        h.interactive = false;
+        *h.probed.lock().unwrap() = azure_sql();
+        h.store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 0);
+        assert_eq!(h.probes(), 1);
     }
 }

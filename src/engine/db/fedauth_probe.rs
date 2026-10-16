@@ -38,7 +38,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Ask the server where its Entra ID users sign in (MS-TDS FEDAUTHINFO).
 /// Ok(None): the server doesn't do Entra ID federated auth (on-prem SQL Server…).
-#[allow(dead_code)] // used by entra_interactive in the next commit
 pub async fn probe(host: &str, port: u16) -> Result<Option<FedAuthInfo>> {
     probe_with(host, port, Trust::System, PROBE_TIMEOUT).await
 }

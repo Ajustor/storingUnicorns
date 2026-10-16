@@ -67,6 +67,16 @@ impl AzureCloud {
         }
     }
 
+    /// The cloud whose Azure SQL resource is `resource` (a server's SPN such
+    /// as `https://database.windows.net/`; case and trailing slash ignored).
+    pub fn from_sql_resource(resource: &str) -> Option<Self> {
+        let resource = resource.trim();
+        let resource = resource.strip_suffix('/').unwrap_or(resource);
+        [Self::Public, Self::UsGovernment, Self::China]
+            .into_iter()
+            .find(|cloud| cloud.sql_resource().eq_ignore_ascii_case(resource))
+    }
+
     /// OAuth 2 scope for Azure SQL in this cloud.
     pub fn sql_scope(self) -> String {
         format!("{}/.default", self.sql_resource())
@@ -538,6 +548,34 @@ mod tests {
             "",
         ] {
             assert_eq!(AzureCloud::from_host(host), AzureCloud::Public, "{host}");
+        }
+    }
+
+    #[test]
+    fn cloud_of_an_azure_sql_resource() {
+        for (resource, cloud) in [
+            ("https://database.windows.net/", AzureCloud::Public),
+            (" HTTPS://Database.Windows.NET ", AzureCloud::Public),
+            (
+                "https://database.usgovcloudapi.net/",
+                AzureCloud::UsGovernment,
+            ),
+            ("https://database.chinacloudapi.cn", AzureCloud::China),
+        ] {
+            assert_eq!(
+                AzureCloud::from_sql_resource(resource),
+                Some(cloud),
+                "{resource}"
+            );
+        }
+        for other in [
+            "https://graph.microsoft.com/",
+            "https://database.windows.net.evil.com/",
+            "https://database.windows.net/x",
+            "http://database.windows.net/",
+            "",
+        ] {
+            assert_eq!(AzureCloud::from_sql_resource(other), None, "{other}");
         }
     }
 

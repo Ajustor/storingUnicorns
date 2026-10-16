@@ -4196,6 +4196,19 @@ mod flow_tests {
         let c = on_server("sql.contoso.internal");
         h.token_for(&c).await.unwrap();
         h.browser.finish();
+        // A token for US Government's Azure SQL, asked for and redeemed.
+        const SCOPE: &str =
+            "https://database.usgovcloudapi.net/.default offline_access openid profile";
+        let Interaction::Waiting { url, .. } = &h.events()[0] else {
+            panic!("no browser sign-in");
+        };
+        let authorize: HashMap<String, String> = Url::parse(url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(authorize["scope"], SCOPE);
+        assert_eq!(h.requests.lock().unwrap()[0].form["scope"], SCOPE);
         let note = h.store.get(&note_of(&c)).unwrap().unwrap();
         assert_eq!(note, format!("{TENANT}@login.microsoftonline.us"));
         // What it stands for when the server doesn't answer.
@@ -4282,6 +4295,33 @@ mod flow_tests {
             assert_eq!(h.store.get(&tid_note(&organizations)).unwrap(), None);
             assert!(!h.session.tids().contains_key(&organizations));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_borrowed_sign_in_ends_a_reconnection() {
+        let mut h = Harness::new(entra_in(&["RT-1"], Some(TENANT)), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        // Restarted, the server names TENANT: a reconnection borrows the
+        // organizations sign-in, whose refresh token is refused…
+        restart(&h);
+        *h.probed.lock().unwrap() = azure_sql();
+        h.interactive = false;
+        let e = h.token_for(&zero_config()).await.unwrap_err().to_string();
+        // …and ends there, without the browser.
+        assert_eq!(e, session_expired("Prod Azure"));
+        assert!(e.starts_with("Session Azure AD expirée"), "{e}");
+        assert_eq!(h.grants(), ["authorization_code", "refresh_token"]);
+        assert_eq!(
+            h.requests.lock().unwrap()[1].path,
+            "/organizations/oauth2/v2.0/token"
+        );
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+        assert_eq!(h.events().len(), 2, "no wait to show");
+        let organizations = zero_config_key("organizations");
+        assert_eq!(h.store.get(&organizations).unwrap(), None);
+        assert_eq!(h.store.get(&tid_note(&organizations)).unwrap(), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

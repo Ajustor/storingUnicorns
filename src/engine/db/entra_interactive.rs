@@ -685,7 +685,8 @@ type Probe = Box<
 
 /// What the flow talks to, replaced in tests.
 struct Deps<'a> {
-    /// Replaces the target's authority (its tenant stays).
+    /// Replaces the target's authority (its tenant stays) in the URLs
+    /// requested (`at_authority`), never in its keys.
     authority: Option<String>,
     /// Asks a server for its tenant.
     probe: Probe,
@@ -697,6 +698,19 @@ struct Deps<'a> {
     timeout: Duration,
     /// Whether the browser may be opened (see `token`).
     interactive: bool,
+}
+
+impl Deps<'_> {
+    /// `t` with the authority its URLs are built with: its own, unless
+    /// replaced (`authority`). Only for URLs: its keyring keys
+    /// (`secret_key`) stay those of its own authority.
+    fn at_authority(&self, t: &Target) -> Target {
+        let mut t = t.clone();
+        if let Some(authority) = &self.authority {
+            t.authority = authority.clone();
+        }
+        t
+    }
 }
 
 /// The error of a reconnection that would need the browser.
@@ -744,19 +758,12 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
     let resolved = resolve_target(config, deps)
         .await
         .map_err(anyhow::Error::msg)?;
-    let override_authority = |mut t: Target| {
-        if let Some(authority) = &deps.authority {
-            t.authority = authority.clone();
-        }
-        t
-    };
     let mut target = resolved.clone();
     if typed_tenant(config).is_none() {
         target = with_kept_sign_in(config, target, deps).await;
     }
     // A borrowed organizations sign-in never goes back to the browser…
     let borrowed = !target.tenant.eq_ignore_ascii_case(&resolved.tenant);
-    let mut target = override_authority(target);
     let access = match acquire(config, &target, deps, !borrowed).await? {
         Some(access) => access,
         // …the server's tenant does.
@@ -765,7 +772,7 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
                 "Entra ID: the borrowed sign-in of {} is gone, signing in to its server's tenant",
                 config.name
             );
-            target = override_authority(resolved.clone());
+            target = resolved.clone();
             acquire(config, &target, deps, true)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!(session_expired(&config.name)))?
@@ -1191,7 +1198,7 @@ async fn redeem(t: &Target, grant: Grant<'_>, deps: &Deps<'_>) -> Result<Tokens,
             form.push(("code_verifier", verifier.into()));
         }
     }
-    let url = t.endpoint("token").to_string();
+    let url = deps.at_authority(t).endpoint("token").to_string();
     let (status, body) = tokio::task::spawn_blocking(move || post_form(&url, &form))
         .await
         .map_err(|e| AuthError::Network(e.to_string()))??;
@@ -1248,7 +1255,12 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
     let redirect_uri = format!("http://localhost:{port}");
     let verifier = random_urlsafe(32)?;
     let state = random_urlsafe(16)?;
-    let url = authorize_url(t, &redirect_uri, &pkce_challenge(&verifier), &state);
+    let url = authorize_url(
+        &deps.at_authority(t),
+        &redirect_uri,
+        &pkce_challenge(&verifier),
+        &state,
+    );
     let app = t.app();
 
     let (code, mut browser) = {
@@ -4257,6 +4269,50 @@ mod flow_tests {
             assert_eq!(h.store.get(&tid_note(&organizations)).unwrap(), None);
             assert!(!h.session.tids().contains_key(&organizations));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_us_government_organizations_sign_in_has_its_own_keys() {
+        let h = Harness::new(entra_in(&[], Some(TENANT)), Behaviour::SignIn).await;
+        // The server doesn't answer: organizations, of its cloud.
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        let c = on_server("srv.database.usgovcloudapi.net");
+        assert_eq!(h.token_for(&c).await.unwrap(), home("AT-code"));
+        h.browser.finish();
+        {
+            let requests = h.requests.lock().unwrap();
+            assert_eq!(requests[0].path, "/organizations/oauth2/v2.0/token");
+            assert_eq!(
+                requests[0].form["scope"],
+                "https://database.usgovcloudapi.net/.default offline_access openid profile"
+            );
+        }
+        // Kept under the cloud's organizations key, with its tid note…
+        let key = format!(
+            "entra:organizations@login.microsoftonline.us:{DEFAULT_CLIENT_ID}:jane@contoso.com"
+        );
+        let tid = format!(
+            "entra:tid:organizations@login.microsoftonline.us:{DEFAULT_CLIENT_ID}:\
+             jane@contoso.com"
+        );
+        assert_eq!(h.store.get(&key).unwrap().as_deref(), Some("RT-1"));
+        assert_eq!(h.store.get(&tid).unwrap().as_deref(), Some(TENANT));
+        // …not under the public cloud's.
+        let public = zero_config_key("organizations");
+        assert_eq!(h.store.get(&public).unwrap(), None);
+        assert_eq!(h.store.get(&tid_note(&public)).unwrap(), None);
+        // Forgetting the connection removes both.
+        let (session, store, forgotten) = (h.session, h.store, c.clone());
+        tokio::task::spawn_blocking(move || {
+            forget_with(&forgotten, session, store, None);
+        })
+        .await
+        .unwrap();
+        for k in [key, tid, note_of(&c)] {
+            assert_eq!(h.store.get(&k).unwrap(), None, "{k}");
+        }
+        assert!(h.session.tokens().is_empty());
+        assert!(h.session.tids().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -313,12 +313,33 @@ avec « Session Azure AD expirée » ; déconnectez puis reconnectez la connexio
 Aucun jeton n'est écrit dans `config.toml` ni dans les journaux.
 
 Pour l'oublier : **Oublier la connexion Azure AD** dans le menu de la connexion
-(interface graphique). Supprimer la connexion, ou changer son tenant, son
-application ou son compte, l'oublie aussi, sauf si une autre connexion utilise
-le même compte (une autre base du même serveur, par exemple). Le trousseau est
-celui du compte du système : tous les profils de storingUnicorns
-(`STORINGUNICORNS_CONFIG_DIR`) partagent ces jetons, et oublier une connexion
-dans un profil l'oublie aussi pour les autres.
+(interface graphique) efface ses jetons :
+
+- avec un tenant saisi, ceux de ce tenant ;
+- sans tenant saisi, ceux du tenant du serveur (celui qu'il a donné pendant la
+  session ou qui a été noté dans le trousseau ; à défaut, l'app le lui
+  redemande, et s'il ne répond pas ces jetons peuvent rester dans le trousseau,
+  ce que le journal signale), et aussi ceux de la connexion partagée faite sans
+  tenant connu (`organizations`, même application et même compte) : les autres
+  connexions de ce compte qui s'en servaient peuvent redemander de se connecter
+  dans le navigateur.
+
+Supprimer la connexion, ou changer son tenant, son application, son compte, sa
+méthode d'authentification ou, sans tenant saisi, son serveur, l'oublie aussi,
+sauf si une autre connexion utilise la même : même tenant saisi, même
+application et même compte, ou, sans tenant saisi, même serveur, même
+application et même compte (une autre base du même serveur, par exemple). Même
+alors, les jetons dont une autre connexion se sert restent (ceux d'un tenant
+commun à deux serveurs, ou de la connexion partagée `organizations`).
+
+Le trousseau garde aussi de petites notes, sans secret : le tenant qu'utilise le
+serveur d'une connexion sans tenant saisi, et celui où a abouti la connexion
+partagée `organizations`. Elles sont effacées avec la connexion Azure AD
+qu'elles décrivent.
+
+Le trousseau est celui du compte du système : tous les profils de
+storingUnicorns (`STORINGUNICORNS_CONFIG_DIR`) partagent ces jetons, et oublier
+une connexion dans un profil l'oublie aussi pour les autres.
 
 ## Building
 

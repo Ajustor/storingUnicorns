@@ -73,6 +73,24 @@ fn advanced_fields(db_type: &DatabaseType, method: &AzureAuthMethod) -> &'static
     }
 }
 
+/// How « Options avancées » is made to show this frame: `Some(open)` sets
+/// it, `None` leaves it as the user folded it. `shown` is `None` until it
+/// first shows in the form, then whether it showed on the previous frame;
+/// `filled` whether a tenant or an application is typed in; `valid` whether
+/// they pass `validate_interactive`.
+fn advanced_forced(shown: Option<bool>, filled: bool, valid: bool) -> Option<bool> {
+    match shown {
+        // The error under the form names one of its fields.
+        _ if !valid => Some(true),
+        // Its first showing: egui still holds the previous form's state.
+        None => Some(filled),
+        // The browser sign-in chosen again, with a tenant or an application
+        // typed in meanwhile (for Azure CLI, say): they are in use.
+        Some(false) if filled => Some(true),
+        _ => None,
+    }
+}
+
 fn default_port(t: &DatabaseType) -> &'static str {
     match t {
         DatabaseType::Postgres => "5432",
@@ -113,9 +131,9 @@ pub struct ConnectionForm {
     pub tenant_id: String,
     /// Entra ID application (client) ID of an interactive browser sign-in.
     pub azure_client_id: String,
-    /// Whether « Options avancées » is unfolded; `None` until it first
-    /// shows (see `advanced_open`).
-    advanced_open: Option<bool>,
+    /// Whether « Options avancées » showed on the previous frame; `None`
+    /// until it first shows (see `advanced_force`).
+    advanced_shown: Option<bool>,
     pub color: Option<[u8; 3]>,
     /// Compatible product; `None` = the bare engine.
     pub flavor: Option<Flavor>,
@@ -158,7 +176,7 @@ impl ConnectionForm {
             azure_auth: c.azure_auth_method.unwrap_or_default(),
             tenant_id: c.tenant_id.unwrap_or_default(),
             azure_client_id: c.azure_client_id.unwrap_or_default(),
-            advanced_open: None,
+            advanced_shown: None,
             name: c.name,
             db_type: c.db_type,
             database: c.database,
@@ -216,12 +234,22 @@ impl ConnectionForm {
         self.db_type = t;
     }
 
-    /// Whether « Options avancées » is unfolded. Decided when it first
-    /// shows: unfolded when a tenant or an application is already filled
-    /// in, so that nothing in use stays hidden; then as the user leaves it.
-    fn advanced_open(&mut self) -> bool {
+    /// How « Options avancées » is made to show this frame, if it shows
+    /// (see `advanced_forced`): nothing in use or wrong in it stays hidden.
+    /// Called once a frame, as it records whether it shows.
+    fn advanced_force(&mut self) -> Option<bool> {
+        if advanced_fields(&self.db_type, &self.azure_auth).is_empty() {
+            if self.advanced_shown.is_some() {
+                self.advanced_shown = Some(false);
+            }
+            return None;
+        }
         let filled = !self.tenant_id.trim().is_empty() || !self.azure_client_id.trim().is_empty();
-        *self.advanced_open.get_or_insert(filled)
+        let valid =
+            entra_interactive::validate_interactive(&self.tenant_id, &self.azure_client_id).is_ok();
+        let forced = advanced_forced(self.advanced_shown, filled, valid);
+        self.advanced_shown = Some(true);
+        forced
     }
 
     fn uses_server(&self) -> bool {
@@ -437,9 +465,10 @@ impl ConnectionForm {
                     ui.end_row();
                 }
             });
+        let forced = self.advanced_force();
         if !advanced_fields(&self.db_type, &self.azure_auth).is_empty() {
             ui.add_space(4.0);
-            self.advanced_options(ui);
+            self.advanced_options(ui, forced);
         }
 
         if let Some(e) = &self.url_error {
@@ -576,13 +605,13 @@ impl ConnectionForm {
     }
 
     /// « Options avancées » of the browser sign-in: the organization's own
-    /// tenant or application, for when the defaults don't suit it.
-    fn advanced_options(&mut self, ui: &mut egui::Ui) {
-        let open = self.advanced_open();
-        let header = egui::CollapsingHeader::new("Options avancées")
+    /// tenant or application, for when the defaults don't suit it. Folded
+    /// as the user leaves it unless `forced` (`advanced_force`).
+    fn advanced_options(&mut self, ui: &mut egui::Ui, forced: Option<bool>) {
+        egui::CollapsingHeader::new("Options avancées")
             .id_salt("aad_advanced")
-            .default_open(open)
-            .open(Some(open))
+            .default_open(forced == Some(true))
+            .open(forced)
             .show(ui, |ui| {
                 egui::Grid::new("conn_form_advanced")
                     .num_columns(2)
@@ -606,12 +635,6 @@ impl ConnectionForm {
                     ui.hyperlink_to(egui::RichText::new("voir le README").small(), ENTRA_APP_DOC);
                 });
             });
-        // Driven by `advanced_open` (`open` above): it unfolds or folds on
-        // the next frame.
-        if header.header_response.clicked() {
-            self.advanced_open = Some(!open);
-            ui.ctx().request_repaint();
-        }
     }
 
     fn ssl_fields(&mut self, ui: &mut egui::Ui) {
@@ -886,6 +909,24 @@ mod tests {
     }
 
     #[test]
+    fn advanced_options_unfold_for_an_error_or_a_value_and_else_stay_as_folded() {
+        // First showing in a form: as its values say, whatever egui
+        // remembers of the previous form.
+        assert_eq!(advanced_forced(None, false, true), Some(false));
+        assert_eq!(advanced_forced(None, true, true), Some(true));
+        // A value the sign-in rejects: unfolded, even when folded by hand.
+        for shown in [None, Some(false), Some(true)] {
+            assert_eq!(advanced_forced(shown, true, false), Some(true), "{shown:?}");
+        }
+        // The browser sign-in chosen again with a tenant or an application.
+        assert_eq!(advanced_forced(Some(false), true, true), Some(true));
+        // Otherwise as the user left it.
+        assert_eq!(advanced_forced(Some(false), false, true), None);
+        assert_eq!(advanced_forced(Some(true), true, true), None);
+        assert_eq!(advanced_forced(Some(true), false, true), None);
+    }
+
+    #[test]
     fn advanced_options_unfold_when_a_tenant_or_an_app_is_filled_in() {
         let browser = |tenant: Option<&str>, app: Option<&str>| ConnectionConfig {
             name: "Az".into(),
@@ -896,29 +937,49 @@ mod tests {
             database: "app".into(),
             ..Default::default()
         };
+        let first = |c| ConnectionForm::new(Some(c)).advanced_force();
         // Nothing to set: folded.
-        assert!(!ConnectionForm::new(Some(browser(None, None))).advanced_open());
-        assert!(!ConnectionForm::new(Some(browser(Some(" "), None))).advanced_open());
+        assert_eq!(first(browser(None, None)), Some(false));
+        assert_eq!(first(browser(Some(" "), None)), Some(false));
         // A connection naming its own tenant or application shows them.
-        assert!(ConnectionForm::new(Some(browser(Some("contoso.com"), None))).advanced_open());
+        assert_eq!(first(browser(Some("contoso.com"), None)), Some(true));
         let app = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
-        assert!(ConnectionForm::new(Some(browser(None, Some(app)))).advanced_open());
+        assert_eq!(first(browser(None, Some(app))), Some(true));
 
-        // Decided when it first shows: a tenant typed for Azure CLI before
-        // switching to the browser sign-in is shown.
-        let mut f = ConnectionForm::new(None);
-        f.set_db_type(DatabaseType::Azure);
+        // Then as the user folds it, whatever it holds.
+        let mut f = ConnectionForm::new(Some(browser(Some("contoso.com"), None)));
+        f.advanced_force();
+        assert_eq!(f.advanced_force(), None);
+        f.tenant_id.clear();
+        assert_eq!(f.advanced_force(), None);
+        // A tenant typed for Azure CLI shows when the browser sign-in is
+        // chosen again…
         f.azure_auth = AzureAuthMethod::Interactive;
+        f.advanced_force();
         f.tenant_id = "contoso.com".into();
         f.azure_auth = AzureAuthMethod::InteractiveBrowser;
-        assert!(f.advanced_open());
-        // Then it stays as it is: emptying a field doesn't fold it…
+        assert_eq!(f.advanced_force(), Some(true));
+        assert_eq!(f.advanced_force(), None);
+        // …and as well coming back from another engine.
+        f.set_db_type(DatabaseType::SQLServer);
+        f.advanced_force();
+        f.set_db_type(DatabaseType::Azure);
+        assert_eq!(f.advanced_force(), Some(true));
+        // Without one, it shows as the user left it.
         f.tenant_id.clear();
-        assert!(f.advanced_open());
-        // …and the user folds it whatever it holds.
-        f.tenant_id = "contoso.com".into();
-        f.advanced_open = Some(false);
-        assert!(!f.advanced_open());
+        f.azure_auth = AzureAuthMethod::Interactive;
+        f.advanced_force();
+        f.azure_auth = AzureAuthMethod::InteractiveBrowser;
+        assert_eq!(f.advanced_force(), None);
+        // A value the sign-in rejects keeps it unfolded: the error under
+        // the form names that field.
+        f.azure_client_id = "my-app".into();
+        assert_eq!(f.advanced_force(), Some(true));
+        assert_eq!(f.advanced_force(), Some(true));
+        f.azure_client_id = app.into();
+        assert_eq!(f.advanced_force(), None);
+        f.tenant_id = "common".into();
+        assert_eq!(f.advanced_force(), Some(true));
     }
 
     #[test]

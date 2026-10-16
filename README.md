@@ -14,7 +14,7 @@ desktop GUI (egui) and a terminal UI (ratatui) sharing the same engine.
   - paste a connection URL (`postgresql://user:pass@host/db?sslmode=require`)
     to fill in the connection form
   - Azure SQL: SQL login, Azure CLI token, managed identity, or your own Entra
-    ID account through the browser (MFA included, see
+    ID account through the browser (MFA included, nothing to set up, see
     [Azure AD interactif](#azure-ad-interactif))
 - **GUI** (default) with DataGrip ergonomics:
   - several connections open at once, each with its own colour (dot on its tabs)
@@ -199,45 +199,36 @@ host = "myserver.database.windows.net"
 port = 1433
 database = "app"
 azure_auth_method = "InteractiveBrowser" # Credentials, Interactive (Azure CLI), InteractiveBrowser, ManagedIdentity
-tenant_id = "contoso.com"               # GUID or domain
-azure_client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # InteractiveBrowser: the organization's app
 username = "jane.doe@contoso.com"       # optional: the account to sign in with
+# Advanced, both optional (InteractiveBrowser):
+# tenant_id = "contoso.com"             # GUID, domain or "organizations"; default: asked from the server
+# azure_client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # the organization's app; default: Microsoft's drivers'
 ```
 
 ## Azure AD interactif
 
 Connexion à Azure SQL avec **votre propre compte Entra ID** (MFA comprise), par
-le navigateur, comme le mode *Active Directory Interactive* de SSMS, sans
-installer Azure CLI. Chaque organisation enregistre une fois sa propre
-application dans Entra ID.
-
-### Enregistrer l'application (une fois, administrateur Entra ID)
-
-1. Portail Azure → **Microsoft Entra ID** → **Inscriptions d'applications** →
-   **Nouvelle inscription** : un nom (par exemple `storingUnicorns`), comptes de
-   **cet annuaire organisationnel uniquement**, sans URI de redirection pour
-   l'instant.
-2. **Authentification** → **Ajouter une plateforme** → **Applications mobiles et
-   de bureau** → URI de redirection personnalisée `http://localhost` (sans port :
-   l'app écoute sur un port libre de `127.0.0.1`).
-3. Toujours dans **Authentification**, **Autoriser les flux clients publics** :
-   **Oui** (application publique, sans secret).
-4. **Autorisations d'API** → **Ajouter une autorisation** → **API utilisées par
-   mon organisation** → **Azure SQL Database** → **Autorisations déléguées** →
-   `user_impersonation`, puis **Accorder un consentement d'administrateur**.
-5. Notez l'**ID d'application (client)** et l'**ID de l'annuaire (locataire)**
-   de la page **Vue d'ensemble**.
+le navigateur, comme le mode *Active Directory Interactive* de SSMS ou de
+DataGrip, sans installer Azure CLI et **sans rien configurer**.
 
 ### Dans storingUnicorns
 
 Type **Azure SQL**, authentification **Azure AD interactif (navigateur)**
-(interface terminal : `←/→` sur `Auth` jusqu'à `Azure AD (navigateur)`) :
+(interface terminal : `←/→` sur `Auth` jusqu'à `Azure AD (navigateur)`). Aucun
+réglage n'est nécessaire : le **Compte** (facultatif,
+`prenom.nom@contoso.com`) est seulement pré-rempli sur la page de connexion.
 
-| Champ | Valeur |
-|---|---|
-| Tenant | ID de l'annuaire ou domaine (`contoso.com`) ; pas `common` ni `organizations` |
-| ID client de l'application | l'ID d'application noté plus haut |
-| Compte (facultatif) | `prenom.nom@contoso.com`, pré-rempli sur la page de connexion |
+Comme les drivers SQL Server de Microsoft (et donc DataGrip) :
+
+- le **tenant** est demandé au serveur : avant la connexion, Azure SQL indique
+  où ses utilisateurs Entra ID se connectent (s'il ne le dit pas,
+  `organizations`, c'est-à-dire l'annuaire de votre compte) ;
+- l'**application** est celle des drivers Microsoft (ID client
+  `7f98cb04-cd1e-40df-9140-3bf7e2cea4db`), publique et déjà autorisée pour
+  Azure SQL : votre organisation n'a rien à enregistrer.
+
+Pour une organisation qui bloque cette application, ou qui veut la sienne, voir
+les [options avancées](#options-avancées).
 
 À la première connexion, la page de connexion Microsoft s'ouvre dans le
 navigateur par défaut ; terminez-la (5 minutes au plus) puis revenez à l'app.
@@ -246,9 +237,10 @@ lien** (si le navigateur ne s'est pas ouvert) et **Annuler** ; l'interface
 terminal affiche le lien complet dans la barre d'état et `Échap` annule. Pour
 copier le lien, sélectionnez-le avec **Maj+glisser** (**Option+glisser** dans
 iTerm2) : l'interface capture la souris, un simple glisser ne sélectionne rien.
-Avec certaines erreurs de configuration (URI de redirection absente,
-application ou tenant introuvable), Microsoft affiche l'erreur dans le
-navigateur sans revenir à l'app : annulez la connexion.
+Avec certaines erreurs (application refusée par l'organisation, tenant
+introuvable, URI de redirection absente de votre propre application), Microsoft
+affiche l'erreur dans le navigateur sans revenir à l'app : annulez la
+connexion.
 
 Interface terminal : le navigateur est ouvert comme le fait le système (sous
 Linux, `$BROWSER` d'abord). Un navigateur en mode texte (`lynx`, `w3m`…)
@@ -270,6 +262,42 @@ ALTER ROLE db_datawriter ADD MEMBER [prenom.nom@contoso.com];
 
 Sans cela, la connexion échoue (erreur 18456) bien que le compte soit
 authentifié ; le message de l'app le rappelle.
+
+### Options avancées
+
+Dans **Options avancées** sous le formulaire (interface graphique, ouvertes
+d'office quand l'un des deux est renseigné), ou dans les champs `Tenant` et
+`ID app` (interface terminal, `auto` tant qu'ils sont vides) :
+
+| Champ | Valeur |
+|---|---|
+| Tenant (facultatif) | ID de l'annuaire ou domaine (`contoso.com`), ou `organizations` ; pas `common` (il accepte les comptes Microsoft personnels, qu'Azure SQL refuse) |
+| ID client de l'application (facultatif) | l'ID d'application enregistrée par votre organisation (voir ci-dessous) |
+
+Indiquer le **tenant** n'est utile que si le serveur ne donne pas le sien et que
+votre compte doit se connecter à un autre annuaire que celui de son
+organisation (un compte invité, par exemple).
+
+Votre **propre application** sert à une organisation qui n'autorise pas celle
+des drivers Microsoft et ne veut pas y consentir (Microsoft demande alors
+l'approbation d'un administrateur, ou l'app signale un consentement manquant,
+`AADSTS65001`), ou qui préfère la sienne. Un administrateur Entra ID
+l'enregistre une fois :
+
+1. Portail Azure → **Microsoft Entra ID** → **Inscriptions d'applications** →
+   **Nouvelle inscription** : un nom (par exemple `storingUnicorns`), comptes de
+   **cet annuaire organisationnel uniquement**, sans URI de redirection pour
+   l'instant.
+2. **Authentification** → **Ajouter une plateforme** → **Applications mobiles et
+   de bureau** → URI de redirection personnalisée `http://localhost` (sans port :
+   l'app écoute sur un port libre de `127.0.0.1`).
+3. Toujours dans **Authentification**, **Autoriser les flux clients publics** :
+   **Oui** (application publique, sans secret).
+4. **Autorisations d'API** → **Ajouter une autorisation** → **API utilisées par
+   mon organisation** → **Azure SQL Database** → **Autorisations déléguées** →
+   `user_impersonation`, puis **Accorder un consentement d'administrateur**.
+5. Notez l'**ID d'application (client)** de la page **Vue d'ensemble** (et
+   l'**ID de l'annuaire (locataire)** si vous indiquez aussi le tenant).
 
 ### Jetons
 

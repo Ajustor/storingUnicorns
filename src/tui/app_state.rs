@@ -324,6 +324,7 @@ impl NewConnectionState {
                 None
             },
             flavor: self.flavor.filter(|f| f.driver() == self.db_type),
+            db_auth: None,
         }
     }
 

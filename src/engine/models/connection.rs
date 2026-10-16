@@ -87,6 +87,26 @@ impl std::fmt::Display for SslMode {
     }
 }
 
+/// How a PostgreSQL / MySQL connection authenticates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum DbAuthMethod {
+    /// The connection's password (or the driver's environment fallbacks).
+    #[default]
+    Password,
+    /// Cloud SQL IAM database authentication: the user's Google account,
+    /// with an OAuth2 token from `gcloud` sent as the password.
+    GcpIam,
+}
+
+impl std::fmt::Display for DbAuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DbAuthMethod::Password => "Mot de passe",
+            DbAuthMethod::GcpIam => "IAM Google Cloud",
+        })
+    }
+}
+
 /// A PostgreSQL- or MySQL-compatible product. Display and dialog defaults
 /// only: the driver is still `db_type`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -163,11 +183,29 @@ pub struct ConnectionConfig {
     /// Compatible product shown instead of the bare engine.
     #[serde(default)]
     pub flavor: Option<Flavor>,
+    /// PostgreSQL / MySQL only; `None` = `DbAuthMethod::Password`.
+    #[serde(default)]
+    pub db_auth: Option<DbAuthMethod>,
 }
 
 impl ConnectionConfig {
+    /// The SSL mode connections use: Google Cloud IAM sends its token as the
+    /// password, so it never goes below `Require`.
     pub fn effective_ssl_mode(&self) -> SslMode {
-        self.ssl_mode.unwrap_or_default()
+        let mode = self.ssl_mode.unwrap_or_default();
+        match (self.effective_db_auth(), mode) {
+            (DbAuthMethod::GcpIam, SslMode::Disable | SslMode::Prefer) => SslMode::Require,
+            _ => mode,
+        }
+    }
+
+    /// The authentication method, `Password` for the engines without a
+    /// choice (only PostgreSQL and MySQL support Google Cloud IAM).
+    pub fn effective_db_auth(&self) -> DbAuthMethod {
+        match self.db_type {
+            DatabaseType::Postgres | DatabaseType::MySQL => self.db_auth.unwrap_or_default(),
+            _ => DbAuthMethod::Password,
+        }
     }
 
     /// The flavor when it matches the driver, else the engine name.
@@ -245,6 +283,7 @@ impl Default for ConnectionConfig {
             ssl_mode: None,
             ssl_ca: None,
             flavor: None,
+            db_auth: None,
         }
     }
 }
@@ -519,6 +558,96 @@ mod tests {
             Some("8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f")
         );
         assert_eq!(back.username.as_deref(), Some("jane@contoso.com"));
+    }
+
+    #[test]
+    fn config_without_db_auth_uses_the_password() {
+        let c: ConnectionConfig = toml::from_str(
+            "name = \"x\"
+db_type = \"Postgres\"
+database = \"d\"
+username = \"u\"",
+        )
+        .unwrap();
+        assert_eq!(c.db_auth, None);
+        assert_eq!(c.effective_db_auth(), DbAuthMethod::Password);
+        assert_eq!(c.effective_ssl_mode(), SslMode::Prefer);
+    }
+
+    #[test]
+    fn gcp_iam_config_round_trips() {
+        let c = ConnectionConfig {
+            db_type: DatabaseType::MySQL,
+            username: Some("jane@example.com".into()),
+            db_auth: Some(DbAuthMethod::GcpIam),
+            ..Default::default()
+        };
+        let text = toml::to_string(&c).unwrap();
+        assert!(text.contains("db_auth = \"GcpIam\""), "{text}");
+        let back: ConnectionConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.db_auth, Some(DbAuthMethod::GcpIam));
+        assert_eq!(back.effective_db_auth(), DbAuthMethod::GcpIam);
+    }
+
+    #[test]
+    fn gcp_iam_is_for_postgres_and_mysql_only() {
+        for (db_type, expected) in [
+            (DatabaseType::Postgres, DbAuthMethod::GcpIam),
+            (DatabaseType::MySQL, DbAuthMethod::GcpIam),
+            (DatabaseType::SQLite, DbAuthMethod::Password),
+            (DatabaseType::SQLServer, DbAuthMethod::Password),
+            (DatabaseType::Azure, DbAuthMethod::Password),
+        ] {
+            let c = ConnectionConfig {
+                db_type: db_type.clone(),
+                db_auth: Some(DbAuthMethod::GcpIam),
+                ..Default::default()
+            };
+            assert_eq!(c.effective_db_auth(), expected, "{db_type}");
+        }
+    }
+
+    #[test]
+    fn gcp_iam_needs_at_least_require() {
+        let with = |ssl_mode| ConnectionConfig {
+            db_auth: Some(DbAuthMethod::GcpIam),
+            ssl_mode,
+            ..Default::default()
+        };
+        assert_eq!(with(None).effective_ssl_mode(), SslMode::Require);
+        assert_eq!(
+            with(Some(SslMode::Disable)).effective_ssl_mode(),
+            SslMode::Require
+        );
+        assert_eq!(
+            with(Some(SslMode::Prefer)).effective_ssl_mode(),
+            SslMode::Require
+        );
+        assert_eq!(
+            with(Some(SslMode::Require)).effective_ssl_mode(),
+            SslMode::Require
+        );
+        assert_eq!(
+            with(Some(SslMode::VerifyCa)).effective_ssl_mode(),
+            SslMode::VerifyCa
+        );
+        assert_eq!(
+            with(Some(SslMode::VerifyFull)).effective_ssl_mode(),
+            SslMode::VerifyFull
+        );
+        // The password keeps the chosen mode.
+        let password = ConnectionConfig {
+            ssl_mode: Some(SslMode::Disable),
+            ..Default::default()
+        };
+        assert_eq!(password.effective_ssl_mode(), SslMode::Disable);
+    }
+
+    #[test]
+    fn db_auth_labels() {
+        assert_eq!(DbAuthMethod::Password.to_string(), "Mot de passe");
+        assert_eq!(DbAuthMethod::GcpIam.to_string(), "IAM Google Cloud");
+        assert_eq!(DbAuthMethod::default(), DbAuthMethod::Password);
     }
 
     #[test]

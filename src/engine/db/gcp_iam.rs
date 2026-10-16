@@ -32,7 +32,7 @@ pub fn validate(db_type: &DatabaseType, username: &str) -> Result<(), String> {
     }
     let account = username.trim();
     if account.is_empty() {
-        return Err("Indique le compte Google (adresse e-mail).".into());
+        return Err("Indique ton compte Google".into());
     }
     if !account.contains('@') {
         return Err(
@@ -514,8 +514,11 @@ mod tests {
             let e = validate(&db, "jane@example.com").unwrap_err();
             assert!(e.contains("PostgreSQL et MySQL"), "{e}");
         }
-        let e = validate(&DatabaseType::Postgres, "  ").unwrap_err();
-        assert!(e.contains("compte Google"), "{e}");
+        // The forms show this one as is.
+        assert_eq!(
+            validate(&DatabaseType::Postgres, "  ").unwrap_err(),
+            "Indique ton compte Google"
+        );
         let e = validate(&DatabaseType::Postgres, "jane").unwrap_err();
         assert!(e.contains("adresse e-mail"), "{e}");
         let e = validate(&DatabaseType::Postgres, "jane@x.com & calc").unwrap_err();

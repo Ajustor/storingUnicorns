@@ -3582,9 +3582,9 @@ mod flow_tests {
         for interactive in [true, false] {
             let mut h = signed_in_without_the_server().await;
             h.interactive = interactive;
-            // Only the refresh token is left (the app was restarted)…
-            h.session.tokens().clear();
-            h.session.servers().clear();
+            // Only the keyring is left (the app was restarted): the tenant
+            // the organizations sign-in landed in is read from there…
+            restart(&h);
             // …and the server, asked again, names its tenant, which holds
             // nothing but where the organizations sign-in landed: that one
             // is renewed, no browser.

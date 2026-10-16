@@ -426,3 +426,26 @@ impl Drop for DatabaseConnection {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_a_connection_closes_its_pool() {
+        // Lazy: nothing listens on the port, no session is ever opened.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://u:p@127.0.0.1:9/db")
+            .unwrap();
+        let kept = pool.clone();
+        drop(DatabaseConnection::Postgres(pool));
+        assert!(kept.is_closed());
+
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://u:p@127.0.0.1:9/db")
+            .unwrap();
+        let kept = pool.clone();
+        drop(DatabaseConnection::MySQL(pool));
+        assert!(kept.is_closed());
+    }
+}

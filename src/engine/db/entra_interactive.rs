@@ -600,6 +600,8 @@ struct Session {
     servers: Mutex<HashMap<String, Probed>>,
     /// `kept_key` → tenant written under it.
     noted: Mutex<HashMap<String, String>>,
+    /// `organizations` key → tenant its sign-in landed in (`note_tid`).
+    tids: Mutex<HashMap<String, String>>,
 }
 
 impl Session {
@@ -613,6 +615,10 @@ impl Session {
 
     fn noted(&self) -> MutexGuard<'_, HashMap<String, String>> {
         self.noted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn tids(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.tids.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lock_for(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -695,9 +701,10 @@ pub async fn token(config: &ConnectionConfig, interactive: bool) -> anyhow::Resu
 }
 
 async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Result<String> {
-    let mut target = resolve_target(config, deps)
+    let resolved = resolve_target(config, deps)
         .await
         .map_err(anyhow::Error::msg)?;
+    let mut target = resolved.clone();
     if typed_tenant(config).is_none() {
         target = with_kept_sign_in(config, target, deps).await;
     }
@@ -705,7 +712,10 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
         target.authority = authority.clone();
     }
     let access = acquire(config, &target, deps).await?;
-    note_tenant(config, &target, deps).await;
+    // The server's tenant, even when the organizations sign-in that landed
+    // there serves it.
+    note_tenant(config, &resolved, deps).await;
+    note_tid(&target, &access, deps).await;
     Ok(access)
 }
 
@@ -768,8 +778,9 @@ async fn acquire(
 }
 
 /// For a connection without a typed tenant, note in the keyring, under
-/// `kept_key`, the tenant its sign-in is kept under (not a secret): `forget`
-/// finds its refresh token without asking the server.
+/// `kept_key`, its server's tenant (`organizations` while the server didn't
+/// answer; not a secret): `forget` finds its refresh token without asking
+/// the server.
 async fn note_tenant(config: &ConnectionConfig, target: &Target, deps: &Deps<'_>) {
     if typed_tenant(config).is_some() {
         return;
@@ -799,15 +810,23 @@ async fn resolve_target(config: &ConnectionConfig, deps: &Deps<'_>) -> Result<Ta
 }
 
 /// `target`, unless it holds no sign-in while the `organizations` one of the
-/// same application and account does: a connection that signed in while its
-/// server didn't answer keeps that sign-in once the server answers.
+/// same application and account does and landed in the very tenant the
+/// server names (`note_tid`): a connection that signed in while its server
+/// didn't answer keeps that sign-in once the server answers, but a guest
+/// tenant never borrows the home one.
 async fn with_kept_sign_in(config: &ConnectionConfig, target: Target, deps: &Deps<'_>) -> Target {
     let Ok(fallback) = Target::for_config(config, None) else {
         return target;
     };
+    let fallback_key = secret_key(&fallback);
     if target.tenant.eq_ignore_ascii_case(&fallback.tenant)
+        || !is_guid(&target.tenant)
         || holds_sign_in(&secret_key(&target), deps).await
-        || !holds_sign_in(&secret_key(&fallback), deps).await
+        || !same_tenant(
+            &target.tenant,
+            noted_tid(&fallback_key, deps).await.as_deref(),
+        )
+        || !holds_sign_in(&fallback_key, deps).await
     {
         return target;
     }
@@ -816,6 +835,62 @@ async fn with_kept_sign_in(config: &ConnectionConfig, target: Target, deps: &Dep
         config.name
     );
     fallback
+}
+
+/// The tenant (`tid` claim) of an access token, read without checking its
+/// signature: it only tells where a sign-in under `organizations` landed,
+/// and the token came straight from the token endpoint over TLS. `None`
+/// when missing or malformed.
+fn token_tid(access: &str) -> Option<String> {
+    let payload = access.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let tid = claims.get("tid")?.as_str()?;
+    is_guid(tid).then(|| tid.to_ascii_lowercase())
+}
+
+/// Keyring note of the tenant the `organizations` sign-in under `key`
+/// landed in (not a secret).
+fn tid_note(key: &str) -> String {
+    format!("entra:tid:{}", key.strip_prefix("entra:").unwrap_or(key))
+}
+
+/// Whether `key` is an `organizations` sign-in's.
+fn is_organizations_key(key: &str) -> bool {
+    key.starts_with(&format!("entra:{ORGANIZATIONS}:"))
+}
+
+/// Whether a sign-in that landed in tenant `tid` serves a server naming
+/// `tenant`: the same tenant, both GUIDs (a domain can't be compared without
+/// the network).
+fn same_tenant(tenant: &str, tid: Option<&str>) -> bool {
+    is_guid(tenant) && tid.is_some_and(|tid| tid.eq_ignore_ascii_case(tenant))
+}
+
+/// For a sign-in kept under `organizations`, note the tenant it landed in
+/// (`tid` of `access`) next to it in the keyring, and in the session.
+async fn note_tid(target: &Target, access: &str, deps: &Deps<'_>) {
+    if !target.tenant.eq_ignore_ascii_case(ORGANIZATIONS) {
+        return;
+    }
+    let Some(tid) = token_tid(access) else {
+        return;
+    };
+    let key = secret_key(target);
+    if deps.session.tids().get(&key) == Some(&tid) {
+        return;
+    }
+    save_secret(deps.store, &tid_note(&key), tid.clone()).await;
+    deps.session.tids().insert(key, tid);
+}
+
+/// The tenant the `organizations` sign-in under `key` landed in, as noted.
+async fn noted_tid(key: &str, deps: &Deps<'_>) -> Option<String> {
+    let known = deps.session.tids().get(key).cloned();
+    if known.is_some() {
+        return known;
+    }
+    load_secret(deps.store, &tid_note(key)).await
 }
 
 /// Whether `key` holds a session token or a refresh token.
@@ -1276,26 +1351,39 @@ fn used_keys(
     if typed_tenant(config).is_some() {
         return vec![secret_key(&target)];
     }
-    let mut keys = Vec::new();
+    let mut tenants = Vec::new();
     let (host, port) = server_of(config);
     let probed = session.servers().get(&server_key(&host, port)).cloned();
     if let Some(probed) = probed {
         let t = Target::for_config(config, probed.info.as_ref());
-        keys.extend(t.ok().map(|t| secret_key(&t)));
+        tenants.extend(t.ok().map(|t| t.tenant));
     }
     let note = kept_key(config);
     let noted = note
         .as_ref()
         .and_then(|note| session.noted().get(note).cloned());
-    let stored = match (note, store) {
-        (Some(note), Some(store)) => store.get(&note).ok().flatten(),
-        _ => None,
-    };
-    for tenant in noted.into_iter().chain(stored) {
-        keys.push(secret_key(&Target {
-            tenant,
-            ..target.clone()
-        }));
+    tenants.extend(noted);
+    if let (Some(note), Some(store)) = (&note, store) {
+        tenants.extend(store.get(note).ok().flatten());
+    }
+    let mut keys: Vec<String> = tenants
+        .iter()
+        .map(|tenant| {
+            secret_key(&Target {
+                tenant: tenant.clone(),
+                ..target.clone()
+            })
+        })
+        .collect();
+    // The organizations sign-in, when it landed in one of these tenants
+    // (`with_kept_sign_in`).
+    let organizations = secret_key(&target);
+    let mut tid = session.tids().get(&organizations).cloned();
+    if let (None, Some(store)) = (&tid, store) {
+        tid = store.get(&tid_note(&organizations)).ok().flatten();
+    }
+    if tenants.iter().any(|t| same_tenant(t, tid.as_deref())) {
+        keys.push(organizations);
     }
     keys
 }
@@ -1482,6 +1570,13 @@ fn forget_key(session: &Session, store: &dyn SecretStore, key: &str) {
     session.tokens().remove(key);
     if let Err(e) = store.delete(key) {
         tracing::warn!("Could not delete the Entra ID refresh token from the keyring: {e}");
+    }
+    // With the tenant an organizations sign-in landed in.
+    if is_organizations_key(key) {
+        session.tids().remove(key);
+        if let Err(e) = store.delete(&tid_note(key)) {
+            tracing::warn!("Could not delete the Entra ID sign-in's tenant from the keyring: {e}");
+        }
     }
 }
 
@@ -1864,6 +1959,61 @@ mod tests {
         assert!(needs_forget(&c, &typed));
         assert!(orphaned(&c, &[other_server, typed]));
         assert!(!orphaned(&c, &[other_db]));
+    }
+
+    /// An access token whose payload is `claims` (signature not checked).
+    fn token_with_claims(claims: &str) -> String {
+        format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
+            URL_SAFE_NO_PAD.encode(claims)
+        )
+    }
+
+    #[test]
+    fn the_tenant_of_an_access_token_is_its_tid() {
+        let claims = format!(
+            r#"{{"aud":"https://database.windows.net","tid":"{}"}}"#,
+            GUID.to_uppercase()
+        );
+        assert_eq!(
+            token_tid(&token_with_claims(&claims)).as_deref(),
+            Some(GUID)
+        );
+        // Padded base64 too.
+        let padded = format!(
+            "x.{}.sig",
+            base64::engine::general_purpose::URL_SAFE.encode(&claims)
+        );
+        assert_eq!(token_tid(&padded).as_deref(), Some(GUID));
+        // Anything else: unknown, never an error.
+        for bad in [
+            token_with_claims(r#"{"aud":"x"}"#),
+            token_with_claims(r#"{"tid":"contoso.com"}"#),
+            token_with_claims(r#"{"tid":42}"#),
+            token_with_claims("not json"),
+            "AT-opaque".to_string(),
+            "a.%%%.b".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(token_tid(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_home_sign_in_serves_only_its_own_tenant() {
+        assert!(same_tenant(GUID, Some(&GUID.to_uppercase())));
+        assert!(!same_tenant(
+            GUID,
+            Some("11111111-2222-3333-4444-555555555555")
+        ));
+        assert!(!same_tenant(GUID, None));
+        // A domain can't be compared without the network.
+        assert!(!same_tenant("contoso.com", Some("contoso.com")));
+        assert_eq!(
+            tid_note("entra:organizations:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com"),
+            "entra:tid:organizations:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com"
+        );
     }
 
     #[test]
@@ -2549,15 +2699,30 @@ mod flow_tests {
     /// refresh `AT-<n>` / `RT-<n>` (rotation); `refused` refresh tokens get
     /// `invalid_grant`.
     fn entra(refused: &'static [&'static str]) -> Box<Answer> {
+        entra_in(refused, None)
+    }
+
+    /// An access token named `name` of an account of tenant `tid`.
+    fn jwt(tid: &str, name: &str) -> String {
+        format!(
+            "{}.{}.{name}",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
+            URL_SAFE_NO_PAD.encode(format!(r#"{{"tid":"{tid}"}}"#))
+        )
+    }
+
+    /// `entra`, its access tokens of an account of tenant `tid` (`jwt`).
+    fn entra_in(refused: &'static [&'static str], tid: Option<&'static str>) -> Box<Answer> {
         let rotation = AtomicUsize::new(1);
+        let access = move |name: &str| tid.map_or(name.to_string(), |tid| jwt(tid, name));
         Box::new(move |form| {
             match form["grant_type"].as_str() {
             "authorization_code" if form["code"] == "the-code" => {
-                (200, tokens_json("AT-code", "RT-1"))
+                (200, tokens_json(&access("AT-code"), "RT-1"))
             }
             "refresh_token" if !refused.contains(&form["refresh_token"].as_str()) => {
                 let n = rotation.fetch_add(1, Ordering::SeqCst) + 1;
-                (200, tokens_json(&format!("AT-{n}"), &format!("RT-{n}")))
+                (200, tokens_json(&access(&format!("AT-{n}")), &format!("RT-{n}")))
             }
             _ => (
                 400,
@@ -3243,22 +3408,41 @@ mod flow_tests {
         // The failure is remembered for a while…
         h.token_for(&zero_config()).await.unwrap();
         assert_eq!(h.probes(), 1);
-        // …then the server is asked again; its tenant holds no sign-in, so
-        // the one made meanwhile stays.
+        // …then the server is asked again. Where the organizations sign-in
+        // landed is unknown (no tenant in its token): the server's tenant
+        // signs in anew.
         h.clock.store(11 * 60, Ordering::SeqCst);
         *h.probed.lock().unwrap() = azure_sql();
         assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        h.browser.finish();
         assert_eq!(h.probes(), 2);
-        assert_eq!(h.grants(), ["authorization_code"]);
-        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+        assert_eq!(h.grants(), ["authorization_code", "authorization_code"]);
+        assert_eq!(
+            h.requests.lock().unwrap()[1].path,
+            format!("/{TENANT}/oauth2/v2.0/token")
+        );
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 2);
     }
 
-    /// Signed in under `organizations` while the server didn't answer.
+    /// An access token of the account, whose home tenant is `TENANT`.
+    fn home(name: &str) -> String {
+        jwt(TENANT, name)
+    }
+
+    /// Signed in under `organizations` while the server didn't answer, with
+    /// an account of `TENANT`.
     async fn signed_in_without_the_server() -> Harness {
-        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        let h = Harness::new(entra_in(&[], Some(TENANT)), Behaviour::SignIn).await;
         *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
-        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), home("AT-code"));
         h.browser.finish();
+        assert_eq!(
+            h.store
+                .get(&tid_note(&zero_config_key("organizations")))
+                .unwrap()
+                .as_deref(),
+            Some(TENANT)
+        );
         // Later on, the server answers.
         h.clock.store(11 * 60, Ordering::SeqCst);
         *h.probed.lock().unwrap() = azure_sql();
@@ -3270,7 +3454,7 @@ mod flow_tests {
         let mut h = signed_in_without_the_server().await;
         h.interactive = false;
         // Not asked again under other operations: the sign-in still works.
-        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), home("AT-code"));
         assert_eq!(h.probes(), 1);
     }
 
@@ -3283,8 +3467,9 @@ mod flow_tests {
             h.session.tokens().clear();
             h.session.servers().clear();
             // …and the server, asked again, names its tenant, which holds
-            // nothing: the organizations sign-in is renewed, no browser.
-            assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
+            // nothing but where the organizations sign-in landed: that one
+            // is renewed, no browser.
+            assert_eq!(h.token_for(&zero_config()).await.unwrap(), home("AT-2"));
             assert_eq!(h.probes(), 2);
             assert_eq!(h.grants(), ["authorization_code", "refresh_token"]);
             assert_eq!(
@@ -3299,7 +3484,37 @@ mod flow_tests {
                     .as_deref(),
                 Some("RT-2")
             );
+            // Noted under the server's tenant, not organizations.
+            assert_eq!(
+                h.store.get(&note_of(&zero_config())).unwrap().as_deref(),
+                Some(TENANT)
+            );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_tenant_never_borrows_the_home_sign_in() {
+        const HOME: &str = "11111111-2222-3333-4444-555555555555";
+        let h = Harness::new(entra_in(&[], Some(HOME)), Behaviour::SignIn).await;
+        // Server A didn't answer: signed in under organizations (home
+        // tenant).
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        h.token_for(&on_server("a.database.windows.net"))
+            .await
+            .unwrap();
+        h.browser.finish();
+        // Server B is in another tenant, where Jane is a guest.
+        *h.probed.lock().unwrap() = azure_sql();
+        let b = on_server("b.database.windows.net");
+        h.token_for(&b).await.unwrap();
+        h.browser.finish();
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 2);
+        assert_eq!(h.grants(), ["authorization_code", "authorization_code"]);
+        assert_eq!(
+            h.requests.lock().unwrap()[1].path,
+            format!("/{TENANT}/oauth2/v2.0/token")
+        );
+        assert_eq!(h.store.get(&note_of(&b)).unwrap().as_deref(), Some(TENANT));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3307,7 +3522,7 @@ mod flow_tests {
         let h = signed_in_without_the_server().await;
         h.session.tokens().clear();
         h.store.set(&zero_config_key(TENANT), "RT-7").unwrap();
-        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), home("AT-2"));
         assert_eq!(
             h.requests.lock().unwrap()[1].path,
             format!("/{TENANT}/oauth2/v2.0/token")
@@ -3442,6 +3657,7 @@ mod flow_tests {
         .unwrap();
         for key in [
             zero_config_key("organizations"),
+            tid_note(&zero_config_key("organizations")),
             zero_config_key(TENANT),
             note_of(&zero_config()),
         ] {
@@ -3449,6 +3665,7 @@ mod flow_tests {
         }
         assert!(h.session.tokens().is_empty());
         assert!(h.session.noted().is_empty());
+        assert!(h.session.tids().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3594,5 +3811,33 @@ mod flow_tests {
         .unwrap();
         assert_eq!(store.get(&zero_config_key(TENANT)).unwrap(), None);
         assert_eq!(store.get(&zero_config_key("organizations")).unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_spares_a_home_sign_in_another_connection_borrows() {
+        // `r` reuses the organizations sign-in, which landed in its server's
+        // tenant.
+        let h = signed_in_without_the_server().await;
+        let r = on_server("r.database.windows.net");
+        h.token_for(&r).await.unwrap();
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1, "borrowed");
+        // Deleting the first connection keeps it, even after a restart.
+        let restarted: &'static Session = Box::leak(Box::default());
+        let store = h.store;
+        tokio::task::spawn_blocking(move || {
+            forget_beside(&zero_config(), &[r], restarted, store, None);
+        })
+        .await
+        .unwrap();
+        assert!(h
+            .store
+            .get(&zero_config_key("organizations"))
+            .unwrap()
+            .is_some());
+        assert!(h
+            .store
+            .get(&tid_note(&zero_config_key("organizations")))
+            .unwrap()
+            .is_some());
     }
 }

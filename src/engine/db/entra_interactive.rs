@@ -40,15 +40,22 @@ const ORGANIZATIONS: &str = "organizations";
 ///
 /// Both are optional: without a tenant, the server's (FEDAUTHINFO) is used,
 /// else `organizations`; without an application, `DEFAULT_CLIENT_ID`. A
-/// typed tenant is a GUID, a domain or `organizations`; `common` is refused,
-/// as it lets personal Microsoft accounts in, which Azure SQL doesn't take.
+/// typed tenant is a GUID, a domain or `organizations`, as a server's
+/// (`is_tenant_name`); `common` and `consumers` are refused, as they let
+/// personal Microsoft accounts in, which Azure SQL doesn't take.
 pub fn validate_interactive(tenant: &str, client_id: &str) -> Result<(), String> {
-    if tenant.trim().eq_ignore_ascii_case("common") {
-        return Err(
+    let tenant = tenant.trim();
+    if is_personal_tenant(tenant) {
+        return Err(format!(
             "Indique le tenant de ton organisation (GUID ou domaine) ou laisse-le vide, \
-             pas « common »"
-                .into(),
-        );
+             pas « {} »",
+            tenant.to_ascii_lowercase()
+        ));
+    }
+    if !tenant.is_empty() && !is_tenant_name(tenant) {
+        return Err("Le tenant doit être un GUID ou un nom de domaine \
+                    (lettres, chiffres, « . » et « - »)"
+            .into());
     }
     let client_id = client_id.trim();
     if !client_id.is_empty() && !is_guid(client_id) {
@@ -211,15 +218,26 @@ fn sts_authority(sts_url: &str) -> Option<(String, String)> {
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(host))?;
     let tenant = url.path_segments()?.next()?;
-    let is_name = !tenant.is_empty()
+    (is_tenant_name(tenant) && !is_personal_tenant(tenant))
+        .then(|| (authority.to_string(), tenant.to_string()))
+}
+
+/// Whether `tenant` reads as a GUID or a domain: letters, digits, `.` and
+/// `-`, at most 253 characters (nothing that could leave its path segment).
+fn is_tenant_name(tenant: &str) -> bool {
+    !tenant.is_empty()
         && tenant.len() <= 253
         && tenant
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
-    let personal = ["common", "consumers"]
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
+/// Whether `tenant` names Entra ID's multi-tenant endpoints that let
+/// personal Microsoft accounts in.
+fn is_personal_tenant(tenant: &str) -> bool {
+    ["common", "consumers"]
         .iter()
-        .any(|t| t.eq_ignore_ascii_case(tenant));
-    (is_name && !personal).then(|| (authority.to_string(), tenant.to_string()))
+        .any(|t| t.eq_ignore_ascii_case(tenant))
 }
 
 /// Key of `t`'s refresh token in the memory cache and the OS keyring.
@@ -328,7 +346,7 @@ pub fn explain(err: &AuthError, app: SignInApp) -> String {
             } else if has(65001) || code == "consent_required" {
                 "Ton organisation n'autorise pas l'application des drivers Microsoft pour Azure \
                  SQL : demande à un administrateur d'accorder son consentement, ou indique \
-                 l'application de ton organisation dans les options avancées."
+                 l'ID client de l'application de ton organisation dans la connexion."
             } else if has(50011) && own {
                 "L'URI de redirection `http://localhost` n'est pas déclarée : ajoute-la dans la \
                  plateforme « Applications mobiles et de bureau » de l'application."
@@ -338,7 +356,7 @@ pub fn explain(err: &AuthError, app: SignInApp) -> String {
                 "Application introuvable dans ce tenant : vérifie l'ID client et le tenant."
             } else if has(700016) {
                 "Ce tenant ne connaît pas l'application des drivers Microsoft : vérifie le \
-                 tenant dans les options avancées, ou laisse-le vide pour utiliser celui du \
+                 champ Tenant de la connexion, ou laisse-le vide pour utiliser celui du \
                  serveur."
             } else if has(90002) {
                 "Tenant introuvable : vérifie le tenant."
@@ -1610,6 +1628,40 @@ mod tests {
              pas « common »"
         );
         assert!(validate_interactive(" COMMON ", "").is_err());
+        // Personal accounts only, as well.
+        assert_eq!(
+            validate_interactive(" Consumers ", "").unwrap_err(),
+            "Indique le tenant de ton organisation (GUID ou domaine) ou laisse-le vide, \
+             pas « consumers »"
+        );
+    }
+
+    #[test]
+    fn a_typed_tenant_is_a_guid_or_a_domain() {
+        for good in [
+            "contoso.com",
+            " Contoso-EU.onmicrosoft.com ",
+            "72f988bf-86f1-41af-91ab-2d7cd011db47",
+            "organizations",
+        ] {
+            assert!(validate_interactive(good, "").is_ok(), "{good}");
+        }
+        let long = "a".repeat(254);
+        for bad in [
+            "contoso.com/evil",
+            "con toso",
+            "contoso.com?x=1",
+            "a%2Fb",
+            "contosö.com",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                validate_interactive(bad, "").unwrap_err(),
+                "Le tenant doit être un GUID ou un nom de domaine \
+                 (lettres, chiffres, « . » et « - »)",
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -2283,7 +2335,7 @@ mod tests {
             consent,
             "Ton organisation n'autorise pas l'application des drivers Microsoft pour Azure SQL \
              : demande à un administrateur d'accorder son consentement, ou indique \
-             l'application de ton organisation dans les options avancées. \
+             l'ID client de l'application de ton organisation dans la connexion. \
              (AADSTS65001: The user or administrator has not consented.)"
         );
         assert!(microsoft(&server("consent_required", "", &[]))
@@ -2295,8 +2347,8 @@ mod tests {
             &[700016]
         ))
         .starts_with(
-            "Ce tenant ne connaît pas l'application des drivers Microsoft : vérifie le tenant \
-             dans les options avancées, ou laisse-le vide pour utiliser celui du serveur."
+            "Ce tenant ne connaît pas l'application des drivers Microsoft : vérifie le champ \
+             Tenant de la connexion, ou laisse-le vide pour utiliser celui du serveur."
         ));
         // Settings of one's own application: nothing for the user to fix.
         for (code, n) in [

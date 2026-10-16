@@ -1,6 +1,6 @@
 [package]
 name = "storingUnicorns"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "A terminal-based database client inspired by DataGrip"
 license = "MIT"
@@ -48,6 +48,12 @@ tiberius = { version = "0.12", default-features = false, features = [
   "rust_decimal",
   "chrono",
 ] }
+
+# Azure SQL FEDAUTHINFO probe (engine::db::fedauth_probe): its TLS handshake
+# travels inside TDS packets, so rustls is driven by hand. The versions sqlx
+# already builds (ring, the system's roots): nothing new is compiled.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
 
 # Decimal support
 rust_decimal = "1"

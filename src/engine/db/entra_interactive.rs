@@ -1,9 +1,13 @@
 //! Azure SQL sign-in with the user's own Entra ID account through the
 //! browser (OAuth 2.0 authorization code + PKCE), like SSMS's "Active
-//! Directory Interactive".
+//! Directory Interactive". Nothing to set up: without a typed tenant the
+//! server tells its own (`fedauth_probe`), without an application
+//! Microsoft's drivers' is used, as DataGrip does.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -19,24 +23,42 @@ use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType};
 use crate::engine::secrets::{self, SecretStore};
 
 use super::azure::{is_guid, AzureCloud};
+use super::fedauth_probe::{self, FedAuthInfo};
+
+/// Application (client) ID of Microsoft's SQL Server drivers: the one the
+/// JDBC driver (so DataGrip) signs in with for `ActiveDirectoryInteractive`,
+/// public and preauthorized for Azure SQL. Used when a connection names no
+/// application.
+pub const DEFAULT_CLIENT_ID: &str = "7f98cb04-cd1e-40df-9140-3bf7e2cea4db";
+
+/// Tenant of a connection that typed none and whose server didn't tell: the
+/// account's own organization.
+const ORGANIZATIONS: &str = "organizations";
 
 /// Check the tenant and application (client) ID of an interactive
 /// connection; a French message for the form otherwise.
 ///
-/// The tenant is a GUID or a domain; `common` / `organizations` are refused
-/// since an organization's application is bound to its own tenant.
+/// Both are optional: without a tenant, the server's (FEDAUTHINFO) is used,
+/// else `organizations`; without an application, `DEFAULT_CLIENT_ID`. A
+/// typed tenant is a GUID, a domain or `organizations`, as a server's
+/// (`is_tenant_name`); `common` and `consumers` are refused, as they let
+/// personal Microsoft accounts in, which Azure SQL doesn't take.
 pub fn validate_interactive(tenant: &str, client_id: &str) -> Result<(), String> {
     let tenant = tenant.trim();
-    if tenant.is_empty() {
-        return Err("Le tenant est obligatoire".into());
-    }
-    let lower = tenant.to_ascii_lowercase();
-    if lower == "common" || lower == "organizations" {
+    if is_personal_tenant(tenant) {
         return Err(format!(
-            "Indique le tenant de ton organisation (GUID ou domaine), pas « {lower} »"
+            "Indique le tenant de ton organisation (GUID ou domaine) ou laisse-le vide, \
+             pas « {} »",
+            tenant.to_ascii_lowercase()
         ));
     }
-    if !is_guid(client_id.trim()) {
+    if !tenant.is_empty() && !is_tenant_name(tenant) {
+        return Err("Le tenant doit être un GUID ou un nom de domaine \
+                    (lettres, chiffres, « . » et « - »)"
+            .into());
+    }
+    let client_id = client_id.trim();
+    if !client_id.is_empty() && !is_guid(client_id) {
         return Err("L'ID client de l'application doit être un GUID".into());
     }
     Ok(())
@@ -75,14 +97,44 @@ pub struct Target {
 }
 
 impl Target {
-    /// The target of an interactive connection: cloud from its host, tenant
-    /// and application checked (`validate_interactive`), account from its
-    /// username.
-    pub fn for_config(config: &ConnectionConfig) -> Result<Target, String> {
+    /// The target of an interactive connection (checked by
+    /// `validate_interactive`): cloud from its host, account from its
+    /// username, application typed or `DEFAULT_CLIENT_ID`, and tenant typed,
+    /// else its server's (`probed`, its FEDAUTHINFO answer: ignored unless
+    /// it names a known Entra ID authority), else `organizations`.
+    pub fn for_config(
+        config: &ConnectionConfig,
+        probed: Option<&FedAuthInfo>,
+    ) -> Result<Target, String> {
         let tenant = config.tenant_id.as_deref().unwrap_or_default().trim();
         let client_id = config.azure_client_id.as_deref().unwrap_or_default().trim();
         validate_interactive(tenant, client_id)?;
         let cloud = AzureCloud::from_host(config.host.as_deref().unwrap_or_default());
+        let from_server = probed.filter(|_| tenant.is_empty()).and_then(|info| {
+            let (authority, tenant) = sts_authority(&info.sts_url)?;
+            // The SPN only switches to another cloud's Azure SQL (a custom
+            // DNS name of a sovereign-cloud server): a token for any other
+            // resource would still be handed to the server.
+            let resource = AzureCloud::from_sql_resource(&info.spn).unwrap_or(cloud);
+            Some((authority, tenant, resource))
+        });
+        let (authority, tenant, resource) = from_server.unwrap_or_else(|| {
+            let tenant = if tenant.is_empty() {
+                ORGANIZATIONS
+            } else {
+                tenant
+            };
+            (
+                cloud.authority_host().to_string(),
+                tenant.to_string(),
+                cloud,
+            )
+        });
+        let client_id = if client_id.is_empty() {
+            DEFAULT_CLIENT_ID.to_string()
+        } else {
+            client_id.to_ascii_lowercase()
+        };
         let login_hint = config
             .username
             .as_deref()
@@ -90,12 +142,21 @@ impl Target {
             .filter(|u| !u.is_empty())
             .map(str::to_string);
         Ok(Target {
-            authority: format!("https://{}", cloud.authority_host()),
-            tenant: tenant.to_string(),
-            client_id: client_id.to_ascii_lowercase(),
-            scope: format!("{} offline_access openid profile", cloud.sql_scope()),
+            authority: format!("https://{authority}"),
+            tenant,
+            client_id,
+            scope: format!("{} offline_access openid profile", resource.sql_scope()),
             login_hint,
         })
+    }
+
+    /// Whose application the sign-in uses.
+    pub fn app(&self) -> SignInApp {
+        if self.client_id == DEFAULT_CLIENT_ID {
+            SignInApp::Microsoft
+        } else {
+            SignInApp::Own
+        }
     }
 
     /// `<authority>/<tenant>/oauth2/v2.0/<endpoint>`, the tenant kept in
@@ -110,11 +171,101 @@ impl Target {
     }
 }
 
+/// The tenant typed in `config`, if any.
+fn typed_tenant(config: &ConnectionConfig) -> Option<&str> {
+    config
+        .tenant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
+/// Server of `config` (host as compared and asked: trimmed, lowercase,
+/// without a trailing dot) and port.
+fn server_of(config: &ConnectionConfig) -> (String, u16) {
+    let host = config.host.as_deref().unwrap_or_default().trim();
+    let host = host.strip_suffix('.').unwrap_or(host);
+    (host.to_ascii_lowercase(), config.port.unwrap_or(1433))
+}
+
+/// Entra ID authorities a server's STS URL may name, and the host to use
+/// for each (`login.windows.net` is the public cloud's old name).
+const KNOWN_AUTHORITIES: [(&str, &str); 5] = [
+    ("login.windows.net", "login.microsoftonline.com"),
+    ("login.microsoftonline.com", "login.microsoftonline.com"),
+    ("login.microsoftonline.us", "login.microsoftonline.us"),
+    ("login.chinacloudapi.cn", "login.chinacloudapi.cn"),
+    (
+        "login.partner.microsoftonline.cn",
+        "login.partner.microsoftonline.cn",
+    ),
+];
+
+/// Authority host and tenant of a server's STS URL
+/// (`https://login.windows.net/<tenant>`): only a known Entra ID authority
+/// over HTTPS, and an organization's tenant (a GUID or a domain).
+fn sts_authority(sts_url: &str) -> Option<(String, String)> {
+    let url = Url::parse(sts_url.trim()).ok()?;
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    let (_, authority) = KNOWN_AUTHORITIES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(host))?;
+    let tenant = url.path_segments()?.next()?;
+    (is_tenant_name(tenant) && !is_personal_tenant(tenant))
+        .then(|| (authority.to_string(), tenant.to_string()))
+}
+
+/// Whether `tenant` reads as a GUID or a domain: letters, digits, `.` and
+/// `-`, at least one letter or digit (never `.` or `..`, which would move
+/// the token request up the URL path), at most 253 characters.
+fn is_tenant_name(tenant: &str) -> bool {
+    tenant.len() <= 253
+        && tenant.bytes().any(|b| b.is_ascii_alphanumeric())
+        && tenant
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+}
+
+/// The host of `authority` when it is a known Entra ID authority other than
+/// the public cloud's.
+fn sovereign_authority(authority: &str) -> Option<&'static str> {
+    let host = authority.strip_prefix("https://")?;
+    KNOWN_AUTHORITIES
+        .iter()
+        .map(|(_, authority)| *authority)
+        .find(|a| *a != AzureCloud::Public.authority_host() && a.eq_ignore_ascii_case(host))
+}
+
+/// Whether `tenant` names Entra ID's multi-tenant endpoints that let
+/// personal Microsoft accounts in.
+fn is_personal_tenant(tenant: &str) -> bool {
+    ["common", "consumers"]
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(tenant))
+}
+
 /// Key of `t`'s refresh token in the memory cache and the OS keyring.
+///
+/// `organizations` names no tenant: its sign-ins differ per cloud, so a
+/// sovereign cloud's carries its authority, `organizations@<host>`. The
+/// public cloud's keeps its form, and the sign-ins kept under it.
 pub fn secret_key(t: &Target) -> String {
+    let mut tenant = t.tenant.to_lowercase();
+    if tenant == ORGANIZATIONS {
+        if let Some(host) = sovereign_authority(&t.authority) {
+            tenant = format!("{ORGANIZATIONS}@{host}");
+        }
+    }
     format!(
         "entra:{}:{}:{}",
-        t.tenant.to_lowercase(),
+        tenant,
         t.client_id.to_lowercase(),
         t.login_hint
             .as_deref()
@@ -171,16 +322,28 @@ pub enum AuthError {
     InvalidResponse(String),
 }
 
-impl std::fmt::Display for AuthError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&explain(self))
-    }
+/// Whose application a sign-in uses (`Target::app`): Entra ID's errors
+/// don't call for the same fix with Microsoft's drivers' application, which
+/// nobody here registered, as with the organization's own.
+///
+/// `AuthError` has no `Display`: every message shown is worded for the
+/// sign-in's application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInApp {
+    /// `DEFAULT_CLIENT_ID`.
+    Microsoft,
+    /// The application typed in the connection.
+    Own,
 }
 
-impl std::error::Error for AuthError {}
+/// `err` as the user's message (`explain`).
+fn failure(err: &AuthError, app: SignInApp) -> anyhow::Error {
+    anyhow::Error::msg(explain(err, app))
+}
 
-/// French message for `err`, Entra ID's own message in parentheses.
-pub fn explain(err: &AuthError) -> String {
+/// French message for `err` in a sign-in with `app`, Entra ID's own message
+/// in parentheses.
+pub fn explain(err: &AuthError, app: SignInApp) -> String {
     match err {
         AuthError::Server {
             code,
@@ -195,16 +358,28 @@ pub fn explain(err: &AuthError) -> String {
                 first_line
             };
             let has = |n: u64| codes.contains(&n) || aadsts_codes(description).contains(&n);
-            let message = if has(65001) || code == "consent_required" {
+            let own = app == SignInApp::Own;
+            // The redirect URI and the public client flows are settings of
+            // the organization's application: Microsoft's has them right.
+            let message = if (has(65001) || code == "consent_required") && own {
                 "L'application n'a pas l'autorisation d'accéder à Azure SQL : un administrateur \
                  doit accorder la permission déléguée « Azure SQL Database / user_impersonation »."
-            } else if has(50011) {
+            } else if has(65001) || code == "consent_required" {
+                "Ton organisation n'autorise pas l'application des drivers Microsoft pour Azure \
+                 SQL : demande à un administrateur d'accorder son consentement, ou indique \
+                 l'ID client de l'application de ton organisation dans les options avancées \
+                 de la connexion (champ ID app dans le terminal)."
+            } else if has(50011) && own {
                 "L'URI de redirection `http://localhost` n'est pas déclarée : ajoute-la dans la \
                  plateforme « Applications mobiles et de bureau » de l'application."
-            } else if has(7000218) {
+            } else if has(7000218) && own {
                 "Active « Autoriser les flux clients publics » dans l'application."
-            } else if has(700016) {
+            } else if has(700016) && own {
                 "Application introuvable dans ce tenant : vérifie l'ID client et le tenant."
+            } else if has(700016) {
+                "Ce tenant ne connaît pas l'application des drivers Microsoft : vérifie le \
+                 tenant dans les options avancées de la connexion (champ Tenant dans le \
+                 terminal), ou laisse-le vide pour utiliser celui du serveur."
             } else if has(90002) {
                 "Tenant introuvable : vérifie le tenant."
             } else {
@@ -437,16 +612,53 @@ const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SIGNED_IN: &str = "Connexion réussie, vous pouvez fermer cet onglet.";
 
-/// Access tokens of the session and one lock per target.
+/// How long a server isn't asked again after its FEDAUTHINFO probe failed
+/// or gave nothing (meanwhile: `organizations`). An answer is kept for the
+/// session.
+const PROBE_RETRY: Duration = Duration::from_secs(10 * 60);
+
+/// A server's answer to the FEDAUTHINFO probe (`None`: it failed or gave
+/// none) and when it came.
+#[derive(Clone)]
+struct Probed {
+    at: SystemTime,
+    info: Option<FedAuthInfo>,
+}
+
+/// Key of a server in `Session::servers`.
+fn server_key(host: &str, port: u16) -> String {
+    format!("{}:{port}", host.to_ascii_lowercase())
+}
+
+/// Access tokens of the session, one lock per target (or server probed),
+/// the servers' answers to the FEDAUTHINFO probe, and the tenants noted in
+/// the keyring (`note_tenant`).
 #[derive(Default)]
 struct Session {
     tokens: Mutex<HashMap<String, Tokens>>,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    servers: Mutex<HashMap<String, Probed>>,
+    /// `kept_key` → tenant written under it.
+    noted: Mutex<HashMap<String, String>>,
+    /// `organizations` key → tenant its sign-in landed in (`note_tid`).
+    tids: Mutex<HashMap<String, String>>,
 }
 
 impl Session {
     fn tokens(&self) -> MutexGuard<'_, HashMap<String, Tokens>> {
         self.tokens.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn servers(&self) -> MutexGuard<'_, HashMap<String, Probed>> {
+        self.servers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn noted(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.noted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn tids(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.tids.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn lock_for(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -464,10 +676,19 @@ fn session() -> &'static Session {
     SESSION.get_or_init(Session::default)
 }
 
+/// The FEDAUTHINFO probe of a server (`fedauth_probe::probe`).
+type Probe = Box<
+    dyn Fn(String, u16) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<FedAuthInfo>>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// What the flow talks to, replaced in tests.
 struct Deps<'a> {
-    /// Replaces the cloud's authority.
+    /// Replaces the target's authority (its tenant stays).
     authority: Option<String>,
+    /// Asks a server for its tenant.
+    probe: Probe,
     open_browser: Box<dyn Fn(&str) + Send + Sync>,
     notify: Box<dyn Fn(Interaction) + Send + Sync>,
     store: &'static dyn SecretStore,
@@ -498,6 +719,9 @@ pub async fn token(config: &ConnectionConfig, interactive: bool) -> anyhow::Resu
     let store = tokio::task::spawn_blocking(secrets::store).await?;
     let deps = Deps {
         authority: None,
+        probe: Box::new(|host, port| {
+            Box::pin(async move { fedauth_probe::probe(&host, port).await })
+        }),
         open_browser: Box::new(open_in_browser),
         notify: Box::new(emit),
         store,
@@ -517,11 +741,53 @@ pub async fn token(config: &ConnectionConfig, interactive: bool) -> anyhow::Resu
 }
 
 async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Result<String> {
-    let mut target = Target::for_config(config).map_err(anyhow::Error::msg)?;
-    if let Some(authority) = &deps.authority {
-        target.authority = authority.clone();
+    let resolved = resolve_target(config, deps)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let override_authority = |mut t: Target| {
+        if let Some(authority) = &deps.authority {
+            t.authority = authority.clone();
+        }
+        t
+    };
+    let mut target = resolved.clone();
+    if typed_tenant(config).is_none() {
+        target = with_kept_sign_in(config, target, deps).await;
     }
-    let key = secret_key(&target);
+    // A borrowed organizations sign-in never goes back to the browser…
+    let borrowed = !target.tenant.eq_ignore_ascii_case(&resolved.tenant);
+    let mut target = override_authority(target);
+    let access = match acquire(config, &target, deps, !borrowed).await? {
+        Some(access) => access,
+        // …the server's tenant does.
+        None => {
+            tracing::info!(
+                "Entra ID: the borrowed sign-in of {} is gone, signing in to its server's tenant",
+                config.name
+            );
+            target = override_authority(resolved.clone());
+            acquire(config, &target, deps, true)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!(session_expired(&config.name)))?
+        }
+    };
+    // The server's tenant, even when the organizations sign-in that landed
+    // there serves it.
+    note_tenant(config, &resolved, deps).await;
+    note_tid(&target, &access, deps).await;
+    Ok(access)
+}
+
+/// An access token for `target`: the session's, renewed, or through the
+/// browser (see `token`); `None` when the browser is needed but not
+/// `browser`.
+async fn acquire(
+    config: &ConnectionConfig,
+    target: &Target,
+    deps: &Deps<'_>,
+    browser: bool,
+) -> anyhow::Result<Option<String>> {
+    let key = secret_key(target);
     // One acquisition at a time per target: simultaneous reconnections
     // share one browser sign-in and one refresh-token rotation.
     let lock = deps.session.lock_for(&key);
@@ -543,13 +809,13 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
     match step {
         Next::UseCached => {
             if let Some(t) = cached {
-                return Ok(t.access);
+                return Ok(Some(t.access));
             }
         }
-        Next::Refresh(refresh) => match redeem(&target, Grant::Refresh(&refresh), deps).await {
+        Next::Refresh(refresh) => match redeem(target, Grant::Refresh(&refresh), deps).await {
             Ok(tokens) => {
                 tracing::info!("Entra ID token renewed for {}", config.name);
-                return Ok(keep(deps, &key, tokens, Some(refresh)).await);
+                return Ok(Some(keep(deps, &key, tokens, Some(refresh)).await));
             }
             Err(e) if needs_interaction(&e) => {
                 tracing::info!(
@@ -559,7 +825,7 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
                 deps.session.tokens().remove(&key);
                 delete_secret(deps.store, &key).await;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(failure(&e, target.app())),
         },
         Next::Interactive => {}
     }
@@ -567,9 +833,257 @@ async fn token_with(config: &ConnectionConfig, deps: &Deps<'_>) -> anyhow::Resul
         tracing::info!("Entra ID sign-in of {} needs the browser", config.name);
         anyhow::bail!(session_expired(&config.name));
     }
-    let tokens = sign_in(&config.name, &target, deps).await?;
+    if !browser {
+        return Ok(None);
+    }
+    let tokens = sign_in(&config.name, target, deps).await?;
     tracing::info!("Entra ID sign-in completed for {}", config.name);
-    Ok(keep(deps, &key, tokens, None).await)
+    Ok(Some(keep(deps, &key, tokens, None).await))
+}
+
+/// For a connection without a typed tenant, note in the keyring, under
+/// `kept_key`, its server's tenant (`organizations` while the server didn't
+/// answer; not a secret, see `note_value`): `forget` finds its refresh token
+/// without asking the server, and a sign-in goes on when the server stops
+/// answering (`noted_server_answer`).
+async fn note_tenant(config: &ConnectionConfig, target: &Target, deps: &Deps<'_>) {
+    if typed_tenant(config).is_some() {
+        return;
+    }
+    let Some(note) = kept_key(config) else {
+        return;
+    };
+    let value = note_value(config, target);
+    if deps.session.noted().get(&note) == Some(&value) {
+        return;
+    }
+    save_secret(deps.store, &note, value.clone()).await;
+    deps.session.noted().insert(note, value);
+}
+
+/// What a connection's note says of `target`: its tenant, with
+/// `@<authority host>` when the authority isn't the one of the cloud the
+/// connection's host names (a custom DNS name of a sovereign-cloud server).
+fn note_value(config: &ConnectionConfig, target: &Target) -> String {
+    let tenant = target.tenant.to_lowercase();
+    let cloud = AzureCloud::from_host(config.host.as_deref().unwrap_or_default());
+    let host = target
+        .authority
+        .strip_prefix("https://")
+        .unwrap_or(&target.authority);
+    if tenant == ORGANIZATIONS || host.eq_ignore_ascii_case(cloud.authority_host()) {
+        tenant
+    } else {
+        format!("{tenant}@{}", host.to_ascii_lowercase())
+    }
+}
+
+/// The server's answer a note (`note_value`) stands for; `None` for
+/// `organizations`, which names no tenant.
+fn noted_answer(config: &ConnectionConfig, value: &str) -> Option<FedAuthInfo> {
+    let cloud = AzureCloud::from_host(config.host.as_deref().unwrap_or_default());
+    let (tenant, host) = value
+        .split_once('@')
+        .unwrap_or((value, cloud.authority_host()));
+    if tenant.is_empty() || tenant.eq_ignore_ascii_case(ORGANIZATIONS) {
+        return None;
+    }
+    Some(FedAuthInfo {
+        sts_url: format!("https://{host}/{tenant}"),
+        spn: format!("{}/", cloud_of_authority(host).sql_resource()),
+    })
+}
+
+/// The target a note (`note_value`) stands for, checked as a server's
+/// answer: `organizations` for one that names no tenant or doesn't read.
+fn noted_target(config: &ConnectionConfig, value: &str) -> Option<Target> {
+    Target::for_config(config, noted_answer(config, value).as_ref()).ok()
+}
+
+/// The cloud of an Entra ID authority host (`KNOWN_AUTHORITIES`).
+fn cloud_of_authority(host: &str) -> AzureCloud {
+    let is = |name: &str| host.eq_ignore_ascii_case(name);
+    if is(AzureCloud::UsGovernment.authority_host()) {
+        AzureCloud::UsGovernment
+    } else if is(AzureCloud::China.authority_host()) || is("login.partner.microsoftonline.cn") {
+        AzureCloud::China
+    } else {
+        AzureCloud::Public
+    }
+}
+
+/// The answer `config`'s server gave before, as noted, for when it doesn't
+/// answer now: its tenant rather than `organizations`, so that its refresh
+/// token keeps working.
+async fn noted_server_answer(config: &ConnectionConfig, deps: &Deps<'_>) -> Option<FedAuthInfo> {
+    let note = kept_key(config)?;
+    let in_session = deps.session.noted().get(&note).cloned();
+    let value = match in_session {
+        Some(value) => value,
+        None => load_secret(deps.store, &note).await?,
+    };
+    let answer = noted_answer(config, &value)?;
+    tracing::info!(
+        "Entra ID: the server of {} didn't answer, signing in to its noted tenant",
+        config.name
+    );
+    Some(answer)
+}
+
+/// The target of `config`, its server asked for its tenant (FEDAUTHINFO)
+/// when none is typed.
+async fn resolve_target(config: &ConnectionConfig, deps: &Deps<'_>) -> Result<Target, String> {
+    // Checked first: an invalid connection asks nothing.
+    let without_server = Target::for_config(config, None)?;
+    if typed_tenant(config).is_some() {
+        return Ok(without_server);
+    }
+    let (host, port) = server_of(config);
+    let answer = match server_answer(&host, port, deps).await {
+        Some(answer) => Some(answer),
+        None => noted_server_answer(config, deps).await,
+    };
+    Target::for_config(config, answer.as_ref())
+}
+
+/// `target`, unless it holds no sign-in while the `organizations` one of the
+/// same application and account does and landed in the very tenant the
+/// server names (`note_tid`): a connection that signed in while its server
+/// didn't answer keeps that sign-in once the server answers, but a guest
+/// tenant never borrows the home one.
+async fn with_kept_sign_in(config: &ConnectionConfig, target: Target, deps: &Deps<'_>) -> Target {
+    let Ok(fallback) = Target::for_config(config, None) else {
+        return target;
+    };
+    let fallback_key = secret_key(&fallback);
+    if target.tenant.eq_ignore_ascii_case(&fallback.tenant)
+        || !is_guid(&target.tenant)
+        || holds_sign_in(&secret_key(&target), deps).await
+        || !same_tenant(
+            &target.tenant,
+            noted_tid(&fallback_key, deps).await.as_deref(),
+        )
+        || !holds_sign_in(&fallback_key, deps).await
+    {
+        return target;
+    }
+    tracing::info!(
+        "Entra ID: {} keeps the sign-in made while its server didn't answer",
+        config.name
+    );
+    fallback
+}
+
+/// The tenant (`tid` claim) of an access token, read without checking its
+/// signature: it only tells where a sign-in under `organizations` landed,
+/// and the token came straight from the token endpoint over TLS. `None`
+/// when missing or malformed.
+fn token_tid(access: &str) -> Option<String> {
+    let payload = access.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let tid = claims.get("tid")?.as_str()?;
+    is_guid(tid).then(|| tid.to_ascii_lowercase())
+}
+
+/// Keyring note of the tenant the `organizations` sign-in under `key`
+/// landed in (not a secret).
+fn tid_note(key: &str) -> String {
+    format!("entra:tid:{}", key.strip_prefix("entra:").unwrap_or(key))
+}
+
+/// Whether `key` is an `organizations` sign-in's (`secret_key`).
+fn is_organizations_key(key: &str) -> bool {
+    key.starts_with(&format!("entra:{ORGANIZATIONS}:"))
+        || key.starts_with(&format!("entra:{ORGANIZATIONS}@"))
+}
+
+/// Whether a sign-in that landed in tenant `tid` serves a server naming
+/// `tenant`: the same tenant, both GUIDs (a domain can't be compared without
+/// the network).
+fn same_tenant(tenant: &str, tid: Option<&str>) -> bool {
+    is_guid(tenant) && tid.is_some_and(|tid| tid.eq_ignore_ascii_case(tenant))
+}
+
+/// For a sign-in kept under `organizations`, note the tenant it landed in
+/// (`tid` of `access`) next to it in the keyring, and in the session.
+async fn note_tid(target: &Target, access: &str, deps: &Deps<'_>) {
+    if !target.tenant.eq_ignore_ascii_case(ORGANIZATIONS) {
+        return;
+    }
+    let Some(tid) = token_tid(access) else {
+        return;
+    };
+    let key = secret_key(target);
+    if deps.session.tids().get(&key) == Some(&tid) {
+        return;
+    }
+    save_secret(deps.store, &tid_note(&key), tid.clone()).await;
+    deps.session.tids().insert(key, tid);
+}
+
+/// The tenant the `organizations` sign-in under `key` landed in, as noted.
+async fn noted_tid(key: &str, deps: &Deps<'_>) -> Option<String> {
+    let known = deps.session.tids().get(key).cloned();
+    if known.is_some() {
+        return known;
+    }
+    load_secret(deps.store, &tid_note(key)).await
+}
+
+/// Whether `key` holds a session token or a refresh token.
+async fn holds_sign_in(key: &str, deps: &Deps<'_>) -> bool {
+    if deps.session.tokens().contains_key(key) {
+        return true;
+    }
+    load_secret(deps.store, key)
+        .await
+        .is_some_and(|refresh| !refresh.is_empty())
+}
+
+/// The FEDAUTHINFO of `host:port`: remembered (an answer for the session, a
+/// failure for `PROBE_RETRY`), else asked, one probe at a time per server.
+/// A reconnection (`!deps.interactive`) never asks again: what the server
+/// said when the user connected decided where the sign-in is.
+async fn server_answer(host: &str, port: u16, deps: &Deps<'_>) -> Option<FedAuthInfo> {
+    if host.is_empty() {
+        return None;
+    }
+    let key = server_key(host, port);
+    let lock = deps.session.lock_for(&format!("probe:{key}"));
+    let _turn = lock.lock().await;
+    let now = (deps.now)();
+    if let Some(known) = deps.session.servers().get(&key) {
+        let stale = matches!(now.duration_since(known.at), Ok(age) if age >= PROBE_RETRY);
+        if known.info.is_some() || !stale || !deps.interactive {
+            return known.info.clone();
+        }
+    }
+    let info = match (deps.probe)(host.to_string(), port).await {
+        Ok(Some(info)) => {
+            tracing::info!("Entra ID authority of {host}: {}", info.sts_url);
+            Some(info)
+        }
+        Ok(None) => {
+            tracing::info!("{host} named no Entra ID authority: signing in with organizations");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Could not ask {host}:{port} for its Entra ID authority ({e:#}): \
+                 signing in with organizations"
+            );
+            None
+        }
+    };
+    deps.session.servers().insert(
+        key,
+        Probed {
+            at: now,
+            info: info.clone(),
+        },
+    );
+    info
 }
 
 /// Whether a refused refresh token calls for a new browser sign-in.
@@ -597,11 +1111,11 @@ async fn load_secret(store: &'static dyn SecretStore, key: &str) -> Option<Strin
     match tokio::task::spawn_blocking(move || store.get(&key)).await {
         Ok(Ok(value)) => value,
         Ok(Err(e)) => {
-            tracing::warn!("Could not read the Entra ID refresh token from the keyring: {e}");
+            tracing::warn!("Could not read the Entra ID sign-in from the keyring: {e}");
             None
         }
         Err(e) => {
-            tracing::warn!("Could not read the Entra ID refresh token from the keyring: {e}");
+            tracing::warn!("Could not read the Entra ID sign-in from the keyring: {e}");
             None
         }
     }
@@ -611,7 +1125,7 @@ async fn save_secret(store: &'static dyn SecretStore, key: &str, value: String) 
     let key = key.to_string();
     let saved = tokio::task::spawn_blocking(move || store.set(&key, &value)).await;
     if let Some(e) = blocking_error(saved) {
-        tracing::warn!("Could not keep the Entra ID refresh token in the keyring: {e}");
+        tracing::warn!("Could not keep the Entra ID sign-in in the keyring: {e}");
     }
 }
 
@@ -722,6 +1236,7 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
     let verifier = random_urlsafe(32)?;
     let state = random_urlsafe(16)?;
     let url = authorize_url(t, &redirect_uri, &pkce_challenge(&verifier), &state);
+    let app = t.app();
 
     let (code, mut browser) = {
         (deps.notify)(Interaction::Waiting {
@@ -734,9 +1249,11 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
         };
         (deps.open_browser)(&url);
         let (v4, v6) = (&v4, v6.as_ref());
-        tokio::time::timeout(deps.timeout, wait_for_code(move || accept(v4, v6), &state))
+        let wait = wait_for_code(move || accept(v4, v6), &state, app);
+        tokio::time::timeout(deps.timeout, wait)
             .await
-            .map_err(|_| AuthError::Timeout)??
+            .unwrap_or(Err(AuthError::Timeout))
+            .map_err(|e| failure(&e, app))?
     };
     let grant = Grant::Code {
         code: &code,
@@ -748,9 +1265,9 @@ async fn sign_in(connection: &str, t: &Target, deps: &Deps<'_>) -> anyhow::Resul
     let tokens = redeem(t, grant, deps).await;
     match &tokens {
         Ok(_) => respond(&mut browser, "200 OK", &page(SIGNED_IN)).await,
-        Err(e) => respond(&mut browser, "400 Bad Request", &page(&explain(e))).await,
+        Err(e) => respond(&mut browser, "400 Bad Request", &page(&explain(e, app))).await,
     }
-    Ok(tokens?)
+    tokens.map_err(|e| failure(&e, app))
 }
 
 /// Listen on a free port of 127.0.0.1 and the same port of ::1 when there
@@ -786,8 +1303,12 @@ async fn accept(v4: &TcpListener, v6: Option<&TcpListener>) -> std::io::Result<T
 /// sign-in comes back: the code with the browser's connection, still to be
 /// answered, or why it failed. Other requests (`/favicon.ico`…) get a 404,
 /// redirects with another `state` (another tab, a forged request) a 400
-/// while the wait goes on.
-async fn wait_for_code<A, F>(mut accept: A, state: &str) -> Result<(String, TcpStream), AuthError>
+/// while the wait goes on. Errors are worded for `app` in the browser.
+async fn wait_for_code<A, F>(
+    mut accept: A,
+    state: &str,
+    app: SignInApp,
+) -> Result<(String, TcpStream), AuthError>
 where
     A: FnMut() -> F,
     F: std::future::Future<Output = std::io::Result<TcpStream>>,
@@ -819,13 +1340,13 @@ where
             Some((target, mut stream)) = rx.recv() => match parse_callback(&target, state) {
                 Err(AuthError::NotACallback) => respond(&mut stream, "404 Not Found", "").await,
                 Err(AuthError::StateMismatch) => {
-                    let message = explain(&AuthError::StateMismatch);
+                    let message = explain(&AuthError::StateMismatch, app);
                     respond(&mut stream, "400 Bad Request", &page(&message)).await;
                 }
                 // Answered once the code is exchanged.
                 Ok(code) => return Ok((code, stream)),
                 Err(e) => {
-                    respond(&mut stream, "400 Bad Request", &page(&explain(&e))).await;
+                    respond(&mut stream, "400 Bad Request", &page(&explain(&e, app))).await;
                     return Err(e);
                 }
             },
@@ -886,26 +1407,228 @@ fn page(message: &str) -> String {
 
 // ========== Forgetting ==========
 
-/// Key of what an interactive browser connection keeps (session token and
-/// refresh token); `None` for other connections, which keep nothing.
-fn kept_key(config: &ConnectionConfig) -> Option<String> {
+/// The target of an interactive browser connection, its server not asked;
+/// `None` for other connections, which keep nothing.
+fn interactive_target(config: &ConnectionConfig) -> Option<Target> {
     let interactive = config.db_type == DatabaseType::Azure
         && config.azure_auth_method == Some(AzureAuthMethod::InteractiveBrowser);
     interactive
-        .then(|| Target::for_config(config).ok())
+        .then(|| Target::for_config(config, None).ok())
         .flatten()
-        .map(|t| secret_key(&t))
+}
+
+/// Which sign-in an interactive browser connection keeps (session token and
+/// refresh token), known without the network; `None` for other
+/// connections, which keep nothing.
+///
+/// With a typed tenant it is the keyring key, as in 0.14.0. Without, the
+/// tenant comes from the server (FEDAUTHINFO), which isn't asked here: the
+/// server stands for it, `entra:auto:<host>:<application>:<account>`. So
+/// connections share a sign-in only when they surely do; two servers of one
+/// tenant look distinct, and deleting one may forget the refresh token the
+/// other also uses: one more browser sign-in, never a token left behind.
+fn kept_key(config: &ConnectionConfig) -> Option<String> {
+    let target = interactive_target(config)?;
+    Some(if typed_tenant(config).is_some() {
+        secret_key(&target)
+    } else {
+        let tenant = format!("auto:{}", server_of(config).0);
+        secret_key(&Target { tenant, ..target })
+    })
+}
+
+/// The keyring keys `config`'s sign-in may be under, known without the
+/// network nor the keyring: its typed tenant's; else `organizations`, the
+/// server's tenant if it answered in this session, and the tenant noted in
+/// this session. Empty for connections that keep nothing.
+fn known_keys(config: &ConnectionConfig, session: &Session) -> Vec<String> {
+    let Some(target) = interactive_target(config) else {
+        return Vec::new();
+    };
+    let mut keys = vec![secret_key(&target)];
+    if typed_tenant(config).is_some() {
+        return keys;
+    }
+    let (host, port) = server_of(config);
+    let answer = session
+        .servers()
+        .get(&server_key(&host, port))
+        .and_then(|p| p.info.clone());
+    if let Some(t) = answer.and_then(|info| Target::for_config(config, Some(&info)).ok()) {
+        keys.push(secret_key(&t));
+    }
+    let noted = kept_key(config).and_then(|note| session.noted().get(&note).cloned());
+    if let Some(t) = noted.and_then(|value| noted_target(config, &value)) {
+        keys.push(secret_key(&t));
+    }
+    let mut unique = Vec::new();
+    for key in keys {
+        if !unique.contains(&key) {
+            unique.push(key);
+        }
+    }
+    unique
+}
+
+/// The keyring keys `config` is known to sign in with, without the network:
+/// its typed tenant's; else the one its server's answer in this session
+/// leads to (`organizations` when it didn't answer), and the tenant noted in
+/// this session or, given the `store`, in the keyring. Empty for
+/// connections that keep nothing.
+fn used_keys(
+    config: &ConnectionConfig,
+    session: &Session,
+    store: Option<&dyn SecretStore>,
+) -> Vec<String> {
+    let Some(target) = interactive_target(config) else {
+        return Vec::new();
+    };
+    if typed_tenant(config).is_some() {
+        return vec![secret_key(&target)];
+    }
+    let mut targets = Vec::new();
+    let (host, port) = server_of(config);
+    let probed = session.servers().get(&server_key(&host, port)).cloned();
+    if let Some(probed) = probed {
+        targets.extend(Target::for_config(config, probed.info.as_ref()).ok());
+    }
+    let note = kept_key(config);
+    let mut values: Vec<String> = note
+        .as_ref()
+        .and_then(|note| session.noted().get(note).cloned())
+        .into_iter()
+        .collect();
+    if let (Some(note), Some(store)) = (&note, store) {
+        values.extend(store.get(note).ok().flatten());
+    }
+    targets.extend(values.iter().filter_map(|v| noted_target(config, v)));
+    let mut keys: Vec<String> = targets.iter().map(secret_key).collect();
+    // The organizations sign-in, when it landed in one of these tenants
+    // (`with_kept_sign_in`).
+    let organizations = secret_key(&target);
+    let mut tid = session.tids().get(&organizations).cloned();
+    if let (None, Some(store)) = (&tid, store) {
+        tid = store.get(&tid_note(&organizations)).ok().flatten();
+    }
+    if targets
+        .iter()
+        .any(|t| same_tenant(&t.tenant, tid.as_deref()))
+    {
+        keys.push(organizations);
+    }
+    keys
+}
+
+/// Forget `config`'s sign-in for good: every key known offline
+/// (`known_keys`, and the tenant noted in the keyring), then the note;
+/// `ask` (the server's FEDAUTHINFO) only as a last resort, when its tenant
+/// is known neither way. Keys one of the `remaining` connections is known
+/// to use stay (`used_keys`). Blocks (keyring, maybe the server): never
+/// call it from async code.
+fn forget_sign_in(
+    config: &ConnectionConfig,
+    remaining: &[ConnectionConfig],
+    session: &Session,
+    store: &dyn SecretStore,
+    ask: &dyn Fn(&str, u16) -> Option<FedAuthInfo>,
+) {
+    if interactive_target(config).is_none() {
+        return;
+    }
+    let used: Vec<String> = remaining
+        .iter()
+        .flat_map(|other| used_keys(other, session, Some(store)))
+        .collect();
+    let forget = |key: &str| {
+        if used.iter().any(|u| u == key) {
+            tracing::info!("Entra ID sign-in kept: another connection uses it");
+        } else {
+            forget_key(session, store, key);
+        }
+    };
+    let mut keys = known_keys(config, session);
+    let note = kept_key(config).filter(|_| typed_tenant(config).is_none());
+    let mut tenant_known = note.is_none();
+    if let Some(note) = &note {
+        let (host, port) = server_of(config);
+        tenant_known |= session
+            .servers()
+            .get(&server_key(&host, port))
+            .is_some_and(|p| p.info.is_some());
+        match store.get(note) {
+            Ok(Some(value)) => {
+                if let Some(t) = noted_target(config, &value) {
+                    // An organizations note doesn't tell the server's tenant:
+                    // a sign-in kept under it before may be left.
+                    tenant_known |= !t.tenant.eq_ignore_ascii_case(ORGANIZATIONS);
+                    let key = secret_key(&t);
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Could not read the Entra ID sign-in's tenant: {e}"),
+        }
+    }
+    for key in &keys {
+        forget(key);
+    }
+    let Some(note) = note else {
+        return;
+    };
+    if let Err(e) = store.delete(&note) {
+        tracing::warn!("Could not delete the Entra ID sign-in's tenant from the keyring: {e}");
+    }
+    session.noted().remove(&note);
+    if tenant_known {
+        return;
+    }
+    let (host, port) = server_of(config);
+    match ask(&host, port).and_then(|info| Target::for_config(config, Some(&info)).ok()) {
+        Some(t) => forget(&secret_key(&t)),
+        None => tracing::warn!(
+            "Entra ID tenant of {host} unknown: a sign-in kept under it may stay in the keyring"
+        ),
+    }
+}
+
+/// The FEDAUTHINFO of `host:port`, waited for on this thread (`forget`'s).
+fn ask_blocking(host: &str, port: u16) -> Option<FedAuthInfo> {
+    match run_bounded(fedauth_probe::probe(host, port)) {
+        Some(Ok(info)) => info,
+        Some(Err(e)) => {
+            tracing::warn!("Could not ask {host}:{port} for its Entra ID tenant: {e:#}");
+            None
+        }
+        None => None,
+    }
+}
+
+/// Run `future` on a runtime of this thread, shut down without waiting for
+/// blocking work it left (a name resolution stuck in getaddrinfo): the
+/// thread stays bounded by the future's own timeouts.
+fn run_bounded<F: Future>(future: F) -> Option<F::Output> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let output = runtime.block_on(future);
+    runtime.shutdown_background();
+    Some(output)
 }
 
 /// Whether saving `new` over `old` must forget `old`'s sign-in: another
-/// tenant, application, account or method (or no longer Azure).
+/// tenant (or server, when none is typed), application, account or method
+/// (or no longer Azure).
 pub fn needs_forget(old: &ConnectionConfig, new: &ConnectionConfig) -> bool {
     let kept = kept_key(old);
     kept.is_some() && kept != kept_key(new)
 }
 
 /// Whether `a` and `b` share one sign-in: interactive browser connections
-/// with the same tenant, application and account (as in `secret_key`).
+/// with the same tenant (or server, when none is typed), application and
+/// account (`kept_key`).
 fn same_sign_in(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
     let key = kept_key(a);
     key.is_some() && key == kept_key(b)
@@ -919,11 +1642,12 @@ fn sign_in_used_by(config: &ConnectionConfig, others: &[ConnectionConfig]) -> bo
 /// `forget` `config`'s sign-in unless one of the `remaining` connections
 /// (those kept after a delete, or all of them, the edited one in its new
 /// form, after an edit) uses the same one: other databases of the same
-/// server keep it. The explicit "Oublier la connexion Azure AD" calls
-/// `forget`.
+/// server keep it. Keys a remaining connection is known to use stay too
+/// (`used_keys`: two servers of one tenant, say). The explicit "Oublier la
+/// connexion Azure AD" calls `forget`.
 pub fn forget_unless_used(config: &ConnectionConfig, remaining: &[ConnectionConfig]) {
     if orphaned(config, remaining) {
-        forget(config);
+        forget_except(config, remaining.to_vec());
     }
 }
 
@@ -938,16 +1662,35 @@ pub fn orphaned(config: &ConnectionConfig, remaining: &[ConnectionConfig]) -> bo
 /// (`needs_forget`) or on request. Nothing for other methods. Doesn't block:
 /// the keyring is updated in the background.
 pub fn forget(config: &ConnectionConfig) {
-    let Some(key) = kept_key(config) else {
-        return;
-    };
+    forget_except(config, Vec::new());
+}
+
+/// `forget`, except what one of the `remaining` connections is known to use.
+fn forget_except(config: &ConnectionConfig, remaining: Vec<ConnectionConfig>) {
     let session = session();
+    let used: Vec<String> = remaining
+        .iter()
+        .flat_map(|other| used_keys(other, session, None))
+        .collect();
     // At once, so that the next connection doesn't reuse it…
-    session.tokens().remove(&key);
-    // …and for good once an acquisition in progress is over. Waiting for it
-    // and the keyring (Secret Service, an unlock prompt) may block: not on
-    // the interface's thread.
-    std::thread::spawn(move || forget_key(session, secrets::store(), &key));
+    for key in known_keys(config, session) {
+        if !used.contains(&key) {
+            session.tokens().remove(&key);
+        }
+    }
+    // …and for good once an acquisition in progress is over. Waiting for it,
+    // the keyring (Secret Service, an unlock prompt) and maybe the server
+    // may block: not on the interface's thread.
+    let config = config.clone();
+    std::thread::spawn(move || {
+        forget_sign_in(
+            &config,
+            &remaining,
+            session,
+            secrets::store(),
+            &ask_blocking,
+        );
+    });
 }
 
 /// Drop `key`'s session token and refresh token once any acquisition in
@@ -960,6 +1703,13 @@ fn forget_key(session: &Session, store: &dyn SecretStore, key: &str) {
     if let Err(e) = store.delete(key) {
         tracing::warn!("Could not delete the Entra ID refresh token from the keyring: {e}");
     }
+    // With the tenant an organizations sign-in landed in.
+    if is_organizations_key(key) {
+        session.tids().remove(key);
+        if let Err(e) = store.delete(&tid_note(key)) {
+            tracing::warn!("Could not delete the Entra ID sign-in's tenant from the keyring: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -969,38 +1719,78 @@ mod tests {
     const CLIENT: &str = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
 
     #[test]
-    fn tenant_is_required() {
-        assert_eq!(
-            validate_interactive("", CLIENT).unwrap_err(),
-            "Le tenant est obligatoire"
-        );
-        assert_eq!(
-            validate_interactive("   ", CLIENT).unwrap_err(),
-            "Le tenant est obligatoire"
-        );
+    fn tenant_and_client_id_are_optional() {
+        for (tenant, client) in [
+            ("", ""),
+            ("  ", "  "),
+            ("", CLIENT),
+            ("contoso.com", ""),
+            (" Organizations ", ""),
+        ] {
+            assert!(
+                validate_interactive(tenant, client).is_ok(),
+                "{tenant:?} {client:?}"
+            );
+        }
     }
 
     #[test]
-    fn multi_tenant_endpoints_are_refused() {
+    fn common_tenant_is_refused() {
         assert_eq!(
             validate_interactive("common", CLIENT).unwrap_err(),
-            "Indique le tenant de ton organisation (GUID ou domaine), pas « common »"
+            "Indique le tenant de ton organisation (GUID ou domaine) ou laisse-le vide, \
+             pas « common »"
         );
+        assert!(validate_interactive(" COMMON ", "").is_err());
+        // Personal accounts only, as well.
         assert_eq!(
-            validate_interactive(" Organizations ", CLIENT).unwrap_err(),
-            "Indique le tenant de ton organisation (GUID ou domaine), pas « organizations »"
+            validate_interactive(" Consumers ", "").unwrap_err(),
+            "Indique le tenant de ton organisation (GUID ou domaine) ou laisse-le vide, \
+             pas « consumers »"
         );
-        assert!(validate_interactive("COMMON", CLIENT).is_err());
     }
 
     #[test]
-    fn client_id_must_be_a_guid() {
-        for bad in ["", "  ", "my-app", "8f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f"] {
+    fn a_typed_tenant_is_a_guid_or_a_domain() {
+        for good in [
+            "contoso.com",
+            " Contoso-EU.onmicrosoft.com ",
+            "72f988bf-86f1-41af-91ab-2d7cd011db47",
+            "organizations",
+        ] {
+            assert!(validate_interactive(good, "").is_ok(), "{good}");
+        }
+        let long = "a".repeat(254);
+        for bad in [
+            ".",
+            "..",
+            "-",
+            "-.-",
+            "contoso.com/evil",
+            "con toso",
+            "contoso.com?x=1",
+            "a%2Fb",
+            "contosö.com",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                validate_interactive(bad, "").unwrap_err(),
+                "Le tenant doit être un GUID ou un nom de domaine \
+                 (lettres, chiffres, « . » et « - »)",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typed_client_id_must_be_a_guid() {
+        for bad in ["my-app", "8f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f"] {
             assert_eq!(
                 validate_interactive("contoso.com", bad).unwrap_err(),
                 "L'ID client de l'application doit être un GUID",
                 "{bad:?}"
             );
+            assert!(validate_interactive("", bad).is_err());
         }
     }
 
@@ -1047,7 +1837,7 @@ mod tests {
     }
 
     fn target() -> Target {
-        Target::for_config(&azure("srv.database.windows.net")).unwrap()
+        Target::for_config(&azure("srv.database.windows.net"), None).unwrap()
     }
 
     #[test]
@@ -1067,33 +1857,205 @@ mod tests {
     fn target_follows_the_cloud_and_the_account() {
         let mut c = azure("srv.database.usgovcloudapi.net");
         c.username = Some(" jane@contoso.com ".into());
-        let t = Target::for_config(&c).unwrap();
+        let t = Target::for_config(&c, None).unwrap();
         assert_eq!(t.authority, "https://login.microsoftonline.us");
         assert!(t
             .scope
             .starts_with("https://database.usgovcloudapi.net/.default "));
         assert_eq!(t.login_hint.as_deref(), Some("jane@contoso.com"));
 
-        let t = Target::for_config(&azure("srv.database.chinacloudapi.cn")).unwrap();
+        let t = Target::for_config(&azure("srv.database.chinacloudapi.cn"), None).unwrap();
         assert_eq!(t.authority, "https://login.chinacloudapi.cn");
 
         c.username = Some("  ".into());
-        assert_eq!(Target::for_config(&c).unwrap().login_hint, None);
+        assert_eq!(Target::for_config(&c, None).unwrap().login_hint, None);
     }
 
     #[test]
     fn target_is_validated() {
         let mut c = azure("srv.database.windows.net");
         c.tenant_id = Some("common".into());
-        assert!(Target::for_config(&c).unwrap_err().contains("« common »"));
-        c.tenant_id = None;
-        assert_eq!(
-            Target::for_config(&c).unwrap_err(),
-            "Le tenant est obligatoire"
-        );
+        assert!(Target::for_config(&c, None)
+            .unwrap_err()
+            .contains("« common »"));
         let mut c = azure("srv.database.windows.net");
-        c.azure_client_id = None;
-        assert!(Target::for_config(&c).unwrap_err().contains("GUID"));
+        c.azure_client_id = Some("my-app".into());
+        assert!(Target::for_config(&c, None).unwrap_err().contains("GUID"));
+    }
+
+    const GUID: &str = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+
+    /// A connection with neither tenant nor application.
+    fn zero_config(host: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            tenant_id: None,
+            azure_client_id: Some("  ".into()),
+            ..azure(host)
+        }
+    }
+
+    fn answer(sts_url: &str, spn: &str) -> FedAuthInfo {
+        FedAuthInfo {
+            sts_url: sts_url.into(),
+            spn: spn.into(),
+        }
+    }
+
+    fn azure_sql_answer() -> FedAuthInfo {
+        answer(
+            &format!("https://login.windows.net/{GUID}"),
+            "https://database.windows.net/",
+        )
+    }
+
+    #[test]
+    fn zero_config_target_uses_the_servers_tenant_and_microsofts_app() {
+        let t = Target::for_config(
+            &zero_config("srv.database.windows.net"),
+            Some(&azure_sql_answer()),
+        )
+        .unwrap();
+        // login.windows.net is the public cloud's old name.
+        assert_eq!(t.authority, "https://login.microsoftonline.com");
+        assert_eq!(t.tenant, GUID);
+        assert_eq!(t.client_id, DEFAULT_CLIENT_ID);
+        assert_eq!(
+            t.scope,
+            "https://database.windows.net/.default offline_access openid profile"
+        );
+        // A typed application with the server's tenant.
+        let c = ConnectionConfig {
+            azure_client_id: Some(CLIENT.to_uppercase()),
+            ..zero_config("srv.database.windows.net")
+        };
+        let t = Target::for_config(&c, Some(&azure_sql_answer())).unwrap();
+        assert_eq!((t.tenant.as_str(), t.client_id.as_str()), (GUID, CLIENT));
+    }
+
+    #[test]
+    fn a_typed_tenant_wins_over_the_server() {
+        let t = Target::for_config(
+            &azure("srv.database.windows.net"),
+            Some(&azure_sql_answer()),
+        )
+        .unwrap();
+        assert_eq!(t, target());
+        let c = ConnectionConfig {
+            tenant_id: Some("organizations".into()),
+            ..zero_config("srv.database.usgovcloudapi.net")
+        };
+        let t = Target::for_config(&c, Some(&azure_sql_answer())).unwrap();
+        assert_eq!(t.tenant, "organizations");
+        assert_eq!(t.authority, "https://login.microsoftonline.us");
+    }
+
+    #[test]
+    fn without_the_servers_answer_the_tenant_is_organizations() {
+        let t = Target::for_config(&zero_config("srv.database.usgovcloudapi.net"), None).unwrap();
+        assert_eq!(t.authority, "https://login.microsoftonline.us");
+        assert_eq!(t.tenant, "organizations");
+        assert_eq!(t.client_id, DEFAULT_CLIENT_ID);
+        assert!(t
+            .scope
+            .starts_with("https://database.usgovcloudapi.net/.default "));
+    }
+
+    #[test]
+    fn known_authorities_of_the_server_are_kept() {
+        for (sts, authority, tenant) in [
+            (
+                format!("https://login.microsoftonline.us/{GUID}"),
+                "https://login.microsoftonline.us",
+                GUID,
+            ),
+            (
+                format!("https://login.chinacloudapi.cn/{GUID}/"),
+                "https://login.chinacloudapi.cn",
+                GUID,
+            ),
+            (
+                format!("https://login.partner.microsoftonline.cn/{GUID}"),
+                "https://login.partner.microsoftonline.cn",
+                GUID,
+            ),
+            (
+                "HTTPS://LOGIN.WINDOWS.NET/contoso.onmicrosoft.com".to_string(),
+                "https://login.microsoftonline.com",
+                "contoso.onmicrosoft.com",
+            ),
+            (
+                format!("https://login.microsoftonline.com/{GUID}/oauth2/authorize"),
+                "https://login.microsoftonline.com",
+                GUID,
+            ),
+        ] {
+            let info = answer(&sts, "https://database.windows.net/");
+            let t =
+                Target::for_config(&zero_config("srv.database.windows.net"), Some(&info)).unwrap();
+            assert_eq!(
+                (t.authority.as_str(), t.tenant.as_str()),
+                (authority, tenant),
+                "{sts}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_authorities_of_the_server_are_ignored() {
+        for sts in [
+            format!("https://evil.example.com/{GUID}"),
+            format!("https://login.microsoftonline.com.evil.com/{GUID}"),
+            format!("http://login.microsoftonline.com/{GUID}"),
+            format!("https://login.microsoftonline.com:8443/{GUID}"),
+            format!("https://user@login.microsoftonline.com/{GUID}"),
+            "https://login.microsoftonline.com/".into(),
+            "https://login.microsoftonline.com/common".into(),
+            "https://login.microsoftonline.com/consumers".into(),
+            "https://login.microsoftonline.com/a%2Fb".into(),
+            "https://login.microsoftonline.com/con toso".into(),
+            "https://login.microsoftonline.com/-".into(),
+            "https://login.microsoftonline.com/.-.".into(),
+            "not a url".into(),
+        ] {
+            let info = answer(&sts, "https://database.windows.net/");
+            let t =
+                Target::for_config(&zero_config("srv.database.windows.net"), Some(&info)).unwrap();
+            assert_eq!(
+                (t.authority.as_str(), t.tenant.as_str()),
+                ("https://login.microsoftonline.com", "organizations"),
+                "{sts}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_servers_spn_only_names_another_clouds_azure_sql() {
+        let sts = format!("https://login.microsoftonline.us/{GUID}");
+        // A custom DNS name of a US Government server.
+        let gov = answer(&sts, "https://database.usgovcloudapi.net/");
+        let t = Target::for_config(&zero_config("sql.contoso.internal"), Some(&gov)).unwrap();
+        assert!(
+            t.scope
+                .starts_with("https://database.usgovcloudapi.net/.default "),
+            "{}",
+            t.scope
+        );
+        // Any other resource is ignored: its token would go to the server.
+        for spn in [
+            "https://graph.microsoft.com/",
+            "https://management.azure.com",
+            "",
+        ] {
+            let info = answer(&sts, spn);
+            let t =
+                Target::for_config(&zero_config("srv.database.windows.net"), Some(&info)).unwrap();
+            assert!(
+                t.scope
+                    .starts_with("https://database.windows.net/.default "),
+                "{spn}: {}",
+                t.scope
+            );
+        }
     }
 
     #[test]
@@ -1108,6 +2070,199 @@ mod tests {
             secret_key(&t),
             "entra:contoso.com:8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f:jane@contoso.com"
         );
+    }
+
+    #[test]
+    fn secret_keys_use_the_effective_tenant_and_application() {
+        // 0.14.0's connections keep their key.
+        assert_eq!(
+            secret_key(&target()),
+            "entra:contoso.com:8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f:-"
+        );
+        let mut c = zero_config("srv.database.windows.net");
+        c.username = Some(" Jane@Contoso.com ".into());
+        assert_eq!(
+            secret_key(&Target::for_config(&c, Some(&azure_sql_answer())).unwrap()),
+            format!("entra:{GUID}:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com")
+        );
+        assert_eq!(
+            secret_key(&Target::for_config(&c, None).unwrap()),
+            "entra:organizations:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com"
+        );
+    }
+
+    #[test]
+    fn kept_sign_ins_are_known_without_the_network() {
+        // Typed tenant: the keyring key, as in 0.14.0.
+        assert_eq!(
+            kept_key(&azure("srv.database.windows.net")).unwrap(),
+            "entra:contoso.com:8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f:-"
+        );
+        // Else the server stands for the tenant it will give.
+        let mut c = zero_config(" SRV.database.windows.net. ");
+        c.username = Some("jane@contoso.com".into());
+        assert_eq!(
+            kept_key(&c).unwrap(),
+            "entra:auto:srv.database.windows.net:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:\
+             jane@contoso.com"
+        );
+        // Other databases of the server share it, other servers don't (even
+        // of the same tenant: unknown without asking them).
+        let other_db = ConnectionConfig {
+            name: "Reporting".into(),
+            database: "reports".into(),
+            host: Some("srv.database.windows.net".into()),
+            ..c.clone()
+        };
+        assert!(same_sign_in(&c, &other_db));
+        assert!(!needs_forget(&c, &other_db));
+        let other_server = ConnectionConfig {
+            host: Some("srv2.database.windows.net".into()),
+            ..c.clone()
+        };
+        assert!(!same_sign_in(&c, &other_server));
+        assert!(needs_forget(&c, &other_server));
+        // Typing the tenant changes the sign-in.
+        let typed = ConnectionConfig {
+            tenant_id: Some(GUID.into()),
+            ..c.clone()
+        };
+        assert!(!same_sign_in(&c, &typed));
+        assert!(needs_forget(&c, &typed));
+        assert!(orphaned(&c, &[other_server, typed]));
+        assert!(!orphaned(&c, &[other_db]));
+    }
+
+    /// An access token whose payload is `claims` (signature not checked).
+    fn token_with_claims(claims: &str) -> String {
+        format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
+            URL_SAFE_NO_PAD.encode(claims)
+        )
+    }
+
+    #[test]
+    fn the_tenant_of_an_access_token_is_its_tid() {
+        let claims = format!(
+            r#"{{"aud":"https://database.windows.net","tid":"{}"}}"#,
+            GUID.to_uppercase()
+        );
+        assert_eq!(
+            token_tid(&token_with_claims(&claims)).as_deref(),
+            Some(GUID)
+        );
+        // Padded base64 too.
+        let padded = format!(
+            "x.{}.sig",
+            base64::engine::general_purpose::URL_SAFE.encode(&claims)
+        );
+        assert_eq!(token_tid(&padded).as_deref(), Some(GUID));
+        // Anything else: unknown, never an error.
+        for bad in [
+            token_with_claims(r#"{"aud":"x"}"#),
+            token_with_claims(r#"{"tid":"contoso.com"}"#),
+            token_with_claims(r#"{"tid":42}"#),
+            token_with_claims("not json"),
+            "AT-opaque".to_string(),
+            "a.%%%.b".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(token_tid(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_home_sign_in_serves_only_its_own_tenant() {
+        assert!(same_tenant(GUID, Some(&GUID.to_uppercase())));
+        assert!(!same_tenant(
+            GUID,
+            Some("11111111-2222-3333-4444-555555555555")
+        ));
+        assert!(!same_tenant(GUID, None));
+        // A domain can't be compared without the network.
+        assert!(!same_tenant("contoso.com", Some("contoso.com")));
+        assert_eq!(
+            tid_note("entra:organizations:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com"),
+            "entra:tid:organizations:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com"
+        );
+    }
+
+    #[test]
+    fn organizations_sign_ins_differ_per_cloud() {
+        let key = |host: &str, tenant: Option<&str>| {
+            let c = ConnectionConfig {
+                tenant_id: tenant.map(Into::into),
+                ..zero_config(host)
+            };
+            secret_key(&Target::for_config(&c, None).unwrap())
+        };
+        let app = DEFAULT_CLIENT_ID;
+        // The public cloud's keeps its key.
+        let public = key("srv.database.windows.net", None);
+        assert_eq!(public, format!("entra:organizations:{app}:-"));
+        let gov = key("srv.database.usgovcloudapi.net", None);
+        assert_eq!(
+            gov,
+            format!("entra:organizations@login.microsoftonline.us:{app}:-")
+        );
+        assert_eq!(
+            key("srv.database.chinacloudapi.cn", Some("Organizations")),
+            format!("entra:organizations@login.chinacloudapi.cn:{app}:-")
+        );
+        for k in [&public, &gov] {
+            assert!(is_organizations_key(k), "{k}");
+        }
+        assert_eq!(
+            tid_note(&gov),
+            format!("entra:tid:organizations@login.microsoftonline.us:{app}:-")
+        );
+        // A tenant's key doesn't change.
+        assert_eq!(
+            key("srv.database.usgovcloudapi.net", Some(GUID)),
+            format!("entra:{GUID}:{app}:-")
+        );
+        assert!(!is_organizations_key(&format!("entra:{GUID}:{app}:-")));
+    }
+
+    #[test]
+    fn keys_of_a_zero_config_sign_in_known_offline() {
+        let session = Session::default();
+        let mut c = zero_config("srv.database.windows.net");
+        c.port = Some(1444);
+        let organizations = secret_key(&Target::for_config(&c, None).unwrap());
+        // The server's tenant is unknown.
+        assert_eq!(known_keys(&c, &session), vec![organizations.clone()]);
+        // Answered in this session: both keys it may have used.
+        session.servers().insert(
+            server_key("srv.database.windows.net", 1444),
+            Probed {
+                at: SystemTime::UNIX_EPOCH,
+                info: Some(azure_sql_answer()),
+            },
+        );
+        let tenant = secret_key(&Target::for_config(&c, Some(&azure_sql_answer())).unwrap());
+        assert_eq!(
+            known_keys(&c, &session),
+            [organizations.clone(), tenant.clone()]
+        );
+        // Or noted when its sign-in was kept.
+        let session = Session::default();
+        session
+            .noted()
+            .insert(kept_key(&c).unwrap(), GUID.to_string());
+        assert_eq!(known_keys(&c, &session), [organizations, tenant]);
+        // Typed tenant: its key only.
+        assert_eq!(
+            known_keys(&azure("srv.database.windows.net"), &session),
+            [secret_key(&target())]
+        );
+        // Other methods keep nothing.
+        let cli = ConnectionConfig {
+            azure_auth_method: Some(AzureAuthMethod::Interactive),
+            ..c
+        };
+        assert!(known_keys(&cli, &session).is_empty());
     }
 
     fn query(url: &str) -> std::collections::HashMap<String, String> {
@@ -1158,14 +2313,14 @@ mod tests {
     #[test]
     fn authorize_url_uses_the_cloud_authority() {
         let mut c = azure("srv.database.usgovcloudapi.net");
-        let t = Target::for_config(&c).unwrap();
+        let t = Target::for_config(&c, None).unwrap();
         let url = authorize_url(&t, "http://localhost:1", "c", "s");
         assert!(
             url.starts_with("https://login.microsoftonline.us/Contoso.com/oauth2/v2.0/authorize?")
         );
         assert!(query(&url)["scope"].starts_with("https://database.usgovcloudapi.net/.default"));
         c.host = Some("srv.database.chinacloudapi.cn".into());
-        let t = Target::for_config(&c).unwrap();
+        let t = Target::for_config(&c, None).unwrap();
         let url = authorize_url(&t, "http://localhost:1", "c", "s");
         assert!(
             url.starts_with("https://login.chinacloudapi.cn/Contoso.com/oauth2/v2.0/authorize?")
@@ -1309,9 +2464,67 @@ mod tests {
         }
     }
 
+    /// `err` explained for a sign-in with the organization's application.
+    fn explain_own(err: &AuthError) -> String {
+        explain(err, SignInApp::Own)
+    }
+
+    #[test]
+    fn the_application_of_a_target_is_known() {
+        let mut t = target();
+        assert_eq!(t.app(), SignInApp::Own);
+        t.client_id = DEFAULT_CLIENT_ID.into();
+        assert_eq!(t.app(), SignInApp::Microsoft);
+        let zero = Target::for_config(&zero_config("srv.database.windows.net"), None).unwrap();
+        assert_eq!(zero.app(), SignInApp::Microsoft);
+    }
+
+    #[test]
+    fn errors_with_microsofts_application_are_worded_for_it() {
+        let microsoft = |e: &AuthError| explain(e, SignInApp::Microsoft);
+        // Consent: the organization blocks it, or names its own.
+        let consent = microsoft(&server(
+            "invalid_grant",
+            "AADSTS65001: The user or administrator has not consented.\r\nTrace ID: 1",
+            &[65001],
+        ));
+        assert_eq!(
+            consent,
+            "Ton organisation n'autorise pas l'application des drivers Microsoft pour Azure SQL \
+             : demande à un administrateur d'accorder son consentement, ou indique \
+             l'ID client de l'application de ton organisation dans les options avancées de \
+             la connexion (champ ID app dans le terminal). \
+             (AADSTS65001: The user or administrator has not consented.)"
+        );
+        assert!(microsoft(&server("consent_required", "", &[]))
+            .starts_with("Ton organisation n'autorise pas l'application des drivers Microsoft"));
+        // Not found: the tenant is the one to check.
+        assert!(microsoft(&server(
+            "unauthorized_client",
+            "AADSTS700016: Application not found",
+            &[700016]
+        ))
+        .starts_with(
+            "Ce tenant ne connaît pas l'application des drivers Microsoft : vérifie le tenant \
+             dans les options avancées de la connexion (champ Tenant dans le terminal), ou \
+             laisse-le vide pour utiliser celui du serveur."
+        ));
+        // Settings of one's own application: nothing for the user to fix.
+        for (code, n) in [
+            ("AADSTS50011: The redirect URI does not match", 50011),
+            ("AADSTS7000218: client_assertion or client_secret", 7000218),
+        ] {
+            let e = microsoft(&server("invalid_client", code, &[n]));
+            assert_eq!(e, format!("Échec de la connexion Azure AD. ({code})"));
+        }
+        // The same for both.
+        let tenant = server("invalid_request", "AADSTS90002: Tenant not found", &[90002]);
+        assert_eq!(microsoft(&tenant), explain_own(&tenant));
+    }
+
     #[test]
     fn known_entra_errors_are_explained() {
-        let consent = explain(&server(
+        let consent = explain_own(&server(
             "invalid_grant",
             "AADSTS65001: The user or administrator has not consented.\r\nTrace ID: 1",
             &[65001],
@@ -1327,9 +2540,9 @@ mod tests {
             consent.ends_with("(AADSTS65001: The user or administrator has not consented.)"),
             "{consent}"
         );
-        assert!(explain(&server("consent_required", "", &[]))
+        assert!(explain_own(&server("consent_required", "", &[]))
             .starts_with("L'application n'a pas l'autorisation"));
-        assert!(explain(&server(
+        assert!(explain_own(&server(
             "invalid_request",
             "AADSTS50011: The redirect URI does not match",
             &[]
@@ -1338,19 +2551,19 @@ mod tests {
             "L'URI de redirection `http://localhost` n'est pas déclarée : ajoute-la dans la \
              plateforme « Applications mobiles et de bureau » de l'application."
         ));
-        assert!(explain(&server(
+        assert!(explain_own(&server(
             "invalid_client",
             "AADSTS7000218: client_assertion or client_secret",
             &[7000218]
         ))
         .starts_with("Active « Autoriser les flux clients publics » dans l'application."));
-        assert!(explain(&server(
+        assert!(explain_own(&server(
             "unauthorized_client",
             "AADSTS700016: Application not found",
             &[700016]
         ))
         .starts_with("Application introuvable dans ce tenant : vérifie l'ID client et le tenant."));
-        assert!(explain(&server(
+        assert!(explain_own(&server(
             "invalid_request",
             "AADSTS90002: Tenant not found",
             &[90002]
@@ -1361,41 +2574,44 @@ mod tests {
     #[test]
     fn codes_are_matched_exactly() {
         // 70001 is none of the known codes (700016, 7000218…).
-        let e = explain(&server("x", "AADSTS70001: other", &[70001]));
+        let e = explain_own(&server("x", "AADSTS70001: other", &[70001]));
         assert!(e.starts_with("Échec de la connexion Azure AD"), "{e}");
         assert!(e.ends_with("(AADSTS70001: other)"), "{e}");
         // Without a description, the OAuth error code.
         assert_eq!(
-            explain(&server("invalid_scope", "", &[])),
+            explain_own(&server("invalid_scope", "", &[])),
             "Échec de la connexion Azure AD. (invalid_scope)"
         );
         // A code only in error_codes is enough.
-        assert!(
-            explain(&server("invalid_client", "", &[7000218])).starts_with("Active « Autoriser")
-        );
+        assert!(explain_own(&server("invalid_client", "", &[7000218]))
+            .starts_with("Active « Autoriser"));
     }
 
     #[test]
     fn cancel_timeout_and_other_failures_are_explained() {
         assert_eq!(
-            explain(&AuthError::Denied {
+            explain_own(&AuthError::Denied {
                 description: "AADSTS65004: User declined".into()
             }),
             "Connexion annulée dans le navigateur. (AADSTS65004: User declined)"
         );
         assert_eq!(
-            explain(&AuthError::Denied {
+            explain_own(&AuthError::Denied {
                 description: String::new()
             }),
             "Connexion annulée dans le navigateur."
         );
         assert_eq!(
-            explain(&AuthError::Timeout),
+            explain_own(&AuthError::Timeout),
             "Connexion non terminée dans le navigateur après 5 minutes."
         );
-        assert!(explain(&AuthError::StateMismatch).contains("state"));
-        assert!(explain(&AuthError::Network("refused".into())).contains("(refused)"));
-        assert_eq!(AuthError::Timeout.to_string(), explain(&AuthError::Timeout));
+        assert!(explain_own(&AuthError::StateMismatch).contains("state"));
+        assert!(explain_own(&AuthError::Network("refused".into())).contains("(refused)"));
+        // Whatever the application.
+        assert_eq!(
+            explain(&AuthError::Timeout, SignInApp::Microsoft),
+            explain_own(&AuthError::Timeout)
+        );
     }
 
     fn tokens(expires_at: SystemTime, refresh: Option<&str>) -> Tokens {
@@ -1565,7 +2781,7 @@ mod tests {
         let session = Session::default();
         let store = crate::engine::secrets::MemoryStore::default();
         let config = signed_in();
-        let key = secret_key(&Target::for_config(&config).unwrap());
+        let key = secret_key(&Target::for_config(&config, None).unwrap());
         session
             .tokens()
             .insert(key.clone(), tokens(at(0), Some("RT")));
@@ -1611,7 +2827,7 @@ mod flow_tests {
     }
 
     fn key() -> String {
-        secret_key(&Target::for_config(&config()).unwrap())
+        secret_key(&Target::for_config(&config(), None).unwrap())
     }
 
     // ----- Fake token endpoint -----
@@ -1694,15 +2910,30 @@ mod flow_tests {
     /// refresh `AT-<n>` / `RT-<n>` (rotation); `refused` refresh tokens get
     /// `invalid_grant`.
     fn entra(refused: &'static [&'static str]) -> Box<Answer> {
+        entra_in(refused, None)
+    }
+
+    /// An access token named `name` of an account of tenant `tid`.
+    fn jwt(tid: &str, name: &str) -> String {
+        format!(
+            "{}.{}.{name}",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
+            URL_SAFE_NO_PAD.encode(format!(r#"{{"tid":"{tid}"}}"#))
+        )
+    }
+
+    /// `entra`, its access tokens of an account of tenant `tid` (`jwt`).
+    fn entra_in(refused: &'static [&'static str], tid: Option<&'static str>) -> Box<Answer> {
         let rotation = AtomicUsize::new(1);
+        let access = move |name: &str| tid.map_or(name.to_string(), |tid| jwt(tid, name));
         Box::new(move |form| {
             match form["grant_type"].as_str() {
             "authorization_code" if form["code"] == "the-code" => {
-                (200, tokens_json("AT-code", "RT-1"))
+                (200, tokens_json(&access("AT-code"), "RT-1"))
             }
             "refresh_token" if !refused.contains(&form["refresh_token"].as_str()) => {
                 let n = rotation.fetch_add(1, Ordering::SeqCst) + 1;
-                (200, tokens_json(&format!("AT-{n}"), &format!("RT-{n}")))
+                (200, tokens_json(&access(&format!("AT-{n}")), &format!("RT-{n}")))
             }
             _ => (
                 400,
@@ -1824,6 +3055,10 @@ mod flow_tests {
         timeout: Duration,
         /// A connection (else a reconnection, which never opens the browser).
         interactive: bool,
+        /// The server's answer to the FEDAUTHINFO probe…
+        probed: Arc<Mutex<Result<Option<FedAuthInfo>, String>>>,
+        /// …and the servers it was asked of.
+        asked: Arc<Mutex<Vec<(String, u16)>>>,
     }
 
     impl Harness {
@@ -1839,6 +3074,8 @@ mod flow_tests {
                 session: Box::leak(Box::default()),
                 timeout: Duration::from_secs(20),
                 interactive: true,
+                probed: Arc::new(Mutex::new(Ok(None))),
+                asked: Arc::default(),
             }
         }
 
@@ -1846,8 +3083,14 @@ mod flow_tests {
             let browser = self.browser.clone();
             let events = self.events.clone();
             let clock = self.clock.clone();
+            let (probed, asked) = (self.probed.clone(), self.asked.clone());
             Deps {
                 authority: Some(self.authority.clone()),
+                probe: Box::new(move |host, port| {
+                    asked.lock().unwrap().push((host, port));
+                    let answer = probed.lock().unwrap().clone();
+                    Box::pin(async move { answer.map_err(anyhow::Error::msg) })
+                }),
                 open_browser: Box::new(move |url| browser.open(url)),
                 notify: Box::new(move |i| events.lock().unwrap().push(i)),
                 store: self.store,
@@ -1861,7 +3104,15 @@ mod flow_tests {
         }
 
         async fn token(&self) -> anyhow::Result<String> {
-            token_with(&config(), &self.deps()).await
+            self.token_for(&config()).await
+        }
+
+        async fn token_for(&self, config: &ConnectionConfig) -> anyhow::Result<String> {
+            token_with(config, &self.deps()).await
+        }
+
+        fn probes(&self) -> usize {
+            self.asked.lock().unwrap().len()
         }
 
         fn grants(&self) -> Vec<String> {
@@ -2011,7 +3262,7 @@ mod flow_tests {
         let e = h.token().await.unwrap_err().to_string();
         h.browser.finish();
         // Refused, then still waiting for the real redirect until the end.
-        assert_eq!(e, explain(&AuthError::Timeout));
+        assert_eq!(e, explain(&AuthError::Timeout, SignInApp::Own));
         assert!(h.grants().is_empty(), "the code must not be exchanged");
         let (status, html) = h.browser.last_page();
         assert_eq!(status, 400);
@@ -2180,9 +3431,12 @@ mod flow_tests {
         let browser = std::thread::spawn(move || {
             let _ = ureq::get(&format!("http://127.0.0.1:{port}/?code=c&state=s")).call();
         });
-        let waited = tokio::time::timeout(Duration::from_secs(10), wait_for_code(accept, "s"))
-            .await
-            .unwrap();
+        let waited = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_code(accept, "s", SignInApp::Own),
+        )
+        .await
+        .unwrap();
         let (code, browser_connection) = waited.unwrap();
         assert_eq!(code, "c");
         drop(browser_connection);
@@ -2231,5 +3485,731 @@ mod flow_tests {
         let redirect_uri = h.browser.redirect_uri.lock().unwrap().clone().unwrap();
         let port = redirect_uri.rsplit(':').next().unwrap();
         assert!(std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_err());
+    }
+
+    // ----- Without tenant nor application -----
+
+    const TENANT: &str = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+
+    fn zero_config() -> ConnectionConfig {
+        ConnectionConfig {
+            tenant_id: None,
+            azure_client_id: None,
+            username: Some("jane@contoso.com".into()),
+            port: Some(1433),
+            ..config()
+        }
+    }
+
+    fn azure_sql() -> Result<Option<FedAuthInfo>, String> {
+        Ok(Some(FedAuthInfo {
+            sts_url: format!("https://login.windows.net/{TENANT}"),
+            spn: "https://database.windows.net/".into(),
+        }))
+    }
+
+    fn zero_config_key(tenant: &str) -> String {
+        format!("entra:{tenant}:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:jane@contoso.com")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_config_signs_in_with_the_servers_tenant_and_microsofts_app() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        h.browser.finish();
+        assert_eq!(
+            *h.asked.lock().unwrap(),
+            [("srv.database.windows.net".to_string(), 1433)]
+        );
+        let events = h.events();
+        let authorize = format!("{}/{TENANT}/oauth2/v2.0/authorize?", h.authority);
+        assert!(
+            matches!(&events[0], Interaction::Waiting { url, .. }
+                if url.starts_with(&authorize)
+                    && url.contains("client_id=7f98cb04-cd1e-40df-9140-3bf7e2cea4db")),
+            "{events:?}"
+        );
+        {
+            let requests = h.requests.lock().unwrap();
+            assert_eq!(requests[0].path, format!("/{TENANT}/oauth2/v2.0/token"));
+            assert_eq!(requests[0].form["client_id"], DEFAULT_CLIENT_ID);
+        }
+        assert_eq!(
+            h.store.get(&zero_config_key(TENANT)).unwrap().as_deref(),
+            Some("RT-1")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn errors_of_microsofts_application_are_worded_for_it() {
+        const BLOCKED: &str = "Ton organisation n'autorise pas l'application des drivers Microsoft";
+        // Refused at the token endpoint…
+        let h = Harness::new(
+            Box::new(|_| {
+                (
+                    400,
+                    r#"{"error":"invalid_grant","error_description":"AADSTS65001: The user or administrator has not consented.","error_codes":[65001]}"#
+                        .into(),
+                )
+            }),
+            Behaviour::SignIn,
+        )
+        .await;
+        *h.probed.lock().unwrap() = azure_sql();
+        let e = h.token_for(&zero_config()).await.unwrap_err().to_string();
+        h.browser.finish();
+        assert!(e.starts_with(BLOCKED), "{e}");
+        let (status, html) = h.browser.last_page();
+        assert_eq!(status, 400);
+        assert!(html.contains(BLOCKED), "{html}");
+
+        // …or in the redirect.
+        let h = Harness::new(
+            entra(&[]),
+            Behaviour::Redirects(&[
+                "error=consent_required&error_description=AADSTS65001%3A+no+consent&state={state}",
+            ]),
+        )
+        .await;
+        *h.probed.lock().unwrap() = azure_sql();
+        let e = h.token_for(&zero_config()).await.unwrap_err().to_string();
+        h.browser.finish();
+        assert!(e.starts_with(BLOCKED), "{e}");
+        let (_, html) = h.browser.last_page();
+        assert!(html.contains(BLOCKED), "{html}");
+        assert!(h.grants().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_servers_answer_is_remembered() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        // Expired: renewed silently, without asking the server again.
+        h.clock.store(2 * 3600, Ordering::SeqCst);
+        *h.probed.lock().unwrap() = Err("unreachable".into());
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
+        assert_eq!(h.probes(), 1);
+        assert_eq!(
+            h.requests.lock().unwrap()[1].path,
+            format!("/{TENANT}/oauth2/v2.0/token")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_the_servers_answer_organizations_signs_in() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        h.browser.finish();
+        {
+            let requests = h.requests.lock().unwrap();
+            assert_eq!(requests[0].path, "/organizations/oauth2/v2.0/token");
+            assert_eq!(requests[0].form["client_id"], DEFAULT_CLIENT_ID);
+        }
+        assert_eq!(
+            h.store
+                .get(&zero_config_key("organizations"))
+                .unwrap()
+                .as_deref(),
+            Some("RT-1")
+        );
+        // The failure is remembered for a while…
+        h.token_for(&zero_config()).await.unwrap();
+        assert_eq!(h.probes(), 1);
+        // …then the server is asked again. Where the organizations sign-in
+        // landed is unknown (no tenant in its token): the server's tenant
+        // signs in anew.
+        h.clock.store(11 * 60, Ordering::SeqCst);
+        *h.probed.lock().unwrap() = azure_sql();
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        h.browser.finish();
+        assert_eq!(h.probes(), 2);
+        assert_eq!(h.grants(), ["authorization_code", "authorization_code"]);
+        assert_eq!(
+            h.requests.lock().unwrap()[1].path,
+            format!("/{TENANT}/oauth2/v2.0/token")
+        );
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 2);
+    }
+
+    /// An access token of the account, whose home tenant is `TENANT`.
+    fn home(name: &str) -> String {
+        jwt(TENANT, name)
+    }
+
+    /// Signed in under `organizations` while the server didn't answer, with
+    /// an account of `TENANT`.
+    async fn signed_in_without_the_server() -> Harness {
+        let h = Harness::new(entra_in(&[], Some(TENANT)), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), home("AT-code"));
+        h.browser.finish();
+        assert_eq!(
+            h.store
+                .get(&tid_note(&zero_config_key("organizations")))
+                .unwrap()
+                .as_deref(),
+            Some(TENANT)
+        );
+        // Later on, the server answers.
+        h.clock.store(11 * 60, Ordering::SeqCst);
+        *h.probed.lock().unwrap() = azure_sql();
+        h
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconnection_keeps_the_servers_last_answer() {
+        let mut h = signed_in_without_the_server().await;
+        h.interactive = false;
+        // Not asked again under other operations: the sign-in still works.
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), home("AT-code"));
+        assert_eq!(h.probes(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sign_in_made_without_the_server_outlives_its_answer() {
+        for interactive in [true, false] {
+            let mut h = signed_in_without_the_server().await;
+            h.interactive = interactive;
+            // Only the keyring is left (the app was restarted): the tenant
+            // the organizations sign-in landed in is read from there…
+            restart(&h);
+            // …and the server, asked again, names its tenant, which holds
+            // nothing but where the organizations sign-in landed: that one
+            // is renewed, no browser.
+            assert_eq!(h.token_for(&zero_config()).await.unwrap(), home("AT-2"));
+            assert_eq!(h.probes(), 2);
+            assert_eq!(h.grants(), ["authorization_code", "refresh_token"]);
+            assert_eq!(
+                h.requests.lock().unwrap()[1].path,
+                "/organizations/oauth2/v2.0/token"
+            );
+            assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                h.store
+                    .get(&zero_config_key("organizations"))
+                    .unwrap()
+                    .as_deref(),
+                Some("RT-2")
+            );
+            // Noted under the server's tenant, not organizations.
+            assert_eq!(
+                h.store.get(&note_of(&zero_config())).unwrap().as_deref(),
+                Some(TENANT)
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_tenant_never_borrows_the_home_sign_in() {
+        const HOME: &str = "11111111-2222-3333-4444-555555555555";
+        let h = Harness::new(entra_in(&[], Some(HOME)), Behaviour::SignIn).await;
+        // Server A didn't answer: signed in under organizations (home
+        // tenant).
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        h.token_for(&on_server("a.database.windows.net"))
+            .await
+            .unwrap();
+        h.browser.finish();
+        // Server B is in another tenant, where Jane is a guest.
+        *h.probed.lock().unwrap() = azure_sql();
+        let b = on_server("b.database.windows.net");
+        h.token_for(&b).await.unwrap();
+        h.browser.finish();
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 2);
+        assert_eq!(h.grants(), ["authorization_code", "authorization_code"]);
+        assert_eq!(
+            h.requests.lock().unwrap()[1].path,
+            format!("/{TENANT}/oauth2/v2.0/token")
+        );
+        assert_eq!(h.store.get(&note_of(&b)).unwrap().as_deref(), Some(TENANT));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_servers_tenant_wins_once_it_holds_a_sign_in() {
+        let h = signed_in_without_the_server().await;
+        h.session.tokens().clear();
+        h.store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), home("AT-2"));
+        assert_eq!(
+            h.requests.lock().unwrap()[1].path,
+            format!("/{TENANT}/oauth2/v2.0/token")
+        );
+        assert_eq!(h.requests.lock().unwrap()[1].form["refresh_token"], "RT-7");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_typed_tenant_never_asks_the_server() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token().await.unwrap();
+        h.browser.finish();
+        assert_eq!(h.probes(), 0);
+        assert_eq!(h.stored().as_deref(), Some("RT-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconnection_asks_the_server_too() {
+        let mut h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        h.interactive = false;
+        *h.probed.lock().unwrap() = azure_sql();
+        h.store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 0);
+        assert_eq!(h.probes(), 1);
+    }
+
+    // ----- Forgetting without a typed tenant -----
+
+    /// The keyring entry noting the tenant of `config`'s sign-in.
+    fn note_of(config: &ConnectionConfig) -> String {
+        kept_key(config).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_tenant_of_a_sign_in_is_noted() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        assert_eq!(
+            note_of(&zero_config()),
+            "entra:auto:srv.database.windows.net:7f98cb04-cd1e-40df-9140-3bf7e2cea4db:\
+             jane@contoso.com"
+        );
+        assert_eq!(
+            h.store.get(&note_of(&zero_config())).unwrap().as_deref(),
+            Some(TENANT)
+        );
+        // Without the server's answer: organizations.
+        let h = signed_in_without_the_server().await;
+        assert_eq!(
+            h.store.get(&note_of(&zero_config())).unwrap().as_deref(),
+            Some("organizations")
+        );
+        // A typed tenant needs no note.
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        h.token().await.unwrap();
+        h.browser.finish();
+        let c = ConnectionConfig {
+            tenant_id: None,
+            ..config()
+        };
+        assert_eq!(h.store.get(&note_of(&c)).unwrap(), None);
+    }
+
+    /// `forget_sign_in` of `config`, no other connection left, with a server
+    /// answering `answer`; how many times it was asked.
+    fn forget_with(
+        config: &ConnectionConfig,
+        session: &Session,
+        store: &MemoryStore,
+        answer: Option<FedAuthInfo>,
+    ) -> usize {
+        forget_beside(config, &[], session, store, answer)
+    }
+
+    /// `forget_with`, the `remaining` connections kept.
+    fn forget_beside(
+        config: &ConnectionConfig,
+        remaining: &[ConnectionConfig],
+        session: &Session,
+        store: &MemoryStore,
+        answer: Option<FedAuthInfo>,
+    ) -> usize {
+        let asked = AtomicUsize::new(0);
+        forget_sign_in(config, remaining, session, store, &|_, _| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            answer.clone()
+        });
+        asked.into_inner()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_finds_the_noted_tenant_without_the_server() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        assert!(h.store.get(&zero_config_key(TENANT)).unwrap().is_some());
+        // The app was restarted: the server's answer is gone, and the
+        // server is unreachable.
+        let restarted = Session::default();
+        let store = h.store;
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(forget_with(&zero_config(), &restarted, store, None), 0);
+        })
+        .await
+        .unwrap();
+        assert_eq!(h.store.get(&zero_config_key(TENANT)).unwrap(), None);
+        assert_eq!(h.store.get(&note_of(&zero_config())).unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_drops_every_key_known_offline() {
+        let h = signed_in_without_the_server().await;
+        // Also kept under the server's tenant, from an earlier sign-in.
+        h.store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        h.session.servers().insert(
+            server_key("srv.database.windows.net", 1433),
+            Probed {
+                at: SystemTime::UNIX_EPOCH,
+                info: azure_sql().unwrap(),
+            },
+        );
+        let (session, store) = (h.session, h.store);
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(forget_with(&zero_config(), session, store, None), 0);
+        })
+        .await
+        .unwrap();
+        for key in [
+            zero_config_key("organizations"),
+            tid_note(&zero_config_key("organizations")),
+            zero_config_key(TENANT),
+            note_of(&zero_config()),
+        ] {
+            assert_eq!(h.store.get(&key).unwrap(), None, "{key}");
+        }
+        assert!(h.session.tokens().is_empty());
+        assert!(h.session.noted().is_empty());
+        assert!(h.session.tids().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_note_the_server_is_asked_last() {
+        let store: &'static MemoryStore = Box::leak(Box::default());
+        let session: &'static Session = Box::leak(Box::default());
+        store
+            .set(&zero_config_key("organizations"), "RT-1")
+            .unwrap();
+        store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        // Unreachable: the organizations key goes, the tenant's can't be
+        // found.
+        let asked =
+            tokio::task::spawn_blocking(move || forget_with(&zero_config(), session, store, None))
+                .await
+                .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(store.get(&zero_config_key("organizations")).unwrap(), None);
+        assert!(store.get(&zero_config_key(TENANT)).unwrap().is_some());
+        // Reachable: its tenant's goes too.
+        let asked = tokio::task::spawn_blocking(move || {
+            forget_with(&zero_config(), session, store, azure_sql().unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(store.get(&zero_config_key(TENANT)).unwrap(), None);
+    }
+
+    #[test]
+    fn work_left_behind_does_not_hold_forgets_thread() {
+        let started = std::time::Instant::now();
+        let out = run_bounded(async {
+            // A name resolution stuck in getaddrinfo, say.
+            drop(tokio::task::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_secs(3))
+            }));
+            7
+        });
+        assert_eq!(out, Some(7));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    // ----- Keys another connection uses -----
+
+    fn on_server(host: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            name: host.into(),
+            host: Some(host.into()),
+            ..zero_config()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_spares_the_keys_other_connections_use() {
+        // Two servers of one tenant: one sign-in, under its key.
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        let (a, b) = (
+            on_server("a.database.windows.net"),
+            on_server("b.database.windows.net"),
+        );
+        h.token_for(&a).await.unwrap();
+        h.browser.finish();
+        h.token_for(&b).await.unwrap();
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+        assert!(orphaned(&a, std::slice::from_ref(&b)));
+        // Deleting `a` keeps what `b` uses (noted in the keyring)…
+        let restarted: &'static Session = Box::leak(Box::default());
+        let store = h.store;
+        let kept = vec![b.clone()];
+        tokio::task::spawn_blocking(move || {
+            forget_beside(&a, &kept, restarted, store, None);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            h.store.get(&zero_config_key(TENANT)).unwrap().as_deref(),
+            Some("RT-1")
+        );
+        assert_eq!(
+            h.store
+                .get(&note_of(&on_server("a.database.windows.net")))
+                .unwrap(),
+            None
+        );
+        assert!(h.store.get(&note_of(&b)).unwrap().is_some());
+        // …and so does the session (its answer from b's server).
+        let a = on_server("a.database.windows.net");
+        let (session, store) = (h.session, h.store);
+        tokio::task::spawn_blocking(move || {
+            store.delete(&note_of(&b)).unwrap();
+            forget_beside(&a, &[b], session, store, None);
+        })
+        .await
+        .unwrap();
+        assert!(h.store.get(&zero_config_key(TENANT)).unwrap().is_some());
+        assert!(!h.session.tokens().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_spares_a_typed_tenants_key_and_a_shared_fallback() {
+        let store: &'static MemoryStore = Box::leak(Box::default());
+        let session: &'static Session = Box::leak(Box::default());
+        let a = on_server("a.database.windows.net");
+        store.set(&note_of(&a), TENANT).unwrap();
+        store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        store
+            .set(&zero_config_key("organizations"), "RT-1")
+            .unwrap();
+        // The same tenant and application, typed.
+        let typed = ConnectionConfig {
+            tenant_id: Some(TENANT.into()),
+            ..on_server("c.database.windows.net")
+        };
+        // A server that didn't answer this session: signed in under
+        // organizations.
+        let failed = on_server("d.database.windows.net");
+        session.servers().insert(
+            server_key("d.database.windows.net", 1433),
+            Probed {
+                at: SystemTime::UNIX_EPOCH,
+                info: None,
+            },
+        );
+        tokio::task::spawn_blocking(move || {
+            forget_beside(&a, &[typed, failed], session, store, None);
+        })
+        .await
+        .unwrap();
+        assert!(store.get(&zero_config_key(TENANT)).unwrap().is_some());
+        assert!(store
+            .get(&zero_config_key("organizations"))
+            .unwrap()
+            .is_some());
+        // Nobody else: both go.
+        let a = on_server("a.database.windows.net");
+        tokio::task::spawn_blocking(move || {
+            store.set(&note_of(&a), TENANT).unwrap();
+            forget_beside(&a, &[], session, store, None);
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.get(&zero_config_key(TENANT)).unwrap(), None);
+        assert_eq!(store.get(&zero_config_key("organizations")).unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgetting_spares_a_home_sign_in_another_connection_borrows() {
+        // `r` reuses the organizations sign-in, which landed in its server's
+        // tenant.
+        let h = signed_in_without_the_server().await;
+        let r = on_server("r.database.windows.net");
+        h.token_for(&r).await.unwrap();
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1, "borrowed");
+        // Deleting the first connection keeps it, even after a restart.
+        let restarted: &'static Session = Box::leak(Box::default());
+        let store = h.store;
+        tokio::task::spawn_blocking(move || {
+            forget_beside(&zero_config(), &[r], restarted, store, None);
+        })
+        .await
+        .unwrap();
+        assert!(h
+            .store
+            .get(&zero_config_key("organizations"))
+            .unwrap()
+            .is_some());
+        assert!(h
+            .store
+            .get(&tid_note(&zero_config_key("organizations")))
+            .unwrap()
+            .is_some());
+    }
+
+    // ----- The noted tenant when the server doesn't answer -----
+
+    /// Memory of a restarted app: only the keyring is left.
+    fn restart(h: &Harness) {
+        h.session.tokens().clear();
+        h.session.servers().clear();
+        h.session.noted().clear();
+        h.session.tids().clear();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_no_longer_answers_keeps_its_noted_tenant() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = azure_sql();
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-code");
+        h.browser.finish();
+        // Restarted, the server doesn't answer: its tenant is the noted one,
+        // its refresh token renews the sign-in, no browser.
+        restart(&h);
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        assert_eq!(h.token_for(&zero_config()).await.unwrap(), "AT-2");
+        assert_eq!(h.probes(), 2);
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            h.requests.lock().unwrap()[1].path,
+            format!("/{TENANT}/oauth2/v2.0/token")
+        );
+        // The note stays.
+        assert_eq!(
+            h.store.get(&note_of(&zero_config())).unwrap().as_deref(),
+            Some(TENANT)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sovereign_tenant_is_noted_with_its_authority() {
+        let h = Harness::new(entra(&[]), Behaviour::SignIn).await;
+        // A custom DNS name of a US Government server.
+        *h.probed.lock().unwrap() = Ok(Some(FedAuthInfo {
+            sts_url: format!("https://login.microsoftonline.us/{TENANT}"),
+            spn: "https://database.usgovcloudapi.net/".into(),
+        }));
+        let c = on_server("sql.contoso.internal");
+        h.token_for(&c).await.unwrap();
+        h.browser.finish();
+        let note = h.store.get(&note_of(&c)).unwrap().unwrap();
+        assert_eq!(note, format!("{TENANT}@login.microsoftonline.us"));
+        // What it stands for when the server doesn't answer.
+        let t = noted_target(&c, &note).unwrap();
+        assert_eq!(t.authority, "https://login.microsoftonline.us");
+        assert_eq!(t.tenant, TENANT);
+        assert!(t
+            .scope
+            .starts_with("https://database.usgovcloudapi.net/.default "));
+        assert_eq!(
+            noted_target(&c, "organizations").unwrap().tenant,
+            "organizations"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_organizations_note_still_asks_the_server_last() {
+        let store: &'static MemoryStore = Box::leak(Box::default());
+        let session: &'static Session = Box::leak(Box::default());
+        store
+            .set(&note_of(&zero_config()), "organizations")
+            .unwrap();
+        store
+            .set(&zero_config_key("organizations"), "RT-1")
+            .unwrap();
+        store.set(&zero_config_key(TENANT), "RT-7").unwrap();
+        // Unreachable: the tenant's refresh token can't be found.
+        let asked =
+            tokio::task::spawn_blocking(move || forget_with(&zero_config(), session, store, None))
+                .await
+                .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(store.get(&zero_config_key("organizations")).unwrap(), None);
+        assert!(store.get(&zero_config_key(TENANT)).unwrap().is_some());
+        // Reachable: it goes too.
+        store
+            .set(&note_of(&zero_config()), "organizations")
+            .unwrap();
+        let asked = tokio::task::spawn_blocking(move || {
+            forget_with(&zero_config(), session, store, azure_sql().unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(store.get(&zero_config_key(TENANT)).unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_borrowed_sign_in_signs_in_to_the_servers_tenant() {
+        // The organizations sign-in landed in TENANT; its refresh token
+        // will be refused.
+        let h = Harness::new(entra_in(&["RT-1"], Some(TENANT)), Behaviour::SignIn).await;
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        // Restarted, the server names TENANT: the organizations sign-in is
+        // borrowed, refused, and the browser signs in to the server's
+        // tenant, not to organizations.
+        restart(&h);
+        *h.probed.lock().unwrap() = azure_sql();
+        h.token_for(&zero_config()).await.unwrap();
+        h.browser.finish();
+        assert_eq!(
+            h.grants(),
+            ["authorization_code", "refresh_token", "authorization_code"]
+        );
+        {
+            let requests = h.requests.lock().unwrap();
+            assert_eq!(requests[1].path, "/organizations/oauth2/v2.0/token");
+            assert_eq!(requests[2].path, format!("/{TENANT}/oauth2/v2.0/token"));
+        }
+        assert_eq!(
+            h.store.get(&zero_config_key(TENANT)).unwrap().as_deref(),
+            Some("RT-1")
+        );
+        assert_eq!(
+            h.store.get(&zero_config_key("organizations")).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_connection_does_not_keep_the_home_sign_in() {
+        const HOME: &str = "11111111-2222-3333-4444-555555555555";
+        let h = Harness::new(entra_in(&[], Some(HOME)), Behaviour::SignIn).await;
+        // `a` signed in under organizations (home tenant)…
+        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+        let a = on_server("a.database.windows.net");
+        h.token_for(&a).await.unwrap();
+        h.browser.finish();
+        // …`x` in TENANT, where the account is a guest.
+        *h.probed.lock().unwrap() = azure_sql();
+        let x = on_server("x.database.windows.net");
+        h.token_for(&x).await.unwrap();
+        h.browser.finish();
+        assert_eq!(h.browser.opened.load(Ordering::SeqCst), 2);
+        // Deleting `a` forgets the home sign-in: `x` doesn't use it.
+        let (session, store) = (h.session, h.store);
+        tokio::task::spawn_blocking(move || {
+            forget_beside(&a, &[x], session, store, None);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            h.store.get(&zero_config_key("organizations")).unwrap(),
+            None
+        );
+        assert_eq!(
+            h.store
+                .get(&tid_note(&zero_config_key("organizations")))
+                .unwrap(),
+            None
+        );
+        assert!(h.store.get(&zero_config_key(TENANT)).unwrap().is_some());
     }
 }

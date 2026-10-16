@@ -1,5 +1,6 @@
 pub mod azure;
 pub mod entra_interactive;
+pub mod fedauth_probe;
 mod mysql;
 mod postgres;
 mod sqlite;

@@ -7,6 +7,31 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.15.0] - 2026-10-16
+
+### Nouveautés
+
+- **Azure AD interactif sans configuration, comme DataGrip** : plus besoin de
+  tenant ni d'application. Comme les drivers SQL Server de Microsoft, l'app
+  demande au serveur Azure SQL le tenant de ses utilisateurs Entra ID et se
+  connecte avec l'application de ces drivers, déjà autorisée pour Azure SQL :
+  votre organisation n'a plus rien à enregistrer. Seul le compte reste à
+  indiquer, et il est facultatif. Voir
+  [Azure AD interactif](https://github.com/Ajustor/storingUnicorns#azure-ad-interactif).
+
+### Modifications
+
+- Le tenant et l'ID client de l'application d'une connexion Azure AD
+  interactive deviennent facultatifs et passent dans les **Options avancées**
+  du formulaire (repliées, sauf s'ils sont renseignés ; `auto` dans l'interface
+  terminal), pour une organisation qui bloque l'application des drivers
+  Microsoft ou préfère la sienne. Le tenant `organizations` est accepté. Les
+  connexions existantes gardent leur tenant et leur application.
+- Les messages d'erreur de la connexion Azure AD tiennent compte de
+  l'application utilisée : avec celle des drivers Microsoft, un consentement
+  refusé invite à demander l'accord d'un administrateur ou à indiquer
+  l'application de votre organisation.
+
 ## [0.14.0] - 2026-10-15
 
 ### Nouveautés

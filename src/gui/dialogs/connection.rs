@@ -27,16 +27,18 @@ const AZURE_METHODS: [AzureAuthMethod; 4] = [
 /// The username field of an Azure managed identity connection.
 const MANAGED_IDENTITY_LABEL: &str = "ID client de l'identité (vide = identité système)";
 
-/// The README section on registering the application of an interactive
-/// browser sign-in.
+/// The README section on the interactive browser sign-in (its advanced
+/// options: the organization's own tenant or application).
 const ENTRA_APP_DOC: &str = "https://github.com/Ajustor/storingUnicorns#azure-ad-interactif";
 
 /// A field of the authentication part of the form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthField {
-    /// `tenant_id`.
+    /// `tenant_id`; optional for the browser sign-in (asked from the
+    /// server).
     Tenant,
-    /// `azure_client_id`: the organization's Entra ID application.
+    /// `azure_client_id`: the organization's Entra ID application, optional
+    /// (Microsoft's drivers' by default).
     AppClientId,
     /// `username` as the Entra ID account (login hint), optional.
     Account,
@@ -55,8 +57,37 @@ fn auth_fields(db_type: &DatabaseType, method: &AzureAuthMethod) -> &'static [Au
     match method {
         AzureAuthMethod::Credentials => &[User, Password],
         AzureAuthMethod::Interactive => &[Tenant],
-        AzureAuthMethod::InteractiveBrowser => &[Tenant, AppClientId, Account],
+        AzureAuthMethod::InteractiveBrowser => &[Account],
         AzureAuthMethod::ManagedIdentity => &[IdentityClientId],
+    }
+}
+
+/// The authentication fields folded under « Options avancées », in order:
+/// the browser sign-in's tenant and application, which it finds by itself
+/// (the server's tenant, Microsoft's drivers' application).
+fn advanced_fields(db_type: &DatabaseType, method: &AzureAuthMethod) -> &'static [AuthField] {
+    if *db_type == DatabaseType::Azure && *method == AzureAuthMethod::InteractiveBrowser {
+        &[AuthField::Tenant, AuthField::AppClientId]
+    } else {
+        &[]
+    }
+}
+
+/// How « Options avancées » is made to show this frame: `Some(open)` sets
+/// it, `None` leaves it as the user folded it. `shown` is `None` until it
+/// first shows in the form, then whether it showed on the previous frame;
+/// `filled` whether a tenant or an application is typed in; `valid` whether
+/// they pass `validate_interactive`.
+fn advanced_forced(shown: Option<bool>, filled: bool, valid: bool) -> Option<bool> {
+    match shown {
+        // The error under the form names one of its fields.
+        _ if !valid => Some(true),
+        // Its first showing: egui still holds the previous form's state.
+        None => Some(filled),
+        // The browser sign-in chosen again, with a tenant or an application
+        // typed in meanwhile (for Azure CLI, say): they are in use.
+        Some(false) if filled => Some(true),
+        _ => None,
     }
 }
 
@@ -100,6 +131,9 @@ pub struct ConnectionForm {
     pub tenant_id: String,
     /// Entra ID application (client) ID of an interactive browser sign-in.
     pub azure_client_id: String,
+    /// Whether « Options avancées » showed on the previous frame; `None`
+    /// until it first shows (see `advanced_force`).
+    advanced_shown: Option<bool>,
     pub color: Option<[u8; 3]>,
     /// Compatible product; `None` = the bare engine.
     pub flavor: Option<Flavor>,
@@ -142,6 +176,7 @@ impl ConnectionForm {
             azure_auth: c.azure_auth_method.unwrap_or_default(),
             tenant_id: c.tenant_id.unwrap_or_default(),
             azure_client_id: c.azure_client_id.unwrap_or_default(),
+            advanced_shown: None,
             name: c.name,
             db_type: c.db_type,
             database: c.database,
@@ -197,6 +232,24 @@ impl ConnectionForm {
             self.flavor = None;
         }
         self.db_type = t;
+    }
+
+    /// How « Options avancées » is made to show this frame, if it shows
+    /// (see `advanced_forced`): nothing in use or wrong in it stays hidden.
+    /// Called once a frame, as it records whether it shows.
+    fn advanced_force(&mut self) -> Option<bool> {
+        if advanced_fields(&self.db_type, &self.azure_auth).is_empty() {
+            if self.advanced_shown.is_some() {
+                self.advanced_shown = Some(false);
+            }
+            return None;
+        }
+        let filled = !self.tenant_id.trim().is_empty() || !self.azure_client_id.trim().is_empty();
+        let valid =
+            entra_interactive::validate_interactive(&self.tenant_id, &self.azure_client_id).is_ok();
+        let forced = advanced_forced(self.advanced_shown, filled, valid);
+        self.advanced_shown = Some(true);
+        forced
     }
 
     fn uses_server(&self) -> bool {
@@ -412,6 +465,11 @@ impl ConnectionForm {
                     ui.end_row();
                 }
             });
+        let forced = self.advanced_force();
+        if !advanced_fields(&self.db_type, &self.azure_auth).is_empty() {
+            ui.add_space(4.0);
+            self.advanced_options(ui, forced);
+        }
 
         if let Some(e) = &self.url_error {
             ui.colored_label(ERROR, e);
@@ -489,61 +547,8 @@ impl ConnectionForm {
                 });
             ui.end_row();
         }
-        const GUID_HINT: &str = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
-        let browser = self.azure_auth == AzureAuthMethod::InteractiveBrowser;
         for field in auth_fields(&self.db_type, &self.azure_auth) {
-            match field {
-                AuthField::Tenant if browser => {
-                    ui.label("Tenant (ID ou domaine)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.tenant_id).hint_text("contoso.com"),
-                    );
-                }
-                AuthField::Tenant => {
-                    ui.label("Tenant ID");
-                    ui.text_edit_singleline(&mut self.tenant_id);
-                }
-                AuthField::AppClientId => {
-                    ui.label("ID client de l'application");
-                    ui.vertical(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.azure_client_id)
-                                .hint_text(GUID_HINT),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            ui.label(
-                                egui::RichText::new("Application à enregistrer dans Entra ID : ")
-                                    .weak()
-                                    .small(),
-                            );
-                            ui.hyperlink_to(
-                                egui::RichText::new("voir le README").small(),
-                                ENTRA_APP_DOC,
-                            );
-                        });
-                    });
-                }
-                AuthField::Account => {
-                    ui.label("Compte (facultatif)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.username)
-                            .hint_text("prenom.nom@contoso.com"),
-                    );
-                }
-                AuthField::IdentityClientId => {
-                    ui.label(MANAGED_IDENTITY_LABEL);
-                    ui.add(egui::TextEdit::singleline(&mut self.username).hint_text(GUID_HINT));
-                }
-                AuthField::User => {
-                    ui.label("Utilisateur");
-                    ui.text_edit_singleline(&mut self.username);
-                }
-                AuthField::Password => {
-                    ui.label("Mot de passe");
-                    ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
-                }
-            }
+            self.auth_field_row(ui, *field);
             ui.end_row();
         }
         ui.label("Base");
@@ -552,6 +557,84 @@ impl ConnectionForm {
         if self.uses_tls() {
             self.ssl_fields(ui);
         }
+    }
+
+    /// The label and the input of `field`: two cells of a grid row.
+    fn auth_field_row(&mut self, ui: &mut egui::Ui, field: AuthField) {
+        const GUID_HINT: &str = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx";
+        let browser = self.azure_auth == AzureAuthMethod::InteractiveBrowser;
+        match field {
+            AuthField::Tenant if browser => {
+                ui.label("Tenant (facultatif)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.tenant_id)
+                        .hint_text("auto : demandé au serveur"),
+                );
+            }
+            AuthField::Tenant => {
+                ui.label("Tenant ID");
+                ui.text_edit_singleline(&mut self.tenant_id);
+            }
+            AuthField::AppClientId => {
+                ui.label("ID client de l'application (facultatif)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.azure_client_id)
+                        .hint_text("auto : application des drivers Microsoft"),
+                );
+            }
+            AuthField::Account => {
+                ui.label("Compte (facultatif)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.username)
+                        .hint_text("prenom.nom@contoso.com"),
+                );
+            }
+            AuthField::IdentityClientId => {
+                ui.label(MANAGED_IDENTITY_LABEL);
+                ui.add(egui::TextEdit::singleline(&mut self.username).hint_text(GUID_HINT));
+            }
+            AuthField::User => {
+                ui.label("Utilisateur");
+                ui.text_edit_singleline(&mut self.username);
+            }
+            AuthField::Password => {
+                ui.label("Mot de passe");
+                ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+            }
+        }
+    }
+
+    /// « Options avancées » of the browser sign-in: the organization's own
+    /// tenant or application, for when the defaults don't suit it. Folded
+    /// as the user leaves it unless `forced` (`advanced_force`).
+    fn advanced_options(&mut self, ui: &mut egui::Ui, forced: Option<bool>) {
+        egui::CollapsingHeader::new("Options avancées")
+            .id_salt("aad_advanced")
+            .default_open(forced == Some(true))
+            .open(forced)
+            .show(ui, |ui| {
+                egui::Grid::new("conn_form_advanced")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        for field in advanced_fields(&self.db_type, &self.azure_auth) {
+                            self.auth_field_row(ui, *field);
+                            ui.end_row();
+                        }
+                    });
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(
+                        egui::RichText::new(
+                            "Le tenant est demandé au serveur ; l'application par défaut est \
+                             celle des drivers Microsoft. ",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    ui.hyperlink_to(egui::RichText::new("voir le README").small(), ENTRA_APP_DOC);
+                });
+            });
     }
 
     fn ssl_fields(&mut self, ui: &mut egui::Ui) {
@@ -739,10 +822,26 @@ mod tests {
         use AuthField::*;
         assert!(AZURE_METHODS.contains(&AzureAuthMethod::InteractiveBrowser));
         let azure = DatabaseType::Azure;
+        // The browser sign-in asks only for the account; its tenant and
+        // application are advanced options.
         assert_eq!(
             auth_fields(&azure, &AzureAuthMethod::InteractiveBrowser),
-            [Tenant, AppClientId, Account]
+            [Account]
         );
+        assert_eq!(
+            advanced_fields(&azure, &AzureAuthMethod::InteractiveBrowser),
+            [Tenant, AppClientId]
+        );
+        for method in AZURE_METHODS {
+            if method != AzureAuthMethod::InteractiveBrowser {
+                assert!(advanced_fields(&azure, &method).is_empty(), "{method}");
+            }
+        }
+        assert!(advanced_fields(
+            &DatabaseType::SQLServer,
+            &AzureAuthMethod::InteractiveBrowser
+        )
+        .is_empty());
         assert_eq!(auth_fields(&azure, &AzureAuthMethod::Interactive), [Tenant]);
         assert_eq!(
             auth_fields(&azure, &AzureAuthMethod::ManagedIdentity),
@@ -763,15 +862,22 @@ mod tests {
     }
 
     #[test]
-    fn interactive_browser_needs_a_tenant_and_an_app_client_id() {
+    fn interactive_browser_checks_a_typed_tenant_and_app_client_id() {
         let mut f = ConnectionForm::new(None);
         f.name = "Az".into();
         f.database = "app".into();
         f.set_db_type(DatabaseType::Azure);
         f.azure_auth = AzureAuthMethod::InteractiveBrowser;
-        assert_eq!(f.validate(&[]).unwrap_err(), "Le tenant est obligatoire");
+        // Both optional: the server's tenant, Microsoft's application.
+        let c = f.validate(&[]).unwrap();
+        assert_eq!((c.tenant_id, c.azure_client_id), (None, None));
         f.tenant_id = "Common".into();
         assert!(f.validate(&[]).unwrap_err().contains("pas « common »"));
+        f.tenant_id = "organizations".into();
+        assert_eq!(
+            f.validate(&[]).unwrap().tenant_id.as_deref(),
+            Some("organizations")
+        );
         f.tenant_id = "contoso.com".into();
         f.azure_client_id = "my-app".into();
         assert_eq!(
@@ -800,6 +906,80 @@ mod tests {
         f.tenant_id.clear();
         let c = f.validate(&[]).unwrap();
         assert_eq!(c.azure_client_id, None);
+    }
+
+    #[test]
+    fn advanced_options_unfold_for_an_error_or_a_value_and_else_stay_as_folded() {
+        // First showing in a form: as its values say, whatever egui
+        // remembers of the previous form.
+        assert_eq!(advanced_forced(None, false, true), Some(false));
+        assert_eq!(advanced_forced(None, true, true), Some(true));
+        // A value the sign-in rejects: unfolded, even when folded by hand.
+        for shown in [None, Some(false), Some(true)] {
+            assert_eq!(advanced_forced(shown, true, false), Some(true), "{shown:?}");
+        }
+        // The browser sign-in chosen again with a tenant or an application.
+        assert_eq!(advanced_forced(Some(false), true, true), Some(true));
+        // Otherwise as the user left it.
+        assert_eq!(advanced_forced(Some(false), false, true), None);
+        assert_eq!(advanced_forced(Some(true), true, true), None);
+        assert_eq!(advanced_forced(Some(true), false, true), None);
+    }
+
+    #[test]
+    fn advanced_options_unfold_when_a_tenant_or_an_app_is_filled_in() {
+        let browser = |tenant: Option<&str>, app: Option<&str>| ConnectionConfig {
+            name: "Az".into(),
+            db_type: DatabaseType::Azure,
+            azure_auth_method: Some(AzureAuthMethod::InteractiveBrowser),
+            tenant_id: tenant.map(Into::into),
+            azure_client_id: app.map(Into::into),
+            database: "app".into(),
+            ..Default::default()
+        };
+        let first = |c| ConnectionForm::new(Some(c)).advanced_force();
+        // Nothing to set: folded.
+        assert_eq!(first(browser(None, None)), Some(false));
+        assert_eq!(first(browser(Some(" "), None)), Some(false));
+        // A connection naming its own tenant or application shows them.
+        assert_eq!(first(browser(Some("contoso.com"), None)), Some(true));
+        let app = "8f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
+        assert_eq!(first(browser(None, Some(app))), Some(true));
+
+        // Then as the user folds it, whatever it holds.
+        let mut f = ConnectionForm::new(Some(browser(Some("contoso.com"), None)));
+        f.advanced_force();
+        assert_eq!(f.advanced_force(), None);
+        f.tenant_id.clear();
+        assert_eq!(f.advanced_force(), None);
+        // A tenant typed for Azure CLI shows when the browser sign-in is
+        // chosen again…
+        f.azure_auth = AzureAuthMethod::Interactive;
+        f.advanced_force();
+        f.tenant_id = "contoso.com".into();
+        f.azure_auth = AzureAuthMethod::InteractiveBrowser;
+        assert_eq!(f.advanced_force(), Some(true));
+        assert_eq!(f.advanced_force(), None);
+        // …and as well coming back from another engine.
+        f.set_db_type(DatabaseType::SQLServer);
+        f.advanced_force();
+        f.set_db_type(DatabaseType::Azure);
+        assert_eq!(f.advanced_force(), Some(true));
+        // Without one, it shows as the user left it.
+        f.tenant_id.clear();
+        f.azure_auth = AzureAuthMethod::Interactive;
+        f.advanced_force();
+        f.azure_auth = AzureAuthMethod::InteractiveBrowser;
+        assert_eq!(f.advanced_force(), None);
+        // A value the sign-in rejects keeps it unfolded: the error under
+        // the form names that field.
+        f.azure_client_id = "my-app".into();
+        assert_eq!(f.advanced_force(), Some(true));
+        assert_eq!(f.advanced_force(), Some(true));
+        f.azure_client_id = app.into();
+        assert_eq!(f.advanced_force(), None);
+        f.tenant_id = "common".into();
+        assert_eq!(f.advanced_force(), Some(true));
     }
 
     #[test]

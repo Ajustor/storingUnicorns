@@ -209,8 +209,11 @@ pub struct NewConnectionState {
     pub active_field: ConnectionField,
     pub cursor_position: usize,
     pub azure_auth_method: AzureAuthMethod,
+    /// Azure CLI's tenant (`common` by default), or the browser sign-in's:
+    /// empty (auto) by default, its server's.
     pub tenant_id: String,
-    /// Entra ID application (client) ID of an interactive browser sign-in.
+    /// Entra ID application (client) ID of an interactive browser sign-in;
+    /// empty (auto): Microsoft's drivers'.
     pub azure_client_id: String,
     pub url: String,
     /// Compatible product; `None` = the bare engine.
@@ -292,14 +295,16 @@ impl NewConnectionState {
             } else {
                 None
             },
+            // Empty: Azure CLI's default tenant, the browser sign-in's
+            // server's (auto).
             tenant_id: if self.db_type == DatabaseType::Azure
                 && matches!(
                     self.azure_auth_method,
                     AzureAuthMethod::Interactive | AzureAuthMethod::InteractiveBrowser
                 )
-                && !self.tenant_id.is_empty()
+                && !self.tenant_id.trim().is_empty()
             {
-                Some(self.tenant_id.clone())
+                Some(self.tenant_id.trim().to_string())
             } else {
                 None
             },
@@ -324,6 +329,19 @@ impl NewConnectionState {
 
     /// Edit form for an existing connection.
     pub fn from_config(conn: &ConnectionConfig) -> Self {
+        let azure_auth_method = conn
+            .azure_auth_method
+            .clone()
+            .unwrap_or(AzureAuthMethod::Credentials);
+        // Without one, the browser sign-in asks the server for its tenant:
+        // the form's default (Azure CLI's) would be refused there.
+        let tenant_id = conn.tenant_id.clone().unwrap_or_else(|| {
+            if azure_auth_method == AzureAuthMethod::InteractiveBrowser {
+                String::new()
+            } else {
+                "common".to_string()
+            }
+        });
         Self {
             name: conn.name.clone(),
             db_type: conn.db_type.clone(),
@@ -332,14 +350,8 @@ impl NewConnectionState {
             username: conn.username.clone().unwrap_or_default(),
             password: conn.password.clone().unwrap_or_default(),
             database: conn.database.clone(),
-            azure_auth_method: conn
-                .azure_auth_method
-                .clone()
-                .unwrap_or(AzureAuthMethod::Credentials),
-            tenant_id: conn
-                .tenant_id
-                .clone()
-                .unwrap_or_else(|| "common".to_string()),
+            azure_auth_method,
+            tenant_id,
             azure_client_id: conn.azure_client_id.clone().unwrap_or_default(),
             active_field: ConnectionField::Name,
             cursor_position: conn.name.len(),
@@ -400,13 +412,10 @@ impl NewConnectionState {
             AzureAuthMethod::InteractiveBrowser => AzureAuthMethod::ManagedIdentity,
             AzureAuthMethod::ManagedIdentity => AzureAuthMethod::Credentials,
         };
-        // The form's default tenant suits Azure CLI, not an organization's
-        // application: start the browser sign-in with an empty one.
+        // The form's default tenant suits Azure CLI, not the browser sign-in
+        // (which refuses it): start that one empty, its server's tenant.
         if self.azure_auth_method == AzureAuthMethod::InteractiveBrowser
-            && matches!(
-                self.tenant_id.trim().to_ascii_lowercase().as_str(),
-                "common" | "organizations"
-            )
+            && self.tenant_id.trim().eq_ignore_ascii_case("common")
         {
             self.tenant_id.clear();
         }
@@ -1655,6 +1664,30 @@ mod tests {
     }
 
     #[test]
+    fn editing_an_interactive_browser_connection_without_settings_keeps_none() {
+        let conn = ConnectionConfig {
+            db_type: DatabaseType::Azure,
+            azure_auth_method: Some(AzureAuthMethod::InteractiveBrowser),
+            ..Default::default()
+        };
+        let nc = NewConnectionState::from_config(&conn);
+        // Auto, not Azure CLI's `common` (refused for this method).
+        assert_eq!(
+            (nc.tenant_id.as_str(), nc.azure_client_id.as_str()),
+            ("", "")
+        );
+        assert!(nc.check().is_ok());
+        let c = nc.to_config();
+        assert_eq!((c.tenant_id, c.azure_client_id), (None, None));
+        // Azure CLI keeps its default.
+        let cli = ConnectionConfig {
+            azure_auth_method: Some(AzureAuthMethod::Interactive),
+            ..conn
+        };
+        assert_eq!(NewConnectionState::from_config(&cli).tenant_id, "common");
+    }
+
+    #[test]
     fn interactive_browser_asks_for_tenant_app_and_account() {
         let t = DatabaseType::Azure;
         let browser = AzureAuthMethod::InteractiveBrowser;
@@ -1715,10 +1748,15 @@ mod tests {
         nc.cycle_azure_auth_method();
         assert_eq!(nc.azure_auth_method, AzureAuthMethod::InteractiveBrowser);
         assert_eq!(nc.tenant_id, "", "refused for this method");
-        nc.tenant_id = "contoso.com".into();
-        nc.azure_auth_method = AzureAuthMethod::Interactive;
-        nc.cycle_azure_auth_method();
-        assert_eq!(nc.tenant_id, "contoso.com");
+        assert!(nc.check().is_ok(), "empty: the server's tenant");
+        // A tenant of one's own is kept, `organizations` included.
+        for tenant in ["contoso.com", "organizations"] {
+            nc.tenant_id = tenant.into();
+            nc.azure_auth_method = AzureAuthMethod::Interactive;
+            nc.cycle_azure_auth_method();
+            assert_eq!(nc.tenant_id, tenant);
+            assert!(nc.check().is_ok(), "{tenant}");
+        }
     }
 
     #[test]
@@ -1728,11 +1766,22 @@ mod tests {
         nc.set_db_type(DatabaseType::Azure);
         nc.azure_auth_method = AzureAuthMethod::InteractiveBrowser;
         assert!(nc.check().unwrap_err().contains("pas « common »"));
-        nc.tenant_id = "contoso.com".into();
+        // Both optional: the server's tenant, Microsoft's application.
+        nc.tenant_id = " ".into();
+        assert!(nc.check().is_ok());
+        assert_eq!(nc.to_config().tenant_id, None);
+        nc.tenant_id = "organizations".into();
+        assert!(nc.check().is_ok());
+        nc.tenant_id = " contoso.com ".into();
+        assert_eq!(nc.to_config().tenant_id.as_deref(), Some("contoso.com"));
+        // The application is optional (Microsoft's), a typed one a GUID.
+        assert!(nc.check().is_ok());
+        nc.azure_client_id = "my-app".into();
         assert_eq!(
             nc.check().unwrap_err(),
             "L'ID client de l'application doit être un GUID"
         );
+        nc.azure_client_id.clear();
         nc.active_field = ConnectionField::ClientId;
         nc.get_active_field_mut().unwrap().push_str(client);
         assert_eq!(nc.get_active_field_value(), client);

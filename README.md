@@ -271,7 +271,7 @@ d'office quand l'un des deux est renseigné), ou dans les champs `Tenant` et
 
 | Champ | Valeur |
 |---|---|
-| Tenant (facultatif) | ID de l'annuaire ou domaine (`contoso.com`), ou `organizations` ; pas `common` (il accepte les comptes Microsoft personnels, qu'Azure SQL refuse) |
+| Tenant (facultatif) | vide : demandé au serveur (à défaut `organizations`). Sinon l'ID de l'annuaire (GUID) ou un domaine (`contoso.com` : lettres, chiffres, `.` et `-`, avec au moins une lettre ou un chiffre), ou `organizations` (le tenant d'origine du compte). `common` et `consumers` sont refusés (ils acceptent les comptes Microsoft personnels, qu'Azure SQL refuse) |
 | ID client de l'application (facultatif) | l'ID d'application enregistrée par votre organisation (voir ci-dessous) |
 
 Indiquer le **tenant** n'est utile que si le serveur ne donne pas le sien et que

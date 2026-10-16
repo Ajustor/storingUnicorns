@@ -824,6 +824,12 @@ async fn acquire(
                 );
                 deps.session.tokens().remove(&key);
                 delete_secret(deps.store, &key).await;
+                // With the tenant an organizations sign-in landed in: a
+                // borrowed one isn't signed in again, which would replace it.
+                if is_organizations_key(&key) {
+                    deps.session.tids().remove(&key);
+                    delete_secret(deps.store, &tid_note(&key)).await;
+                }
             }
             Err(e) => return Err(failure(&e, target.app())),
         },
@@ -4214,36 +4220,43 @@ mod flow_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_refused_borrowed_sign_in_signs_in_to_the_servers_tenant() {
-        // The organizations sign-in landed in TENANT; its refresh token
-        // will be refused.
-        let h = Harness::new(entra_in(&["RT-1"], Some(TENANT)), Behaviour::SignIn).await;
-        *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
-        h.token_for(&zero_config()).await.unwrap();
-        h.browser.finish();
-        // Restarted, the server names TENANT: the organizations sign-in is
-        // borrowed, refused, and the browser signs in to the server's
-        // tenant, not to organizations.
-        restart(&h);
-        *h.probed.lock().unwrap() = azure_sql();
-        h.token_for(&zero_config()).await.unwrap();
-        h.browser.finish();
-        assert_eq!(
-            h.grants(),
-            ["authorization_code", "refresh_token", "authorization_code"]
-        );
-        {
-            let requests = h.requests.lock().unwrap();
-            assert_eq!(requests[1].path, "/organizations/oauth2/v2.0/token");
-            assert_eq!(requests[2].path, format!("/{TENANT}/oauth2/v2.0/token"));
+        for restarted in [true, false] {
+            // The organizations sign-in landed in TENANT; its refresh token
+            // will be refused.
+            let h = Harness::new(entra_in(&["RT-1"], Some(TENANT)), Behaviour::SignIn).await;
+            *h.probed.lock().unwrap() = Err("Le serveur ne répond pas".into());
+            h.token_for(&zero_config()).await.unwrap();
+            h.browser.finish();
+            // Restarted, or later in the session, the server names TENANT:
+            // the organizations sign-in is borrowed, refused, and the
+            // browser signs in to the server's tenant, not to organizations.
+            if restarted {
+                restart(&h);
+            } else {
+                h.clock.store(2 * 3600, Ordering::SeqCst);
+            }
+            *h.probed.lock().unwrap() = azure_sql();
+            h.token_for(&zero_config()).await.unwrap();
+            h.browser.finish();
+            assert_eq!(
+                h.grants(),
+                ["authorization_code", "refresh_token", "authorization_code"]
+            );
+            {
+                let requests = h.requests.lock().unwrap();
+                assert_eq!(requests[1].path, "/organizations/oauth2/v2.0/token");
+                assert_eq!(requests[2].path, format!("/{TENANT}/oauth2/v2.0/token"));
+            }
+            assert_eq!(
+                h.store.get(&zero_config_key(TENANT)).unwrap().as_deref(),
+                Some("RT-1")
+            );
+            // The refused sign-in is dropped with the tenant it landed in.
+            let organizations = zero_config_key("organizations");
+            assert_eq!(h.store.get(&organizations).unwrap(), None);
+            assert_eq!(h.store.get(&tid_note(&organizations)).unwrap(), None);
+            assert!(!h.session.tids().contains_key(&organizations));
         }
-        assert_eq!(
-            h.store.get(&zero_config_key(TENANT)).unwrap().as_deref(),
-            Some("RT-1")
-        );
-        assert_eq!(
-            h.store.get(&zero_config_key("organizations")).unwrap(),
-            None
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

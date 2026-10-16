@@ -7,6 +7,19 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.15.1] - 2026-10-16
+
+### Corrections
+
+- **Azure AD interactif** : une note de tenant abîmée dans le trousseau du
+  système est ignorée au lieu d'être mal lue (un tenant `../x` était lu comme
+  `x`), et son adresse de connexion doit être exactement celle d'un service
+  Microsoft connu.
+- Une connexion Azure AD sans tenant connu qui est refusée efface aussi la note
+  de son tenant.
+- Les connexions sans tenant connu des clouds Azure Government et Azure Chine
+  sont gardées à part de celles du cloud public.
+
 ## [0.15.0] - 2026-10-16
 
 ### Nouveautés

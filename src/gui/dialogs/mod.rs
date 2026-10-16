@@ -276,9 +276,10 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             app.worker.cancel_test();
         }
         // A sign-in only a test used (connection not saved, or saved with
-        // another account) is forgotten.
+        // another account) is forgotten, unless saved connections use its
+        // keys too.
         for config in form.orphaned_tests(&app.config.connections) {
-            entra_interactive::forget(&config);
+            entra_interactive::forget_unless_used(&config, &app.config.connections);
         }
     }
     // A dialog may open another one in its place (batch → confirmation).

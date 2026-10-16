@@ -107,7 +107,29 @@ pub async fn probe(host: &str, port: u16) -> anyhow::Result<Option<FedAuthInfo>>
     **effectif** : `entra:<tenant ou organizations>:<client>:<compte ou ->`.
     `same_sign_in` / `forget_unless_used` / `orphaned` raisonnent sur les
     valeurs effectives connues sans réseau : tenant saisi sinon `auto:<host>`.
-    Documenter ce choix dans le code et le tester.
+    Documenter ce choix dans le code et le tester. Clés et notes (aucune note
+    n'est un secret) :
+    - `organizations` ne nomme aucun tenant et ses connexions diffèrent d'un
+      cloud à l'autre : hors du cloud public, sa clé porte l'hôte d'autorité,
+      `entra:organizations@<hôte d'autorité>:<client>:<compte ou ->` (ex.
+      `entra:organizations@login.microsoftonline.us:…`) ; celle du cloud
+      public garde sa forme `entra:organizations:…`.
+    - Note du tenant (`tid`) : à côté d'une connexion `organizations`,
+      `entra:tid:<sa clé sans « entra: »>` (ex.
+      `entra:tid:organizations@login.microsoftonline.us:…`) garde le tenant où
+      elle a abouti (`tid` du jeton d'accès, un GUID). Une connexion sans
+      tenant saisi dont le serveur nomme ce tenant, et qui n'a rien sous sa
+      propre clé, l'emprunte (jamais pour un tenant invité). La note part avec
+      la connexion (`forget`) et quand son jeton d'actualisation est refusé.
+    - Note du serveur : sans tenant saisi,
+      `entra:auto:<host>:<client>:<compte ou ->` → `<tenant>`, ou
+      `<tenant>@<hôte d'autorité>` quand l'autorité n'est pas celle du cloud
+      déduit de l'hôte (nom DNS personnalisé d'un serveur d'un cloud
+      souverain) ; `organizations` tant que le serveur n'a pas répondu. Elle
+      sert à oublier la connexion sans demander au serveur, et à se connecter
+      quand il ne répond plus. Relue, elle ne compte que si son hôte
+      d'autorité est exactement un hôte connu (casse ignorée) et son tenant un
+      nom de tenant ; sinon, comme sans note.
   - Reconnexion non interactive : même résolution (cache de la sonde).
   - Les connexions 0.14.0 (tenant + ID client saisis) gardent exactement leur
     comportement et leur clé.

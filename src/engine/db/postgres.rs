@@ -740,7 +740,10 @@ mod tests {
         let o = connect_options(&c);
         assert_eq!(o.get_username(), "sa@proj.iam");
         assert!(matches!(o.get_ssl_mode(), PgSslMode::Require));
+        // The saved password is never sent. (PG* variables may still fill
+        // the field, as on CI runners with PGPASSWORD set; the token
+        // replaces it when connecting.)
         let debug = format!("{o:?}");
-        assert!(debug.contains("password: None"), "{debug}");
+        assert!(!debug.contains("\"old\""), "{debug}");
     }
 }

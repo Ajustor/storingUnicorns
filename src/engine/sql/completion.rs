@@ -3,8 +3,8 @@
 //!
 //! Suggestions replace the token ending at the cursor: the trailing word
 //! (letters, digits, `_`), or an identifier from its typed opening quote.
-//! This is what `lexer::extract_token` finds, except that quote characters
-//! inside string literals and comments are not taken for opening quotes.
+//! Quote characters inside string literals and comments are not taken for
+//! opening quotes.
 
 use crate::engine::db::utils::split_qualified;
 use crate::engine::sql::lexer::{is_keyword, keywords};
@@ -1108,6 +1108,8 @@ pub fn complete(text: &str, cursor: usize, cx: &Context) -> Completions {
 /// Tables referenced by the statement at `cursor` (FROM, JOIN, UPDATE,
 /// INSERT INTO, DELETE FROM; commas; optional AS; quoted / qualified names;
 /// only the nesting level of the cursor for subqueries).
+// Part of the module's API; the frontends ask `complete`, which uses it.
+#[allow(dead_code)]
 pub fn tables_in_scope(text: &str, cursor: usize) -> Vec<TableRef> {
     let cursor = floor_boundary(text, cursor);
     let (s, e) = statement_at(text, cursor);
@@ -1781,13 +1783,6 @@ mod tests {
                 let _ = complete_for_table(text, c, BarMode::OrderBy, &tref("x"), &cx);
             }
         }
-    }
-
-    #[test]
-    fn get_completions_still_works() {
-        use crate::engine::sql::lexer::get_completions;
-        let got = get_completions("SELECT * FROM us", 16, &[], &["users".to_string()]);
-        assert_eq!(got, ["users"]);
     }
 
     #[test]

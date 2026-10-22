@@ -1,6 +1,4 @@
 //! SQL text utilities shared by the frontends.
-// TODO(context-completion): used by the GUI/TUI tasks
-#[allow(dead_code)]
 pub mod completion;
 pub mod format;
 pub mod lexer;

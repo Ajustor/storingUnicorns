@@ -1045,7 +1045,8 @@ impl AppState {
             .clone();
         let query = self.query_input().to_string();
         let cursor = self.cursor_position().min(query.len());
-        let (token_start, _, _) = crate::engine::sql::lexer::extract_token(&query[..cursor]);
+        // Same token the engine completed (quotes in strings / comments ignored).
+        let token_start = crate::engine::sql::completion::token_start(&query, cursor);
 
         let new_query = format!("{}{}{}", &query[..token_start], insert, &query[cursor..]);
         let new_cursor = token_start + insert.len();

@@ -3,10 +3,6 @@
 //! all of them have the same header, width per role, scrolling body,
 //! message line, footer buttons and keys.
 
-// Until the forms and lists use it too, part of the API is unused.
-// TODO(standard modals): drop once every dialog is migrated.
-#![allow(dead_code)]
-
 use egui::{Align, Key, Layout, Modifiers, RichText};
 use egui_phosphor::regular as icon;
 
@@ -46,10 +42,13 @@ impl ModalSize {
     }
 }
 
-/// Highest the scrolling body of a modal grows: 75 % of the window, so
-/// that the header and the buttons stay in view.
-pub fn body_max_height(screen_height: f32) -> f32 {
-    (screen_height * 0.75).max(0.0)
+/// Highest the scrolling body of a modal grows: 75 % of the window, and
+/// never more than what the header, message line and footer (`chrome`)
+/// leave, so that they stay in view in a small window.
+pub fn body_max_height(screen_height: f32, chrome: f32) -> f32 {
+    (screen_height * 0.75)
+        .min(screen_height - WINDOW_MARGIN - chrome)
+        .max(0.0)
 }
 
 /// Look of a footer button.
@@ -135,12 +134,6 @@ impl<'a> ModalSpec<'a> {
         self.icon = Some(icon);
         self
     }
-
-    /// No cancel button (information modal).
-    pub fn without_cancel(mut self) -> Self {
-        self.cancel = None;
-        self
-    }
 }
 
 /// What the user did with a modal this frame.
@@ -209,9 +202,20 @@ pub fn show<T: Clone>(
         });
     });
     ui.separator();
+    // Room left for the body: the window less the header drawn above, the
+    // footer (separator and a row of buttons), the message line and the
+    // frame's margins.
+    let chrome = {
+        let s = ui.spacing();
+        let line = s.interact_size.y + s.item_spacing.y;
+        let header = ui.min_rect().height() + s.item_spacing.y;
+        let separator = 6.0 + s.item_spacing.y;
+        let message = if message.is_some() { line + 4.0 } else { 0.0 };
+        header + separator + line + message + s.menu_margin.sum().y
+    };
     egui::ScrollArea::vertical()
         .id_salt("modal-body")
-        .max_height(body_max_height(screen.height()))
+        .max_height(body_max_height(screen.height(), chrome))
         .auto_shrink([false, true])
         .show(ui, body);
     if let Some((kind, text)) = message {
@@ -225,7 +229,10 @@ pub fn show<T: Clone>(
         ui.label(text);
     }
     ui.separator();
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    // One row exactly: a bare right-to-left layout would take (and centre
+    // the buttons in) all the height left in the window.
+    let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(row, Layout::right_to_left(Align::Center), |ui| {
         // Right to left: the last slot is drawn first.
         for slot in footer_slots(spec.cancel.is_some(), buttons)
             .into_iter()
@@ -405,8 +412,50 @@ mod tests {
 
     #[test]
     fn body_takes_at_most_three_quarters_of_the_window() {
-        assert_eq!(body_max_height(800.0), 600.0);
-        assert_eq!(body_max_height(480.0), 360.0);
+        assert_eq!(body_max_height(800.0, 100.0), 600.0);
+        // Small windows: the header and the footer (`chrome`) keep their room.
+        assert_eq!(body_max_height(480.0, 100.0), 480.0 - 32.0 - 100.0);
+        assert_eq!(body_max_height(100.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn egui_a_tall_body_scrolls_and_the_footer_stays_in_a_small_window() {
+        for (w, h) in [(720.0, 480.0), (1280.0, 800.0)] {
+            let ctx = egui::Context::default();
+            let mut footer = None;
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w, h),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    let modal = egui::Modal::new(egui::Id::new("t")).show(ctx, |ui| {
+                        let _ = show(
+                            ui,
+                            ModalSpec::new("Titre", ModalSize::Large),
+                            |ui| {
+                                for i in 0..200 {
+                                    ui.label(format!("ligne {i}"));
+                                }
+                            },
+                            Some((MessageKind::Error, "Erreur")),
+                            &buttons(),
+                        );
+                    });
+                    footer = Some(modal.response.rect);
+                });
+            }
+            let rect = footer.unwrap();
+            assert!(
+                rect.top() >= WINDOW_MARGIN / 2.0 - 1.0
+                    && rect.bottom() <= h - WINDOW_MARGIN / 2.0 + 1.0,
+                "{w}x{h}: the modal {rect:?} fits in the window"
+            );
+            assert!(rect.height() > h * 0.6, "{w}x{h}: the body uses the room");
+        }
     }
 
     #[test]
@@ -428,7 +477,7 @@ mod tests {
         let spec = ModalSpec::new("Titre", ModalSize::Small);
         assert_eq!(spec.cancel, Some(CANCEL));
         assert_eq!(spec.icon, None);
-        assert_eq!(spec.icon("i").without_cancel().cancel, None);
+        assert_eq!(spec.icon("i").icon, Some("i"));
     }
 
     #[test]

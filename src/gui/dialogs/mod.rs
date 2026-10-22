@@ -63,40 +63,14 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         return;
     };
     let mut keep = true;
-    let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
-        // Standard modals size themselves (`modal::ModalSize`).
-        if let Some(response) = standard_ui(app, ui, &mut dialog) {
-            return Some(response);
-        }
-        ui.set_min_width(420.0);
-        match &mut dialog {
-            // Drawn by `standard_ui`.
-            Dialog::Connection(_)
-            | Dialog::Structure(_)
-            | Dialog::ConfirmDeleteConnection(_)
-            | Dialog::DiscardEdits(_)
-            | Dialog::CloseTab { .. }
-            | Dialog::ConfirmRerun { .. }
-            | Dialog::ConfirmQuit { .. }
-            | Dialog::EndTx(_)
-            | Dialog::ConfirmTruncate { .. }
-            | Dialog::History(_)
-            | Dialog::TableSearch(_)
-            | Dialog::Batch(_) => {}
-        }
-        None
-    });
+    // Each dialog sizes itself (`modal::ModalSize`).
+    let modal =
+        egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| dialog_ui(app, ui, &mut dialog));
     // Escape or a click outside cancels the dialog.
     let outside = modal.should_close();
-    match modal.inner {
-        Some(response) => {
-            if let Some(answer) = settle(response, outside) {
-                let effect = effect(&dialog, answer);
-                keep = apply(app, ctx, &mut dialog, effect);
-            }
-        }
-        None if outside => keep = false,
-        None => {}
+    if let Some(answer) = settle(modal.inner, outside) {
+        let effect = effect(&dialog, answer);
+        keep = apply(app, ctx, &mut dialog, effect);
     }
     if let (false, Dialog::Connection(form)) = (keep, &mut dialog) {
         // Nobody waits for the test of a closed form any more: stop it (and
@@ -150,14 +124,10 @@ fn settle(response: ModalResponse<Answer>, outside: bool) -> Option<Option<Answe
     }
 }
 
-/// Draw `dialog` (every dialog is a standard modal).
-fn standard_ui(
-    app: &mut App,
-    ui: &mut egui::Ui,
-    dialog: &mut Dialog,
-) -> Option<ModalResponse<Answer>> {
+/// Draw `dialog`, a standard modal.
+fn dialog_ui(app: &mut App, ui: &mut egui::Ui, dialog: &mut Dialog) -> ModalResponse<Answer> {
     let small = |title| ModalSpec::new(title, ModalSize::Small);
-    let response = match dialog {
+    match dialog {
         Dialog::ConfirmDeleteConnection(name) => {
             let tabs = app
                 .tabs
@@ -287,8 +257,7 @@ fn standard_ui(
             form.ui(ui, sign_in).map(Answer::Connection)
         }
         Dialog::Structure(d) => structure::ui(app, ui, d).map(Answer::Structure),
-    };
-    Some(response)
+    }
 }
 
 /// "Abandonner les modifications ?": Submit them first, drop them, or

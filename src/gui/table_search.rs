@@ -88,6 +88,8 @@ impl TableSearch {
         ui: &mut egui::Ui,
         color_of: &dyn Fn(&str) -> Color32,
     ) -> Option<(String, String, String)> {
+        let screen = ui.ctx().screen_rect();
+        ui.set_width(super::popup::modal_width(screen.width()));
         ui.heading("Rechercher une table");
         // Keys are taken before the text field sees them.
         let (down, up, enter) = ui.input_mut(|i| {
@@ -124,28 +126,27 @@ impl TableSearch {
         let mut open = enter.then_some(self.selected);
         ui.separator();
         egui::ScrollArea::vertical()
-            .max_height(420.0)
+            .max_height(super::popup::modal_list_height(screen.height()))
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for (pos, &i) in self.matches[..shown].iter().enumerate() {
                     let (connection, schema, table) = &self.tables[i];
-                    ui.horizontal(|ui| {
-                        super::theme::dot(ui, color_of(connection));
-                        let r = ui.selectable_label(
-                            pos == self.selected,
-                            RichText::new(format!("{schema}.{table}")).monospace(),
-                        );
-                        ui.label(RichText::new(connection).weak());
-                        if (up || down) && pos == self.selected {
-                            r.scroll_to_me(None);
-                        }
-                        if r.clicked() {
-                            self.selected = pos;
-                        }
-                        if r.double_clicked() {
-                            open = Some(pos);
-                        }
-                    });
+                    let r = table_row(
+                        ui,
+                        pos == self.selected,
+                        &format!("{schema}.{table}"),
+                        connection,
+                        color_of(connection),
+                    );
+                    if (up || down) && pos == self.selected {
+                        r.scroll_to_me(None);
+                    }
+                    if r.clicked() {
+                        self.selected = pos;
+                    }
+                    if r.double_clicked() {
+                        open = Some(pos);
+                    }
                 }
             });
         if self.matches.len() > shown {
@@ -156,6 +157,70 @@ impl TableSearch {
             );
         }
         open.map(|pos| self.tables[self.matches[pos]].clone())
+    }
+}
+
+/// Full-width row: the connection's colour dot, `name` (elided when the
+/// row is too narrow, then shown whole in a tooltip) and the connection
+/// name aligned right.
+fn table_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    name: &str,
+    connection: &str,
+    color: Color32,
+) -> egui::Response {
+    use super::popup;
+    use egui::TextStyle;
+    let pad = ui.spacing().button_padding;
+    let gap = ui.spacing().item_spacing.x;
+    let height = ui.text_style_height(&TextStyle::Monospace) + 2.0 * pad.y;
+    let (response, rect) = popup::selectable_row(ui, selected, height);
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let mut inner = rect.shrink2(pad);
+    inner.min.x += 2.0;
+    let painter = ui.painter_at(rect);
+    painter.circle_filled(egui::pos2(inner.left() + 5.0, rect.center().y), 4.0, color);
+    inner.min.x += 10.0 + gap;
+    let text = if selected {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+    // Weak text would vanish on the selection background.
+    let side_text = || {
+        let t = RichText::new(connection);
+        if selected {
+            t.color(text)
+        } else {
+            t.weak()
+        }
+    };
+    let mut side = popup::one_line(ui, side_text(), f32::INFINITY, TextStyle::Body);
+    let (name_width, side_width) = popup::split_row(inner.width(), side.size().x, 2.0 * gap);
+    if side_width < side.size().x {
+        side = popup::one_line(ui, side_text(), side_width, TextStyle::Body);
+    }
+    let galley = popup::one_line(
+        ui,
+        RichText::new(name).monospace(),
+        name_width,
+        TextStyle::Monospace,
+    );
+    let elided = galley.elided || side.elided;
+    let y = |g: &egui::Galley| rect.center().y - g.size().y / 2.0;
+    painter.galley(egui::pos2(inner.left(), y(&galley)), galley, text);
+    painter.galley(
+        egui::pos2(inner.right() - side.size().x, y(&side)),
+        side,
+        text,
+    );
+    if elided {
+        response.on_hover_text(format!("{name} — {connection}"))
+    } else {
+        response
     }
 }
 

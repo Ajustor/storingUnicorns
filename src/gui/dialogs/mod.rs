@@ -104,7 +104,6 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 }
             }
             Dialog::TableSearch(search) => {
-                ui.set_min_width(520.0);
                 let color_of = |name: &str| app.color_of(name);
                 if let Some((connection, schema, table)) = search.ui(ui, &color_of) {
                     let quotes = app.sessions.get(&connection).map(|s| s.quotes);

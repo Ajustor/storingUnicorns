@@ -8,6 +8,7 @@ use crate::engine::models::{
     AzureAuthMethod, ConnectionConfig, DatabaseType, DbAuthMethod, Flavor, SslMode,
 };
 use crate::engine::presets;
+use crate::gui::popup;
 use crate::gui::sign_in;
 use crate::gui::theme::{self, CONNECTION_COLORS, ERROR, SUCCESS};
 
@@ -490,7 +491,10 @@ impl ConnectionForm {
 
                 ui.label("Modèle");
                 let mut flavor = self.flavor;
+                let labels = std::iter::once("Aucun".to_string())
+                    .chain(Flavor::ALL.iter().map(|f| f.to_string()));
                 egui::ComboBox::from_id_salt("flavor")
+                    .width(popup::combo_width(ui, labels))
                     .selected_text(flavor.map_or("Aucun".to_string(), |f| f.to_string()))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut flavor, None, "Aucun");
@@ -506,6 +510,10 @@ impl ConnectionForm {
                 ui.label("Type");
                 let mut t = self.db_type.clone();
                 egui::ComboBox::from_id_salt("db_type")
+                    .width(popup::combo_width(
+                        ui,
+                        DB_TYPES.iter().map(|d| d.to_string()),
+                    ))
                     .selected_text(t.to_string())
                     .show_ui(ui, |ui| {
                         for d in DB_TYPES {
@@ -609,6 +617,10 @@ impl ConnectionForm {
         if azure {
             ui.label("Authentification");
             egui::ComboBox::from_id_salt("azure_auth")
+                .width(popup::combo_width(
+                    ui,
+                    AZURE_METHODS.iter().map(|m| m.to_string()),
+                ))
                 .selected_text(self.azure_auth.to_string())
                 .show_ui(ui, |ui| {
                     for m in AZURE_METHODS {
@@ -622,6 +634,10 @@ impl ConnectionForm {
             ui.label("Authentification");
             let mut method = self.db_auth;
             egui::ComboBox::from_id_salt("db_auth")
+                .width(popup::combo_width(
+                    ui,
+                    DB_AUTH_METHODS.iter().map(|m| m.to_string()),
+                ))
                 .selected_text(method.to_string())
                 .show_ui(ui, |ui| {
                     for m in DB_AUTH_METHODS {
@@ -740,6 +756,10 @@ impl ConnectionForm {
         ui.label("SSL");
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("ssl_mode")
+                .width(popup::combo_width(
+                    ui,
+                    SslMode::ALL.iter().map(|m| m.to_string()),
+                ))
                 .selected_text(self.ssl_mode.to_string())
                 .show_ui(ui, |ui| {
                     for m in SslMode::ALL {

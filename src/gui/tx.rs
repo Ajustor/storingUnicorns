@@ -43,7 +43,10 @@ pub fn controls(ui: &mut egui::Ui, id: impl std::hash::Hash, view: TxView) -> Op
     let selected = if manual { "Tx : Manuel" } else { "Tx : Auto" };
     egui::ComboBox::from_id_salt(("tx_mode", id))
         .selected_text(selected)
-        .width(110.0)
+        .width(crate::gui::popup::combo_width(
+            ui,
+            ["Tx : Manuel", "Tx : Auto"],
+        ))
         .show_ui(ui, |ui| {
             if ui
                 .selectable_label(!manual, "Auto")

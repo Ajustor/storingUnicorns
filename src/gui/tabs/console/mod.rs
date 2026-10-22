@@ -504,7 +504,12 @@ fn connection_selector(ui: &mut egui::Ui, cx: &ConsoleContext) -> Option<String>
         .map(|(_, c)| *c)
         .unwrap_or(Color32::GRAY);
     theme::dot(ui, color);
+    // Items are a dot then the name: room for the dot on top of the name.
+    let width = crate::gui::popup::combo_width(ui, cx.connections.iter().map(|(n, _)| n))
+        + 10.0
+        + ui.spacing().item_spacing.x;
     egui::ComboBox::from_id_salt(("console_connection", cx.tab))
+        .width(width.min(crate::gui::popup::COMBO_MAX))
         .selected_text(cx.connection)
         .show_ui(ui, |ui| {
             for (name, color) in cx.connections {

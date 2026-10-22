@@ -5,6 +5,7 @@ mod editor;
 mod explorer;
 mod history_popup;
 mod persist;
+mod popup;
 mod rows;
 mod grid;
 mod sessions;

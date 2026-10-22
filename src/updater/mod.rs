@@ -504,33 +504,43 @@ fn verify_digest(bytes: &[u8], expected: &str) -> Result<(), String> {
 pub fn run_exit_action(action: &ExitAction, args: &[&str]) -> std::io::Result<()> {
     match action {
         ExitAction::Relaunch => relaunch_exe().and_then(|exe| {
-            std::process::Command::new(exe)
-                .args(args)
-                .spawn()
-                .map(|_| ())
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(args);
+            detached(&mut cmd);
+            cmd.spawn().map(|_| ())
         }),
         // `/passive` shows a progress bar and triggers UAC; MajorUpgrade in the
         // WiX manifest removes the previous version.
-        ExitAction::RunMsi(msi) => std::process::Command::new("msiexec")
-            .arg("/i")
-            .arg(msi)
-            .arg("/passive")
-            .spawn()
-            .map(|_| ()),
+        ExitAction::RunMsi(msi) => {
+            let mut cmd = std::process::Command::new("msiexec");
+            cmd.arg("/i").arg(msi).arg("/passive");
+            detached(&mut cmd);
+            cmd.spawn().map(|_| ())
+        }
         ExitAction::RunMsiThenRelaunch(msi) => std::env::current_exe().and_then(|exe| {
             let script = msi_relaunch_script(msi, &exe);
             let mut cmd = std::process::Command::new("powershell.exe");
             cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden"])
                 .arg("-EncodedCommand")
                 .arg(encode_powershell_command(&script));
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                cmd.creation_flags(CREATE_NO_WINDOW);
-            }
+            detached(&mut cmd);
             cmd.spawn().map(|_| ())
         }),
+    }
+}
+
+/// Started from a GUI that has left its console: no standard handles to
+/// inherit (they would be dangling), and on Windows no console window for the
+/// child (`storingUnicorns.exe` is a console program).
+fn detached(cmd: &mut std::process::Command) {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
 }
 

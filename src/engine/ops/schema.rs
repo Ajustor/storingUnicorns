@@ -61,19 +61,23 @@ pub async fn table_details(
     cache: &TableCache,
     table: &str,
 ) -> Result<TableDetails> {
-    let (columns, indexes, foreign_keys) = tokio::join!(
+    let (columns, indexes, foreign_keys, incoming) = tokio::join!(
         cached_columns(conn, cache, table),
         conn.get_indexes(table),
         conn.get_foreign_keys(table),
+        conn.get_incoming_foreign_keys(table),
     );
     let (indexes, indexes_error) = degrade(indexes);
     let (foreign_keys, foreign_keys_error) = degrade(foreign_keys);
+    let (incoming, incoming_error) = degrade(incoming);
     Ok(TableDetails {
         columns: columns?,
         indexes,
         foreign_keys,
         indexes_error,
         foreign_keys_error,
+        incoming,
+        incoming_error,
     })
 }
 

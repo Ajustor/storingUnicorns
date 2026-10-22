@@ -321,6 +321,18 @@ pub struct ForeignKeyInfo {
     pub ref_columns: Vec<String>,
 }
 
+/// A foreign key of another table that points at this one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncomingForeignKey {
+    pub name: String,
+    /// Referencing table, qualified like `get_tables` ("schema.table").
+    pub table: String,
+    /// Its columns, in key order.
+    pub columns: Vec<String>,
+    /// This table's columns, matching `columns` one to one.
+    pub ref_columns: Vec<String>,
+}
+
 /// Columns, indexes and foreign keys of a table.
 #[derive(Debug, Clone, Default)]
 pub struct TableDetails {
@@ -332,6 +344,10 @@ pub struct TableDetails {
     pub indexes_error: Option<String>,
     /// Same for `foreign_keys`.
     pub foreign_keys_error: Option<String>,
+    /// Foreign keys of other tables pointing at this one.
+    pub incoming: Vec<IncomingForeignKey>,
+    /// Same for `incoming`.
+    pub incoming_error: Option<String>,
 }
 
 /// The value of a NULL cell. Cells are text, so NULL needs a value of its

@@ -387,6 +387,30 @@ impl DatabaseConnection {
         }
     }
 
+    /// Foreign keys of other tables pointing at `table_name` (stub: scans
+    /// every table's foreign keys, matching on the bare table name).
+    pub async fn get_incoming_foreign_keys(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<crate::engine::models::IncomingForeignKey>> {
+        use crate::engine::db::utils::split_qualified;
+        let bare = split_qualified(table_name).1;
+        let mut out = Vec::new();
+        for table in self.get_tables().await? {
+            for fk in self.get_foreign_keys(&table).await.unwrap_or_default() {
+                if split_qualified(&fk.ref_table).1.eq_ignore_ascii_case(&bare) {
+                    out.push(crate::engine::models::IncomingForeignKey {
+                        name: fk.name,
+                        table: table.clone(),
+                        columns: fk.columns,
+                        ref_columns: fk.ref_columns,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Close the connection's sessions now (a pool shared by other handles
     /// is closed for them too). SQL Server clients close when dropped.
     pub async fn close_sessions(&self) {

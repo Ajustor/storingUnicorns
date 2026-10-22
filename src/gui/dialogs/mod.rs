@@ -14,7 +14,7 @@ use super::worker::Event;
 use crate::engine::db::entra_interactive;
 use crate::engine::ops::transfer::qualified;
 use connection::{ConnectionForm, FormAction};
-use structure::StructureDialog;
+use structure::{StructureAction, StructureDialog};
 use transfer::BatchDialog;
 
 pub enum Dialog {
@@ -65,39 +65,11 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let mut keep = true;
     let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
         // Standard modals size themselves (`modal::ModalSize`).
-        if let Some(response) = standard_ui(app, ui, &dialog) {
+        if let Some(response) = standard_ui(app, ui, &mut dialog) {
             return Some(response);
         }
         ui.set_min_width(420.0);
         match &mut dialog {
-            Dialog::Connection(form) => {
-                let sign_in = form.testing_name().and_then(|n| app.sign_ins.url_of(n));
-                match form.ui(ui, sign_in) {
-                    FormAction::None => {}
-                    FormAction::CancelTest => {
-                        if let Some(name) = form.testing_name() {
-                            app.sign_ins.dismiss(name);
-                        }
-                        app.worker.cancel_test();
-                        form.test_cancelled();
-                    }
-                    FormAction::Cancel => keep = false,
-                    FormAction::Test => match form.validate(&app.config.connections) {
-                        Ok(cfg) => {
-                            form.start_test(cfg.clone());
-                            app.worker.test_connection(cfg);
-                        }
-                        Err(e) => form.error = Some(e),
-                    },
-                    FormAction::Save => match form.validate(&app.config.connections) {
-                        Ok(cfg) => {
-                            app.save_connection(form.original_name.clone(), cfg);
-                            keep = false;
-                        }
-                        Err(e) => form.error = Some(e),
-                    },
-                }
-            }
             Dialog::History(popup) => {
                 if let HistoryAction::Insert(sql) = popup.ui(ui, &app.history) {
                     if let Some(tab) = app.tabs.active_mut() {
@@ -118,10 +90,11 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     keep = false;
                 }
             }
-            Dialog::Structure(d) => keep = structure::ui(app, ui, d),
             Dialog::Batch(b) => keep = transfer::batch_ui(app, ui, b),
             // Drawn by `standard_ui`.
-            Dialog::ConfirmDeleteConnection(_)
+            Dialog::Connection(_)
+            | Dialog::Structure(_)
+            | Dialog::ConfirmDeleteConnection(_)
             | Dialog::DiscardEdits(_)
             | Dialog::CloseTab { .. }
             | Dialog::ConfirmRerun { .. }
@@ -136,8 +109,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     match modal.inner {
         Some(response) => {
             if let Some(answer) = settle(response, outside) {
-                keep = false;
-                apply(app, ctx, effect(&dialog, answer));
+                let effect = effect(&dialog, answer);
+                keep = apply(app, ctx, &mut dialog, effect);
             }
         }
         None if outside => keep = false,
@@ -173,6 +146,8 @@ enum Answer {
     Drop,
     Commit,
     Rollback,
+    Connection(FormAction),
+    Structure(StructureAction),
 }
 
 /// The answer a standard dialog got this frame: `Some(None)` to cancel it
@@ -187,8 +162,22 @@ fn settle(response: ModalResponse<Answer>, outside: bool) -> Option<Option<Answe
     }
 }
 
-/// Draw `dialog` if it is a standard one (confirmations); `None` otherwise.
-fn standard_ui(app: &mut App, ui: &mut egui::Ui, dialog: &Dialog) -> Option<ModalResponse<Answer>> {
+/// Draw `dialog` if it is a standard one (confirmations, forms); `None`
+/// otherwise.
+fn standard_ui(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    dialog: &mut Dialog,
+) -> Option<ModalResponse<Answer>> {
+    match dialog {
+        Dialog::Connection(form) => {
+            let sign_in = form.testing_name().and_then(|n| app.sign_ins.url_of(n));
+            return Some(form.ui(ui, sign_in).map(Answer::Connection));
+        }
+        Dialog::Structure(d) => return Some(structure::ui(app, ui, d).map(Answer::Structure)),
+        _ => {}
+    }
+    let dialog = &*dialog;
     let small = |title| ModalSpec::new(title, ModalSize::Small);
     let response = match dialog {
         Dialog::ConfirmDeleteConnection(name) => {
@@ -309,11 +298,9 @@ fn standard_ui(app: &mut App, ui: &mut egui::Ui, dialog: &Dialog) -> Option<Moda
         Dialog::ConfirmTruncate { connection, tables } => {
             transfer::confirm_truncate_ui(ui, connection, tables).map(|()| Answer::Confirm)
         }
-        Dialog::Connection(_)
-        | Dialog::History(_)
-        | Dialog::TableSearch(_)
-        | Dialog::Structure(_)
-        | Dialog::Batch(_) => return None,
+        // Forms: drawn above.
+        Dialog::Connection(_) | Dialog::Structure(_) => return None,
+        Dialog::History(_) | Dialog::TableSearch(_) | Dialog::Batch(_) => return None,
     };
     Some(response)
 }
@@ -355,6 +342,10 @@ enum Effect {
         connection: String,
         tables: Vec<String>,
     },
+    /// A button of the connection form (the form is the dialog).
+    Connection(FormAction),
+    /// A button of the structure dialog (the dialog is its own).
+    Structure(StructureAction),
 }
 
 /// The effect of `answer` (`None`: cancelled) to `dialog`.
@@ -385,12 +376,26 @@ fn effect(dialog: &Dialog, answer: Option<Answer>) -> Effect {
             connection: connection.clone(),
             tables: tables.clone(),
         },
+        (Dialog::Connection(_), Some(Answer::Connection(a))) => Effect::Connection(a),
+        (Dialog::Structure(_), Some(Answer::Structure(a))) => Effect::Structure(a),
         _ => Effect::Nothing,
     }
 }
 
-fn apply(app: &mut App, ctx: &egui::Context, effect: Effect) {
+/// Do `effect`; whether `dialog` stays open (only the forms' buttons keep
+/// it open: a test, or a save refused by the form's checks).
+fn apply(app: &mut App, ctx: &egui::Context, dialog: &mut Dialog, effect: Effect) -> bool {
     match effect {
+        Effect::Connection(action) => {
+            if let Dialog::Connection(form) = dialog {
+                return form.act(app, action);
+            }
+        }
+        Effect::Structure(action) => {
+            if let Dialog::Structure(d) = dialog {
+                return structure::act(app, d, action);
+            }
+        }
         Effect::Nothing => {}
         Effect::DeleteConnection(name) => app.delete_connection(&name),
         Effect::AnswerDiscard(id, answer) => answer_discard(app, id, answer),
@@ -405,6 +410,7 @@ fn apply(app: &mut App, ctx: &egui::Context, effect: Effect) {
         Effect::EndTx { connection, commit } => app.end_tx_then_auto(&connection, commit),
         Effect::Truncate { connection, tables } => transfer::truncate(app, &connection, tables),
     }
+    false
 }
 
 /// Answers to "Abandonner les modifications ?".
@@ -561,5 +567,48 @@ mod tests {
                 tables: vec!["a".into(), "b".into()]
             }
         );
+    }
+
+    fn connection_form() -> Dialog {
+        Dialog::Connection(Box::new(ConnectionForm::new(None)))
+    }
+
+    fn structure() -> Dialog {
+        Dialog::Structure(StructureDialog {
+            connection: "prod".into(),
+            table: "t".into(),
+            title: "t".into(),
+            edit: None,
+            applying: false,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn form_buttons_reach_their_form() {
+        for action in [FormAction::Save, FormAction::Test, FormAction::CancelTest] {
+            assert_eq!(
+                effect(&connection_form(), Some(Answer::Connection(action))),
+                Effect::Connection(action)
+            );
+        }
+        for action in [StructureAction::Apply, StructureAction::CloseEdit] {
+            assert_eq!(
+                effect(&structure(), Some(Answer::Structure(action))),
+                Effect::Structure(action)
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_a_form_just_closes_it() {
+        // Annuler, ×, Escape or a click outside: the dialog closes (`show`
+        // then stops the connection test and forgets its orphaned sign-ins).
+        for response in [ModalResponse::Cancel, ModalResponse::None] {
+            assert_eq!(settle(response, true), Some(None));
+        }
+        assert_eq!(settle(ModalResponse::Cancel, false), Some(None));
+        assert_eq!(effect(&connection_form(), None), Effect::Nothing);
+        assert_eq!(effect(&structure(), None), Effect::Nothing);
     }
 }

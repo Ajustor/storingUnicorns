@@ -1,6 +1,7 @@
 //! New / edit connection form.
 
-use egui::{Sense, Stroke, StrokeKind};
+use egui::{Key, Modifiers, Sense, Stroke, StrokeKind};
+use egui_phosphor::regular as icon;
 
 use crate::engine::db::azure::{self, AzureCloud};
 use crate::engine::db::{entra_interactive, gcp_iam};
@@ -8,9 +9,11 @@ use crate::engine::models::{
     AzureAuthMethod, ConnectionConfig, DatabaseType, DbAuthMethod, Flavor, SslMode,
 };
 use crate::engine::presets;
+use crate::gui::app::App;
+use crate::gui::modal::{self, MessageKind, ModalButton, ModalResponse, ModalSize, ModalSpec};
 use crate::gui::popup;
 use crate::gui::sign_in;
-use crate::gui::theme::{self, CONNECTION_COLORS, ERROR, SUCCESS};
+use crate::gui::theme::{self, CONNECTION_COLORS, ERROR};
 
 const DB_TYPES: [DatabaseType; 5] = [
     DatabaseType::Postgres,
@@ -194,14 +197,17 @@ pub struct ConnectionForm {
     tested: Vec<ConnectionConfig>,
 }
 
+/// What the form asks for (closing it is the modal's `Cancel`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FormAction {
-    None,
     Save,
     Test,
     /// Stop the running test (its browser sign-in).
     CancelTest,
-    Cancel,
 }
+
+/// Id of the « Coller une URL » field, where Enter means « Remplir ».
+const URL_FIELD: &str = "conn_url";
 
 impl ConnectionForm {
     /// `Some(config)` edits that connection; `None` creates a new one.
@@ -451,17 +457,64 @@ impl ConnectionForm {
         })
     }
 
-    /// Draw the form; `sign_in` is the URL of the browser sign-in the test
-    /// waits for (`testing_name`'s; the modal hides the banner). Returns the
-    /// action the user took.
-    pub fn ui(&mut self, ui: &mut egui::Ui, sign_in: Option<&str>) -> FormAction {
-        let mut action = FormAction::None;
-        ui.heading(if self.original_name.is_some() {
+    /// Draw the form in the standard modal; `sign_in` is the URL of the
+    /// browser sign-in the test waits for (`testing_name`'s; the modal hides
+    /// the banner). Returns what the user asked for.
+    pub fn ui(&mut self, ui: &mut egui::Ui, sign_in: Option<&str>) -> ModalResponse<FormAction> {
+        let title = if self.original_name.is_some() {
             "Modifier la connexion"
         } else {
             "Nouvelle connexion"
-        });
-        ui.add_space(6.0);
+        };
+        let waiting = sign_in.is_some() && self.testing_name().is_some();
+        let message = self.message(waiting);
+        let buttons = self.buttons();
+        let mut cancel_test = false;
+        let response = modal::show(
+            ui,
+            ModalSpec::new(title, ModalSize::Medium).icon(icon::DATABASE),
+            |ui| cancel_test = self.body(ui, sign_in),
+            message.as_ref().map(|(kind, text)| (*kind, text.as_str())),
+            &buttons,
+        );
+        match response {
+            ModalResponse::None if cancel_test => ModalResponse::Button(FormAction::CancelTest),
+            response => response,
+        }
+    }
+
+    /// Footer buttons (« Annuler » is the modal's own).
+    fn buttons(&self) -> Vec<ModalButton<FormAction>> {
+        let test = ModalButton::secondary("Tester", FormAction::Test).enabled(!self.testing);
+        vec![
+            if self.testing {
+                test.hint("Test en cours…")
+            } else {
+                test
+            },
+            ModalButton::primary("Enregistrer", FormAction::Save),
+        ]
+    }
+
+    /// The message line: the form's error, else the test's outcome or
+    /// progress (`waiting`: the body shows the browser sign-in instead).
+    fn message(&self, waiting: bool) -> Option<(MessageKind, String)> {
+        if let Some(e) = &self.error {
+            return Some((MessageKind::Error, e.clone()));
+        }
+        match &self.test_result {
+            Some(Ok(())) => Some((MessageKind::Success, "Connexion réussie".into())),
+            Some(Err(e)) => Some((MessageKind::Error, e.clone())),
+            None if self.testing && !waiting => {
+                Some((MessageKind::Info, "Test de la connexion en cours…".into()))
+            }
+            None => None,
+        }
+    }
+
+    /// The fields, then the browser sign-in the test waits for; whether
+    /// its « Annuler » was clicked.
+    fn body(&mut self, ui: &mut egui::Ui, sign_in: Option<&str>) -> bool {
         egui::Grid::new("conn_form")
             .num_columns(2)
             .spacing([12.0, 8.0])
@@ -476,18 +529,30 @@ impl ConnectionForm {
 
                 ui.label("Coller une URL");
                 ui.horizontal(|ui| {
-                    ui.add(
+                    let field = ui.add(
                         egui::TextEdit::singleline(&mut self.url)
+                            .id(egui::Id::new(URL_FIELD))
                             .hint_text("postgresql://user:pass@host:5432/db?sslmode=require"),
                     );
-                    if ui
-                        .add_enabled(!self.url.trim().is_empty(), egui::Button::new("Remplir"))
-                        .clicked()
-                    {
+                    // Enter here fills the form, it doesn't save it.
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    if enter {
+                        ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                    }
+                    let filled = !self.url.trim().is_empty();
+                    let clicked = ui
+                        .add_enabled(filled, egui::Button::new("Remplir"))
+                        .clicked();
+                    if filled && (clicked || enter) {
                         self.url_error = self.apply_url().err();
                     }
                 });
                 ui.end_row();
+                if let Some(e) = &self.url_error {
+                    ui.label("");
+                    ui.colored_label(ERROR, e);
+                    ui.end_row();
+                }
 
                 ui.label("Modèle");
                 let mut flavor = self.flavor;
@@ -549,53 +614,48 @@ impl ConnectionForm {
             ui.add_space(4.0);
             self.advanced_options(ui, forced);
         }
-
-        if let Some(e) = &self.url_error {
-            ui.colored_label(ERROR, e);
+        match (self.testing_name(), sign_in) {
+            (Some(name), Some(url)) => {
+                ui.add_space(6.0);
+                sign_in::waiting_row(ui, name, url, true)
+            }
+            _ => false,
         }
-        if let Some(e) = &self.error {
-            ui.colored_label(ERROR, e);
-        }
-        match &self.test_result {
-            Some(Ok(())) => {
-                ui.colored_label(SUCCESS, "Connexion réussie");
-            }
-            Some(Err(e)) => {
-                ui.colored_label(ERROR, e);
-            }
-            None => {}
-        }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("Enregistrer").clicked() {
-                action = FormAction::Save;
-            }
-            if ui
-                .add_enabled(!self.testing, egui::Button::new("Tester"))
-                .clicked()
-            {
-                action = FormAction::Test;
-            }
-            if self.testing {
-                ui.spinner();
-            }
-            if ui.button("Annuler").clicked() {
-                action = FormAction::Cancel;
-            }
-        });
-        if let (Some(name), Some(url)) = (self.testing_name(), sign_in) {
-            ui.add_space(6.0);
-            if sign_in::waiting_row(ui, name, url, true) {
-                action = FormAction::CancelTest;
-            }
-        }
-        action
     }
 
     /// The running test was cancelled.
     pub fn test_cancelled(&mut self) {
         self.testing = false;
         self.test_result = Some(Err(sign_in::CANCELLED.into()));
+    }
+
+    /// Do `action` (a footer button, or the sign-in's « Annuler »);
+    /// whether the form stays open.
+    pub fn act(&mut self, app: &mut App, action: FormAction) -> bool {
+        match action {
+            FormAction::CancelTest => {
+                if let Some(name) = self.testing_name() {
+                    app.sign_ins.dismiss(name);
+                }
+                app.worker.cancel_test();
+                self.test_cancelled();
+            }
+            FormAction::Test => match self.validate(&app.config.connections) {
+                Ok(cfg) => {
+                    self.start_test(cfg.clone());
+                    app.worker.test_connection(cfg);
+                }
+                Err(e) => self.error = Some(e),
+            },
+            FormAction::Save => match self.validate(&app.config.connections) {
+                Ok(cfg) => {
+                    app.save_connection(self.original_name.clone(), cfg);
+                    return false;
+                }
+                Err(e) => self.error = Some(e),
+            },
+        }
+        true
     }
 
     fn server_fields(&mut self, ui: &mut egui::Ui) {
@@ -827,6 +887,7 @@ impl ConnectionForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::modal::ButtonKind;
 
     fn existing() -> Vec<ConnectionConfig> {
         vec![ConnectionConfig {
@@ -1435,5 +1496,121 @@ mod tests {
             ..a.clone()
         };
         assert!(!same_target(&a, &c));
+    }
+
+    #[test]
+    fn footer_offers_test_and_save_and_test_waits_for_the_running_one() {
+        let mut f = ConnectionForm::new(None);
+        let b = f.buttons();
+        assert_eq!(
+            b.iter()
+                .map(|b| (b.label.as_str(), b.kind, b.action, b.enabled))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Tester", ButtonKind::Secondary, FormAction::Test, true),
+                ("Enregistrer", ButtonKind::Primary, FormAction::Save, true),
+            ]
+        );
+        f.start_test(ConnectionConfig::default());
+        let b = f.buttons();
+        assert!(!b[0].enabled);
+        assert_eq!(b[0].hint.as_deref(), Some("Test en cours…"));
+        // Saving stays possible while a test runs (as before).
+        assert!(b[1].enabled);
+    }
+
+    #[test]
+    fn message_line_shows_the_error_then_the_test() {
+        let mut f = ConnectionForm::new(None);
+        assert_eq!(f.message(false), None);
+        f.start_test(ConnectionConfig::default());
+        assert_eq!(
+            f.message(false),
+            Some((MessageKind::Info, "Test de la connexion en cours…".into()))
+        );
+        // The body shows the browser sign-in instead.
+        assert_eq!(f.message(true), None);
+        f.testing = false;
+        f.test_result = Some(Ok(()));
+        assert_eq!(
+            f.message(false),
+            Some((MessageKind::Success, "Connexion réussie".into()))
+        );
+        f.test_result = Some(Err("refusée".into()));
+        assert_eq!(
+            f.message(false),
+            Some((MessageKind::Error, "refusée".into()))
+        );
+        f.error = Some("Nom requis".into());
+        assert_eq!(
+            f.message(false),
+            Some((MessageKind::Error, "Nom requis".into()))
+        );
+    }
+
+    fn enter() -> egui::Event {
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    /// Show `form` in a modal once per entry of `frames`, the URL field
+    /// focused first when `url_focus`; the responses.
+    fn run(
+        form: &mut ConnectionForm,
+        frames: Vec<Vec<egui::Event>>,
+        url_focus: bool,
+    ) -> Vec<ModalResponse<FormAction>> {
+        let ctx = egui::Context::default();
+        let mut out = vec![];
+        for (n, events) in frames.into_iter().enumerate() {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 900.0),
+                )),
+                events,
+                focused: true,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                let modal =
+                    egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| form.ui(ui, None));
+                out.push(modal.inner);
+                if n == 0 && url_focus {
+                    ctx.memory_mut(|m| m.request_focus(egui::Id::new(URL_FIELD)));
+                }
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn enter_saves_the_form() {
+        let mut f = ConnectionForm::new(None);
+        let r = run(&mut f, vec![vec![], vec![enter()]], false);
+        assert_eq!(
+            r,
+            vec![ModalResponse::None, ModalResponse::Button(FormAction::Save)]
+        );
+    }
+
+    #[test]
+    fn enter_in_the_url_field_fills_the_form_without_saving() {
+        let mut f = ConnectionForm::new(None);
+        f.url = "postgresql://bob@db.example.com:5433/shop".into();
+        let r = run(&mut f, vec![vec![], vec![enter()], vec![]], true);
+        assert_eq!(r, vec![ModalResponse::None; 3]);
+        assert_eq!(f.host, "db.example.com");
+        assert_eq!(f.port, "5433");
+        assert!(f.url.is_empty());
+        // Empty, Enter there does nothing either.
+        let mut f = ConnectionForm::new(None);
+        let r = run(&mut f, vec![vec![], vec![enter()]], true);
+        assert_eq!(r[1], ModalResponse::None);
     }
 }

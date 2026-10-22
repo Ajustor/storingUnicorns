@@ -9,6 +9,7 @@ use crate::engine::models::{Column, DatabaseType};
 use crate::engine::services::{ColumnDefinition, SchemaModification};
 
 use super::super::app::App;
+use super::super::modal::{self, MessageKind, ModalButton, ModalResponse, ModalSize, ModalSpec};
 use super::super::status;
 use super::super::theme::{ACCENT, ERROR};
 use super::Dialog;
@@ -162,31 +163,100 @@ fn column_fields(ui: &mut egui::Ui, c: &mut ColumnDefinition, name_editable: boo
         });
 }
 
-/// Draws the dialog; returns false when it should close.
-pub fn ui(app: &mut App, ui: &mut egui::Ui, d: &mut StructureDialog) -> bool {
-    let mut keep = true;
-    ui.set_min_width(560.0);
-    ui.heading(format!("{} Structure de {}", icon::COLUMNS, d.title));
-    ui.label(RichText::new(&d.connection).weak().small());
-    ui.add_space(6.0);
+/// What the footer asks for (closing the dialog is the modal's `Cancel`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructureAction {
+    /// Run the pending change.
+    Apply,
+    /// Drop the pending change.
+    CloseEdit,
+}
 
+/// What the body lists.
+enum Content<'a> {
+    NotConnected,
+    Loading,
+    Error(&'a str),
+    Columns { columns: &'a [Column], sqlite: bool },
+}
+
+/// Draw the dialog in the standard modal; what the user asked for.
+pub fn ui(app: &App, ui: &mut egui::Ui, d: &mut StructureDialog) -> ModalResponse<StructureAction> {
     let session = app.sessions.get(&d.connection);
     let sqlite = session.is_some_and(|s| s.config.db_type == DatabaseType::SQLite);
-    match session.map(|s| (s.details.get(&d.table), s.loading.contains_key(&d.table))) {
-        None => {
+    let content = match session.map(|s| (s.details.get(&d.table), s.loading.contains_key(&d.table)))
+    {
+        None => Content::NotConnected,
+        Some((None, _)) | Some((_, true)) => Content::Loading,
+        Some((Some(Err(e)), _)) => Content::Error(e),
+        Some((Some(Ok(details)), _)) => Content::Columns {
+            columns: &details.columns,
+            sqlite,
+        },
+    };
+    draw(ui, d, content)
+}
+
+fn draw(
+    ui: &mut egui::Ui,
+    d: &mut StructureDialog,
+    content: Content,
+) -> ModalResponse<StructureAction> {
+    let title = format!("Structure de {}", d.title);
+    let spec = ModalSpec {
+        cancel: Some("Fermer"),
+        ..ModalSpec::new(&title, ModalSize::Medium).icon(icon::COLUMNS)
+    };
+    let message = match (&d.error, d.applying) {
+        (Some(e), _) => Some((MessageKind::Error, e.clone())),
+        (None, true) => Some((MessageKind::Info, "Modification en cours…".to_owned())),
+        (None, false) => None,
+    };
+    let buttons = buttons(d);
+    modal::show(
+        ui,
+        spec,
+        |ui| body(ui, d, content),
+        message.as_ref().map(|(kind, text)| (*kind, text.as_str())),
+        &buttons,
+    )
+}
+
+/// Footer buttons: those of the pending change, if any.
+fn buttons(d: &StructureDialog) -> Vec<ModalButton<StructureAction>> {
+    let Some(edit) = &d.edit else {
+        return vec![];
+    };
+    let ready = !d.applying && edit.is_complete();
+    let apply = match edit {
+        ColumnEdit::Drop(_) => ModalButton::danger("Supprimer", StructureAction::Apply),
+        _ => ModalButton::primary("Appliquer", StructureAction::Apply),
+    };
+    vec![
+        ModalButton::secondary("Annuler la modification", StructureAction::CloseEdit),
+        apply.enabled(ready),
+    ]
+}
+
+fn body(ui: &mut egui::Ui, d: &mut StructureDialog, content: Content) {
+    ui.label(RichText::new(&d.connection).weak().small());
+    ui.add_space(6.0);
+    match content {
+        Content::NotConnected => {
             ui.colored_label(ERROR, status::not_connected(&d.connection));
         }
-        Some((None, _)) | Some((_, true)) => {
+        Content::Loading => {
             ui.spinner();
         }
-        Some((Some(Err(e)), _)) => {
+        Content::Error(e) => {
             ui.colored_label(ERROR, e);
         }
-        Some((Some(Ok(details)), _)) => {
+        Content::Columns { columns, sqlite } => {
             egui::ScrollArea::vertical()
+                .id_salt("structure_columns_scroll")
                 .max_height(320.0)
                 .show(ui, |ui| {
-                    columns_grid(ui, &details.columns, sqlite, d.applying, &mut d.edit);
+                    columns_grid(ui, columns, sqlite, d.applying, &mut d.edit);
                 });
             if ui
                 .add_enabled(
@@ -201,77 +271,60 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui, d: &mut StructureDialog) -> bool {
         }
     }
 
-    let mut apply = false;
-    if let Some(edit) = &mut d.edit {
-        ui.separator();
-        let danger = matches!(edit, ColumnEdit::Drop(_));
-        match edit {
-            ColumnEdit::Add(c) => {
-                ui.strong("Nouvelle colonne");
-                column_fields(ui, c, true);
-            }
-            ColumnEdit::Modify(c) => {
-                ui.strong(format!("Modifier {}", c.name));
-                column_fields(ui, c, false);
-            }
-            ColumnEdit::Rename { old, new } => {
-                ui.strong(format!("Renommer {old}"));
-                ui.text_edit_singleline(new);
-            }
-            ColumnEdit::Drop(name) => {
-                ui.label(
-                    RichText::new(format!(
-                        "{} Supprimer la colonne {name} et toutes ses données ?",
-                        icon::WARNING
-                    ))
-                    .color(ERROR),
-                );
-            }
+    let Some(edit) = &mut d.edit else {
+        return;
+    };
+    ui.separator();
+    match edit {
+        ColumnEdit::Add(c) => {
+            ui.strong("Nouvelle colonne");
+            column_fields(ui, c, true);
         }
-        let ready = !d.applying && edit.is_complete();
-        ui.horizontal(|ui| {
-            let button = if danger {
-                egui::Button::new(RichText::new("Supprimer").color(egui::Color32::WHITE))
-                    .fill(ERROR)
-            } else {
-                egui::Button::new("Appliquer")
-            };
-            if ui.add_enabled(ready, button).clicked() {
-                apply = true;
-            }
-            if ui.button("Annuler").clicked() {
-                d.edit = None;
-                d.error = None;
-            }
-            if d.applying {
-                ui.spinner();
-            }
-        });
-    }
-    if let Some(e) = &d.error {
-        ui.add(egui::Label::new(RichText::new(e).color(ERROR)).wrap());
-    }
-    if apply {
-        if let (Some(edit), Some(session)) = (&d.edit, app.sessions.get(&d.connection)) {
-            let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
-            d.applying = true;
-            d.error = None;
-            app.worker.apply_schema(
-                d.connection.clone(),
-                conn,
-                edit.to_modification(&d.table),
-                db_type,
+        ColumnEdit::Modify(c) => {
+            ui.strong(format!("Modifier {}", c.name));
+            column_fields(ui, c, false);
+        }
+        ColumnEdit::Rename { old, new } => {
+            ui.strong(format!("Renommer {old}"));
+            ui.text_edit_singleline(new);
+        }
+        ColumnEdit::Drop(name) => {
+            ui.label(
+                RichText::new(format!(
+                    "{} Supprimer la colonne {name} et toutes ses données ?",
+                    icon::WARNING
+                ))
+                .color(ERROR),
             );
         }
     }
+}
 
-    ui.add_space(8.0);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if ui.button("Fermer").clicked() {
-            keep = false;
+/// Do `action`; the dialog stays open.
+pub fn act(app: &mut App, d: &mut StructureDialog, action: StructureAction) -> bool {
+    match action {
+        StructureAction::CloseEdit => {
+            d.edit = None;
+            d.error = None;
         }
-    });
-    keep
+        StructureAction::Apply => {
+            let ready = d.edit.as_ref().is_some_and(|e| e.is_complete()) && !d.applying;
+            if let (true, Some(edit), Some(session)) =
+                (ready, &d.edit, app.sessions.get(&d.connection))
+            {
+                let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
+                d.applying = true;
+                d.error = None;
+                app.worker.apply_schema(
+                    d.connection.clone(),
+                    conn,
+                    edit.to_modification(&d.table),
+                    db_type,
+                );
+            }
+        }
+    }
+    true
 }
 
 /// Column list with per-column actions (they set `edit`).
@@ -337,6 +390,7 @@ fn columns_grid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::modal::ButtonKind;
 
     #[test]
     fn edit_builds_the_right_modification() {
@@ -387,5 +441,113 @@ mod tests {
         };
         assert!(!empty.is_complete());
         assert!(ColumnEdit::Drop("a".into()).is_complete());
+    }
+
+    fn dialog(edit: Option<ColumnEdit>) -> StructureDialog {
+        StructureDialog {
+            connection: "Boutique".into(),
+            table: "\"main\".\"t\"".into(),
+            title: "t".into(),
+            edit,
+            applying: false,
+            error: None,
+        }
+    }
+
+    fn filled() -> ColumnEdit {
+        ColumnEdit::Add(ColumnDefinition {
+            name: "remise".into(),
+            data_type: "INT".into(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn footer_holds_the_pending_change_s_buttons() {
+        assert!(buttons(&dialog(None)).is_empty());
+        let b = buttons(&dialog(Some(filled())));
+        assert_eq!(
+            b.iter()
+                .map(|b| (b.label.as_str(), b.kind, b.action, b.enabled))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Annuler la modification",
+                    ButtonKind::Secondary,
+                    StructureAction::CloseEdit,
+                    true
+                ),
+                (
+                    "Appliquer",
+                    ButtonKind::Primary,
+                    StructureAction::Apply,
+                    true
+                ),
+            ]
+        );
+        // Incomplete, or already running: cannot be applied.
+        let b = buttons(&dialog(Some(ColumnEdit::Add(ColumnDefinition::default()))));
+        assert!(!b[1].enabled);
+        let mut running = dialog(Some(filled()));
+        running.applying = true;
+        assert!(!buttons(&running)[1].enabled);
+        // Dropping a column is destructive.
+        let b = buttons(&dialog(Some(ColumnEdit::Drop("a".into()))));
+        assert_eq!(
+            (b[1].label.as_str(), b[1].kind),
+            ("Supprimer", ButtonKind::Danger)
+        );
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Draw `d` over columns, then press `k`: the response.
+    fn press(d: &mut StructureDialog, k: egui::Key) -> ModalResponse<StructureAction> {
+        let columns = [Column {
+            name: "id".into(),
+            type_name: "INTEGER".into(),
+            nullable: false,
+            is_primary_key: true,
+        }];
+        let ctx = egui::Context::default();
+        let mut last = ModalResponse::None;
+        for events in [vec![], vec![key(k)]] {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                let content = Content::Columns {
+                    columns: &columns,
+                    sqlite: false,
+                };
+                last = egui::Modal::new(egui::Id::new("dialog"))
+                    .show(ctx, |ui| draw(ui, d, content))
+                    .inner;
+            });
+        }
+        last
+    }
+
+    #[test]
+    fn enter_applies_a_ready_change_but_never_a_drop() {
+        let mut d = dialog(Some(filled()));
+        assert_eq!(
+            press(&mut d, egui::Key::Enter),
+            ModalResponse::Button(StructureAction::Apply)
+        );
+        let mut d = dialog(Some(ColumnEdit::Drop("id".into())));
+        assert_eq!(press(&mut d, egui::Key::Enter), ModalResponse::None);
+        let mut d = dialog(None);
+        assert_eq!(press(&mut d, egui::Key::Enter), ModalResponse::None);
+        assert_eq!(press(&mut d, egui::Key::Escape), ModalResponse::Cancel);
     }
 }

@@ -132,7 +132,7 @@ impl App {
             }
             ConsoleAction::Rebind(name) => {
                 tab.connection = name;
-                c.completion = Default::default();
+                *c.completion = Default::default();
                 self.consoles_changed();
             }
             ConsoleAction::History(search) => {

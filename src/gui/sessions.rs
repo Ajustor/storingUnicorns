@@ -4,8 +4,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::engine::models::{ConnectionConfig, SchemaInfo, TableDetails};
+use crate::engine::ops::transfer::qualified;
 use crate::engine::ops::tx::ManualTx;
-use crate::engine::sql::statements::quote_chars;
+use crate::engine::sql::completion::{ColumnInfo, TableRef};
+use crate::engine::sql::statements::{quote_chars, quote_ident};
+
+use super::editor::completion::CompletionSource;
 
 use super::tx::TxView;
 use super::worker::{Conn, RunId, Runner, Worker};
@@ -96,6 +100,114 @@ impl Session {
     pub fn load_details(&mut self, worker: &mut Worker, name: &str, table: &str) {
         let run = worker.table_details(name.to_string(), self.conn.clone(), table.to_string());
         self.loading.insert(table.to_string(), run);
+    }
+
+    /// Key in `details` of the table `t` names: its schema when given, else
+    /// the first schema holding it (exact name first, then ignoring case).
+    pub fn details_key(&self, t: &TableRef) -> Option<String> {
+        details_key(&self.schemas, t, self.quotes)
+    }
+
+    /// Columns of `t` for completion: `None` while not loaded (unknown
+    /// tables, and failed loads, have none).
+    pub fn completion_columns(&self, t: &TableRef) -> Option<Vec<ColumnInfo>> {
+        completion_columns(&self.schemas, &self.details, self.quotes, t)
+    }
+
+    /// Load the details of `t` (completion), unless they are loaded or
+    /// loading already.
+    pub fn request_columns(&mut self, worker: &mut Worker, name: &str, t: &TableRef) {
+        let Some(key) = self.details_key(t) else {
+            return;
+        };
+        if !self.details.contains_key(&key) && !self.loading.contains_key(&key) {
+            self.load_details(worker, name, &key);
+        }
+    }
+}
+
+/// See [`Session::details_key`].
+pub fn details_key(schemas: &[SchemaInfo], t: &TableRef, quotes: (char, char)) -> Option<String> {
+    let in_schema = |s: &SchemaInfo| {
+        t.schema
+            .as_deref()
+            .is_none_or(|want| s.name.eq_ignore_ascii_case(want))
+    };
+    let find = |eq: &dyn Fn(&str) -> bool| {
+        schemas.iter().filter(|s| in_schema(s)).find_map(|s| {
+            s.tables
+                .iter()
+                .find(|n| eq(n))
+                .map(|n| qualified(&s.name, n, quotes))
+        })
+    };
+    find(&|n| n == t.name).or_else(|| find(&|n| n.eq_ignore_ascii_case(&t.name)))
+}
+
+/// See [`Session::completion_columns`].
+pub fn completion_columns(
+    schemas: &[SchemaInfo],
+    details: &HashMap<String, Result<TableDetails, String>>,
+    quotes: (char, char),
+    t: &TableRef,
+) -> Option<Vec<ColumnInfo>> {
+    let Some(key) = details_key(schemas, t, quotes) else {
+        return Some(Vec::new());
+    };
+    match details.get(&key)? {
+        Ok(d) => Some(
+            d.columns
+                .iter()
+                .map(|c| ColumnInfo {
+                    name: c.name.clone(),
+                    type_name: c.type_name.clone(),
+                    primary_key: c.is_primary_key,
+                })
+                .collect(),
+        ),
+        Err(_) => Some(Vec::new()),
+    }
+}
+
+/// Tables offered by completion: bare names with a single schema, else
+/// `schema.table` (a part holding a dot is quoted).
+pub fn completion_tables(schemas: &[SchemaInfo], quotes: (char, char)) -> Vec<String> {
+    if schemas.len() <= 1 {
+        return tables_of(schemas);
+    }
+    let part = |p: &str| {
+        if p.contains('.') {
+            quote_ident(p, quotes)
+        } else {
+            p.to_string()
+        }
+    };
+    schemas
+        .iter()
+        .flat_map(|s| {
+            s.tables
+                .iter()
+                .map(move |t| format!("{}.{}", part(&s.name), part(t)))
+        })
+        .collect()
+}
+
+/// Completion over a session (none: disconnected).
+pub struct SessionSource<'a>(pub Option<&'a Session>);
+
+impl CompletionSource for SessionSource<'_> {
+    fn quotes(&self) -> (char, char) {
+        self.0.map_or(('"', '"'), |s| s.quotes)
+    }
+
+    fn tables(&self) -> Vec<String> {
+        self.0
+            .map(|s| completion_tables(&s.schemas, s.quotes))
+            .unwrap_or_default()
+    }
+
+    fn columns(&self, t: &TableRef) -> Option<Vec<ColumnInfo>> {
+        self.0.map_or(Some(Vec::new()), |s| s.completion_columns(t))
     }
 }
 
@@ -201,14 +313,6 @@ impl Sessions {
                 .iter()
                 .map(|(name, s)| (name.as_str(), s.schemas.as_slice())),
         )
-    }
-
-    /// Table names of one connection (completion).
-    pub fn tables_of(&self, name: &str) -> Vec<String> {
-        self.open
-            .get(name)
-            .map(|s| tables_of(&s.schemas))
-            .unwrap_or_default()
     }
 }
 
@@ -319,6 +423,91 @@ mod tests {
         assert!(s.edited("prod", false, false));
         // Nothing being opened.
         assert!(!s.edited("prod", false, false));
+    }
+
+    fn table(schema: Option<&str>, name: &str) -> TableRef {
+        TableRef {
+            schema: schema.map(Into::into),
+            name: name.into(),
+            alias: None,
+        }
+    }
+
+    #[test]
+    fn details_key_finds_the_schema_of_a_table() {
+        let schemas = vec![
+            schema("public", &["users", "Orders"]),
+            schema("sales", &["orders", "users"]),
+        ];
+        let q = ('"', '"');
+        let key = |s, n| details_key(&schemas, &table(s, n), q);
+        assert_eq!(key(None, "users").as_deref(), Some("\"public\".\"users\""));
+        assert_eq!(
+            key(Some("SALES"), "users").as_deref(),
+            Some("\"sales\".\"users\"")
+        );
+        // An exact name wins over one differing in case only.
+        assert_eq!(key(None, "orders").as_deref(), Some("\"sales\".\"orders\""));
+        assert_eq!(
+            key(None, "ORDERS").as_deref(),
+            Some("\"public\".\"Orders\"")
+        );
+        assert_eq!(key(None, "nope"), None);
+        assert_eq!(key(Some("aux"), "users"), None);
+    }
+
+    #[test]
+    fn completion_tables_are_qualified_with_several_schemas() {
+        let q = ('"', '"');
+        let one = vec![schema("main", &["b", "a"])];
+        assert_eq!(completion_tables(&one, q), vec!["a", "b"]);
+        let two = vec![schema("public", &["users"]), schema("a.b", &["t"])];
+        assert_eq!(
+            completion_tables(&two, q),
+            vec!["public.users", "\"a.b\".t"]
+        );
+    }
+
+    #[test]
+    fn completion_columns_follow_the_loaded_details() {
+        use crate::engine::models::Column;
+        let schemas = vec![schema("main", &["users", "bad"])];
+        let mut details = HashMap::new();
+        let q = ('"', '"');
+        let cols =
+            |details: &HashMap<_, _>, n| completion_columns(&schemas, details, q, &table(None, n));
+        assert_eq!(cols(&details, "users"), None, "not loaded yet");
+        details.insert(
+            qualified("main", "users", q),
+            Ok(TableDetails {
+                columns: vec![Column {
+                    name: "id".into(),
+                    type_name: "INTEGER".into(),
+                    nullable: false,
+                    is_primary_key: true,
+                }],
+                ..TableDetails::default()
+            }),
+        );
+        details.insert(qualified("main", "bad", q), Err("boom".into()));
+        assert_eq!(
+            cols(&details, "USERS"),
+            Some(vec![ColumnInfo {
+                name: "id".into(),
+                type_name: "INTEGER".into(),
+                primary_key: true,
+            }])
+        );
+        assert_eq!(
+            cols(&details, "bad"),
+            Some(vec![]),
+            "failed: nothing to wait for"
+        );
+        assert_eq!(
+            cols(&details, "nope"),
+            Some(vec![]),
+            "unknown: nothing to load"
+        );
     }
 
     #[test]

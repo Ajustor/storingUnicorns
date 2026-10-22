@@ -12,7 +12,8 @@ use egui_phosphor::regular as icon;
 use crate::engine::models::{Column, QueryResult};
 use crate::engine::ops::rows::RowChanges;
 use crate::engine::sql::format::format_sql;
-use crate::gui::editor::{self, completion::Completion, EditorContext};
+use crate::gui::editor::completion::{Completion, CompletionSource};
+use crate::gui::editor::{self, EditorContext};
 use crate::gui::theme::{self, ACCENT, ERROR};
 use crate::gui::tx::{self, TxAction, TxView};
 
@@ -68,7 +69,8 @@ pub struct ConsoleTab {
     pub editor_height: f32,
     /// Columns of the result tabs (completion and highlighting).
     pub known_columns: Vec<String>,
-    pub completion: Completion,
+    /// Boxed: it keeps the console variant of `TabKind` small.
+    pub completion: Box<Completion>,
     /// Move the editor cursor to `cursor` on the next frame (restored console).
     restore_cursor: bool,
     next_result_id: u64,
@@ -128,7 +130,8 @@ pub struct ConsoleContext<'a> {
     pub running: bool,
     /// False while a modal is open: no shortcut fires.
     pub shortcuts: bool,
-    pub tables: &'a dyn Fn() -> Vec<String>,
+    /// Tables and columns of the connection (completion).
+    pub source: &'a dyn CompletionSource,
     /// Transaction mode of the connection.
     pub tx: TxView,
 }
@@ -176,7 +179,7 @@ impl ConsoleTab {
             running_since: None,
             editor_height: 220.0,
             known_columns: Vec::new(),
-            completion: Completion::default(),
+            completion: Box::default(),
             restore_cursor: true,
             next_result_id: 1,
             submitting: None,
@@ -330,7 +333,7 @@ impl ConsoleTab {
         // Editor, resizable through the splitter below it.
         let max_editor = (ui.available_height() - 120.0).max(60.0);
         self.editor_height = self.editor_height.clamp(60.0, max_editor);
-        let tables = cx.tables;
+        let source = cx.source;
         let out = egui::ScrollArea::vertical()
             .id_salt(id.with("scroll"))
             .max_height(self.editor_height)
@@ -345,7 +348,7 @@ impl ConsoleTab {
                     &mut self.completion,
                     EditorContext {
                         known_columns: &self.known_columns,
-                        tables,
+                        source,
                     },
                 )
             })

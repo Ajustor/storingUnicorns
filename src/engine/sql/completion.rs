@@ -113,10 +113,12 @@ const OTHER_CLAUSES: &[&str] = &[
     "UNION",
     "INTERSECT",
     "EXCEPT",
-    "AS",
+    "MINUS",
     "WITH",
-    "USING",
 ];
+/// Keywords that only matter right before the cursor (an alias, a USING
+/// list); further back they are walked over.
+const LOCAL_CLAUSES: &[&str] = &["AS", "USING"];
 /// Words that end a table reference (never an alias), besides keywords.
 const NOT_ALIAS: &[&str] = &[
     "FETCH",
@@ -558,14 +560,18 @@ impl<'t> Stmt<'t> {
         refs
     }
 
-    /// Tables of the level of `cursor`, CTE names left out.
-    fn tables_in_scope(&self, cursor: usize) -> Vec<TableRef> {
+    /// `refs` without the CTE names.
+    fn without_ctes(&self, mut refs: Vec<TableRef>) -> Vec<TableRef> {
         let ctes = self.cte_names();
-        let mut refs = self.table_refs(&self.level(self.scope_opener(cursor)));
         refs.retain(|r| {
             r.schema.is_some() || !ctes.iter().any(|c| c.eq_ignore_ascii_case(&r.name))
         });
         refs
+    }
+
+    /// Tables of the level of `cursor`, CTE names left out.
+    fn tables_in_scope(&self, cursor: usize) -> Vec<TableRef> {
+        self.without_ctes(self.table_refs(&self.level(self.scope_opener(cursor))))
     }
 
     /// Clause governing the position before token `before` (exclusive),
@@ -592,11 +598,31 @@ impl<'t> Stmt<'t> {
                         && prev.is_some_and(|p| self.is_punct(p, ','));
                     return Clause::Table(first || after_comma);
                 }
+                T::Word if self.is_any(k, LOCAL_CLAUSES) => {
+                    if first {
+                        return Clause::Other;
+                    }
+                }
                 T::Word if self.is_any(k, OTHER_CLAUSES) => return Clause::Other,
                 _ => {}
             }
         }
         Clause::None
+    }
+
+    /// `JOIN t USING (…|`: the tables joined so far, the one of the JOIN
+    /// last.
+    fn using_tables(&self, cursor: usize) -> Option<Vec<TableRef>> {
+        let o = *self.enclosing(cursor).first()?;
+        let using = o.checked_sub(1).filter(|&k| self.is(k, "USING"))?;
+        let items: Vec<Item> = self
+            .level(self.scope_opener(cursor))
+            .into_iter()
+            .take_while(|it| match it {
+                Item::Tok(i) | Item::Group(i) => *i < using,
+            })
+            .collect();
+        Some(self.without_ctes(self.table_refs(&items)))
     }
 
     /// `INSERT INTO t (…|`: the table whose column list holds the cursor.
@@ -666,6 +692,24 @@ impl Builder<'_, '_> {
     fn columns_of(&mut self, table: &TableRef) {
         for col in self.load(table).unwrap_or_default() {
             self.column(&col, None);
+        }
+    }
+
+    /// `USING (…)` list: the columns of the joined (last) table also found
+    /// in one of the others.
+    fn shared_columns(&mut self, tables: &[TableRef]) {
+        let Some((joined, others)) = tables.split_last() else {
+            return;
+        };
+        let cols = self.load(joined);
+        let others: Vec<Vec<ColumnInfo>> = others.iter().filter_map(|t| self.load(t)).collect();
+        for col in cols.unwrap_or_default() {
+            let shared = others
+                .iter()
+                .any(|cs| cs.iter().any(|c| c.name.eq_ignore_ascii_case(&col.name)));
+            if shared || tables.len() == 1 {
+                self.column(&col, None);
+            }
         }
     }
 
@@ -879,6 +923,10 @@ pub fn complete(text: &str, cursor: usize, cx: &Context) -> Completions {
     }
     if let Some(t) = stmt.insert_columns_table(cur) {
         b.columns_of(&t);
+        return b.out;
+    }
+    if let Some(tables) = stmt.using_tables(cur) {
+        b.shared_columns(&tables);
         return b.out;
     }
     match clause {
@@ -1579,5 +1627,32 @@ mod tests {
         use crate::engine::sql::lexer::get_completions;
         let got = get_completions("SELECT * FROM us", 16, &[], &["users".to_string()]);
         assert_eq!(got, ["users"]);
+    }
+
+    #[test]
+    fn as_does_not_stop_completion() {
+        let c = run("SELECT u.name AS n, | FROM users u");
+        assert_eq!(labels(&c, Kind::Column), ["id", "email", "name"]);
+        let c = run("SELECT COUNT(*) AS c, | FROM users");
+        assert_eq!(labels(&c, Kind::Column), ["id", "email", "name"]);
+        let c = run("SELECT * FROM users AS u, |");
+        assert_eq!(labels(&c, Kind::Table).len(), 4);
+        let c = run("SELECT * FROM users AS u JOIN orders o USING (id) WHERE |");
+        assert_eq!(labels(&c, Kind::Column)[0], "u.id");
+        // Right after AS: an alias is typed, no columns.
+        let c = run("SELECT name AS | FROM users");
+        assert!(labels(&c, Kind::Column).is_empty());
+    }
+
+    #[test]
+    fn join_using_lists_the_shared_columns() {
+        let c = run("SELECT * FROM users u JOIN orders o USING (|");
+        assert_eq!(labels(&c, Kind::Column), ["id"]);
+        assert_eq!(c.items.len(), 1);
+        let c = run("SELECT * FROM orders JOIN users USING (id, |)");
+        assert_eq!(labels(&c, Kind::Column), ["id"]);
+        let c = run("SELECT * FROM users JOIN audit USING (|)");
+        assert!(c.items.is_empty());
+        assert_eq!(c.missing, [tref("audit")]);
     }
 }

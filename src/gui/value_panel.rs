@@ -190,8 +190,28 @@ struct Focus<'a> {
     generation: u64,
 }
 
+/// The focus moved to `target`: write what was typed for the previous
+/// cell into its pending edits. Why it couldn't be, if so.
+fn hand_over(panel: &mut ValuePanel, tabs: &mut Tabs, target: Option<CellKey>) -> Option<String> {
+    let (key, generation, value) = panel.take_unapplied(target)?;
+    let cell = cell(tabs, key).filter(|f| f.generation == generation);
+    match (value, cell) {
+        (Ok(v), Some(f)) if f.editable => {
+            f.edits.set(f.rows, f.row, f.col, v);
+            None
+        }
+        (Err(e), _) => Some(e),
+        _ => Some("la cellule n'est plus modifiable".to_string()),
+    }
+}
+
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let target = focused_key(&app.tabs);
+    // Moving the focus applies what was typed for the previous cell, also
+    // when the move opens a preview (a link clicked on another cell).
+    if let Some(e) = hand_over(&mut app.value_panel, &mut app.tabs, target) {
+        app.error(format!("Valeur non appliquée : {e}"));
+    }
     // Focusing another cell than the one the links were followed from
     // closes the preview.
     if app
@@ -209,21 +229,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     ui.strong("Valeur");
     ui.separator();
-    // Moving the focus applies what was typed for the previous cell.
-    if let Some((key, generation, value)) = app.value_panel.take_unapplied(target) {
-        let cell = cell(&mut app.tabs, key).filter(|f| f.generation == generation);
-        let failure = match (value, cell) {
-            (Ok(v), Some(f)) if f.editable => {
-                f.edits.set(f.rows, f.row, f.col, v);
-                None
-            }
-            (Err(e), _) => Some(e),
-            _ => Some("la cellule n'est plus modifiable".to_string()),
-        };
-        if let Some(e) = failure {
-            app.error(format!("Valeur non appliquée : {e}"));
-        }
-    }
     let link = target.and_then(|key| focused_link(app, key));
     let mut follow = None;
     let panel = &mut app.value_panel;
@@ -780,6 +785,41 @@ mod tests {
             p.take_unapplied(Some(a)),
             Some((b, 0, Err("JSON invalide".into())))
         );
+    }
+
+    #[test]
+    fn text_typed_for_a_cell_is_applied_when_the_focus_moves() {
+        use crate::engine::models::{Column, QueryResult};
+        use crate::gui::tabs::data::DataTab;
+        let column = |name: &str| Column {
+            name: name.into(),
+            type_name: "TEXT".into(),
+            nullable: true,
+            is_primary_key: name == "id",
+        };
+        let mut d = DataTab::new("t".into(), ('"', '"'));
+        d.result = Some(QueryResult {
+            columns: vec![column("id"), column("name")],
+            rows: vec![vec!["1".into(), "a".into()], vec!["2".into(), "b".into()]],
+            primary_key: vec!["id".into()],
+            ..Default::default()
+        });
+        let mut tabs = Tabs::default();
+        let id = tabs.add("c".into(), "t".into(), TabKind::Data(Box::new(d)));
+        let a = (id, 0, RowRef::Base(0), 1);
+        let b = (id, 0, RowRef::Base(1), 1);
+        let mut p = ValuePanel::default();
+        p.sync(a, "a", 0);
+        p.buffer = "typed".into();
+        assert_eq!(hand_over(&mut p, &mut tabs, Some(a)), None, "still on it");
+        // The focus moves to B (say, its link clicked: a preview opens).
+        assert_eq!(hand_over(&mut p, &mut tabs, Some(b)), None);
+        let TabKind::Data(d) = &tabs.list[0].kind else {
+            unreachable!()
+        };
+        let rows = &d.result.as_ref().unwrap().rows;
+        assert_eq!(d.grid.edits.value(rows, RowRef::Base(0), 1), "typed");
+        assert_eq!(hand_over(&mut p, &mut tabs, Some(b)), None, "once");
     }
 
     #[test]

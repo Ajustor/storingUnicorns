@@ -347,10 +347,8 @@ pub struct TableDetails {
     /// Same for `foreign_keys`.
     pub foreign_keys_error: Option<String>,
     /// Foreign keys of other tables pointing at this one.
-    #[allow(dead_code)] // TODO(fk-navigation): used by the GUI task
     pub incoming: Vec<IncomingForeignKey>,
     /// Same as `indexes_error` for `incoming`.
-    #[allow(dead_code)] // TODO(fk-navigation): used by the GUI task
     pub incoming_error: Option<String>,
 }
 

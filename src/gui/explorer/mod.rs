@@ -19,10 +19,11 @@ use crate::engine::ops::transfer::qualified;
 use super::app::App;
 use super::dialogs::transfer::{self, BatchKind};
 use super::dialogs::{self, connection::ConnectionForm, Dialog};
+use super::fk;
 use super::rows::fixed_row;
 use super::sessions::{Session, Sessions};
 use super::status::one_line;
-use super::theme::{self, ACCENT, ERROR};
+use super::theme::{self, ERROR};
 use tree::{
     conn_views, connection_id, flatten, group_error, group_id, has_pk, inputs_key, schema_id,
     table_id, Group, Row, RowKind, TableAt, Tree,
@@ -634,11 +635,25 @@ fn item_row(ui: &mut egui::Ui, d: &TableDetails, group: Group, index: usize) {
             let Some(c) = d.columns.get(index) else {
                 return;
             };
+            let color = fk::link_color(ui.visuals().dark_mode);
             if c.is_primary_key {
-                ui.label(RichText::new(icon::KEY).color(ACCENT))
+                ui.label(RichText::new(icon::KEY).color(color))
                     .on_hover_text("Clé primaire");
             }
-            ui.label(&c.name);
+            let link = fk::link_of(&d.foreign_keys, &c.name);
+            if let Some(l) = &link {
+                ui.label(
+                    RichText::new(format!("{} FK", icon::LINK))
+                        .small()
+                        .strong()
+                        .color(color),
+                )
+                .on_hover_text(l.tooltip());
+            }
+            let name = ui.label(&c.name);
+            if let Some(l) = &link {
+                name.on_hover_text(l.tooltip());
+            }
             ui.label(RichText::new(&c.type_name).weak());
             if !c.nullable {
                 ui.label(RichText::new("NOT NULL").weak().small());

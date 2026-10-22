@@ -574,6 +574,7 @@ mod tests {
             edit: None,
             applying: false,
             error: None,
+            goto: None,
         })
     }
 

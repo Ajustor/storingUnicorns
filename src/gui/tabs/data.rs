@@ -7,7 +7,7 @@ use egui::{Galley, Key, RichText};
 use egui_phosphor::regular as icon;
 
 use crate::engine::db::utils::split_qualified;
-use crate::engine::models::QueryResult;
+use crate::engine::models::{QueryResult, TableDetails};
 use crate::engine::ops::query::has_full_key;
 use crate::engine::ops::rows::NO_PRIMARY_KEY;
 use crate::engine::sql::completion::{BarMode, ColumnInfo, TableRef};
@@ -15,7 +15,8 @@ use crate::engine::sql::paging::{toggle_order, DataQuery};
 use crate::engine::sql::statements::quote_ident;
 use crate::gui::editor::completion::{Completion, CompletionSource, Scope};
 use crate::gui::editor::HighlightCache;
-use crate::gui::grid::changes::PendingEdits;
+use crate::gui::fk::{self, ColumnLink};
+use crate::gui::grid::changes::{PendingEdits, RowRef};
 use crate::gui::grid::{self, GridAction, GridOptions, GridState};
 use crate::gui::status::one_line_label;
 use crate::gui::theme::ERROR;
@@ -94,6 +95,15 @@ pub enum DataAction {
     Export,
     /// Transaction mode, Commit or Rollback of the connection.
     Tx(TxAction),
+    /// Follow the foreign key of cell (`row`, `col`): preview the linked
+    /// row, or open it in a filtered tab.
+    Follow {
+        row: RowRef,
+        col: usize,
+        new_tab: bool,
+    },
+    /// Open the rows of incoming key `fk` pointing at `row`.
+    Referencing { row: RowRef, fk: usize },
 }
 
 pub struct DataTab {
@@ -143,6 +153,8 @@ pub struct DataContext<'a> {
     pub tx: TxView,
     /// Tables and columns of the connection (completion of the bars).
     pub source: &'a dyn CompletionSource,
+    /// Keys of the table (marking and following foreign keys), once loaded.
+    pub details: Option<&'a TableDetails>,
 }
 
 /// The displayed table's columns: the connection's metadata, else those of
@@ -174,6 +186,7 @@ impl CompletionSource for TableSource<'_> {
                         name: c.name.clone(),
                         type_name: c.type_name.clone(),
                         primary_key: c.is_primary_key,
+                        foreign_key: None,
                     })
                     .collect(),
             ),
@@ -210,6 +223,29 @@ impl DataTab {
             sort: None,
             completions: Default::default(),
         }
+    }
+
+    /// A tab of `table` showing the rows `condition` selects (filter bar
+    /// filled in and applied).
+    pub fn filtered(table: String, quotes: (char, char), condition: &str) -> Self {
+        let mut tab = Self::new(table, quotes);
+        tab.filter_input = condition.to_string();
+        tab.query.filter = condition.to_string();
+        tab
+    }
+
+    /// The values of row `r` as shown (pending edits applied).
+    pub fn row_values(&self, r: RowRef) -> Option<Vec<String>> {
+        let result = self.result.as_ref()?;
+        let RowRef::Base(i) = r else {
+            return None;
+        };
+        result.rows.get(i)?;
+        Some(
+            (0..result.columns.len())
+                .map(|c| self.grid.edits.value(&result.rows, r, c).to_string())
+                .collect(),
+        )
     }
 
     /// The displayed table, for completion.
@@ -395,6 +431,14 @@ impl DataTab {
             ui.label(RichText::new(format!("{} {hint}", icon::HOURGLASS)).weak());
         }
         let editable = self.editable() && busy.is_none();
+        let (links, incoming): (Vec<Option<ColumnLink>>, Vec<String>) =
+            match (cx.details, &self.result) {
+                (Some(d), Some(r)) => (
+                    fk::column_links(&r.columns, &d.foreign_keys),
+                    d.incoming.iter().map(fk::incoming_label).collect(),
+                ),
+                _ => (Vec::new(), Vec::new()),
+            };
         let Some(result) = &self.result else {
             if self.loading {
                 ui.spinner();
@@ -410,6 +454,8 @@ impl DataTab {
                 editable,
                 server_sort: true,
                 sort_indicator: self.sort,
+                links: &links,
+                incoming: &incoming,
             },
         );
         match grid_action {
@@ -423,6 +469,12 @@ impl DataTab {
                 action = Some(DataAction::Submit);
             }
             GridAction::Export => action = Some(DataAction::Export),
+            GridAction::Follow { row, col, new_tab } => {
+                action = Some(DataAction::Follow { row, col, new_tab })
+            }
+            GridAction::Referencing { row, fk } => {
+                action = Some(DataAction::Referencing { row, fk })
+            }
             _ => {}
         }
         action
@@ -602,6 +654,33 @@ mod tests {
             truncated: false,
             primary_key: vec!["id".into()],
         }
+    }
+
+    #[test]
+    fn a_filtered_tab_loads_the_link_s_condition() {
+        let mut t = DataTab::filtered("\"main\".\"users\"".into(), ('"', '"'), "\"id\" = '3'");
+        assert_eq!(t.filter_input, "\"id\" = '3'");
+        assert_eq!(t.query.filter, "\"id\" = '3'");
+        assert_eq!(t.query.table, "\"main\".\"users\"");
+        assert!(t.needs_load);
+        // Applying the bar again keeps it.
+        assert_eq!(t.navigate(Nav::Apply), DataAction::Load { count: true });
+        assert_eq!(t.query.filter, "\"id\" = '3'");
+    }
+
+    #[test]
+    fn row_values_show_pending_edits_of_saved_rows() {
+        let mut t = DataTab::new("t".into(), ('"', '"'));
+        assert_eq!(t.row_values(RowRef::Base(0)), None, "nothing loaded");
+        t.result = Some(page(2));
+        let rows = t.result.as_ref().unwrap().rows.clone();
+        t.grid.edits.set(&rows, RowRef::Base(1), 1, "edited".into());
+        assert_eq!(
+            t.row_values(RowRef::Base(1)),
+            Some(vec!["1".into(), "edited".into()])
+        );
+        assert_eq!(t.row_values(RowRef::Base(5)), None);
+        assert_eq!(t.row_values(RowRef::New(0)), None, "not saved yet");
     }
 
     #[test]
@@ -850,6 +929,7 @@ mod tests {
                     loading: false,
                     tx: TxView::Auto,
                     source,
+                    details: None,
                 };
                 action = t.filter_bar(ui, &cx);
                 // Whether Enter is still there for what comes next (a dialog).

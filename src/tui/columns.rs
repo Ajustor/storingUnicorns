@@ -163,6 +163,7 @@ pub async fn poll(state: &mut AppState) {
                         name: c.name,
                         type_name: c.data_type,
                         primary_key: c.is_primary_key,
+                        foreign_key: None,
                     })
                     .collect();
                 state.completion_columns.insert(&k, cols);
@@ -210,6 +211,7 @@ mod tests {
             name: name.into(),
             type_name: ty.into(),
             primary_key: pk,
+            foreign_key: None,
         }
     }
 

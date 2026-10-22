@@ -91,7 +91,7 @@ pub enum GridAction {
     /// "Exporter…" in the footer.
     Export,
     /// Follow the foreign key of a cell: preview the linked row, or open
-    /// it in a filtered tab (`new_tab`: Ctrl+click).
+    /// it in a filtered tab (`new_tab`: Ctrl+click, Cmd on macOS).
     Follow {
         row: RowRef,
         col: usize,
@@ -605,8 +605,9 @@ fn link_cell(ui: &mut egui::Ui, text: RichText, link: &ColumnLink, selected: boo
     // Selected: underlined, so it still reads as a link.
     let hovered = selected || ui.rect_contains_pointer(ui.max_rect());
     let hint = format!(
-        "{} · clic sur l'icône : aperçu (Alt+Entrée) · Ctrl+clic : ouvrir dans un onglet",
-        link.tooltip()
+        "{} · clic sur l'icône : aperçu (Alt+Entrée) · {} : ouvrir dans un onglet",
+        link.tooltip(),
+        fk::tab_click_here()
     );
     let clicked = ui
         .add(
@@ -656,9 +657,10 @@ fn context_menu(ui: &mut egui::Ui, m: &MenuCell, action: &mut Option<CellAction>
         item(
             ui,
             format!(
-                "{} Ouvrir {} dans un onglet (Ctrl+clic)",
+                "{} Ouvrir {} dans un onglet ({})",
                 icon::ARROW_SQUARE_OUT,
-                link.table
+                link.table,
+                fk::tab_click_here()
             ),
             CellAction::Follow(r, c, true),
         );

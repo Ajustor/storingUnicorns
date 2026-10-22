@@ -274,7 +274,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             }
             if ui
                 .button(icon::ARROW_SQUARE_OUT)
-                .on_hover_text(format!("Ouvrir {} dans un onglet (Ctrl+clic)", l.table))
+                .on_hover_text(format!(
+                    "Ouvrir {} dans un onglet ({})",
+                    l.table,
+                    fk::tab_click_here()
+                ))
                 .clicked()
             {
                 follow = Some((tab, row, col, true));
@@ -551,8 +555,9 @@ fn preview_row(
                         let r = ui
                             .link(RichText::new(format!("{} {value}", icon::LINK)).color(color))
                             .on_hover_text(format!(
-                                "{} · clic : suivre · Ctrl+clic : ouvrir dans un onglet",
-                                l.tooltip()
+                                "{} · clic : suivre · {} : ouvrir dans un onglet",
+                                l.tooltip(),
+                                fk::tab_click_here()
                             ));
                         if r.clicked() {
                             let new_tab = ui.input(|i| i.modifiers.command);

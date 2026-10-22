@@ -55,9 +55,9 @@ fn degrade<T>(r: Result<Vec<T>>) -> (Vec<T>, Option<String>) {
 }
 
 /// Columns (through `cache`), indexes, foreign keys and incoming foreign
-/// keys of `table`, fetched concurrently. Only the columns are required: servers that lack part of
-/// the catalog (CockroachDB, Redshift…) get empty index / key lists with
-/// the reason.
+/// keys of `table`, fetched concurrently. Only the columns are required:
+/// servers that lack part of the catalog (CockroachDB, Redshift…) get empty
+/// index / key lists with the reason.
 pub async fn table_details(
     conn: &DatabaseConnection,
     cache: &TableCache,
@@ -397,7 +397,8 @@ mod tests {
         use crate::engine::sql::relations::{follow, referencing};
         let conn = sqlite_mem(&[
             "CREATE TABLE p (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (b, a))",
-            "CREATE TABLE c (id INTEGER PRIMARY KEY, pa INTEGER, x INTEGER, y INTEGER,              FOREIGN KEY (PA) REFERENCES P(A), FOREIGN KEY (x, y) REFERENCES p)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, pa INTEGER, x INTEGER, y INTEGER, \
+             FOREIGN KEY (PA) REFERENCES P(A), FOREIGN KEY (x, y) REFERENCES p)",
             "CREATE TABLE nopk (v INTEGER)",
             "CREATE TABLE d (id INTEGER PRIMARY KEY, n INTEGER REFERENCES nopk)",
         ])

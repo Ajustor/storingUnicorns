@@ -1348,7 +1348,9 @@ async fn integration_incoming_fks_postgres() {
     // A partitioned referencing table: its partitions hold cloned
     // constraints (`conparentid` set), listed once through the parent.
     for sql in [
-        "CREATE TABLE su_it_fk1.part (id INT, sid INT,          CONSTRAINT part_single_fk FOREIGN KEY (sid) REFERENCES su_it_fk1.single (id))          PARTITION BY RANGE (id)",
+        "CREATE TABLE su_it_fk1.part (id INT, sid INT, \
+         CONSTRAINT part_single_fk FOREIGN KEY (sid) REFERENCES su_it_fk1.single (id)) \
+         PARTITION BY RANGE (id)",
         "CREATE TABLE su_it_fk1.part_1 PARTITION OF su_it_fk1.part FOR VALUES FROM (0) TO (100)",
         "CREATE TABLE su_it_fk1.part_2 PARTITION OF su_it_fk1.part FOR VALUES FROM (100) TO (200)",
     ] {

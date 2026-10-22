@@ -654,6 +654,9 @@ pub struct AppState {
     /// Completion asked for (Ctrl+Space) and not dismissed: refreshed when
     /// the columns it waits for arrive.
     pub completion_wanted: bool,
+    /// Tab, cursor and text the completion was asked for: columns arriving
+    /// after the user moved on don't open it.
+    pub completion_anchor: Option<(usize, usize, String)>,
     /// Columns of the cited tables, for completion.
     pub completion_columns: ColumnStore,
     pub known_columns: Vec<String>, // Columns from last query result
@@ -759,6 +762,7 @@ impl AppState {
             completion_selected: 0,
             show_completion: false,
             completion_wanted: false,
+            completion_anchor: None,
             completion_columns: ColumnStore::default(),
             known_columns: Vec::new(),
             table_cache: TableCache::default(),
@@ -1014,6 +1018,25 @@ impl AppState {
         self.completion_selected = 0;
         self.show_completion = !self.completion_suggestions.is_empty();
         self.completion_wanted = true;
+        self.completion_anchor = Some(self.completion_position());
+    }
+
+    /// Where the editor is: tab, cursor and text.
+    fn completion_position(&self) -> (usize, usize, String) {
+        (
+            self.query_tabs.active_tab,
+            self.cursor_position(),
+            self.query_input().to_string(),
+        )
+    }
+
+    /// Whether the user is still where the completion was asked for (the
+    /// editor focused, same tab, cursor and text).
+    pub fn completion_still_wanted(&self) -> bool {
+        self.completion_wanted
+            && self.active_panel == ActivePanel::QueryEditor
+            && !self.is_dialog_open()
+            && self.completion_anchor.as_ref() == Some(&self.completion_position())
     }
 
     /// Recompute the suggestions asked for (columns arrived), keeping the
@@ -1060,6 +1083,7 @@ impl AppState {
     pub fn hide_completion(&mut self) {
         self.show_completion = false;
         self.completion_wanted = false;
+        self.completion_anchor = None;
         self.completion_suggestions.clear();
         self.completion_selected = 0;
     }

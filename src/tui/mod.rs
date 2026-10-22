@@ -104,7 +104,7 @@ pub async fn run(opts: crate::cli::TuiOptions) -> Result<()> {
     terminal.show_cursor()?;
 
     // Close any open connection
-    state.completion_columns.clear();
+    state.completion_columns.stop().await;
     if let Some(conn) = state.connection.take() {
         columns::close(conn).await;
     }

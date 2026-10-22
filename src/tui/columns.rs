@@ -77,6 +77,17 @@ impl ColumnStore {
         self.loaded.clear();
         self.failed.clear();
     }
+
+    /// `clear`, once the stopped loads are over: they no longer hold the
+    /// connection, which can then be closed gracefully.
+    pub async fn stop(&mut self) {
+        let pending: Vec<_> = self.pending.drain(..).collect();
+        self.clear();
+        for (_, task) in pending {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 /// Load the columns of `table` in the background, unless they are loaded,
@@ -96,9 +107,14 @@ pub fn request(state: &mut AppState, table: &TableRef) {
             .find(|t| t.eq_ignore_ascii_case(&table.name))?;
         schema_ok.then(|| (s.name.clone(), name.clone()))
     });
-    if let Some((schema, name)) = known {
-        table.schema = Some(schema);
-        table.name = name;
+    match known {
+        Some((schema, name)) => {
+            table.schema = Some(schema);
+            table.name = name;
+        }
+        // Not a table (a CTE, a typo): nothing to load.
+        None if !state.schemas.is_empty() => return,
+        None => {}
     }
     let table = &table;
     let k = key(table);
@@ -161,8 +177,13 @@ pub async fn poll(state: &mut AppState) {
             }
         }
     }
-    if state.completion_wanted {
+    // Only where it was asked for: after a move, typing, another panel or
+    // tab, Enter would insert a suggestion instead of a newline.
+    if state.completion_still_wanted() {
         state.refresh_completions();
+    } else {
+        state.completion_wanted = false;
+        state.completion_anchor = None;
     }
 }
 
@@ -336,6 +357,32 @@ mod tests {
             items.contains(&("email".into(), "TEXT".into())),
             "{items:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn names_absent_from_the_known_tables_are_not_fetched() {
+        let mut state = editor("WITH recent AS (SELECT 1) SELECT | FROM recent, userz");
+        state.connection = Some(Arc::new(sqlite_mem(&[]).await));
+        state.update_completions();
+        assert!(!state.completion_columns.is_loading());
+        // Without a table list (not loaded), a cited table is still asked.
+        state.schemas.clear();
+        state.update_completions();
+        assert!(state.completion_columns.is_loading());
+    }
+
+    #[tokio::test]
+    async fn stopping_awaits_the_loads_so_the_connection_closes_cleanly() {
+        let mut state = editor("SELECT | FROM users");
+        state.connection = Some(Arc::new(
+            sqlite_mem(&["CREATE TABLE users (id INTEGER PRIMARY KEY)"]).await,
+        ));
+        state.update_completions();
+        assert!(state.completion_columns.is_loading());
+        state.completion_columns.stop().await;
+        let conn = state.connection.take().unwrap();
+        // No load holds it any more: `close` gets it back to close it.
+        assert_eq!(Arc::strong_count(&conn), 1);
     }
 
     #[tokio::test]

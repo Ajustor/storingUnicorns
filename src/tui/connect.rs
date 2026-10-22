@@ -122,7 +122,7 @@ pub async fn poll(state: &mut AppState) {
     };
     match outcome {
         Ok(conn) => {
-            state.completion_columns.clear();
+            state.completion_columns.stop().await;
             if let Some(old) = state.connection.take() {
                 super::columns::close(old).await;
             }

@@ -5,7 +5,7 @@ pub mod structure;
 pub mod transfer;
 
 use super::app::App;
-use super::history_popup::{HistoryAction, HistoryPopup};
+use super::history_popup::HistoryPopup;
 use super::modal::{self, MessageKind, ModalButton, ModalResponse, ModalSize, ModalSpec};
 use super::table_search::TableSearch;
 use super::tabs::console::RunKind;
@@ -15,7 +15,7 @@ use crate::engine::db::entra_interactive;
 use crate::engine::ops::transfer::qualified;
 use connection::{ConnectionForm, FormAction};
 use structure::{StructureAction, StructureDialog};
-use transfer::BatchDialog;
+use transfer::{BatchDialog, BatchStart};
 
 pub enum Dialog {
     Connection(Box<ConnectionForm>),
@@ -70,27 +70,6 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         }
         ui.set_min_width(420.0);
         match &mut dialog {
-            Dialog::History(popup) => {
-                if let HistoryAction::Insert(sql) = popup.ui(ui, &app.history) {
-                    if let Some(tab) = app.tabs.active_mut() {
-                        if let TabKind::Console(c) = &mut tab.kind {
-                            c.insert(ui.ctx(), tab.id, &sql);
-                        }
-                    }
-                    keep = false;
-                }
-            }
-            Dialog::TableSearch(search) => {
-                let color_of = |name: &str| app.color_of(name);
-                if let Some((connection, schema, table)) = search.ui(ui, &color_of) {
-                    let quotes = app.sessions.get(&connection).map(|s| s.quotes);
-                    if let Some(quotes) = quotes {
-                        app.open_data(&connection, &qualified(&schema, &table, quotes), &table);
-                    }
-                    keep = false;
-                }
-            }
-            Dialog::Batch(b) => keep = transfer::batch_ui(app, ui, b),
             // Drawn by `standard_ui`.
             Dialog::Connection(_)
             | Dialog::Structure(_)
@@ -100,7 +79,10 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             | Dialog::ConfirmRerun { .. }
             | Dialog::ConfirmQuit { .. }
             | Dialog::EndTx(_)
-            | Dialog::ConfirmTruncate { .. } => {}
+            | Dialog::ConfirmTruncate { .. }
+            | Dialog::History(_)
+            | Dialog::TableSearch(_)
+            | Dialog::Batch(_) => {}
         }
         None
     });
@@ -148,6 +130,12 @@ enum Answer {
     Rollback,
     Connection(FormAction),
     Structure(StructureAction),
+    /// Insert this history entry into the active console.
+    Insert(usize),
+    /// Open the data of this table of the table search.
+    Open(usize),
+    /// Start the batch.
+    StartBatch,
 }
 
 /// The answer a standard dialog got this frame: `Some(None)` to cancel it
@@ -162,22 +150,12 @@ fn settle(response: ModalResponse<Answer>, outside: bool) -> Option<Option<Answe
     }
 }
 
-/// Draw `dialog` if it is a standard one (confirmations, forms); `None`
-/// otherwise.
+/// Draw `dialog` (every dialog is a standard modal).
 fn standard_ui(
     app: &mut App,
     ui: &mut egui::Ui,
     dialog: &mut Dialog,
 ) -> Option<ModalResponse<Answer>> {
-    match dialog {
-        Dialog::Connection(form) => {
-            let sign_in = form.testing_name().and_then(|n| app.sign_ins.url_of(n));
-            return Some(form.ui(ui, sign_in).map(Answer::Connection));
-        }
-        Dialog::Structure(d) => return Some(structure::ui(app, ui, d).map(Answer::Structure)),
-        _ => {}
-    }
-    let dialog = &*dialog;
     let small = |title| ModalSpec::new(title, ModalSize::Small);
     let response = match dialog {
         Dialog::ConfirmDeleteConnection(name) => {
@@ -298,9 +276,17 @@ fn standard_ui(
         Dialog::ConfirmTruncate { connection, tables } => {
             transfer::confirm_truncate_ui(ui, connection, tables).map(|()| Answer::Confirm)
         }
-        // Forms: drawn above.
-        Dialog::Connection(_) | Dialog::Structure(_) => return None,
-        Dialog::History(_) | Dialog::TableSearch(_) | Dialog::Batch(_) => return None,
+        Dialog::History(popup) => popup.ui(ui, &app.history).map(Answer::Insert),
+        Dialog::TableSearch(search) => {
+            let color_of = |name: &str| app.color_of(name);
+            search.ui(ui, &color_of).map(Answer::Open)
+        }
+        Dialog::Batch(b) => transfer::batch_ui(ui, b).map(|()| Answer::StartBatch),
+        Dialog::Connection(form) => {
+            let sign_in = form.testing_name().and_then(|n| app.sign_ins.url_of(n));
+            form.ui(ui, sign_in).map(Answer::Connection)
+        }
+        Dialog::Structure(d) => structure::ui(app, ui, d).map(Answer::Structure),
     };
     Some(response)
 }
@@ -346,6 +332,14 @@ enum Effect {
     Connection(FormAction),
     /// A button of the structure dialog (the dialog is its own).
     Structure(StructureAction),
+    /// Insert this history entry into the active console.
+    InsertHistory(usize),
+    OpenTable {
+        connection: String,
+        schema: String,
+        table: String,
+    },
+    Batch(BatchStart),
 }
 
 /// The effect of `answer` (`None`: cancelled) to `dialog`.
@@ -378,6 +372,16 @@ fn effect(dialog: &Dialog, answer: Option<Answer>) -> Effect {
         },
         (Dialog::Connection(_), Some(Answer::Connection(a))) => Effect::Connection(a),
         (Dialog::Structure(_), Some(Answer::Structure(a))) => Effect::Structure(a),
+        (Dialog::History(_), Some(Insert(i))) => Effect::InsertHistory(i),
+        (Dialog::TableSearch(search), Some(Open(i))) => match search.table(i) {
+            Some((connection, schema, table)) => Effect::OpenTable {
+                connection: connection.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+            },
+            None => Effect::Nothing,
+        },
+        (Dialog::Batch(b), Some(StartBatch)) => b.start().map_or(Effect::Nothing, Effect::Batch),
         _ => Effect::Nothing,
     }
 }
@@ -409,6 +413,26 @@ fn apply(app: &mut App, ctx: &egui::Context, dialog: &mut Dialog, effect: Effect
         Effect::CancelRestart => app.updater.cancel_restart(),
         Effect::EndTx { connection, commit } => app.end_tx_then_auto(&connection, commit),
         Effect::Truncate { connection, tables } => transfer::truncate(app, &connection, tables),
+        Effect::InsertHistory(index) => {
+            let sql = app.history.get(index).map(|e| e.sql.clone());
+            if let (Some(sql), Some(tab)) = (sql, app.tabs.active_mut()) {
+                if let TabKind::Console(c) = &mut tab.kind {
+                    c.insert(ctx, tab.id, &sql);
+                }
+            }
+        }
+        Effect::OpenTable {
+            connection,
+            schema,
+            table,
+        } => {
+            let quotes = app.sessions.get(&connection).map(|s| s.quotes);
+            if let Some(quotes) = quotes {
+                app.open_data(&connection, &qualified(&schema, &table, quotes), &table);
+            }
+        }
+        // A truncate opens its confirmation in the batch's place.
+        Effect::Batch(start) => transfer::start_batch(app, start),
     }
     false
 }
@@ -610,5 +634,60 @@ mod tests {
         assert_eq!(settle(ModalResponse::Cancel, false), Some(None));
         assert_eq!(effect(&connection_form(), None), Effect::Nothing);
         assert_eq!(effect(&structure(), None), Effect::Nothing);
+    }
+
+    fn table_search() -> Dialog {
+        Dialog::TableSearch(TableSearch::new(vec![(
+            "prod".into(),
+            "public".into(),
+            "orders".into(),
+        )]))
+    }
+
+    fn batch(dir: Option<&str>) -> Dialog {
+        let schemas = [crate::engine::models::SchemaInfo {
+            name: "main".into(),
+            tables: vec!["a".into()],
+            expanded: true,
+        }];
+        let mut b = BatchDialog::new("prod", transfer::BatchKind::Export, &schemas);
+        b.set_all(true);
+        b.dir = dir.map(Into::into);
+        Dialog::Batch(b)
+    }
+
+    #[test]
+    fn list_dialogs_act_on_their_selection() {
+        let history = Dialog::History(HistoryPopup::new(String::new()));
+        assert_eq!(
+            effect(&history, Some(Answer::Insert(4))),
+            Effect::InsertHistory(4)
+        );
+        assert_eq!(
+            effect(&table_search(), Some(Answer::Open(0))),
+            Effect::OpenTable {
+                connection: "prod".into(),
+                schema: "public".into(),
+                table: "orders".into()
+            }
+        );
+        assert_eq!(
+            effect(&table_search(), Some(Answer::Open(3))),
+            Effect::Nothing,
+            "gone"
+        );
+        let Effect::Batch(start) = effect(&batch(Some("dump")), Some(Answer::StartBatch)) else {
+            panic!("the batch starts");
+        };
+        assert_eq!(start.tables, vec![("main".to_string(), "a".to_string())]);
+        assert_eq!(
+            effect(&batch(None), Some(Answer::StartBatch)),
+            Effect::Nothing,
+            "not ready"
+        );
+        // Cancelling them does nothing.
+        for dialog in [history, table_search(), batch(Some("dump"))] {
+            assert_eq!(effect(&dialog, None), Effect::Nothing);
+        }
     }
 }

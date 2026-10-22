@@ -2,6 +2,9 @@
 //! double-click opens its data.
 
 use egui::{Color32, Key, Modifiers, RichText};
+use egui_phosphor::regular as icon;
+
+use super::modal::{self, ModalButton, ModalResponse, ModalSize, ModalSpec};
 
 /// Rows shown at most.
 pub const MAX_SHOWN: usize = 50;
@@ -82,15 +85,54 @@ impl TableSearch {
         }
     }
 
-    /// Body of the modal; returns the `(connection, schema, table)` to open.
+    /// The table search modal (standard, large): "Ouvrir" (Enter, a
+    /// double-click) answers the selected table, by its index (see
+    /// [`TableSearch::table`]).
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         color_of: &dyn Fn(&str) -> Color32,
-    ) -> Option<(String, String, String)> {
+    ) -> ModalResponse<usize> {
+        let any = !self.matches.is_empty();
+        let open = ModalButton::primary(format!("{} Ouvrir", icon::TABLE), ())
+            .enabled(any)
+            .hint(if any {
+                "Ouvrir les données de la table (Entrée)"
+            } else {
+                "Aucune table sélectionnée"
+            });
+        let mut activated = None;
+        let response = modal::show(
+            ui,
+            ModalSpec::new("Rechercher une table", ModalSize::Large).icon(icon::MAGNIFYING_GLASS),
+            |ui| activated = self.body(ui, color_of),
+            None,
+            std::slice::from_ref(&open),
+        );
+        let pos = match response {
+            ModalResponse::Cancel => return ModalResponse::Cancel,
+            // Enter or a double-click in the list.
+            ModalResponse::None => match activated {
+                Some(pos) => pos,
+                None => return ModalResponse::None,
+            },
+            ModalResponse::Button(()) => self.selected,
+        };
+        match self.matches.get(pos) {
+            Some(&i) => ModalResponse::Button(i),
+            None => ModalResponse::None,
+        }
+    }
+
+    /// `(connection, schema, table)` of the table at `index`.
+    pub fn table(&self, index: usize) -> Option<&(String, String, String)> {
+        self.tables.get(index)
+    }
+
+    /// Search field and list; the position in the list to open when Enter
+    /// or a double-click asks for it.
+    fn body(&mut self, ui: &mut egui::Ui, color_of: &dyn Fn(&str) -> Color32) -> Option<usize> {
         let screen = ui.ctx().screen_rect();
-        ui.set_width(super::popup::modal_width(screen.width()));
-        ui.heading("Rechercher une table");
         // Keys are taken before the text field sees them.
         let (down, up, enter) = ui.input_mut(|i| {
             (
@@ -156,7 +198,7 @@ impl TableSearch {
                     .weak(),
             );
         }
-        open.map(|pos| self.tables[self.matches[pos]].clone())
+        open
     }
 }
 
@@ -261,5 +303,61 @@ mod tests {
         assert_eq!(ranked("user", &tables), vec![2, 0]);
         assert_eq!(ranked("audit.l", &tables), vec![3]);
         assert_eq!(ranked("", &tables), vec![3, 1, 0, 2], "by name");
+    }
+
+    // --- The modal, through egui -------------------------------------------
+
+    use crate::gui::ui_test::{click, key, Driver};
+
+    fn search() -> TableSearch {
+        let t = |c: &str, s: &str, n: &str| (c.to_string(), s.to_string(), n.to_string());
+        // Listed by name: log (3), orders (1), users (0).
+        TableSearch::new(vec![
+            t("dev", "main", "users"),
+            t("prod", "public", "orders"),
+            t("prod", "audit", "log"),
+        ])
+    }
+
+    fn gray(_: &str) -> Color32 {
+        Color32::GRAY
+    }
+
+    #[test]
+    fn enter_opens_the_selected_table() {
+        let mut s = search();
+        let mut d = Driver::new();
+        let mut frame = |events| d.modal(events, |ui| s.ui(ui, &gray));
+        assert_eq!(frame(vec![]), ModalResponse::None);
+        assert_eq!(frame(vec![key(Key::ArrowDown)]), ModalResponse::None);
+        assert_eq!(frame(vec![key(Key::Enter)]), ModalResponse::Button(1));
+        assert_eq!(s.table(1).unwrap().2, "orders");
+    }
+
+    #[test]
+    fn open_button_opens_the_selected_table() {
+        let mut s = search();
+        let mut d = Driver::new();
+        d.modal(vec![], |ui| s.ui(ui, &gray));
+        for _ in 0..2 {
+            d.modal(vec![key(Key::ArrowDown)], |ui| s.ui(ui, &gray));
+        }
+        let open = d.button("Ouvrir").expect("Ouvrir");
+        assert!(open.enabled);
+        let r = d.modal(click(open.center), |ui| s.ui(ui, &gray));
+        assert_eq!(r, ModalResponse::Button(0), "users");
+    }
+
+    #[test]
+    fn nothing_to_open_without_a_match() {
+        let mut s = search();
+        s.query = "zzz".into();
+        s.matches = ranked(&s.query, &s.tables);
+        let mut d = Driver::new();
+        d.modal(vec![], |ui| s.ui(ui, &gray));
+        assert!(!d.button("Ouvrir").unwrap().enabled);
+        let r = d.modal(vec![key(Key::Enter)], |ui| s.ui(ui, &gray));
+        assert_eq!(r, ModalResponse::None);
+        assert_eq!(s.table(9), None);
     }
 }

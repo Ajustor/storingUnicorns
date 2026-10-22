@@ -16,6 +16,8 @@ mod table_search;
 mod tabs;
 mod theme;
 mod tx;
+#[cfg(test)]
+mod ui_test;
 mod value_panel;
 mod worker;
 

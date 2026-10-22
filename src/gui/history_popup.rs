@@ -9,6 +9,7 @@ use egui_phosphor::regular as icon;
 use crate::engine::services::history::{History, HistoryEntry};
 
 use super::editor::HighlightCache;
+use super::modal::{self, ModalButton, ModalResponse, ModalSize, ModalSpec};
 use super::popup;
 use super::theme::ERROR;
 
@@ -16,6 +17,8 @@ use super::theme::ERROR;
 pub struct HistoryPopup {
     pub search: String,
     pub selected: usize,
+    /// History index of the selected entry, when there is one.
+    chosen: Option<usize>,
     focus_search: bool,
     results: SearchCache,
     /// Highlighted SQL of the preview pane.
@@ -46,10 +49,13 @@ impl SearchCache {
     }
 }
 
-pub enum HistoryAction {
-    None,
-    /// Insert this SQL into the active console.
-    Insert(String),
+/// Footer buttons of the history modal, acting on the selected entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryAction {
+    /// Insert its SQL into the active console (and close).
+    Insert,
+    /// Copy its SQL to the clipboard (and stay open).
+    Copy,
 }
 
 /// "à l'instant", "il y a 5 min", "il y a 3 h", "il y a 2 j" (unix seconds).
@@ -160,23 +166,55 @@ impl HistoryPopup {
         Self {
             search,
             selected: 0,
+            chosen: None,
             focus_search: true,
             results: SearchCache::default(),
             preview: HighlightCache::default(),
         }
     }
 
-    /// Body of the modal (the caller draws the modal and closes it on
-    /// Escape). Sized from the window: see [`popup::modal_width`].
-    pub fn ui(&mut self, ui: &mut egui::Ui, history: &History) -> HistoryAction {
+    /// The history modal (standard, large): "Insérer" (Enter, a
+    /// double-click) and "Copier" act on the selected entry. Copying keeps
+    /// the modal open; the answer to insert is the entry's index in
+    /// `history`.
+    pub fn ui(&mut self, ui: &mut egui::Ui, history: &History) -> ModalResponse<usize> {
+        let any = !self.results.get(history, &self.search).is_empty();
+        let buttons = footer(any);
+        let mut activated = false;
+        let response = modal::show(
+            ui,
+            ModalSpec::new("Historique", ModalSize::Large).icon(icon::CLOCK_COUNTER_CLOCKWISE),
+            |ui| activated = self.body(ui, history),
+            None,
+            &buttons,
+        );
+        let response = match response {
+            // Enter or a double-click in the list.
+            ModalResponse::None if activated => ModalResponse::Button(HistoryAction::Insert),
+            r => r,
+        };
+        let chosen = self.chosen.filter(|&i| history.get(i).is_some());
+        match response {
+            ModalResponse::None => ModalResponse::None,
+            ModalResponse::Cancel => ModalResponse::Cancel,
+            ModalResponse::Button(action) => match (action, chosen) {
+                (HistoryAction::Insert, Some(i)) => ModalResponse::Button(i),
+                (HistoryAction::Copy, Some(i)) => {
+                    if let Some(e) = history.get(i) {
+                        ui.ctx().copy_text(e.sql.clone());
+                    }
+                    ModalResponse::None
+                }
+                (_, None) => ModalResponse::None,
+            },
+        }
+    }
+
+    /// Search field, list and preview; true when Enter or a double-click
+    /// asks to insert the selected entry.
+    fn body(&mut self, ui: &mut egui::Ui, history: &History) -> bool {
         let screen = ui.ctx().screen_rect();
-        let width = popup::modal_width(screen.width());
-        ui.set_width(width);
-        ui.horizontal(|ui| {
-            ui.heading("Historique");
-            let count = self.results.get(history, &self.search).len();
-            ui.label(RichText::new(format!("{count} requête(s)")).weak());
-        });
+        let width = ui.available_width();
         let search = ui.add(
             egui::TextEdit::singleline(&mut self.search)
                 .hint_text(format!(
@@ -193,8 +231,9 @@ impl HistoryPopup {
         }
         let entries = self.results.get(history, &self.search);
         if entries.is_empty() {
+            self.chosen = None;
             ui.label(RichText::new("Aucune requête").weak());
-            return HistoryAction::None;
+            return false;
         }
         self.selected = self.selected.min(entries.len() - 1);
         let (down, up, enter) = ui.input_mut(|i| {
@@ -210,10 +249,8 @@ impl HistoryPopup {
         if up {
             self.selected = self.selected.saturating_sub(1);
         }
-        let mut action = HistoryAction::None;
-        if let Some(e) = history.get(entries[self.selected].0).filter(|_| enter) {
-            action = HistoryAction::Insert(e.sql.clone());
-        }
+        let mut activated = enter;
+        let count = entries.len();
         let now = now_secs();
         let height = popup::modal_list_height(screen.height());
         // Side by side when there is room, else the preview under the list.
@@ -243,16 +280,15 @@ impl HistoryPopup {
                             *selected = i;
                         }
                         if r.double_clicked() {
-                            action = HistoryAction::Insert(e.sql.clone());
+                            activated = true;
                         }
                     }
                 });
         };
         let chosen = history.get(entries[self.selected].0);
-        let mut insert = false;
-        let mut preview = |ui: &mut egui::Ui, cache: &mut HighlightCache| {
+        let preview = |ui: &mut egui::Ui, cache: &mut HighlightCache| {
             if let Some(e) = chosen {
-                insert = preview_pane(
+                preview_pane(
                     ui,
                     cache,
                     e,
@@ -262,6 +298,9 @@ impl HistoryPopup {
         };
         if side_by_side {
             ui.horizontal_top(|ui| {
+                // The separator spans the row's height: in the modal's
+                // scrolling body, that would grow every frame.
+                ui.set_max_height(height);
                 ui.vertical(|ui| list(ui, &mut self.selected));
                 ui.separator();
                 ui.vertical(|ui| preview(ui, &mut self.preview));
@@ -271,18 +310,37 @@ impl HistoryPopup {
             ui.separator();
             preview(ui, &mut self.preview);
         }
-        if insert {
-            if let Some(e) = chosen {
-                action = HistoryAction::Insert(e.sql.clone());
-            }
-        }
+        // A click in the list selects that entry: the buttons act on it.
+        self.chosen = entries.get(self.selected).map(|&(i, _)| i);
         ui.label(
-            RichText::new("↑↓ naviguer · Entrée ou double-clic : insérer · Échap : fermer")
-                .small()
-                .weak(),
+            RichText::new(format!(
+                "{count} requête(s) · ↑↓ naviguer · Entrée ou double-clic : insérer · Échap : fermer"
+            ))
+            .small()
+            .weak(),
         );
-        action
+        activated
     }
+}
+
+/// Footer buttons, acting on the selected entry (none: disabled).
+fn footer(any: bool) -> [ModalButton<HistoryAction>; 2] {
+    let none = "Aucune requête sélectionnée";
+    let button =
+        |b: ModalButton<HistoryAction>, hint| b.enabled(any).hint(if any { hint } else { none });
+    [
+        button(
+            ModalButton::secondary(format!("{} Copier", icon::COPY), HistoryAction::Copy),
+            "Copier la requête dans le presse-papiers",
+        ),
+        button(
+            ModalButton::primary(
+                format!("{} Insérer", icon::ARROW_SQUARE_IN),
+                HistoryAction::Insert,
+            ),
+            "Insérer dans la console (Entrée)",
+        ),
+    ]
 }
 
 /// One entry of the list: the summary (error entries marked) over
@@ -346,15 +404,9 @@ fn entry_row(
 }
 
 /// Connection, date, duration and status of `e`, then its whole SQL,
-/// highlighted, in a scroll area of `height`. True when "Insérer" is
-/// clicked.
-fn preview_pane(
-    ui: &mut egui::Ui,
-    cache: &mut HighlightCache,
-    e: &HistoryEntry,
-    height: f32,
-) -> bool {
-    let mut insert = false;
+/// highlighted, in a scroll area of `height` (the footer's buttons act on
+/// it).
+fn preview_pane(ui: &mut egui::Ui, cache: &mut HighlightCache, e: &HistoryEntry, height: f32) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(&e.connection).strong());
         ui.label(RichText::new(format!("· {} · {} ms", absolute_time(e.at), e.duration_ms)).weak());
@@ -365,28 +417,15 @@ fn preview_pane(
         }
     });
     let text = preview_text(&e.sql);
-    let buttons = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+    let header = ui.text_style_height(&TextStyle::Body) + ui.spacing().item_spacing.y;
     egui::ScrollArea::both()
         .id_salt("history_preview")
-        .max_height((height - buttons - ui.text_style_height(&TextStyle::Body)).max(60.0))
+        .max_height((height - header).max(60.0))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let galley = cache.layout(ui, &text, &[], ui.available_width());
             ui.add(egui::Label::new(galley).selectable(true));
         });
-    ui.horizontal(|ui| {
-        if ui
-            .button(format!("{} Insérer", icon::ARROW_SQUARE_IN))
-            .on_hover_text("Insérer dans la console (Entrée)")
-            .clicked()
-        {
-            insert = true;
-        }
-        if ui.button(format!("{} Copier", icon::COPY)).clicked() {
-            ui.ctx().copy_text(e.sql.clone());
-        }
-    });
-    insert
 }
 
 #[cfg(test)]
@@ -513,6 +552,72 @@ mod tests {
         e.at = 1_000;
         e.duration_ms = 12;
         assert_eq!(meta_line(&e, 1_300), "Démo SQLite · il y a 5 min · 12 ms");
+    }
+
+    // --- The modal, through egui -------------------------------------------
+
+    use crate::gui::ui_test::{click, key, Driver};
+
+    /// A history of three queries; the indexes of "c", "b", "a" (newest
+    /// first, as listed).
+    fn three() -> (tempfile::TempDir, History, Vec<usize>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = History::load_from(dir.path().join("h.json"));
+        for sql in ["SELECT 'a'", "SELECT 'b'", "SELECT 'c'"] {
+            history.push(entry(sql));
+        }
+        let listed = history.search_indices("");
+        assert_eq!(history.get(listed[0]).unwrap().sql, "SELECT 'c'");
+        (dir, history, listed)
+    }
+
+    #[test]
+    fn enter_inserts_the_selected_entry() {
+        let (_dir, history, listed) = three();
+        let mut popup = HistoryPopup::new(String::new());
+        let mut d = Driver::new();
+        let mut frame = |events| d.modal(events, |ui| popup.ui(ui, &history));
+        assert_eq!(frame(vec![]), ModalResponse::None);
+        assert_eq!(frame(vec![key(Key::ArrowDown)]), ModalResponse::None);
+        assert_eq!(
+            frame(vec![key(Key::Enter)]),
+            ModalResponse::Button(listed[1]),
+            "the list's Enter inserts, once"
+        );
+    }
+
+    #[test]
+    fn footer_buttons_act_on_the_selected_entry() {
+        let (_dir, history, listed) = three();
+        let mut popup = HistoryPopup::new(String::new());
+        let mut d = Driver::new();
+        d.modal(vec![], |ui| popup.ui(ui, &history));
+        d.modal(vec![key(Key::ArrowDown)], |ui| popup.ui(ui, &history));
+        // Copier copies the selected query and keeps the modal open.
+        let copy = d.button("Copier").expect("Copier");
+        assert!(copy.enabled);
+        let r = d.modal(click(copy.center), |ui| popup.ui(ui, &history));
+        assert_eq!(r, ModalResponse::None);
+        assert_eq!(d.copied(), ["SELECT 'b'"]);
+        let insert = d.button("Insérer").expect("Insérer");
+        let r = d.modal(click(insert.center), |ui| popup.ui(ui, &history));
+        assert_eq!(r, ModalResponse::Button(listed[1]));
+        let cancel = d.button("Annuler").expect("Annuler");
+        let r = d.modal(click(cancel.center), |ui| popup.ui(ui, &history));
+        assert_eq!(r, ModalResponse::Cancel);
+    }
+
+    #[test]
+    fn nothing_to_insert_without_a_match() {
+        let (_dir, history, _) = three();
+        let mut popup = HistoryPopup::new("introuvable".into());
+        let mut d = Driver::new();
+        d.modal(vec![], |ui| popup.ui(ui, &history));
+        for label in ["Insérer", "Copier"] {
+            assert!(!d.button(label).expect(label).enabled, "{label}");
+        }
+        let r = d.modal(vec![key(Key::Enter)], |ui| popup.ui(ui, &history));
+        assert_eq!(r, ModalResponse::None);
     }
 
     #[test]

@@ -9,6 +9,33 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
 
 ## [Non publié]
 
+### Modifications
+
+- **Fenêtres de dialogue homogènes** : toutes les fenêtres (connexion,
+  structure, historique, recherche de table, export / import / vidage par lot,
+  confirmations) ont la même présentation : le titre avec un bouton **×**, un
+  contenu qui défile quand il est long, et les boutons toujours visibles en
+  bas, **Annuler** à gauche, l'action principale à droite et en couleur, les
+  actions destructives en rouge. Leur largeur dépend de leur rôle et ne dépasse
+  jamais la fenêtre. `Entrée` déclenche l'action principale (jamais une action
+  destructive, et pas dans un champ multiligne ni une liste déroulante
+  ouverte, ni avec la touche `Entrée` qui vient d'ouvrir la fenêtre) ;
+  `Échap`, **×** ou un clic hors de la fenêtre annulent, partout (sauf si une
+  liste déroulante est ouverte : `Échap` la ferme d'abord). Les touches ne
+  partent plus vers la console ou la grille restée derrière la fenêtre.
+- Les erreurs, le test de connexion en cours et son résultat s'affichent juste
+  au-dessus des boutons (un message long défile).
+- Libellés : **Quitter quand même** (au lieu de « Fermer quand même ») pour
+  quitter avec des modifications ou des transactions en attente ; pour terminer
+  une transaction, **Commit** est l'action principale et **Rollback** est en
+  rouge. Les boutons des fenêtres de l'historique (**Insérer**, **Copier**), de
+  la recherche de table (**Ouvrir**), de la structure (**Appliquer** /
+  **Supprimer**, **Fermer**) et du traitement par lot (**Exporter**,
+  **Importer**, **Vider…**) sont dans la barre du bas ; ce qui manque pour
+  lancer un traitement par lot est indiqué au-dessus du bouton.
+- **Vider les tables** : la confirmation liste maintenant toutes les tables à
+  vider (la liste défile ; elle s'arrêtait à 12).
+
 ### Corrections
 
 - **Mise à jour sous Windows** : « Redémarrer maintenant » n'appliquait pas la

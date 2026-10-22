@@ -4,6 +4,7 @@ mod dialogs;
 mod editor;
 mod explorer;
 mod history_popup;
+mod modal;
 mod persist;
 mod popup;
 mod rows;
@@ -15,6 +16,8 @@ mod table_search;
 mod tabs;
 mod theme;
 mod tx;
+#[cfg(test)]
+mod ui_test;
 mod value_panel;
 mod worker;
 

@@ -174,19 +174,81 @@ fn command_line(args: &[String], windows: bool) -> (&'static str, Vec<String>) {
 async fn run_gcloud(args: Vec<String>) -> std::io::Result<CmdOutput> {
     let (program, args) = command_line(&args, cfg!(target_os = "windows"));
     let mut command = tokio::process::Command::new(program);
+    command.args(&args).stdin(std::process::Stdio::null());
+    run_bounded(command, GCLOUD_TIMEOUT).await
+}
+
+/// Run `command` for at most `timeout`. On a timeout, or when the future is
+/// dropped, the child is killed — on Windows with its whole process tree:
+/// `kill_on_drop` alone stops `cmd.exe` but leaves `gcloud`'s Python running.
+async fn run_bounded(
+    mut command: tokio::process::Command,
+    timeout: Duration,
+) -> std::io::Result<CmdOutput> {
+    // On Windows `TreeGuard` stops the whole tree, `cmd` included; killing
+    // `cmd` first would orphan its children before `taskkill` sees them.
     command
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(GCLOUD_TIMEOUT, command.output())
+        .kill_on_drop(!cfg!(windows))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    use tokio::io::AsyncReadExt;
+    let mut child = command.spawn()?;
+    let (mut out, mut err) = (child.stdout.take(), child.stderr.take());
+    // Declared after `child`, so dropped first: the tree is killed while
+    // its root is still alive and links its descendants.
+    let mut tree = TreeGuard(child.id());
+    let run = async {
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let read_out = async {
+            if let Some(o) = out.as_mut() {
+                o.read_to_end(&mut stdout).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let read_err = async {
+            if let Some(e) = err.as_mut() {
+                e.read_to_end(&mut stderr).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let (status, o, e) = tokio::join!(child.wait(), read_out, read_err);
+        o?;
+        e?;
+        Ok::<_, std::io::Error>((status?, stdout, stderr))
+    };
+    let (status, stdout, stderr) = tokio::time::timeout(timeout, run)
         .await
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+    tree.0 = None; // exited: nothing left to kill
     Ok(CmdOutput {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: output.stdout,
-        stderr: output.stderr,
+        success: status.success(),
+        code: status.code(),
+        stdout,
+        stderr,
     })
+}
+
+/// Kills the process tree of a still-running child when dropped.
+struct TreeGuard(Option<u32>);
+
+impl Drop for TreeGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(pid) = self.0 {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            // Fire and forget: `taskkill` must not block the runtime.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+        #[cfg(not(windows))]
+        let _ = self.0;
+    }
 }
 
 /// Why `gcloud` gave no token.
@@ -818,5 +880,91 @@ mod tests {
         let renewed = cached_token("cache-a@example.com", run).await.unwrap();
         assert_ne!(renewed.secret(), a.secret());
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Processes whose command line contains `marker`.
+    #[cfg(windows)]
+    fn processes_with(marker: &str) -> usize {
+        let script = format!(
+            "@(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{marker}*' \
+             -and $_.Name -eq 'PING.EXE' }}).Count"
+        );
+        let powershell = std::path::Path::new(&std::env::var("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let out = std::process::Command::new(powershell)
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// `cmd /C ping` with a target unique to the test: `cmd` is the child,
+    /// `ping` the grandchild that `kill_on_drop` alone would leave running.
+    #[cfg(windows)]
+    async fn assert_tree_killed(marker: &str, run: impl Future<Output = ()>) {
+        let started = Instant::now();
+        run.await;
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match processes_with(marker) {
+                0 => return,
+                n => assert!(Instant::now() < deadline, "{n} ping left running"),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    fn ping_tree(marker: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("cmd");
+        command.args(["/C", "ping", "-n", "60", marker]);
+        command
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_timeout_kills_the_whole_process_tree() {
+        let marker = "127.0.0.61";
+        assert_tree_killed(marker, async {
+            let e = run_bounded(ping_tree(marker), Duration::from_secs(1))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        })
+        .await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn dropping_the_run_kills_the_whole_process_tree() {
+        let marker = "127.0.0.62";
+        assert_tree_killed(marker, async {
+            let run = run_bounded(ping_tree(marker), Duration::from_secs(60));
+            assert!(tokio::time::timeout(Duration::from_secs(1), run)
+                .await
+                .is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_gives_its_output() {
+        let mut command = if cfg!(windows) {
+            let mut c = tokio::process::Command::new("cmd");
+            c.args(["/C", "echo tok& echo oops 1>&2& exit 3"]);
+            c
+        } else {
+            let mut c = tokio::process::Command::new("sh");
+            c.args(["-c", "echo tok; echo oops >&2; exit 3"]);
+            c
+        };
+        command.stdin(std::process::Stdio::null());
+        let out = run_bounded(command, Duration::from_secs(10)).await.unwrap();
+        assert!(!out.success);
+        assert_eq!(out.code, Some(3));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "tok");
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "oops");
     }
 }

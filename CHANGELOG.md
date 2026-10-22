@@ -7,6 +7,30 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Modifications
+
+- **Fenêtres de dialogue homogènes** : toutes les fenêtres (connexion,
+  structure, historique, recherche de table, export / import / vidage par lot,
+  confirmations) ont la même présentation : le titre avec un bouton **×**, un
+  contenu qui défile quand il est long, et les boutons toujours visibles en
+  bas, **Annuler** à gauche, l'action principale à droite et en couleur, les
+  actions destructives en rouge. Leur largeur dépend de leur rôle et ne dépasse
+  jamais la fenêtre. `Entrée` déclenche l'action principale (jamais une action
+  destructive, et pas dans un champ multiligne ni une liste déroulante
+  ouverte) ; `Échap`, **×** ou un clic hors de la fenêtre annulent, partout.
+- Les erreurs, le test de connexion en cours et son résultat s'affichent sur
+  une ligne au-dessus des boutons.
+- Libellés : **Quitter quand même** (au lieu de « Fermer quand même ») pour
+  quitter avec des modifications ou des transactions en attente ; pour terminer
+  une transaction, **Commit** est l'action principale et **Rollback** est en
+  rouge. Les boutons des fenêtres de l'historique (**Insérer**, **Copier**), de
+  la recherche de table (**Ouvrir**), de la structure (**Appliquer** /
+  **Supprimer**, **Fermer**) et du traitement par lot (**Exporter**,
+  **Importer**, **Vider…**) sont dans la barre du bas ; ce qui manque pour
+  lancer un traitement par lot est indiqué au-dessus du bouton.
+
 ## [0.16.0] - 2026-10-22
 
 ### Nouveautés

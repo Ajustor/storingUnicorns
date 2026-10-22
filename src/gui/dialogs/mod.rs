@@ -94,7 +94,6 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 }
             }
             Dialog::History(popup) => {
-                ui.set_min_width(640.0);
                 if let HistoryAction::Insert(sql) = popup.ui(ui, &app.history) {
                     if let Some(tab) = app.tabs.active_mut() {
                         if let TabKind::Console(c) = &mut tab.kind {

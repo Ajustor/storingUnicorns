@@ -714,11 +714,8 @@ impl<'t> Stmt<'t> {
                         && prev.is_some_and(|p| self.is_punct(p, ','));
                     return Clause::Table(first || after_comma);
                 }
-                T::Word if self.is_any(k, LOCAL_CLAUSES) => {
-                    if first {
-                        return Clause::Other;
-                    }
-                }
+                // Further back, AS / USING are walked over.
+                T::Word if first && self.is_any(k, LOCAL_CLAUSES) => return Clause::Other,
                 T::Word if self.is_any(k, OTHER_CLAUSES) => return Clause::Other,
                 _ => {}
             }

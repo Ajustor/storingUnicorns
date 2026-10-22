@@ -552,13 +552,17 @@ fn preview_row(
                 let null = is_null(value);
                 match (&link, null) {
                     (Some(l), false) => {
+                        // Truncated like the other values, in full on hover.
                         let r = ui
-                            .link(RichText::new(format!("{} {value}", icon::LINK)).color(color))
-                            .on_hover_text(format!(
-                                "{} · clic : suivre · {} : ouvrir dans un onglet",
-                                l.tooltip(),
-                                fk::tab_click_here()
-                            ));
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(format!("{} {value}", icon::LINK)).color(color),
+                                )
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(link_hover(value, l));
                         if r.clicked() {
                             let new_tab = ui.input(|i| i.modifiers.command);
                             action = Some(PreviewAction::Follow { fk: l.fk, new_tab });
@@ -576,6 +580,17 @@ fn preview_row(
             }
         });
     action
+}
+
+/// Hover text of a link value of the preview: the full value, where it
+/// points and how to follow it.
+fn link_hover(value: &str, link: &ColumnLink) -> String {
+    format!(
+        "{value}
+{} · clic : suivre · {} : ouvrir dans un onglet",
+        link.tooltip(),
+        fk::tab_click_here()
+    )
 }
 
 /// Do what the preview asked for.
@@ -825,6 +840,20 @@ mod tests {
         let rows = &d.result.as_ref().unwrap().rows;
         assert_eq!(d.grid.edits.value(rows, RowRef::Base(0), 1), "typed");
         assert_eq!(hand_over(&mut p, &mut tabs, Some(b)), None, "once");
+    }
+
+    #[test]
+    fn a_long_link_value_is_shown_in_full_on_hover() {
+        let link = ColumnLink {
+            fk: 0,
+            target: "users.id".into(),
+            table: "users".into(),
+            composite: false,
+        };
+        let long = "x".repeat(300);
+        let hover = link_hover(&long, &link);
+        assert!(hover.starts_with(&long));
+        assert!(hover.contains("Clé étrangère → users.id"));
     }
 
     #[test]

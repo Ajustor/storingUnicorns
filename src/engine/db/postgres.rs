@@ -413,8 +413,11 @@ pub async fn get_foreign_keys(pool: &PgPool, table_name: &str) -> Result<Vec<For
 }
 
 /// Get the foreign keys of other tables pointing at a table, from
-/// `pg_constraint` (`confrelid` = the table). The referencing table is
-/// always qualified with its schema (`schema.table`).
+/// `pg_constraint` (`confrelid` = the table). Constraints cloned onto the
+/// partitions of a partitioned table (`conparentid` set, PostgreSQL 11+;
+/// older servers fail and the list degrades) are left out: the key is
+/// listed once, on the partitioned table. The referencing table is always
+/// qualified with its schema (`schema.table`).
 pub async fn get_incoming_foreign_keys(
     pool: &PgPool,
     table_name: &str,
@@ -441,8 +444,8 @@ pub async fn get_incoming_foreign_keys(
          JOIN pg_namespace n ON n.oid = t.relnamespace
          JOIN pg_class rt ON rt.oid = c.confrelid
          JOIN pg_namespace rn ON rn.oid = rt.relnamespace
-         WHERE c.contype = 'f' AND rn.nspname = COALESCE($1, current_schema())
-           AND rt.relname = $2
+         WHERE c.contype = 'f' AND c.conparentid = 0
+           AND rn.nspname = COALESCE($1, current_schema()) AND rt.relname = $2
          ORDER BY n.nspname, t.relname, c.conname",
     )
     .bind(schema)

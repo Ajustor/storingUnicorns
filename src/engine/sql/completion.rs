@@ -322,6 +322,16 @@ fn current_token(before: &str) -> Option<(usize, String, Option<char>)> {
     }
 }
 
+/// Byte offset where the token completed at `cursor` starts: what a chosen
+/// suggestion's `insert` replaces, up to the cursor. Same rule as
+/// [`complete`]: the trailing word, or from a typed opening identifier
+/// quote, quotes inside literals and comments ignored. Inside a literal or
+/// a comment, the cursor itself (nothing to replace).
+pub fn token_start(text: &str, cursor: usize) -> usize {
+    let cursor = floor_boundary(text, cursor);
+    current_token(&text[..cursor]).map_or(cursor, |(start, _, _)| start)
+}
+
 /// Largest char boundary of `text` not after `cursor`.
 fn floor_boundary(text: &str, cursor: usize) -> usize {
     let mut c = cursor.min(text.len());
@@ -1986,5 +1996,27 @@ mod tests {
         assert_eq!(labels(&c, Kind::Column), ["email"]);
         let c = run("SELECT * FROM orders; SELECT [em| FROM users");
         assert_eq!(labels(&c, Kind::Column), ["email"]);
+    }
+
+    #[test]
+    fn token_start_follows_the_completion_rule() {
+        let ts = |s: &str| {
+            let (text, c) = at(s);
+            token_start(&text, c)
+        };
+        assert_eq!(ts("SELECT em|"), 7);
+        assert_eq!(ts("SELECT u.em| FROM users u"), 9);
+        assert_eq!(ts("SELECT * FROM |"), 14);
+        assert_eq!(ts(r#"SELECT "em| FROM users"#), 7);
+        assert_eq!(ts("SELECT [em|"), 7);
+        // Quotes inside earlier literals and comments are not opening quotes.
+        assert_eq!(ts(r#"WHERE name = 'O"Brien' AND em|"#), 27);
+        assert_eq!(ts("-- \"x\nSELECT em|"), 13);
+        // Inside a literal: nothing to replace.
+        assert_eq!(ts("SELECT 'ab|"), 10);
+        assert_eq!(ts("SELECT é|"), 7);
+        // Past the end or inside a multibyte char: clamped to a boundary.
+        assert_eq!(token_start("é", 1), 0);
+        assert_eq!(token_start("ab", 9), 0);
     }
 }

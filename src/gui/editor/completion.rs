@@ -8,9 +8,9 @@
 use egui::{Key, Modifiers};
 
 use crate::engine::sql::completion::{
-    complete, complete_for_table, BarMode, ColumnInfo, Completions, Context, Suggestion, TableRef,
+    complete, complete_for_table, token_start, BarMode, ColumnInfo, Completions, Context,
+    Suggestion, TableRef,
 };
-use crate::engine::sql::lexer::extract_token;
 
 use super::{char_to_byte, set_cursor};
 
@@ -101,8 +101,12 @@ pub struct Completion {
 /// Replace the token ending at `cursor` with `suggestion`; returns the new
 /// text and cursor (bytes).
 pub fn apply_suggestion(text: &str, cursor: usize, suggestion: &str) -> (String, usize) {
-    let cursor = cursor.min(text.len());
-    let (start, _, _) = extract_token(&text[..cursor]);
+    // Same token as the one completed (quotes in literals ignored).
+    let start = token_start(text, cursor);
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
     let mut out = String::with_capacity(text.len() + suggestion.len());
     out.push_str(&text[..start]);
     out.push_str(suggestion);
@@ -374,6 +378,20 @@ mod tests {
         let (text, cursor) = apply_suggestion("SELECT * FROM ", 14, "users");
         assert_eq!(text, "SELECT * FROM users");
         assert_eq!(cursor, 19);
+    }
+
+    #[test]
+    fn apply_ignores_quotes_inside_earlier_strings() {
+        let text = r#"SELECT * FROM users WHERE name = 'O"Brien' AND em"#;
+        let (out, cursor) = apply_suggestion(text, text.len(), "email");
+        assert_eq!(
+            out,
+            r#"SELECT * FROM users WHERE name = 'O"Brien' AND email"#
+        );
+        assert_eq!(cursor, out.len());
+        // The WHERE bar of the table view.
+        let (out, _) = apply_suggestion("name = '[x' AND n", 17, "name");
+        assert_eq!(out, "name = '[x' AND name");
     }
 
     #[test]

@@ -5,7 +5,6 @@ use crate::engine::db::utils::{
 };
 use crate::engine::db::DatabaseConnection;
 use crate::engine::models::{Column, DatabaseType};
-use crate::engine::sql::statements::quote_chars;
 
 #[cfg(test)] // integration tests
 pub use crate::engine::db::utils::transaction_bounds;
@@ -20,8 +19,7 @@ pub async fn update_row(
     original: &[String],
     new: &[String],
 ) -> Result<u64> {
-    let (qs, qe) = quote_chars(&conn.db_type());
-    let Some(sql) = build_update_query(table, columns, original, new, qs, qe) else {
+    let Some(sql) = build_update_query(table, columns, original, new, &conn.db_type()) else {
         return Ok(0);
     };
     conn.execute_checked_batch(&[sql], &[Some(1)]).await
@@ -39,16 +37,15 @@ pub async fn insert_row(
     Ok(conn.execute_query(&sql).await?.rows_affected)
 }
 
-/// Delete the row matching `values`, quoting identifiers with `quotes`.
-/// Fails (and deletes nothing) unless exactly one row matches.
+/// Delete the row matching `values`. Fails (and deletes nothing) unless
+/// exactly one row matches.
 pub async fn delete_row(
     conn: &DatabaseConnection,
     table: &str,
     columns: &[Column],
     values: &[String],
-    quotes: (char, char),
 ) -> Result<u64> {
-    let sql = build_delete_query(table, columns, values, quotes.0, quotes.1);
+    let sql = build_delete_query(table, columns, values, &conn.db_type());
     conn.execute_checked_batch(&[sql], &[Some(1)]).await
 }
 
@@ -115,13 +112,12 @@ pub fn submit_statements(
     if !columns.iter().any(|c| c.is_primary_key) {
         anyhow::bail!("{NO_PRIMARY_KEY}");
     }
-    let (qs, qe) = quote_chars(db);
     let deletes = changes
         .deletes
         .iter()
-        .map(|values| (build_delete_query(table, columns, values, qs, qe), Some(1)));
+        .map(|values| (build_delete_query(table, columns, values, db), Some(1)));
     let updates = changes.updates.iter().filter_map(|(original, new)| {
-        build_update_query(table, columns, original, new, qs, qe).map(|sql| (sql, Some(1)))
+        build_update_query(table, columns, original, new, db).map(|sql| (sql, Some(1)))
     });
     let inserts = changes
         .inserts
@@ -246,7 +242,7 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(count(&conn, "t").await, "3");
-        let n = delete_row(&conn, "t", &cols(), &row("2", "b"), ('"', '"'))
+        let n = delete_row(&conn, "t", &cols(), &row("2", "b"))
             .await
             .unwrap();
         assert_eq!(n, 1);
@@ -405,7 +401,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(delete_row(&conn, "d", &columns, &row("1", "a"), ('"', '"'))
+        assert!(delete_row(&conn, "d", &columns, &row("1", "a"))
             .await
             .is_err());
         assert_eq!(count(&conn, "d").await, "3");

@@ -372,12 +372,24 @@ pub fn group_incoming_foreign_keys(
     keys
 }
 
+/// `value` as a quoted string literal for `db`: `'` doubled everywhere;
+/// MySQL also treats `\` as an escape (default `sql_mode`), so it is doubled
+/// too; SQL Server / Azure get `N'…'` so that non-Latin text survives.
+fn quote_string(value: &str, db: &DatabaseType) -> String {
+    let escaped = value.replace('\'', "''");
+    match db {
+        DatabaseType::MySQL => format!("'{}'", escaped.replace('\\', "\\\\")),
+        DatabaseType::SQLServer | DatabaseType::Azure => format!("N'{escaped}'"),
+        DatabaseType::Postgres | DatabaseType::SQLite => format!("'{escaped}'"),
+    }
+}
+
 /// SQL literal for `value` in column `col`: `NULL` for `NULL_CELL`. For
 /// numeric types a number is left unquoted and an empty value is NULL;
 /// anything else (the text "NULL" and the empty string included) is a quoted
-/// string, so a non-numeric value typed in a numeric column is rejected by
-/// the database instead of being run as SQL.
-fn sql_literal(col: &Column, value: &str) -> String {
+/// string ([`quote_string`]), so a non-numeric value typed in a numeric
+/// column is rejected by the database instead of being run as SQL.
+fn sql_literal(col: &Column, value: &str, db: &DatabaseType) -> String {
     if is_null(value) {
         return "NULL".to_string();
     }
@@ -398,13 +410,13 @@ fn sql_literal(col: &Column, value: &str) -> String {
             return number.to_string();
         }
     }
-    format!("'{}'", value.replace('\'', "''"))
+    quote_string(&value, db)
 }
 
-/// `"col" = <literal>`, or `"col" IS NULL` for a NULL value.
-pub(crate) fn where_part(col: &Column, value: &str, quote_start: char, quote_end: char) -> String {
-    let literal = sql_literal(col, value);
-    let name = quote_ident(&col.name, (quote_start, quote_end));
+/// `"col" = <literal>`, or `"col" IS NULL` for a NULL value, for `db`.
+pub(crate) fn where_part(col: &Column, value: &str, db: &DatabaseType) -> String {
+    let literal = sql_literal(col, value, db);
+    let name = quote_ident(&col.name, quote_chars(db));
     if literal == "NULL" {
         format!("{name} IS NULL")
     } else {
@@ -418,8 +430,7 @@ pub fn build_update_clauses(
     columns: &[Column],
     original_values: &[String],
     new_values: &[String],
-    quote_start: char,
-    quote_end: char,
+    db: &DatabaseType,
 ) -> (String, String) {
     // Build SET clause only for changed values
     let set_parts: Vec<String> = columns
@@ -429,15 +440,15 @@ pub fn build_update_clauses(
         .map(|(col, (_, new))| {
             format!(
                 "{} = {}",
-                quote_ident(&col.name, (quote_start, quote_end)),
-                sql_literal(col, new)
+                quote_ident(&col.name, quote_chars(db)),
+                sql_literal(col, new, db)
             )
         })
         .collect();
 
     (
         set_parts.join(", "),
-        build_where_clause(columns, original_values, quote_start, quote_end),
+        build_where_clause(columns, original_values, db),
     )
 }
 
@@ -481,8 +492,7 @@ fn map_bit_value(value: &str) -> String {
 pub fn build_insert_parts(
     columns: &[Column],
     values: &[Option<String>],
-    quote_start: char,
-    quote_end: char,
+    db: &DatabaseType,
 ) -> (String, String) {
     let mut col_parts: Vec<String> = Vec::new();
     let mut val_parts: Vec<String> = Vec::new();
@@ -491,8 +501,8 @@ pub fn build_insert_parts(
         let Some(val) = val else {
             continue;
         };
-        col_parts.push(quote_ident(&col.name, (quote_start, quote_end)));
-        val_parts.push(sql_literal(col, val));
+        col_parts.push(quote_ident(&col.name, quote_chars(db)));
+        val_parts.push(sql_literal(col, val, db));
     }
 
     (col_parts.join(", "), val_parts.join(", "))
@@ -504,11 +514,9 @@ pub fn build_update_query(
     columns: &[Column],
     original_values: &[String],
     new_values: &[String],
-    quote_start: char,
-    quote_end: char,
+    db: &DatabaseType,
 ) -> Option<String> {
-    let (set_clause, where_clause) =
-        build_update_clauses(columns, original_values, new_values, quote_start, quote_end);
+    let (set_clause, where_clause) = build_update_clauses(columns, original_values, new_values, db);
 
     if set_clause.is_empty() {
         return None;
@@ -529,8 +537,7 @@ pub fn build_insert_query(
     values: &[Option<String>],
     db: &DatabaseType,
 ) -> String {
-    let (quote_start, quote_end) = quote_chars(db);
-    let (columns_part, values_part) = build_insert_parts(columns, values, quote_start, quote_end);
+    let (columns_part, values_part) = build_insert_parts(columns, values, db);
     if !columns_part.is_empty() {
         format!("INSERT INTO {table_name} ({columns_part}) VALUES ({values_part})")
     } else if *db == DatabaseType::MySQL {
@@ -542,19 +549,14 @@ pub fn build_insert_query(
 
 /// Build a WHERE clause for identifying a specific row (for DELETE).
 /// Uses primary key columns if available, otherwise all columns.
-pub fn build_where_clause(
-    columns: &[Column],
-    values: &[String],
-    quote_start: char,
-    quote_end: char,
-) -> String {
+pub fn build_where_clause(columns: &[Column], values: &[String], db: &DatabaseType) -> String {
     let has_primary_keys = columns.iter().any(|c| c.is_primary_key);
 
     let where_parts: Vec<String> = columns
         .iter()
         .zip(values.iter())
         .filter(|(col, _)| !has_primary_keys || col.is_primary_key)
-        .map(|(col, val)| where_part(col, val, quote_start, quote_end))
+        .map(|(col, val)| where_part(col, val, db))
         .collect();
 
     where_parts.join(" AND ")
@@ -565,10 +567,9 @@ pub fn build_delete_query(
     table_name: &str,
     columns: &[Column],
     values: &[String],
-    quote_start: char,
-    quote_end: char,
+    db: &DatabaseType,
 ) -> String {
-    let where_clause = build_where_clause(columns, values, quote_start, quote_end);
+    let where_clause = build_where_clause(columns, values, db);
     format!("DELETE FROM {} WHERE {}", table_name, where_clause)
 }
 
@@ -703,29 +704,84 @@ mod tests {
             nullable: true,
             is_primary_key: true,
         };
-        assert_eq!(sql_literal(&col("int"), " 42 "), "42");
-        assert_eq!(sql_literal(&col("numeric(10,2)"), "-1.5e3"), "-1.5e3");
-        assert_eq!(sql_literal(&col("int"), ""), "NULL");
         assert_eq!(
-            sql_literal(&col("int"), "1; DROP TABLE t"),
+            sql_literal(&col("int"), " 42 ", &DatabaseType::Postgres),
+            "42"
+        );
+        assert_eq!(
+            sql_literal(&col("numeric(10,2)"), "-1.5e3", &DatabaseType::Postgres),
+            "-1.5e3"
+        );
+        assert_eq!(
+            sql_literal(&col("int"), "", &DatabaseType::Postgres),
+            "NULL"
+        );
+        assert_eq!(
+            sql_literal(&col("int"), "1; DROP TABLE t", &DatabaseType::Postgres),
             "'1; DROP TABLE t'"
         );
-        assert_eq!(sql_literal(&col("bit"), "true"), "1");
-        assert_eq!(sql_literal(&col("text"), "it's"), "'it''s'");
-        assert_eq!(sql_literal(&col("text"), ""), "''");
+        assert_eq!(
+            sql_literal(&col("bit"), "true", &DatabaseType::Postgres),
+            "1"
+        );
+        assert_eq!(
+            sql_literal(&col("text"), "it's", &DatabaseType::Postgres),
+            "'it''s'"
+        );
+        assert_eq!(sql_literal(&col("text"), "", &DatabaseType::Postgres), "''");
         let cols = [col("int"), col("text")];
         let (set, filter) = build_update_clauses(
             &cols,
             &["1".into(), "a".into()],
             &["".into(), NULL_CELL.into()],
-            '"',
-            '"',
+            &DatabaseType::Postgres,
         );
         assert_eq!(set, "\"c\" = NULL, \"c\" = NULL");
         assert_eq!(filter, "\"c\" = 1 AND \"c\" = 'a'");
         assert_eq!(
-            build_where_clause(&cols, &[NULL_CELL.into(), "x".into()], '[', ']'),
-            "[c] IS NULL AND [c] = 'x'"
+            build_where_clause(
+                &cols,
+                &[NULL_CELL.into(), "x".into()],
+                &DatabaseType::SQLServer
+            ),
+            "[c] IS NULL AND [c] = N'x'"
+        );
+    }
+
+    /// Quoted literals per engine: MySQL doubles backslashes (an escape
+    /// character there), SQL Server marks Unicode with `N`.
+    #[test]
+    fn string_literals_are_escaped_per_engine() {
+        let col = Column {
+            name: "c".into(),
+            type_name: "varchar(50)".into(),
+            nullable: true,
+            is_primary_key: true,
+        };
+        let lit = |v: &str, db: DatabaseType| sql_literal(&col, v, &db);
+        assert_eq!(
+            lit("x\\' OR 1=1 -- ", DatabaseType::MySQL),
+            "'x\\\\'' OR 1=1 -- '"
+        );
+        assert_eq!(lit("ends\\", DatabaseType::MySQL), "'ends\\\\'");
+        assert_eq!(lit("C:\\temp", DatabaseType::MySQL), "'C:\\\\temp'");
+        assert_eq!(lit("it's", DatabaseType::MySQL), "'it''s'");
+        assert_eq!(lit("東京 🦄", DatabaseType::SQLServer), "N'東京 🦄'");
+        assert_eq!(lit("it's", DatabaseType::Azure), "N'it''s'");
+        for db in [DatabaseType::Postgres, DatabaseType::SQLite] {
+            assert_eq!(lit("C:\\temp", db.clone()), "'C:\\temp'");
+            assert_eq!(lit("x\\' y", db.clone()), "'x\\'' y'");
+            assert_eq!(lit("東京", db), "'東京'");
+        }
+        // Numbers stay unquoted everywhere.
+        let int = Column {
+            type_name: "int".into(),
+            ..col.clone()
+        };
+        assert_eq!(sql_literal(&int, "5", &DatabaseType::SQLServer), "5");
+        assert_eq!(
+            build_where_clause(&[col], &["a\\b".into()], &DatabaseType::MySQL),
+            "`c` = 'a\\\\b'"
         );
     }
 
@@ -744,37 +800,35 @@ mod tests {
             &cols,
             &["1".into(), "a".into()],
             &[NULL_CELL.into(), "NULL".into()],
-            '"',
-            '"',
+            &DatabaseType::Postgres,
         );
         assert_eq!(set, "\"c\" = NULL, \"c\" = 'NULL'");
         let (set, _) = build_update_clauses(
             &cols,
             &["1".into(), "a".into()],
             &["1".into(), "".into()],
-            '"',
-            '"',
+            &DatabaseType::Postgres,
         );
         assert_eq!(set, "\"c\" = ''");
         assert_eq!(
-            build_where_clause(&cols, &["1".into(), "NULL".into()], '"', '"'),
+            build_where_clause(&cols, &["1".into(), "NULL".into()], &DatabaseType::Postgres),
             "\"c\" = 1 AND \"c\" = 'NULL'"
         );
         assert_eq!(
-            build_where_clause(&cols, &["1".into(), "".into()], '"', '"'),
+            build_where_clause(&cols, &["1".into(), "".into()], &DatabaseType::Postgres),
             "\"c\" = 1 AND \"c\" = ''"
         );
         let set = |a: &str, b: &str| [Some(a.to_string()), Some(b.to_string())];
         assert_eq!(
-            build_insert_parts(&cols, &set(NULL_CELL, NULL_CELL), '"', '"').1,
+            build_insert_parts(&cols, &set(NULL_CELL, NULL_CELL), &DatabaseType::Postgres).1,
             "NULL, NULL"
         );
         assert_eq!(
-            build_insert_parts(&cols, &set("7", ""), '"', '"').1,
+            build_insert_parts(&cols, &set("7", ""), &DatabaseType::Postgres).1,
             "7, ''"
         );
         assert_eq!(
-            build_insert_parts(&cols, &set("7", "NULL"), '"', '"').1,
+            build_insert_parts(&cols, &set("7", "NULL"), &DatabaseType::Postgres).1,
             "7, 'NULL'"
         );
     }
@@ -808,7 +862,7 @@ mod tests {
                 &[some("42"), None, some("")],
                 &DatabaseType::SQLServer
             ),
-            "INSERT INTO t ([id], [status]) VALUES (42, '')"
+            "INSERT INTO t ([id], [status]) VALUES (42, N'')"
         );
         assert_eq!(
             build_insert_query("t", &cols, &[None, None, None], &DatabaseType::SQLite),
@@ -863,11 +917,11 @@ mod tests {
         }];
         let (x, y) = (vec!["x".to_string()], vec!["y".to_string()]);
         assert_eq!(
-            build_delete_query("t", &cols, &x, '"', '"'),
+            build_delete_query("t", &cols, &x, &DatabaseType::Postgres),
             "DELETE FROM t WHERE \"a\"\"b\" = 'x'"
         );
         assert_eq!(
-            build_update_query("t", &cols, &x, &y, '"', '"').unwrap(),
+            build_update_query("t", &cols, &x, &y, &DatabaseType::Postgres).unwrap(),
             "UPDATE t SET \"a\"\"b\" = 'y' WHERE \"a\"\"b\" = 'x'"
         );
         let cols = vec![Column {
@@ -876,7 +930,7 @@ mod tests {
         }];
         assert_eq!(
             build_insert_query("t", &cols, &[Some("v".into())], &DatabaseType::SQLServer),
-            "INSERT INTO t ([x]]y]) VALUES ('v')"
+            "INSERT INTO t ([x]]y]) VALUES (N'v')"
         );
     }
 

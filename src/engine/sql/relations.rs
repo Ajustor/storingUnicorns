@@ -3,7 +3,6 @@
 
 use crate::engine::db::utils::where_part;
 use crate::engine::models::{is_null, Column, DatabaseType, ForeignKeyInfo, IncomingForeignKey};
-use crate::engine::sql::statements::quote_chars;
 
 /// The `WHERE` condition (without the keyword) selecting the rows whose
 /// `target_columns` equal `values` (one per column; `NULL_CELL` gives
@@ -17,7 +16,6 @@ pub fn match_condition(
     target_types: &[Option<String>],
     db: &DatabaseType,
 ) -> String {
-    let (q0, q1) = quote_chars(db);
     target_columns
         .iter()
         .zip(values)
@@ -29,7 +27,7 @@ pub fn match_condition(
                 nullable: true,
                 is_primary_key: false,
             };
-            where_part(&col, value, q0, q1)
+            where_part(&col, value, db)
         })
         .collect::<Vec<_>>()
         .join(" AND ")
@@ -111,11 +109,11 @@ mod tests {
         );
         assert_eq!(
             match_condition(&cols, &vals, &[], &DatabaseType::SQLServer),
-            "[id] = '42'"
+            "[id] = N'42'"
         );
         assert_eq!(
             match_condition(&cols, &vals, &[], &DatabaseType::Azure),
-            "[id] = '42'"
+            "[id] = N'42'"
         );
     }
 
@@ -132,7 +130,7 @@ mod tests {
         );
         assert_eq!(
             match_condition(&s(&["a]b"]), &vals, &[], &DatabaseType::SQLServer),
-            "[a]]b] = '1'"
+            "[a]]b] = N'1'"
         );
     }
 
@@ -184,7 +182,7 @@ mod tests {
             &[Some("int".into())],
             &DatabaseType::SQLServer,
         );
-        assert_eq!(c, "[i] = '1 OR 1=1'");
+        assert_eq!(c, "[i] = N'1 OR 1=1'");
     }
 
     #[test]
@@ -196,6 +194,14 @@ mod tests {
             &DatabaseType::SQLite,
         );
         assert_eq!(c, "\"name\" = 'O''Brien'");
+        // MySQL: a backslash is an escape there, so it is doubled.
+        let c = match_condition(
+            &s(&["path"]),
+            &s(&["C:\\x\\' OR 1=1 -- "]),
+            &[],
+            &DatabaseType::MySQL,
+        );
+        assert_eq!(c, "`path` = 'C:\\\\x\\\\'' OR 1=1 -- '");
     }
 
     #[test]
@@ -242,7 +248,10 @@ mod tests {
         let cells = [("id", "it's")];
         assert_eq!(
             referencing(&fk, &row(&cells), &DatabaseType::SQLServer),
-            Some(("dbo.child".to_string(), "[parent_id] = 'it''s'".to_string()))
+            Some((
+                "dbo.child".to_string(),
+                "[parent_id] = N'it''s'".to_string()
+            ))
         );
         let cells = [("id", NULL_CELL)];
         assert_eq!(

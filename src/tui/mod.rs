@@ -1685,14 +1685,13 @@ async fn handle_save_row(state: &mut AppState) {
 
     // Debug mode: show query in editor instead of executing
     if state.debug_mode {
-        let quote_chars = state.get_quote_chars();
+        let db_type = state.connection.as_ref().unwrap().db_type();
         if let Some(query) = db::utils::build_update_query(
             &table_name,
             &columns,
             &original_values,
             &new_values,
-            quote_chars.0,
-            quote_chars.1,
+            &db_type,
         ) {
             let query_len = query.len();
             state.set_query(query);
@@ -3010,17 +3009,10 @@ async fn handle_delete_row(state: &mut AppState) {
         return;
     }
 
-    let quote_chars = state.get_quote_chars();
-
     // Debug mode: show query
     if state.debug_mode {
-        let query = db::utils::build_delete_query(
-            &table_name,
-            &columns,
-            &row_values,
-            quote_chars.0,
-            quote_chars.1,
-        );
+        let db_type = state.connection.as_ref().unwrap().db_type();
+        let query = db::utils::build_delete_query(&table_name, &columns, &row_values, &db_type);
         let query_len = query.len();
         state.set_query(query);
         state.set_cursor_position(query_len);
@@ -3036,7 +3028,6 @@ async fn handle_delete_row(state: &mut AppState) {
         &table_name,
         &columns,
         &row_values,
-        quote_chars,
     )
     .await;
 

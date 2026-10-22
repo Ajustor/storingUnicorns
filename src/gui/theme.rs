@@ -266,6 +266,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn symbols_and_emoji_have_glyphs_on_windows() {
+        if !std::path::Path::new(r"C:\Windows\Fonts\seguisym.ttf").exists() {
+            eprintln!("skipped: seguisym.ttf is not installed (Server Core?)");
+            return;
+        }
         let fonts = egui::epaint::text::Fonts::new(1.0, 2048, fonts());
         for family in [
             egui::FontId::monospace(13.0),

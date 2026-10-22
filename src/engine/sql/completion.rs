@@ -119,6 +119,8 @@ const OTHER_CLAUSES: &[&str] = &[
 /// Keywords that only matter right before the cursor (an alias, a USING
 /// list); further back they are walked over.
 const LOCAL_CLAUSES: &[&str] = &["AS", "USING"];
+/// Set operations: each branch has its own tables.
+const SET_OPERATIONS: &[&str] = &["UNION", "INTERSECT", "EXCEPT", "MINUS"];
 /// Words that end a table reference (never an alias), besides keywords.
 const NOT_ALIAS: &[&str] = &[
     "FETCH",
@@ -569,9 +571,30 @@ impl<'t> Stmt<'t> {
         refs
     }
 
+    /// Items of the level inside `opener`, only the branch of a set
+    /// operation (UNION, INTERSECT, EXCEPT, MINUS) holding `cursor`.
+    fn branch(&self, opener: Option<usize>, cursor: usize) -> Vec<Item> {
+        let mut items = self.level(opener);
+        let mut start = 0;
+        for (k, item) in items.iter().enumerate() {
+            if let Item::Tok(i) = *item {
+                if self.is_any(i, SET_OPERATIONS) {
+                    if self.toks[i].end <= cursor {
+                        start = k + 1;
+                    } else {
+                        items.truncate(k);
+                        break;
+                    }
+                }
+            }
+        }
+        items.drain(..start.min(items.len()));
+        items
+    }
+
     /// Tables of the level of `cursor`, CTE names left out.
     fn tables_in_scope(&self, cursor: usize) -> Vec<TableRef> {
-        self.without_ctes(self.table_refs(&self.level(self.scope_opener(cursor))))
+        self.without_ctes(self.table_refs(&self.branch(self.scope_opener(cursor), cursor)))
     }
 
     /// Clause governing the position before token `before` (exclusive),
@@ -616,7 +639,7 @@ impl<'t> Stmt<'t> {
         let o = *self.enclosing(cursor).first()?;
         let using = o.checked_sub(1).filter(|&k| self.is(k, "USING"))?;
         let items: Vec<Item> = self
-            .level(self.scope_opener(cursor))
+            .branch(self.scope_opener(cursor), cursor)
             .into_iter()
             .take_while(|it| match it {
                 Item::Tok(i) | Item::Group(i) => *i < using,
@@ -1654,5 +1677,18 @@ mod tests {
         let c = run("SELECT * FROM users JOIN audit USING (|)");
         assert!(c.items.is_empty());
         assert_eq!(c.missing, [tref("audit")]);
+    }
+
+    #[test]
+    fn set_operations_split_the_scope() {
+        let sql = "SELECT id FROM users UNION SELECT | FROM orders";
+        assert_eq!(scope(sql), vec![t(None, "orders", None)]);
+        assert_eq!(labels(&run(sql), Kind::Column), ["id", "user_id", "total"]);
+        let sql = "SELECT | FROM users UNION ALL SELECT id FROM orders";
+        assert_eq!(scope(sql), vec![t(None, "users", None)]);
+        let sql = "SELECT 1 FROM a INTERSECT SELECT 2 FROM b EXCEPT SELECT | FROM c MINUS SELECT 3 FROM d";
+        assert_eq!(scope(sql), vec![t(None, "c", None)]);
+        let sql = "SELECT * FROM (SELECT id FROM users UNION SELECT | FROM orders) x";
+        assert_eq!(scope(sql), vec![t(None, "orders", None)]);
     }
 }

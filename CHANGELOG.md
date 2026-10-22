@@ -7,6 +7,34 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Nouveautés
+
+- **Complétion contextuelle** : dans les consoles, les barres `WHERE` /
+  `ORDER BY` de la vue d'une table et l'éditeur de l'interface terminal, la
+  complétion propose les colonnes des tables citées dans l'instruction sous le
+  curseur. `alias.` donne les colonnes de cette table, les jointures préfixent
+  les noms ambigus, et `INSERT INTO t (…)` et `UPDATE … SET` complètent les
+  colonnes de `t`. Le type et la clé primaire sont affichés, les noms sont
+  protégés selon le moteur et les colonnes se chargent en arrière-plan.
+  `Ctrl+Espace` ouvre la liste, `↑` / `↓` choisissent, `Entrée` ou `Tab`
+  valident, `Échap` ferme.
+- **Historique des requêtes refait** (`Ctrl+Alt+E`) : un résumé par entrée avec
+  la connexion, l'heure et la durée, un aperçu du SQL avec coloration, les
+  boutons **Insérer** et **Copier**, et une recherche dans le SQL et le nom de la
+  connexion.
+
+### Corrections
+
+- **Historique** : un `history.json` enregistré avec un BOM était lu comme vide
+  puis écrasé ; il est maintenant lu correctement.
+- **Historique** : les doublons qui ne différaient que par les fins de ligne
+  (CRLF / LF) sont fusionnés.
+- Les caractères emoji et symboles ne s'affichent plus comme des cases.
+- Les listes déroulantes et la recherche de la vue d'une table sont assez larges
+  pour leur contenu.
+
 ## [0.15.2] - 2026-10-16
 
 ### Nouveautés

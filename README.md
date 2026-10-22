@@ -24,9 +24,10 @@ desktop GUI (egui) and a terminal UI (ratatui) sharing the same engine.
   - database explorer: connection → schemas → tables → columns / keys / indexes,
     loaded lazily, with a filter and context menus (data, console, DDL, structure,
     export / import / truncate, single table or batch)
-  - SQL consoles: highlighting, completion of tables and columns, formatting,
+  - SQL consoles: highlighting, context-aware completion of tables and columns
+    (see [Complétion contextuelle](#complétion-contextuelle)), formatting,
     one result tab per statement (pinnable) plus an "Sortie" log, results capped
-    at 1 000 rows, persistent query history
+    at 1 000 rows, persistent query history (searchable, with a SQL preview)
   - table data editor: 500-row pages, total counted in the background, `WHERE` /
     `ORDER BY` bar, click a header to sort, inline editing (changed cells
     highlighted, new rows green, deleted rows struck through in red), changes
@@ -85,6 +86,40 @@ From the sources: `cargo run` (GUI) or `cargo run -- tui`.
 - Errors are shown in red in the status bar (hover for the full text) and in
   the console's "Sortie" tab; nothing is swallowed.
 
+### Complétion contextuelle
+
+La complétion (console, barres `WHERE` / `ORDER BY` de la vue d'une table, et
+éditeur de l'interface terminal) propose des noms selon la position du curseur
+dans l'instruction en cours, et non plus seulement les colonnes du dernier
+résultat :
+
+- **Colonnes des tables citées** : après `SELECT`, `WHERE`, `ORDER BY`,
+  `GROUP BY`, `ON`… ce sont les colonnes des tables de `FROM` / `JOIN`
+  (uniquement celles du niveau de sous-requête où se trouve le curseur).
+- **`alias.`** (ou `table.`) : les colonnes de cette table seulement.
+- **Jointures** : les colonnes de toutes les tables jointes ; un nom présent dans
+  plusieurs tables est préfixé (`u.id`, `o.id`).
+- **`INSERT INTO t (…)`** : les colonnes de `t` ; **`UPDATE t SET …`** : les
+  colonnes de `t`.
+- Chaque suggestion affiche le **type** de la colonne et `PK` pour une clé
+  primaire.
+- Les noms sont **protégés selon le moteur** quand c'est nécessaire (`"…"`
+  PostgreSQL, `` `…` `` MySQL, `[…]` SQL Server).
+- Les colonnes d'une table sont **chargées en arrière-plan** à la première
+  utilisation ; la liste se complète dès qu'elles arrivent, sans bloquer la
+  saisie.
+
+Touches : `Ctrl+Espace` ouvre la liste, `↑` / `↓` choisissent, `Entrée` ou `Tab`
+valident (la suggestion remplace le mot en cours), `Échap` ferme.
+
+### Historique des requêtes
+
+`Ctrl+Alt+E` ouvre l'historique : chaque entrée affiche un résumé de la requête,
+sa **connexion**, l'**heure** et la **durée** d'exécution. Un volet d'**aperçu**
+montre le SQL complet avec sa coloration. La recherche porte sur le SQL et sur
+le nom de la connexion. **Insérer** place la requête dans la console, **Copier**
+la met dans le presse-papiers.
+
 ### Raccourcis (GUI)
 
 | Touche                      | Action                                                   |
@@ -93,11 +128,11 @@ From the sources: `cargo run` (GUI) or `cargo run -- tui`.
 | `F5`                        | Exécuter tout le script                                  |
 | `Échap`                     | Annuler la requête en cours / l'édition de cellule / fermer la modale |
 | `Ctrl+Alt+L`                | Formater le SQL                                          |
-| `Ctrl+Alt+E`                | Historique des requêtes                                  |
+| `Ctrl+Alt+E`                | Historique des requêtes (recherche, aperçu, Insérer / Copier) |
 | `Ctrl+N`                    | Rechercher une table                                     |
 | `Ctrl+T` / `Ctrl+W`         | Nouvelle console (connexion courante) / fermer l'onglet  |
 | `Ctrl+S`                    | Enregistrer les consoles                                 |
-| `Ctrl+Espace`               | Autocomplétion                                           |
+| `Ctrl+Espace`               | Autocomplétion contextuelle (console, barres WHERE / ORDER BY) |
 | `F2` / double-clic          | Éditer la cellule                                        |
 | `Alt+Insert` / `Ctrl+Suppr` | Ajouter / supprimer une ligne                            |
 | `Ctrl+R`                    | Rafraîchir (explorateur ou données)                      |

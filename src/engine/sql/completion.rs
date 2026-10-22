@@ -8,7 +8,7 @@
 
 use crate::engine::db::utils::split_qualified;
 use crate::engine::sql::lexer::{is_keyword, keywords};
-use crate::engine::sql::statements::{quote_ident, split_statements};
+use crate::engine::sql::statements::quote_ident;
 
 /// A table referenced by a statement, names unquoted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -138,6 +138,28 @@ const NOT_ALIAS: &[&str] = &[
     "PARTITION",
     "APPLY",
     "ONLY",
+    "GO",
+];
+/// Reserved words (in some engine) missing from the lexer's keywords: a
+/// name equal to one of them is quoted.
+const RESERVED: &[&str] = &[
+    "user",
+    "current_user",
+    "session_user",
+    "window",
+    "limit",
+    "offset",
+    "order",
+    "group",
+    "table",
+    "column",
+    "check",
+    "default",
+    "primary",
+    "references",
+    "analyse",
+    "analyze",
+    "end",
 ];
 
 // ---------------------------------------------------------------------------
@@ -182,6 +204,18 @@ fn scan(s: &str, i: usize, keep: impl Fn(char) -> bool) -> usize {
         .map_or(s.len(), |(p, _)| i + p)
 }
 
+/// The dollar-quote opening `s` (`$$` or `$tag$`, the tag an identifier not
+/// starting with a digit, so `$1` is a parameter).
+fn dollar_tag(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('$')?;
+    let len = rest.find('$')?;
+    let tag = &rest[..len];
+    let mut chars = tag.chars();
+    let valid = chars.next().is_none_or(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_');
+    valid.then(|| &s[..len + 2])
+}
+
 /// Tokens of `s` with byte spans, comments included, whitespace dropped.
 fn lex(s: &str) -> Vec<Tok> {
     let n = s.len();
@@ -207,6 +241,17 @@ fn lex(s: &str) -> Vec<Tok> {
                 }
             }
             T::Comment
+        } else if let Some(tag) = dollar_tag(&s[i..]) {
+            // PostgreSQL dollar quoting: `$$ … $$`, `$tag$ … $tag$`.
+            let body = i + tag.len();
+            match s[body..].find(tag) {
+                Some(p) => i = body + p + tag.len(),
+                None => {
+                    i = n;
+                    open = true;
+                }
+            }
+            T::Str
         } else if matches!(c, '\'' | '"' | '`' | '[') {
             let close = if c == '[' { ']' } else { c };
             i += 1;
@@ -286,27 +331,21 @@ fn floor_boundary(text: &str, cursor: usize) -> usize {
     c
 }
 
-/// Byte range of the statement under the cursor, split like the console.
+/// Byte range of the statement under the cursor: between the `;` around it
+/// outside literals, comments and quoted identifiers (the console's
+/// `split_statements` boundaries, plus quoted identifiers holding a `;`).
 fn statement_at(text: &str, cursor: usize) -> (usize, usize) {
-    let stmts = split_statements(text);
-    if let Some(&(s, e, _)) = stmts.iter().find(|(s, e, _)| *s <= cursor && cursor <= *e) {
-        return (s, e);
+    let mut start = 0;
+    for t in lex(text) {
+        if t.kind == T::Punct(';') {
+            if t.end <= cursor {
+                start = t.end;
+            } else {
+                return (start, t.start);
+            }
+        }
     }
-    // Between statements (after a `;`): an empty statement.
-    let start = stmts
-        .iter()
-        .filter(|(_, e, _)| *e < cursor)
-        .map(|(_, e, _)| e + 1)
-        .max()
-        .unwrap_or(0)
-        .min(cursor);
-    let end = stmts
-        .iter()
-        .filter(|(s, _, _)| *s > cursor)
-        .map(|(s, _, _)| *s)
-        .min()
-        .unwrap_or(text.len());
-    (start, end.max(cursor))
+    (start, text.len())
 }
 
 /// Whether `name` must be quoted to be used as is with these quotes.
@@ -317,7 +356,10 @@ fn needs_quotes(name: &str, (q0, _): (char, char)) -> bool {
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
     // PostgreSQL folds bare names to lower case.
-    !plain || is_keyword(name) || (q0 == '"' && name.chars().any(|c| c.is_ascii_uppercase()))
+    !plain
+        || is_keyword(name)
+        || RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name))
+        || (q0 == '"' && name.chars().any(|c| c.is_ascii_uppercase()))
 }
 
 /// Quote pair matching an opening quote typed by the user.
@@ -967,26 +1009,27 @@ impl Builder<'_, '_> {
 /// the cursor counts).
 pub fn complete(text: &str, cursor: usize, cx: &Context) -> Completions {
     let cursor = floor_boundary(text, cursor);
-    let (s, e) = statement_at(text, cursor);
-    let stmt_text = &text[s..e];
-    let cur = cursor - s;
-    let Some((tstart, prefix, typed)) = current_token(&stmt_text[..cur]) else {
+    let Some((tstart, prefix, typed)) = current_token(&text[..cursor]) else {
         return Completions::default();
     };
     // An identifier whose opening quote is typed would swallow the rest of
-    // the statement: analyse the text without it (same byte offsets).
+    // the script: analyse the text without it (same byte offsets).
     let blanked;
-    let stmt = if typed.is_some() {
+    let text = if typed.is_some() {
         blanked = format!(
             "{}{}{}",
-            &stmt_text[..tstart],
-            " ".repeat(cur - tstart),
-            &stmt_text[cur..]
+            &text[..tstart],
+            " ".repeat(cursor - tstart),
+            &text[cursor..]
         );
-        Stmt::new(&blanked)
+        blanked.as_str()
     } else {
-        Stmt::new(stmt_text)
+        text
     };
+    let (s, e) = statement_at(text, cursor);
+    let stmt = Stmt::new(&text[s..e]);
+    let cur = cursor - s;
+    let tstart = tstart.max(s) - s;
     let mut b = Builder {
         cx,
         prefix,
@@ -1896,5 +1939,55 @@ mod tests {
         // Bare columns: only the level of the cursor.
         let sql = "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE |)";
         assert_eq!(labels(&run(sql), Kind::Column), ["id", "user_id", "total"]);
+    }
+
+    #[test]
+    fn dollar_quoted_strings() {
+        let c = run(r#"SELECT $$ it's "a" [b $$ AS a, | FROM users"#);
+        assert_eq!(labels(&c, Kind::Column), ["id", "email", "name"]);
+        let sql = "DO $body$ BEGIN; PERFORM 1; END $body$; SELECT | FROM users";
+        assert_eq!(scope(sql), vec![t(None, "users", None)]);
+        assert!(run("SELECT $$ ab|").items.is_empty());
+        assert!(run("SELECT $x$ a; b| $x$").items.is_empty());
+        // `$1` is a parameter, not a quote.
+        let c = run("SELECT * FROM users WHERE id = $1 AND |");
+        assert_eq!(labels(&c, Kind::Column), ["id", "email", "name"]);
+    }
+
+    #[test]
+    fn go_is_not_an_alias() {
+        assert_eq!(
+            scope("SELECT | FROM users\nGO"),
+            vec![t(None, "users", None)]
+        );
+    }
+
+    #[test]
+    fn common_reserved_words_are_quoted() {
+        for w in [
+            "user",
+            "USER",
+            "limit",
+            "end",
+            "analyze",
+            "current_user",
+            "window",
+        ] {
+            assert!(needs_quotes(w, MYSQL), "{w}");
+        }
+        assert!(!needs_quotes("users", MYSQL));
+    }
+
+    #[test]
+    fn statement_boundaries_skip_quoted_semicolons() {
+        let c = run("SELECT `a;b`, | FROM users");
+        assert_eq!(labels(&c, Kind::Column), ["id", "email", "name"]);
+        let c = run("SELECT [a;b], | FROM users; SELECT * FROM orders");
+        assert_eq!(labels(&c, Kind::Column), ["id", "email", "name"]);
+        // A typed opening quote does not swallow the next statements.
+        let c = run(r#"SELECT "em| FROM users; SELECT * FROM orders"#);
+        assert_eq!(labels(&c, Kind::Column), ["email"]);
+        let c = run("SELECT * FROM orders; SELECT [em| FROM users");
+        assert_eq!(labels(&c, Kind::Column), ["email"]);
     }
 }

@@ -122,10 +122,11 @@ pub async fn poll(state: &mut AppState) {
     };
     match outcome {
         Ok(conn) => {
+            state.completion_columns.clear();
             if let Some(old) = state.connection.take() {
-                old.close().await;
+                super::columns::close(old).await;
             }
-            state.connection = Some(conn);
+            state.connection = Some(std::sync::Arc::new(conn));
             state.current_connection_config = Some(config.clone());
             state.set_status(format!("Connected to {}", config.name));
             super::handle_refresh_tables(state).await;

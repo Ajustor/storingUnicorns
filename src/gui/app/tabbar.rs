@@ -145,6 +145,10 @@ impl App {
                         loading: tab.runs.page.is_some(),
                         tx: sessions.tx_view(&tab.connection),
                         source: &SessionSource(sessions.get(&tab.connection)),
+                        details: sessions
+                            .get(&tab.connection)
+                            .and_then(|s| s.details.get(&d.table))
+                            .and_then(|r| r.as_ref().ok()),
                     },
                 );
                 None
@@ -155,6 +159,10 @@ impl App {
             }
         };
         let id = tab.id;
+        let keys_of = match &tab.kind {
+            TabKind::Data(d) => Some(d.table.clone()),
+            _ => None,
+        };
         // Columns the completion popups need: loaded like the explorer's.
         let requests = match &mut tab.kind {
             TabKind::Console(c) => c.completion.take_requests(),
@@ -168,6 +176,10 @@ impl App {
                     s.request_columns(&mut self.worker, &name, t);
                 }
             }
+        }
+        // The keys of a data tab's table (foreign key links).
+        if let Some(table) = keys_of {
+            self.ensure_details(&connection, &table);
         }
         if let Some(action) = action {
             self.console_action(index, action);

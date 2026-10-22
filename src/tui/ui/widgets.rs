@@ -1388,6 +1388,7 @@ mod tests {
             name: name.into(),
             type_name: ty.into(),
             primary_key: pk,
+            foreign_key: None,
         };
         state.completion_columns.insert(
             "main.users",

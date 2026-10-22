@@ -29,6 +29,7 @@ use super::worker::Worker;
 
 mod actions;
 mod events;
+pub mod links;
 mod tabbar;
 mod tx;
 
@@ -54,6 +55,8 @@ pub struct App {
     pub explorer_tree: super::explorer::tree::Tree,
     pub show_value_panel: bool,
     pub value_panel: ValuePanel,
+    /// Linked-row preview shown by the value panel instead of the cell.
+    pub fk_preview: Option<super::fk::Preview>,
     pub status: Status,
     /// Import/export/truncate progress, per operation.
     pub progress: status::Progress,
@@ -127,6 +130,7 @@ impl App {
             explorer_tree: Default::default(),
             show_value_panel: false,
             value_panel: ValuePanel::default(),
+            fk_preview: None,
             status,
             progress: status::Progress::default(),
             dialog: None,

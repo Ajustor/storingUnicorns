@@ -5,13 +5,18 @@
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
-use crate::engine::models::{is_null, Column, NULL_CELL};
+use crate::engine::models::{is_null, Column, ForeignKeyInfo, QueryResult, NULL_CELL};
 
+use super::app::links::LinkOpen;
 use super::app::App;
+use super::fk::{self, CellLink, ColumnLink, RowState};
 use super::grid::changes::{PendingEdits, RowRef};
-use super::tabs::data::busy_hint;
+use super::tabs::data::{busy_hint, DataAction};
 use super::tabs::{TabId, TabKind, Tabs};
 use super::theme::{ACCENT, ERROR};
+
+/// Warnings of the preview (several matching rows).
+const AMBER: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xA6, 0x4C);
 
 /// Pretty-printed form of `s` when it is a JSON object or array.
 pub fn pretty_json(s: &str) -> Option<String> {
@@ -96,7 +101,7 @@ fn reformat_json(s: &str, pretty: bool) -> Option<String> {
 }
 
 /// Which cell the panel shows: (tab, console result id or 0, row, column).
-type CellKey = (TabId, u64, RowRef, usize);
+pub type CellKey = (TabId, u64, RowRef, usize);
 
 /// Cheap identity of a shown value: its address and length, and the grid
 /// generation. A value that changes is a new string (an edit, a new page),
@@ -186,9 +191,24 @@ struct Focus<'a> {
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
+    let target = focused_key(&app.tabs);
+    // Focusing another cell than the one the links were followed from
+    // closes the preview.
+    if app
+        .fk_preview
+        .as_ref()
+        .is_some_and(|p| p.origin.is_some() && p.origin != target)
+    {
+        app.fk_preview = None;
+    }
+    if app.fk_preview.is_some() {
+        if let Some(action) = preview_ui(app, ui) {
+            preview_act(app, action);
+        }
+        return;
+    }
     ui.strong("Valeur");
     ui.separator();
-    let target = focused_key(&app.tabs);
     // Moving the focus applies what was typed for the previous cell.
     if let Some((key, generation, value)) = app.value_panel.take_unapplied(target) {
         let cell = cell(&mut app.tabs, key).filter(|f| f.generation == generation);
@@ -204,6 +224,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             app.error(format!("Valeur non appliquée : {e}"));
         }
     }
+    let link = target.and_then(|key| focused_link(app, key));
+    let mut follow = None;
     let panel = &mut app.value_panel;
     let Some(f) = target.and_then(|key| cell(&mut app.tabs, key)) else {
         panel.key = None;
@@ -222,11 +244,38 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 ui.label(RichText::new(format!("Colonne {}", f.col + 1)).strong());
             }
         }
+        if f.column.is_some_and(|c| c.is_primary_key) {
+            fk::pk_badge(ui);
+        }
+        if let Some(l) = &link {
+            fk::fk_badge(ui, &l.tooltip());
+        }
         if panel.json {
             ui.label(RichText::new("JSON").small().color(ACCENT))
                 .on_hover_text("Affiché indenté, écrit compact");
         }
     });
+    if let Some(l) = &link {
+        let color = fk::link_color(ui.visuals().dark_mode);
+        let (tab, _, row, col) = f.key;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("→ {}", l.target)).color(color));
+            if ui
+                .button(format!("{} Voir la ligne liée", icon::LINK))
+                .on_hover_text("Aperçu ici (Alt+Entrée dans la grille)")
+                .clicked()
+            {
+                follow = Some((tab, row, col, false));
+            }
+            if ui
+                .button(icon::ARROW_SQUARE_OUT)
+                .on_hover_text(format!("Ouvrir {} dans un onglet (Ctrl+clic)", l.table))
+                .clicked()
+            {
+                follow = Some((tab, row, col, true));
+            }
+        });
+    }
 
     let mut set = None;
     if f.editable {
@@ -292,6 +341,287 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
     if let Some(v) = set {
         f.edits.set(f.rows, f.row, f.col, v);
+    }
+    if let Some((tab, row, col, new_tab)) = follow {
+        app.data_action(tab, DataAction::Follow { row, col, new_tab });
+    }
+}
+
+/// The foreign key of the focused cell of a data tab, when its value links
+/// somewhere: where it points.
+fn focused_link(app: &App, key: CellKey) -> Option<ColumnLink> {
+    let (tab_id, _, row, col) = key;
+    let tab = app.tabs.list.iter().find(|t| t.id == tab_id)?;
+    let TabKind::Data(d) = &tab.kind else {
+        return None;
+    };
+    let details = app
+        .sessions
+        .get(&tab.connection)?
+        .details
+        .get(&d.table)?
+        .as_ref()
+        .ok()?;
+    let result = d.result.as_ref()?;
+    let link = fk::link_of(&details.foreign_keys, &result.columns.get(col)?.name)?;
+    let value = d.row_values(row)?.into_iter().nth(col)?;
+    let saved = !d.grid.edits.is_deleted(row);
+    (fk::cell_link(Some(&link), is_null(&value), saved) == CellLink::Active).then_some(link)
+}
+
+/// What the preview asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewAction {
+    /// Back one step (closes the preview from the first one).
+    Back,
+    Forward,
+    /// Jump to step `i` of the breadcrumb.
+    Go(usize),
+    Close,
+    /// Open the current step in a filtered tab.
+    OpenTab,
+    /// Follow key `fk` of the shown row (a new tab with Ctrl).
+    Follow {
+        fk: usize,
+        new_tab: bool,
+    },
+    /// Open the rows of incoming key `fk` pointing at the shown row.
+    Referencing(usize),
+}
+
+/// The linked-row preview: breadcrumb, the row's columns (its own keys
+/// clickable) and the tables pointing at it.
+fn preview_ui(app: &App, ui: &mut egui::Ui) -> Option<PreviewAction> {
+    let p = app.fk_preview.as_ref()?;
+    let step = p.current();
+    let details = app
+        .sessions
+        .get(&p.connection)
+        .and_then(|s| s.details.get(&step.target.table))
+        .and_then(|r| r.as_ref().ok());
+    let dark = ui.visuals().dark_mode;
+    let color = fk::link_color(dark);
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(icon::LINK).color(color));
+        ui.strong(format!("{} liée", step.target.title));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button(icon::X)
+                .on_hover_text("Fermer l'aperçu")
+                .clicked()
+            {
+                action = Some(PreviewAction::Close);
+            }
+        });
+    });
+    // Breadcrumb: the origin table, then each followed row.
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if ui
+            .link(RichText::new(&p.origin_title).weak())
+            .on_hover_text("Revenir à la cellule")
+            .clicked()
+        {
+            action = Some(PreviewAction::Close);
+        }
+        for (i, (title, current)) in p.crumbs().into_iter().enumerate() {
+            ui.label(RichText::new(icon::CARET_RIGHT).weak());
+            if current {
+                ui.label(RichText::new(title).strong().color(color));
+            } else if ui.link(title).clicked() {
+                action = Some(PreviewAction::Go(i));
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui
+            .button(format!("{} Retour", icon::ARROW_LEFT))
+            .on_hover_text("Étape précédente (la première revient à la cellule)")
+            .clicked()
+        {
+            action = Some(PreviewAction::Back);
+        }
+        if ui
+            .add_enabled(p.can_forward(), egui::Button::new(icon::ARROW_RIGHT))
+            .on_hover_text("Étape suivante")
+            .clicked()
+        {
+            action = Some(PreviewAction::Forward);
+        }
+        if ui
+            .button(format!("{} Ouvrir dans un onglet", icon::ARROW_SQUARE_OUT))
+            .on_hover_text(format!("{} filtré sur cette clé", step.target.title))
+            .clicked()
+        {
+            action = Some(PreviewAction::OpenTab);
+        }
+    });
+    ui.label(
+        RichText::new(&step.target.condition)
+            .monospace()
+            .weak()
+            .small(),
+    );
+    ui.separator();
+    match &step.state {
+        RowState::Loading => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Chargement…").weak());
+            });
+        }
+        RowState::Failed(e) => {
+            ui.colored_label(ERROR, e);
+        }
+        RowState::Missing => {
+            let notice = step.state.notice().unwrap_or_default();
+            ui.colored_label(ERROR, format!("{} {notice}", icon::LINK_BREAK));
+        }
+        RowState::Found { result, many } => {
+            if let (true, Some(notice)) = (*many, step.state.notice()) {
+                ui.label(RichText::new(format!("{} {notice}", icon::WARNING)).color(AMBER));
+            }
+            let fks = details.map_or(&[][..], |d| &d.foreign_keys[..]);
+            let incoming = details.map_or(&[][..], |d| &d.incoming[..]);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if let Some(a) = preview_row(ui, result, fks, color) {
+                        action = Some(a);
+                    }
+                    if !incoming.is_empty() {
+                        ui.add_space(8.0);
+                        ui.strong("Référencée par");
+                        for (i, fk) in incoming.iter().enumerate() {
+                            let text =
+                                format!("{} {}", icon::TREE_STRUCTURE, fk::incoming_label(fk));
+                            if ui
+                                .link(RichText::new(text).color(color))
+                                .on_hover_text("Ouvrir les lignes qui pointent ici dans un onglet")
+                                .clicked()
+                            {
+                                action = Some(PreviewAction::Referencing(i));
+                            }
+                        }
+                    }
+                });
+        }
+    }
+    action
+}
+
+/// The columns of the first row of `result`: name (with its key badges),
+/// type and value; values of foreign key columns are links.
+fn preview_row(
+    ui: &mut egui::Ui,
+    result: &QueryResult,
+    fks: &[ForeignKeyInfo],
+    color: egui::Color32,
+) -> Option<PreviewAction> {
+    let row = result.rows.first()?;
+    let mut action = None;
+    egui::Grid::new("fk_preview_row")
+        .num_columns(2)
+        .striped(true)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            for (c, value) in result.columns.iter().zip(row) {
+                let link = fk::link_of(fks, &c.name);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if c.is_primary_key {
+                        fk::pk_badge(ui);
+                    }
+                    if let Some(l) = &link {
+                        fk::fk_badge(ui, &l.tooltip());
+                    }
+                    ui.label(RichText::new(&c.name).strong())
+                        .on_hover_text(&c.type_name);
+                });
+                let null = is_null(value);
+                match (&link, null) {
+                    (Some(l), false) => {
+                        let r = ui
+                            .link(RichText::new(format!("{} {value}", icon::LINK)).color(color))
+                            .on_hover_text(format!(
+                                "{} · clic : suivre · Ctrl+clic : ouvrir dans un onglet",
+                                l.tooltip()
+                            ));
+                        if r.clicked() {
+                            let new_tab = ui.input(|i| i.modifiers.command);
+                            action = Some(PreviewAction::Follow { fk: l.fk, new_tab });
+                        }
+                    }
+                    (_, true) => {
+                        ui.label(RichText::new("NULL").weak().italics());
+                    }
+                    (None, false) => {
+                        ui.add(egui::Label::new(value.as_str()).truncate())
+                            .on_hover_text(value.as_str());
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    action
+}
+
+/// Do what the preview asked for.
+fn preview_act(app: &mut App, action: PreviewAction) {
+    let Some(p) = app.fk_preview.as_mut() else {
+        return;
+    };
+    match action {
+        PreviewAction::Back => {
+            if !p.back() {
+                app.fk_preview = None;
+            }
+        }
+        PreviewAction::Forward => p.forward(),
+        PreviewAction::Go(i) => p.go(i),
+        PreviewAction::Close => app.fk_preview = None,
+        PreviewAction::OpenTab => {
+            let (connection, target) = (p.connection.clone(), p.current().target.clone());
+            app.open_filtered(&connection, &target);
+        }
+        PreviewAction::Follow { .. } | PreviewAction::Referencing(_) => {
+            let connection = p.connection.clone();
+            let step = p.current();
+            let source = step.target.table.clone();
+            let RowState::Found { result, .. } = &step.state else {
+                return;
+            };
+            let (columns, values) = (result.columns.clone(), result.rows[0].clone());
+            let details = app
+                .sessions
+                .get(&connection)
+                .and_then(|s| s.details.get(&source))
+                .and_then(|r| r.as_ref().ok());
+            match action {
+                PreviewAction::Follow { fk, new_tab } => {
+                    let Some(key) = details.and_then(|d| d.foreign_keys.get(fk)).cloned() else {
+                        return;
+                    };
+                    let open = if new_tab {
+                        LinkOpen::Tab
+                    } else {
+                        LinkOpen::Preview {
+                            origin: None,
+                            origin_title: String::new(),
+                        }
+                    };
+                    app.follow_fk(&connection, &source, &key, &columns, &values, open);
+                }
+                PreviewAction::Referencing(i) => {
+                    let Some(key) = details.and_then(|d| d.incoming.get(i)).cloned() else {
+                        return;
+                    };
+                    app.open_referencing(&connection, &source, &key, &columns, &values);
+                }
+                _ => {}
+            }
+        }
     }
 }
 

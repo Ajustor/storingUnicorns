@@ -24,6 +24,8 @@ pub struct ColumnInfo {
     pub name: String,
     pub type_name: String,
     pub primary_key: bool,
+    /// Table the column references, when it is part of a foreign key.
+    pub foreign_key: Option<String>,
 }
 
 /// What a suggestion is.
@@ -394,12 +396,19 @@ fn starts_with_ci(s: &str, prefix: &str) -> bool {
     prefix.is_empty() || s.to_lowercase().starts_with(&prefix.to_lowercase())
 }
 
+/// `PK int`, `FK → users int`, `PK FK → users int`, `int`.
 fn column_detail(c: &ColumnInfo) -> String {
-    match (c.primary_key, c.type_name.is_empty()) {
-        (true, true) => "PK".to_string(),
-        (true, false) => format!("PK {}", c.type_name),
-        (false, _) => c.type_name.clone(),
+    let mut parts: Vec<String> = Vec::new();
+    if c.primary_key {
+        parts.push("PK".to_string());
     }
+    if let Some(table) = &c.foreign_key {
+        parts.push(format!("FK → {table}"));
+    }
+    if !c.type_name.is_empty() {
+        parts.push(c.type_name.clone());
+    }
+    parts.join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,6 +1168,7 @@ mod tests {
             name: name.into(),
             type_name: ty.into(),
             primary_key: pk,
+            foreign_key: None,
         }
     }
 
@@ -1482,6 +1492,14 @@ mod tests {
         let c = run("SELECT | FROM users");
         assert_eq!(c.items[0].detail, "PK int");
         assert_eq!(c.items[1].detail, "varchar(255)");
+        let fk = |pk, ty: &str| ColumnInfo {
+            foreign_key: Some("users".into()),
+            ..col("user_id", ty, pk)
+        };
+        assert_eq!(column_detail(&fk(false, "int")), "FK → users int");
+        assert_eq!(column_detail(&fk(true, "int")), "PK FK → users int");
+        assert_eq!(column_detail(&fk(false, "")), "FK → users");
+        assert_eq!(column_detail(&col("id", "", true)), "PK");
         assert_eq!(
             c.items
                 .iter()

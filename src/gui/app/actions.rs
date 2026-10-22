@@ -8,6 +8,7 @@ use crate::gui::tabs::console::{self, ConsoleAction, RunKind};
 use crate::gui::tabs::data::DataAction;
 use crate::gui::tabs::{TabId, TabKind};
 
+use super::links::DataLink;
 use super::App;
 
 impl App {
@@ -93,6 +94,12 @@ impl App {
             DataAction::Tx(action) => {
                 let connection = tab.connection.clone();
                 self.tx_action(&connection, action);
+            }
+            DataAction::Follow { row, col, new_tab } => {
+                self.data_link(id, row, DataLink::Follow { col, new_tab })
+            }
+            DataAction::Referencing { row, fk } => {
+                self.data_link(id, row, DataLink::Referencing(fk))
             }
             DataAction::Export => {
                 let Some(result) = d.result.clone() else {

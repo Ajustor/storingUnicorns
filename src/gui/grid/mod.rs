@@ -11,6 +11,7 @@ use egui_phosphor::regular as icon;
 
 use crate::engine::models::{display_cell, is_null, Column, QueryResult, NULL_CELL};
 use crate::engine::ops::rows::detect_system_columns;
+use crate::gui::fk::{self, CellLink, ColumnLink};
 use crate::gui::theme::{ACCENT, ERROR, SUCCESS};
 
 use changes::{PendingEdits, RowRef};
@@ -89,6 +90,19 @@ pub enum GridAction {
     SelectionChanged,
     /// "Exporter…" in the footer.
     Export,
+    /// Follow the foreign key of a cell: preview the linked row, or open
+    /// it in a filtered tab (`new_tab`: Ctrl+click).
+    Follow {
+        row: RowRef,
+        col: usize,
+        new_tab: bool,
+    },
+    /// "Enregistrements liés": the rows of incoming key `fk` pointing at
+    /// `row`.
+    Referencing {
+        row: RowRef,
+        fk: usize,
+    },
 }
 
 pub struct GridOptions<'a> {
@@ -98,6 +112,11 @@ pub struct GridOptions<'a> {
     pub server_sort: bool,
     /// Sort arrow of a server-sorted grid.
     pub sort_indicator: Option<(usize, bool)>,
+    /// Foreign key of each column (empty: none known).
+    pub links: &'a [Option<ColumnLink>],
+    /// Labels of the keys of other tables pointing at this one, for the
+    /// "Enregistrements liés" menu of a row.
+    pub incoming: &'a [String],
 }
 
 const AMBER: Color32 = Color32::from_rgb(0xF2, 0xA6, 0x4C);
@@ -161,6 +180,51 @@ enum CellAction {
     SetDefault(RowRef, usize),
     AddRow,
     ToggleDelete(RowRef),
+    Follow(RowRef, usize, bool),
+    Referencing(RowRef, usize),
+}
+
+/// The marked header of a column: key icon and FK badge before the name,
+/// then the sort arrow.
+fn header_job(
+    ui: &egui::Ui,
+    column: &Column,
+    link: Option<&ColumnLink>,
+    sort: Option<bool>,
+) -> (egui::text::LayoutJob, String) {
+    let (marks, hover) = fk::header_marks(column, link);
+    let style = ui.style();
+    let color = fk::link_color(ui.visuals().dark_mode);
+    let mut job = egui::text::LayoutJob::default();
+    let mut add = |text: RichText| {
+        text.append_to(
+            &mut job,
+            style,
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        )
+    };
+    if marks.pk {
+        add(RichText::new(format!("{} ", icon::KEY)).color(color));
+    }
+    if marks.fk.is_some() {
+        add(RichText::new(format!("{} FK ", icon::LINK))
+            .small()
+            .strong()
+            .color(color));
+    }
+    add(RichText::new(&column.name).strong());
+    if let Some(asc) = sort {
+        add(RichText::new(format!(
+            " {}",
+            if asc {
+                icon::CARET_UP
+            } else {
+                icon::CARET_DOWN
+            }
+        )));
+    }
+    (job, hover)
 }
 
 /// Virtualised data grid: sortable header, local filter (unless
@@ -209,7 +273,26 @@ pub fn show(
             )
         });
     }
-    let mut action = if state.editing.is_some() {
+    // Alt+Entrée on a link cell previews the linked row (checked before
+    // the grid's keys: Entrée alone would take it to edit the cell).
+    let follow_key = match (grid_focused, &state.editing, state.selected) {
+        (true, None, Some((r, c))) => {
+            let link = opts.links.get(c).and_then(Option::as_ref);
+            let blank = state.edits.is_default(r, c) || is_null(state.edits.value(rows, r, c));
+            let saved = matches!(r, RowRef::Base(_)) && !state.edits.is_deleted(r);
+            (fk::cell_link(link, blank, saved) == CellLink::Active
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter)))
+            .then_some(GridAction::Follow {
+                row: r,
+                col: c,
+                new_tab: false,
+            })
+        }
+        _ => None,
+    };
+    let mut action = if let Some(follow) = follow_key {
+        follow
+    } else if state.editing.is_some() {
         state.editing_keys(&ctx, (focus_id, edit_id), result)
     } else if grid_focused {
         state.grid_keys(&ctx, result, opts.editable)
@@ -287,31 +370,17 @@ pub fn show(
                         });
                         for (c, column) in result.columns.iter().enumerate() {
                             header.col(|ui| {
-                                let mut text = String::new();
-                                if column.is_primary_key {
-                                    text.push_str(icon::KEY);
-                                    text.push(' ');
-                                }
-                                text.push_str(&column.name);
-                                if let Some((_, asc)) = sort_shown.filter(|(sc, _)| *sc == c) {
-                                    text.push(' ');
-                                    text.push_str(if asc {
-                                        icon::CARET_UP
-                                    } else {
-                                        icon::CARET_DOWN
-                                    });
-                                }
+                                let sort = sort_shown.filter(|(sc, _)| *sc == c).map(|(_, a)| a);
+                                let link = opts.links.get(c).and_then(Option::as_ref);
+                                let (job, hover) = header_job(ui, column, link, sort);
                                 let r = ui
                                     .add(
-                                        egui::Label::new(RichText::new(text).strong())
+                                        egui::Label::new(job)
                                             .selectable(false)
                                             .sense(Sense::click())
                                             .truncate(),
                                     )
-                                    .on_hover_text(format!(
-                                        "{} · cliquer pour trier",
-                                        column.type_name
-                                    ));
+                                    .on_hover_text(format!("{hover} · cliquer pour trier"));
                                 if r.clicked() {
                                     header_clicked = Some(c);
                                 }
@@ -324,7 +393,8 @@ pub fn show(
                             let r = row_ref(view, d);
                             let is_new = matches!(r, RowRef::New(_));
                             let deleted = edits.is_deleted(r);
-                            row.set_selected(selected.is_some_and(|(sr, _)| sr == r));
+                            let row_selected = selected.is_some_and(|(sr, _)| sr == r);
+                            row.set_selected(row_selected);
                             row.col(|ui| {
                                 if is_new {
                                     ui.label(RichText::new(icon::PLUS).color(SUCCESS));
@@ -333,6 +403,16 @@ pub fn show(
                                 }
                             });
                             for c in 0..ncols {
+                                let link = opts.links.get(c).and_then(Option::as_ref);
+                                let edited_here = editing
+                                    .as_ref()
+                                    .is_some_and(|(er, ec, _)| (*er, *ec) == (r, c));
+                                let blank =
+                                    edits.is_default(r, c) || is_null(edits.value(rows, r, c));
+                                let saved = matches!(r, RowRef::Base(_)) && !deleted;
+                                let active = !edited_here
+                                    && fk::cell_link(link, blank, saved) == CellLink::Active;
+                                let mut icon_clicked = false;
                                 let (_, resp) = row.col(|ui| {
                                     let rect = ui.max_rect();
                                     if is_new {
@@ -368,9 +448,16 @@ pub fn show(
                                             } else {
                                                 cell_text(value, deleted)
                                             };
-                                            ui.add(
-                                                egui::Label::new(text).selectable(false).truncate(),
-                                            );
+                                            if let (true, Some(link)) = (active, link) {
+                                                icon_clicked =
+                                                    link_cell(ui, text, link, row_selected);
+                                            } else {
+                                                ui.add(
+                                                    egui::Label::new(text)
+                                                        .selectable(false)
+                                                        .truncate(),
+                                                );
+                                            }
                                         }
                                     }
                                     if *selected == Some((r, c)) {
@@ -385,14 +472,25 @@ pub fn show(
                                         }
                                     }
                                 });
-                                if resp.double_clicked() {
+                                let command = ctx.input(|i| i.modifiers.command);
+                                if icon_clicked {
+                                    cell_action = Some(CellAction::Follow(r, c, command));
+                                } else if active && command && resp.clicked() {
+                                    cell_action = Some(CellAction::Follow(r, c, true));
+                                } else if resp.double_clicked() {
                                     cell_action = Some(CellAction::Edit(r, c));
                                 } else if resp.clicked() || resp.secondary_clicked() {
                                     cell_action = Some(CellAction::Select(r, c));
                                 }
-                                resp.context_menu(|ui| {
-                                    context_menu(ui, r, c, deleted, opts.editable, &mut cell_action)
-                                });
+                                let menu = MenuCell {
+                                    row: r,
+                                    col: c,
+                                    deleted,
+                                    editable: opts.editable,
+                                    link: link.filter(|_| active),
+                                    incoming: if saved { opts.incoming } else { &[] },
+                                };
+                                resp.context_menu(|ui| context_menu(ui, &menu, &mut cell_action));
                             }
                         });
                     });
@@ -470,6 +568,20 @@ pub fn show(
             state.toggle_delete(r);
             focus_grid();
         }
+        Some(CellAction::Follow(r, c, new_tab)) => {
+            state.commit_edit(rows);
+            state.selected = Some((r, c));
+            focus_grid();
+            action = GridAction::Follow {
+                row: r,
+                col: c,
+                new_tab,
+            };
+        }
+        Some(CellAction::Referencing(r, fk)) => {
+            state.commit_edit(rows);
+            action = GridAction::Referencing { row: r, fk };
+        }
         None => {}
     }
     state.clamp(rows, ncols);
@@ -479,14 +591,92 @@ pub fn show(
     action
 }
 
-fn context_menu(
-    ui: &mut egui::Ui,
-    r: RowRef,
-    c: usize,
+/// A cell's value drawn as a link: link icon and value in the link
+/// colour (the selection's text colour on a selected row), underlined on
+/// hover. Whether the icon was clicked.
+fn link_cell(ui: &mut egui::Ui, text: RichText, link: &ColumnLink, selected: bool) -> bool {
+    let color = if selected {
+        ui.visuals().selection.stroke.color
+    } else {
+        fk::link_color(ui.visuals().dark_mode)
+    };
+    // Selected: underlined, so it still reads as a link.
+    let hovered = selected || ui.rect_contains_pointer(ui.max_rect());
+    let hint = format!(
+        "{} · clic sur l'icône : aperçu (Alt+Entrée) · Ctrl+clic : ouvrir dans un onglet",
+        link.tooltip()
+    );
+    let clicked = ui
+        .add(
+            egui::Label::new(RichText::new(icon::LINK).color(color))
+                .selectable(false)
+                .sense(Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(&hint)
+        .clicked();
+    let text = if hovered { text.underline() } else { text };
+    ui.add(
+        egui::Label::new(text.color(color))
+            .selectable(false)
+            .truncate(),
+    )
+    .on_hover_text(hint);
+    clicked
+}
+
+/// The cell a context menu is opened on.
+struct MenuCell<'a> {
+    row: RowRef,
+    col: usize,
     deleted: bool,
     editable: bool,
-    action: &mut Option<CellAction>,
-) {
+    /// Its foreign key, when it links somewhere.
+    link: Option<&'a ColumnLink>,
+    /// Incoming keys of the row's table (none for unsaved rows).
+    incoming: &'a [String],
+}
+
+fn context_menu(ui: &mut egui::Ui, m: &MenuCell, action: &mut Option<CellAction>) {
+    let (r, c, deleted) = (m.row, m.col, m.deleted);
+    let mut item = |ui: &mut egui::Ui, label: String, a: CellAction| {
+        if ui.button(label).clicked() {
+            *action = Some(a);
+            ui.close_menu();
+        }
+    };
+    if let Some(link) = m.link {
+        item(
+            ui,
+            format!("{} Voir la ligne liée (Alt+Entrée)", icon::LINK),
+            CellAction::Follow(r, c, false),
+        );
+        item(
+            ui,
+            format!(
+                "{} Ouvrir {} dans un onglet (Ctrl+clic)",
+                icon::ARROW_SQUARE_OUT,
+                link.table
+            ),
+            CellAction::Follow(r, c, true),
+        );
+    }
+    if !m.incoming.is_empty() {
+        ui.menu_button(
+            format!("{} Enregistrements liés", icon::TREE_STRUCTURE),
+            |ui| {
+                for (i, label) in m.incoming.iter().enumerate() {
+                    if ui.button(label).clicked() {
+                        *action = Some(CellAction::Referencing(r, i));
+                        ui.close_menu();
+                    }
+                }
+            },
+        );
+    }
+    if m.link.is_some() || !m.incoming.is_empty() {
+        ui.separator();
+    }
     let mut item = |ui: &mut egui::Ui, label: String, a: CellAction| {
         if ui.button(label).clicked() {
             *action = Some(a);
@@ -503,7 +693,7 @@ fn context_menu(
         format!("{} Copier la ligne", icon::COPY),
         CellAction::CopyRow(r),
     );
-    if !editable {
+    if !m.editable {
         return;
     }
     ui.separator();

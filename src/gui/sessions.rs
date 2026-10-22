@@ -162,6 +162,7 @@ pub fn completion_columns(
                     name: c.name.clone(),
                     type_name: c.type_name.clone(),
                     primary_key: c.is_primary_key,
+                    foreign_key: super::fk::link_of(&d.foreign_keys, &c.name).map(|l| l.table),
                 })
                 .collect(),
         ),
@@ -496,6 +497,7 @@ mod tests {
                 name: "id".into(),
                 type_name: "INTEGER".into(),
                 primary_key: true,
+                foreign_key: None,
             }])
         );
         assert_eq!(

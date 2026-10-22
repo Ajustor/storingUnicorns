@@ -36,6 +36,13 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
 - **Vider les tables** : la confirmation liste maintenant toutes les tables à
   vider (la liste défile ; elle s'arrêtait à 12).
 
+### Corrections
+
+- **Mise à jour sous Windows** : « Redémarrer maintenant » n'appliquait pas la
+  mise à jour quand l'app avait été lancée par un double-clic sur l'exe (le
+  relancement échouait avec « Descripteur non valide ») ; depuis un terminal il
+  fonctionnait déjà.
+
 ## [0.16.0] - 2026-10-22
 
 ### Nouveautés

@@ -18,6 +18,23 @@ mod sys {
     extern "system" {
         pub fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
         pub fn FreeConsole() -> i32;
+        pub fn SetStdHandle(std_handle: u32, handle: *mut core::ffi::c_void) -> i32;
+    }
+
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+
+    /// Leave the console, and forget its handles: once it's gone they are
+    /// dangling, and `std::process::Command` would fail to hand them to a
+    /// child ("The handle is invalid"), e.g. the relaunch after an update.
+    pub fn detach_console() {
+        unsafe {
+            FreeConsole();
+            for h in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                SetStdHandle(h, core::ptr::null_mut());
+            }
+        }
     }
 }
 
@@ -30,14 +47,14 @@ pub fn prepare_gui() -> GuiLaunch {
         // Don't leak the flag to our own children (e.g. an updater relaunch),
         // which would then skip detaching.
         std::env::remove_var(DETACHED_ENV);
-        unsafe { sys::FreeConsole() };
+        sys::detach_console();
         return GuiLaunch::Continue;
     }
     let mut pids = [0u32; 4];
     let attached = unsafe { sys::GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) };
     if attached <= 1 {
         // Our own console (double-click / shortcut): just hide it.
-        unsafe { sys::FreeConsole() };
+        sys::detach_console();
         return GuiLaunch::Continue;
     }
     // Shared with a shell: start a detached copy so the prompt returns.

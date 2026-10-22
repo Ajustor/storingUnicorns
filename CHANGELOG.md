@@ -7,6 +7,15 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Corrections
+
+- **Mise à jour sous Windows** : « Redémarrer maintenant » n'appliquait pas la
+  mise à jour quand l'app avait été lancée par un double-clic sur l'exe (le
+  relancement échouait avec « Descripteur non valide ») ; depuis un terminal il
+  fonctionnait déjà.
+
 ## [0.16.0] - 2026-10-22
 
 ### Nouveautés

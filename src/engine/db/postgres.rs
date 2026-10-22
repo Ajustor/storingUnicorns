@@ -4,8 +4,8 @@ use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{postgres::PgRow, Column as SqlxColumn, PgPool, Postgres, Row, TypeInfo};
 
 use crate::engine::models::{
-    Column, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, SslMode,
-    NULL_CELL,
+    Column, ConnectionConfig, DbAuthMethod, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
+    SslMode, NULL_CELL,
 };
 
 use super::utils::{fetch_rows_and_result, group_tables_by_schema, split_qualified, TxConnection};
@@ -16,7 +16,8 @@ use super::utils::{fetch_rows_and_result, group_tables_by_schema, split_qualifie
 /// to the environment: without a password, `PGPASSWORD`, then the pgpass
 /// file (`PGPASSFILE`, `~/.pgpass`, `%APPDATA%\postgresql\pgpass.conf`);
 /// without a CA, `PGSSLROOTCERT`; and always `PGSSLCERT`, `PGSSLKEY`,
-/// `PGAPPNAME`, `PGOPTIONS`.
+/// `PGAPPNAME`, `PGOPTIONS`. With Google Cloud IAM, the user is the
+/// account's database user and `connect` adds the token as password.
 pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
     // NOTE: `VerifyCa` still checks the host name. sqlx 0.8.6's
     // `NoHostnameTlsVerifier` (sqlx-core/src/net/tls/tls_rustls.rs) only
@@ -26,7 +27,7 @@ pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
     let mut o = base_options(config)
         .host(config.host.as_deref().unwrap_or("localhost"))
         .port(config.port.unwrap_or(5432))
-        .username(config.username.as_deref().unwrap_or("postgres"))
+        .username(&login_user(config))
         .ssl_mode(match config.effective_ssl_mode() {
             SslMode::Disable => PgSslMode::Disable,
             SslMode::Prefer => PgSslMode::Prefer,
@@ -39,7 +40,7 @@ pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
     if !config.database.is_empty() {
         o = o.database(&config.database);
     }
-    if let Some(p) = &config.password {
+    if let Some(p) = config.password.as_ref().filter(|_| !iam(config)) {
         o = o.password(p);
     }
     if let Some(ca) = &config.ssl_ca {
@@ -48,13 +49,28 @@ pub fn connect_options(config: &ConnectionConfig) -> PgConnectOptions {
     o
 }
 
+fn iam(config: &ConnectionConfig) -> bool {
+    config.effective_db_auth() == DbAuthMethod::GcpIam
+}
+
+/// The user name sent to the server.
+fn login_user(config: &ConnectionConfig) -> String {
+    let user = config.username.as_deref().unwrap_or("postgres");
+    if iam(config) {
+        super::gcp_iam::database_user(&config.db_type, user)
+    } else {
+        user.to_string()
+    }
+}
+
 /// The options `connect_options` starts from. Without a password, sqlx's
 /// URL parser is the only public way to read the pgpass file for *our*
 /// host/port/user/database (`PgConnectOptions::new()` looks it up for the
 /// defaults, before the fields are set), so those four go through a URL's
 /// query string, which `url` encodes and sqlx decodes.
 fn base_options(config: &ConnectionConfig) -> PgConnectOptions {
-    if config.password.is_some() {
+    // With IAM the token is the password: no pgpass.
+    if config.password.is_some() || iam(config) {
         return PgConnectOptions::new_without_pgpass();
     }
     let mut url = url::Url::parse("postgres://localhost").expect("static URL");
@@ -63,7 +79,7 @@ fn base_options(config: &ConnectionConfig) -> PgConnectOptions {
         query
             .append_pair("host", config.host.as_deref().unwrap_or("localhost"))
             .append_pair("port", &config.port.unwrap_or(5432).to_string())
-            .append_pair("user", config.username.as_deref().unwrap_or("postgres"));
+            .append_pair("user", &login_user(config));
         if !config.database.is_empty() {
             query.append_pair("dbname", &config.database);
         }
@@ -76,8 +92,21 @@ fn base_options(config: &ConnectionConfig) -> PgConnectOptions {
 
 /// Connect to PostgreSQL. In `Prefer` mode, a failed TLS handshake is retried
 /// without TLS (see `tls::should_retry_plain`).
+/// With Google Cloud IAM, signs in with a `gcloud` token, renewed while the
+/// pool lives (at least `Require`: no plain-text retry).
 pub async fn connect(config: &ConnectionConfig, pool: PoolOptions<Postgres>) -> Result<PgPool> {
     let options = connect_options(config);
+    if iam(config) {
+        use super::gcp_iam;
+        return gcp_iam::connect_renewing(
+            pool,
+            gcp_iam::account(config)?,
+            gcp_iam::gcloud_provider(),
+            gcp_iam::Timing::DEFAULT,
+            move |token| options.clone().password(token.secret()),
+        )
+        .await;
+    }
     match pool.clone().connect_with(options.clone()).await {
         Err(e) if super::tls::should_retry_plain(config.effective_ssl_mode(), &e) => {
             tracing::debug!("TLS failed in Prefer mode ({e}); retrying without TLS");
@@ -696,5 +725,25 @@ mod tests {
                 std::mem::discriminant(&want)
             );
         }
+    }
+
+    #[test]
+    fn gcp_iam_options_use_the_database_user_and_tls() {
+        let c = ConnectionConfig {
+            username: Some("sa@proj.iam.gserviceaccount.com".into()),
+            // A password left from before is not sent: the token is.
+            password: Some("old".into()),
+            ssl_mode: Some(SslMode::Disable),
+            db_auth: Some(crate::engine::models::DbAuthMethod::GcpIam),
+            ..Default::default()
+        };
+        let o = connect_options(&c);
+        assert_eq!(o.get_username(), "sa@proj.iam");
+        assert!(matches!(o.get_ssl_mode(), PgSslMode::Require));
+        // The saved password is never sent. (PG* variables may still fill
+        // the field, as on CI runners with PGPASSWORD set; the token
+        // replaces it when connecting.)
+        let debug = format!("{o:?}");
+        assert!(!debug.contains("\"old\""), "{debug}");
     }
 }

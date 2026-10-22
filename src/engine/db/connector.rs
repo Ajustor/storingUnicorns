@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::engine::models::{
-    ConnectionConfig, DatabaseType, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
+    ConnectionConfig, DatabaseType, DbAuthMethod, ForeignKeyInfo, IndexInfo, QueryResult,
+    SchemaInfo,
 };
 
 pub use super::sqlserver::SqlServerClient;
-use super::{azure, mysql, postgres, sqlite, sqlserver, tls, utils};
+use super::{azure, gcp_iam, mysql, postgres, sqlite, sqlserver, tls, utils};
 
 /// A known TLS failure gets a French hint; the driver's message stays in
 /// parentheses for diagnosis. Other errors are unchanged.
@@ -18,6 +19,22 @@ fn explain_tls(e: anyhow::Error, config: &ConnectionConfig) -> anyhow::Error {
     let host = config.host.as_deref().unwrap_or("localhost");
     match tls::explain(&format!("{e:#}"), host, config.effective_ssl_mode()) {
         Some(hint) => anyhow::anyhow!("{hint}\n({e:#})"),
+        None => e,
+    }
+}
+
+/// A login refused with Google Cloud IAM gets a hint about the IAM user on
+/// the instance; other errors are unchanged.
+fn explain_iam(e: anyhow::Error, config: &ConnectionConfig) -> anyhow::Error {
+    if config.effective_db_auth() != DbAuthMethod::GcpIam {
+        return e;
+    }
+    let account = config.username.as_deref().unwrap_or_default();
+    match gcp_iam::login_hint(&format!("{e:#}"), &config.db_type, account) {
+        Some(hint) => anyhow::anyhow!(
+            "{hint}
+({e:#})"
+        ),
         None => e,
     }
 }
@@ -77,7 +94,7 @@ impl DatabaseConnection {
                     .map_err(anyhow::Error::msg)?;
                 let pool = postgres::connect(config, pool_options(opened))
                     .await
-                    .map_err(|e| explain_tls(e, config))?;
+                    .map_err(|e| explain_iam(explain_tls(e, config), config))?;
                 Ok(DatabaseConnection::Postgres(pool))
             }
             DatabaseType::MySQL => {
@@ -85,7 +102,7 @@ impl DatabaseConnection {
                     .map_err(anyhow::Error::msg)?;
                 let pool = mysql::connect(config, pool_options(opened))
                     .await
-                    .map_err(|e| explain_tls(e, config))?;
+                    .map_err(|e| explain_iam(explain_tls(e, config), config))?;
                 Ok(DatabaseConnection::MySQL(pool))
             }
             DatabaseType::SQLite => {
@@ -383,10 +400,10 @@ impl DatabaseConnection {
 
     /// Close the connection
     pub async fn close(self) {
-        match self {
-            DatabaseConnection::Postgres(pool) => postgres::close(pool).await,
-            DatabaseConnection::MySQL(pool) => mysql::close(pool).await,
-            DatabaseConnection::SQLite(pool) => sqlite::close(pool).await,
+        match &self {
+            DatabaseConnection::Postgres(pool) => postgres::close(pool.clone()).await,
+            DatabaseConnection::MySQL(pool) => mysql::close(pool.clone()).await,
+            DatabaseConnection::SQLite(pool) => sqlite::close(pool.clone()).await,
             DatabaseConnection::SQLServer(_) => {
                 // Tiberius client is dropped automatically
             }
@@ -394,5 +411,41 @@ impl DatabaseConnection {
                 // Azure client is dropped automatically
             }
         }
+    }
+}
+
+impl Drop for DatabaseConnection {
+    /// The pool is closed with its last handle: the Google Cloud IAM renewal
+    /// task holds one more and stops when the pool is marked closed (done
+    /// at once by `close()`, without awaiting the sessions' shutdown).
+    fn drop(&mut self) {
+        match self {
+            DatabaseConnection::Postgres(pool) => std::mem::drop(pool.close()),
+            DatabaseConnection::MySQL(pool) => std::mem::drop(pool.close()),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_a_connection_closes_its_pool() {
+        // Lazy: nothing listens on the port, no session is ever opened.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://u:p@127.0.0.1:9/db")
+            .unwrap();
+        let kept = pool.clone();
+        drop(DatabaseConnection::Postgres(pool));
+        assert!(kept.is_closed());
+
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://u:p@127.0.0.1:9/db")
+            .unwrap();
+        let kept = pool.clone();
+        drop(DatabaseConnection::MySQL(pool));
+        assert!(kept.is_closed());
     }
 }

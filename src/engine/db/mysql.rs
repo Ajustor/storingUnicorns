@@ -4,8 +4,8 @@ use sqlx::pool::PoolOptions;
 use sqlx::{mysql::MySqlRow, Column as SqlxColumn, MySql, MySqlPool, Row, TypeInfo};
 
 use crate::engine::models::{
-    Column, ConnectionConfig, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, SslMode,
-    NULL_CELL,
+    Column, ConnectionConfig, DbAuthMethod, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
+    SslMode, NULL_CELL,
 };
 
 use super::utils::{
@@ -14,7 +14,9 @@ use super::utils::{
 };
 
 /// Options built field by field: no URL, so any character works in the
-/// password.
+/// password. With Google Cloud IAM, the user is the account's database user,
+/// the token goes in clear text (over TLS: `mysql_clear_password`) and
+/// `connect` adds it as password.
 pub fn connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
     // NOTE: `VerifyCa` still checks the host name. sqlx 0.8.6's
     // `NoHostnameTlsVerifier` (sqlx-core/src/net/tls/tls_rustls.rs) only
@@ -24,7 +26,7 @@ pub fn connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
     let mut o = MySqlConnectOptions::new()
         .host(config.host.as_deref().unwrap_or("localhost"))
         .port(config.port.unwrap_or(3306))
-        .username(config.username.as_deref().unwrap_or("root"))
+        .username(&login_user(config))
         .ssl_mode(match config.effective_ssl_mode() {
             SslMode::Disable => MySqlSslMode::Disabled,
             SslMode::Prefer => MySqlSslMode::Preferred,
@@ -36,7 +38,9 @@ pub fn connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
     if !config.database.is_empty() {
         o = o.database(&config.database);
     }
-    if let Some(p) = &config.password {
+    if iam(config) {
+        o = o.enable_cleartext_plugin(true);
+    } else if let Some(p) = &config.password {
         o = o.password(p);
     }
     if let Some(ca) = &config.ssl_ca {
@@ -45,10 +49,37 @@ pub fn connect_options(config: &ConnectionConfig) -> MySqlConnectOptions {
     o
 }
 
+fn iam(config: &ConnectionConfig) -> bool {
+    config.effective_db_auth() == DbAuthMethod::GcpIam
+}
+
+/// The user name sent to the server.
+fn login_user(config: &ConnectionConfig) -> String {
+    let user = config.username.as_deref().unwrap_or("root");
+    if iam(config) {
+        super::gcp_iam::database_user(&config.db_type, user)
+    } else {
+        user.to_string()
+    }
+}
+
 /// Connect to MySQL. In `Prefer` mode, a failed TLS handshake is retried
 /// without TLS (see `tls::should_retry_plain`).
+/// With Google Cloud IAM, signs in with a `gcloud` token, renewed while the
+/// pool lives (at least `Require`: no plain-text retry).
 pub async fn connect(config: &ConnectionConfig, pool: PoolOptions<MySql>) -> Result<MySqlPool> {
     let options = connect_options(config);
+    if iam(config) {
+        use super::gcp_iam;
+        return gcp_iam::connect_renewing(
+            pool,
+            gcp_iam::account(config)?,
+            gcp_iam::gcloud_provider(),
+            gcp_iam::Timing::DEFAULT,
+            move |token| options.clone().password(token.secret()),
+        )
+        .await;
+    }
     match pool.clone().connect_with(options.clone()).await {
         Err(e) if super::tls::should_retry_plain(config.effective_ssl_mode(), &e) => {
             tracing::debug!("TLS failed in Prefer mode ({e}); retrying without TLS");
@@ -430,5 +461,24 @@ mod tests {
                 std::mem::discriminant(&want)
             );
         }
+    }
+
+    #[test]
+    fn gcp_iam_options_use_cleartext_over_tls() {
+        let c = mysql(ConnectionConfig {
+            username: Some("jane@example.com".into()),
+            password: Some("old".into()),
+            db_auth: Some(crate::engine::models::DbAuthMethod::GcpIam),
+            ..Default::default()
+        });
+        let o = connect_options(&c);
+        assert_eq!(o.get_username(), "jane");
+        assert!(matches!(o.get_ssl_mode(), MySqlSslMode::Required));
+        let debug = format!("{o:?}");
+        assert!(debug.contains("password: None"), "{debug}");
+        assert!(debug.contains("enable_cleartext_plugin: true"), "{debug}");
+        // Not with a password.
+        let o = connect_options(&ConnectionConfig { db_auth: None, ..c });
+        assert!(format!("{o:?}").contains("enable_cleartext_plugin: false"));
     }
 }

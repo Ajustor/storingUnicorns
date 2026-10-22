@@ -7,7 +7,8 @@ use ratatui::{
 
 use super::centered_rect;
 use crate::engine::db::azure::AzureCloud;
-use crate::engine::models::{AzureAuthMethod, DatabaseType};
+use crate::engine::db::gcp_iam;
+use crate::engine::models::{AzureAuthMethod, DatabaseType, SslMode};
 use crate::engine::presets;
 use crate::tui::{uses_tls, AppState, ConnectionField, DialogMode};
 use crate::tui::ui::widgets::draw_cursor;
@@ -19,6 +20,8 @@ const FIELD_HEIGHT: u16 = 2;
 const MAX_FIELDS: u16 = 11;
 /// Placeholder of an optional field the app fills in by itself.
 const AUTO: &str = "auto";
+/// Width of the port when the sign-in choice shares its row.
+const PORT_WIDTH: u16 = 16;
 
 /// Where the connection dialog is drawn: 60 % wide, tall enough for every
 /// field (24 rows), clamped to the terminal.
@@ -72,11 +75,14 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     let show_tenant = azure_cli || browser;
     let managed_identity = is_azure && nc.azure_auth_method == AzureAuthMethod::ManagedIdentity;
     let show_username = !azure_cli;
-    let show_password = !is_azure || nc.azure_auth_method == AzureAuthMethod::Credentials;
+    let gcp_iam = nc.gcp_iam();
+    let show_password =
+        !gcp_iam && (!is_azure || nc.azure_auth_method == AzureAuthMethod::Credentials);
     let show_ssl = uses_tls(&nc.db_type);
 
     // Name, URL, Modèle, Type, Host, Port, Database, plus the engine- and
-    // authentication-specific fields.
+    // authentication-specific fields. PostgreSQL / MySQL's sign-in choice
+    // shares the port's row: with SSL, they already fill the dialog.
     let fields = 7
         + u16::from(is_azure)
         + u16::from(show_tenant)
@@ -285,31 +291,67 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     // right-aligned, where the host value can't hide it.
     if is_azure {
         let cloud = format!(" {} ", AzureCloud::from_host(&nc.host));
-        let area = chunks[idx];
-        let len = cloud.chars().count() as u16;
-        if area.height > 1 && len < area.width {
-            frame.buffer_mut().set_stringn(
-                area.x + area.width - len - 1,
-                area.y + 1,
-                &cloud,
-                len as usize,
-                Style::default().fg(Color::DarkGray),
-            );
-        }
+        render_on_rule(frame, chunks[idx], &cloud);
     }
     idx += 1;
 
-    render_field(
-        frame,
-        chunks[idx],
-        "Port",
-        &nc.port,
-        ConnectionField::Port,
-        false,
-    );
+    if show_ssl {
+        let row = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(PORT_WIDTH), Constraint::Min(0)])
+            .split(chunks[idx]);
+        render_field(
+            frame,
+            row[0],
+            "Port",
+            &nc.port,
+            ConnectionField::Port,
+            false,
+        );
+        // A short hint: the row is shared.
+        let active = nc.active_field == ConnectionField::DbAuth;
+        let style = Style::default().fg(if active { Color::Cyan } else { Color::Gray });
+        let hint = if active { " ←/→" } else { "" };
+        let paragraph = Paragraph::new(format!("Auth: {}{hint}", nc.db_auth))
+            .style(style)
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(style),
+            );
+        frame.render_widget(paragraph, row[1]);
+    } else {
+        render_field(
+            frame,
+            chunks[idx],
+            "Port",
+            &nc.port,
+            ConnectionField::Port,
+            false,
+        );
+    }
     idx += 1;
 
-    if managed_identity {
+    if gcp_iam {
+        // The Google account, kept in the username; the database user it
+        // stands for on the rule, where the value can't hide it.
+        const LABEL: &str = "Compte Google";
+        render_field(
+            frame,
+            chunks[idx],
+            LABEL,
+            &nc.username,
+            ConnectionField::Username,
+            false,
+        );
+        if nc.username.is_empty() {
+            render_placeholder(frame, chunks[idx], LABEL, "prenom.nom@domaine.com");
+        } else {
+            let user = gcp_iam::database_user(&nc.db_type, &nc.username);
+            render_on_rule(frame, chunks[idx], &format!(" utilisateur base : {user} "));
+        }
+        idx += 1;
+    } else if managed_identity {
         // The user-assigned identity's client ID, kept in the username.
         const LABEL: &str = "ID client";
         render_field(
@@ -376,6 +418,10 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     if show_ssl {
         let mode = nc.ssl_mode.to_string();
         render_cycle(frame, chunks[idx], "SSL", &mode, ConnectionField::SslMode);
+        // The IAM sign-in connects with TLS whatever the mode says.
+        if gcp_iam && matches!(nc.ssl_mode, SslMode::Disable | SslMode::Prefer) {
+            render_on_rule(frame, chunks[idx], " IAM : au moins Obligatoire ");
+        }
         idx += 1;
         render_field(
             frame,
@@ -394,6 +440,21 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
                 "utilisé en mode Vérifier",
             );
         }
+    }
+}
+
+/// Dimmed `text` on a field's bottom rule, right-aligned; left out when it
+/// doesn't fit.
+fn render_on_rule(frame: &mut Frame, area: Rect, text: &str) {
+    let len = text.chars().count() as u16;
+    if area.height > 1 && len < area.width {
+        frame.buffer_mut().set_stringn(
+            area.x + area.width - len - 1,
+            area.y + 1,
+            text,
+            len as usize,
+            Style::default().fg(Color::DarkGray),
+        );
     }
 }
 
@@ -540,6 +601,64 @@ mod tests {
         let all = screen(&state).join("\n");
         assert!(all.contains("Auth: Azure CLI"), "{all}");
         assert!(!all.contains("ID app"), "{all}");
+    }
+
+    #[test]
+    fn the_sign_in_choice_shares_the_port_row() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.open_new_connection_dialog();
+        let rows = screen(&state);
+        let all = rows.join("\n");
+        let port = rows.iter().find(|r| r.contains("Port: 5432")).unwrap();
+        assert!(port.contains("Auth: Mot de passe"), "{all}");
+        assert!(all.contains("Password:"), "{all}");
+        // Every field still fits.
+        assert!(rows[23].contains('└'), "{all}");
+
+        state.new_connection.active_field = ConnectionField::DbAuth;
+        let all = screen(&state).join("\n");
+        assert!(all.contains("Auth: Mot de passe ←/→"), "{all}");
+
+        // Other engines don't offer it.
+        state.new_connection.set_db_type(DatabaseType::SQLServer);
+        let all = screen(&state).join("\n");
+        assert!(!all.contains("Auth:"), "{all}");
+    }
+
+    #[test]
+    fn gcp_iam_asks_for_the_google_account_and_hints_the_user() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.open_new_connection_dialog();
+        state.new_connection.set_db_type(DatabaseType::MySQL);
+        state.new_connection.username = "root".into();
+        state.new_connection.cycle_db_auth();
+        let rows = screen(&state);
+        let all = rows.join("\n");
+        for label in [
+            "Auth: IAM Google Cloud",
+            "Compte Google: prenom.nom@domaine.com",
+            // The engine raises the default mode.
+            "IAM : au moins Obligatoire",
+        ] {
+            assert!(all.contains(label), "{label} missing:\n{all}");
+        }
+        assert!(!all.contains("Password:"), "{all}");
+        assert!(!all.contains("utilisateur base"), "{all}");
+        assert!(rows[23].contains('└'), "{all}");
+
+        state.new_connection.username = "jane@example.com".into();
+        state.new_connection.ssl_mode = SslMode::VerifyFull;
+        let all = screen(&state).join("\n");
+        assert!(all.contains("Compte Google: jane@example.com"), "{all}");
+        assert!(all.contains(" utilisateur base : jane "), "{all}");
+        assert!(!all.contains("au moins"), "{all}");
+
+        state.new_connection.set_db_type(DatabaseType::Postgres);
+        let all = screen(&state).join("\n");
+        assert!(
+            all.contains(" utilisateur base : jane@example.com "),
+            "{all}"
+        );
     }
 
     #[test]

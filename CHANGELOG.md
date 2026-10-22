@@ -7,6 +7,20 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.15.2] - 2026-10-16
+
+### Nouveautés
+
+- **IAM Google Cloud pour Cloud SQL** : connexion à une instance Cloud SQL
+  PostgreSQL ou MySQL avec votre compte Google, sans mot de passe ni proxy.
+  Choisissez **Authentification : IAM Google Cloud** dans le formulaire (à côté
+  du port dans l'interface terminal) et indiquez votre **Compte Google** ;
+  l'app obtient le jeton avec `gcloud` (après `gcloud auth login`), se connecte
+  en TLS (au moins *Obligatoire*) et renouvelle le jeton avant son expiration.
+  Le formulaire affiche le nom d'utilisateur que la base attend (l'adresse
+  complète pour PostgreSQL, la partie avant `@` pour MySQL). Voir
+  [IAM Google Cloud](https://github.com/Ajustor/storingUnicorns#iam-google-cloud-cloud-sql).
+
 ## [0.15.1] - 2026-10-16
 
 ### Corrections

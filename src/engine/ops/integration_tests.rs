@@ -4,7 +4,8 @@
 //! is missing, so a plain `cargo test` stays offline. Run them with
 //! `cargo test -- --ignored integration` and:
 //!
-//! - `SU_IT_PG=postgres://user:pw@host:port/db`
+//! - `SU_IT_PG=postgres://user:pw@host:port/db` (a superuser: the Google
+//!   Cloud IAM test creates a role)
 //! - `SU_IT_MYSQL=mysql://user:pw@host:port/db`
 //! - `SU_IT_MSSQL=host=127.0.0.1;port=1433;user=sa;password=...;database=db`
 //!   (the database must exist)
@@ -1086,4 +1087,118 @@ async fn integration_cockroach() {
         scalar(&conn, "SELECT name FROM su_crdb WHERE id = 1").await,
         "a"
     );
+}
+
+/// Google Cloud IAM renewal, with a fake token provider whose "token" is a
+/// password the test changes on the server: once renewed, the pool's new
+/// connections sign in with the new one; the renewal stops with the pool.
+#[tokio::test]
+#[ignore]
+async fn integration_gcp_iam_token_renewal() {
+    use crate::engine::db::gcp_iam::{connect_renewing, Provider, Timing, Token};
+    use sqlx::Connection;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let Some(dsn) = env("SU_IT_PG") else {
+        eprintln!("SU_IT_PG not set, skipping");
+        return;
+    };
+    let admin = sqlx::PgPool::connect(&dsn).await.unwrap();
+    let set_password = |token: &str| format!("ALTER ROLE su_iam_it PASSWORD '{token}'");
+    sqlx::query("DROP ROLE IF EXISTS su_iam_it")
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query("CREATE ROLE su_iam_it LOGIN PASSWORD 'tok-1'")
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    // `current` is what the provider hands out; `served` what it handed out.
+    let current = Arc::new(Mutex::new("tok-1".to_string()));
+    let served = Arc::new(Mutex::new(Vec::<String>::new()));
+    let provider: Provider = {
+        let (current, served) = (current.clone(), served.clone());
+        Arc::new(move |account| {
+            assert_eq!(account, "jane@example.com");
+            let token = current.lock().unwrap().clone();
+            served.lock().unwrap().push(token.clone());
+            Box::pin(async move {
+                Ok(Token::new(
+                    token,
+                    Instant::now() + Duration::from_millis(300),
+                ))
+            })
+        })
+    };
+    let timing = Timing {
+        renew_before: Duration::ZERO,
+        min_delay: Duration::from_millis(200),
+        retry: Duration::from_millis(100),
+        max_retry: Duration::from_millis(100),
+    };
+    let base: sqlx::postgres::PgConnectOptions = dsn.parse().unwrap();
+    let base = base.username("su_iam_it");
+    let options = {
+        let base = base.clone();
+        move |t: &Token| base.clone().password(t.secret())
+    };
+    let connect = || {
+        connect_renewing(
+            sqlx::postgres::PgPoolOptions::new().max_connections(1),
+            "jane@example.com".to_string(),
+            provider.clone(),
+            timing,
+            options.clone(),
+        )
+    };
+    let who = "SELECT current_user::text";
+    let pool = connect().await.unwrap();
+    let user: String = sqlx::query_scalar(who).fetch_one(&pool).await.unwrap();
+    assert_eq!(user, "su_iam_it");
+
+    // The token changes on the server; wait for the pool to get it.
+    *current.lock().unwrap() = "tok-2".into();
+    sqlx::query(&set_password("tok-2"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while served.lock().unwrap().last().map(String::as_str) != Some("tok-2") {
+        assert!(
+            Instant::now() < deadline,
+            "no renewal: {:?}",
+            served.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The old token no longer signs in…
+    let old = sqlx::PgConnection::connect_with(&base.clone().password("tok-1")).await;
+    assert!(old.is_err());
+    // …but a new connection of the pool does.
+    pool.acquire().await.unwrap().close().await.unwrap();
+    let user: String = sqlx::query_scalar(who).fetch_one(&pool).await.unwrap();
+    assert_eq!(user, "su_iam_it");
+
+    // Closing the pool stops the renewal.
+    pool.close().await;
+    let count = served.lock().unwrap().len();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(served.lock().unwrap().len(), count);
+
+    // So does dropping a connection without closing it.
+    let conn = DatabaseConnection::Postgres(connect().await.unwrap());
+    assert_eq!(scalar(&conn, who).await, "su_iam_it");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(conn);
+    let count = served.lock().unwrap().len();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(served.lock().unwrap().len(), count);
+
+    sqlx::query("DROP ROLE su_iam_it")
+        .execute(&admin)
+        .await
+        .unwrap();
 }

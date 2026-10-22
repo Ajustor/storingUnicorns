@@ -462,6 +462,25 @@ impl<'t> Stmt<'t> {
             .find(|&o| self.is_subquery(o))
     }
 
+    /// Tables of the levels enclosing the one of `cursor`, innermost first.
+    fn outer_scopes(&self, cursor: usize) -> Vec<Vec<Ref>> {
+        let mut openers: Vec<Option<usize>> = self
+            .enclosing(cursor)
+            .into_iter()
+            .filter(|&o| self.is_subquery(o))
+            .map(Some)
+            .collect();
+        if openers.is_empty() {
+            return Vec::new();
+        }
+        openers.remove(0);
+        openers.push(None);
+        openers
+            .into_iter()
+            .map(|o| self.without_ctes(self.table_refs(&self.branch(o, cursor))))
+            .collect()
+    }
+
     /// Items of the level just inside `opener` (the whole statement for `None`).
     fn level(&self, opener: Option<usize>) -> Vec<Item> {
         let (mut i, end) = match opener {
@@ -906,7 +925,7 @@ impl Builder<'_, '_> {
 
     /// The table a `q.` (or `s.t.`) qualifier names: an alias or table in
     /// scope, else a known table.
-    fn resolve(&self, parts: &[String], scope: &[TableRef]) -> Option<TableRef> {
+    fn resolve(&self, parts: &[String], scopes: &[Vec<TableRef>]) -> Option<TableRef> {
         let (schema, name) = match parts {
             [name] => (None, name),
             [.., schema, name] => (Some(schema), name),
@@ -915,19 +934,23 @@ impl Builder<'_, '_> {
         let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
         let schema_ok =
             |t: &Option<String>| schema.is_none_or(|s| t.as_deref().is_some_and(|ts| eq(ts, s)));
-        if schema.is_none() {
+        // The level of the cursor first, then the enclosing ones (a
+        // correlated subquery sees the tables of its outer queries).
+        for scope in scopes {
+            if schema.is_none() {
+                if let Some(t) = scope
+                    .iter()
+                    .find(|t| t.alias.as_deref().is_some_and(|a| eq(a, name)))
+                {
+                    return Some(t.clone());
+                }
+            }
             if let Some(t) = scope
                 .iter()
-                .find(|t| t.alias.as_deref().is_some_and(|a| eq(a, name)))
+                .find(|t| eq(&t.name, name) && schema_ok(&t.schema))
             {
                 return Some(t.clone());
             }
-        }
-        if let Some(t) = scope
-            .iter()
-            .find(|t| eq(&t.name, name) && schema_ok(&t.schema))
-        {
-            return Some(t.clone());
         }
         self.cx.tables.iter().find_map(|full| {
             let (s, n) = split_qualified(full);
@@ -994,12 +1017,16 @@ pub fn complete(text: &str, cursor: usize, cx: &Context) -> Completions {
     let clause = stmt.clause(chain, opener);
 
     if !parts.is_empty() {
-        if matches!(clause, Clause::Table(_)) {
-            b.tables(parts.last().map(String::as_str));
-        } else if let Some(t) = b.resolve(&parts, &scope) {
-            b.columns_of(&t);
+        let mut scopes = vec![scope];
+        scopes.extend(stmt.outer_scopes(cur).iter().map(|s| b.canonical_all(s)));
+        let table = if matches!(clause, Clause::Table(_)) {
+            None
         } else {
-            b.tables(parts.last().map(String::as_str));
+            b.resolve(&parts, &scopes)
+        };
+        match table {
+            Some(t) => b.columns_of(&t),
+            None => b.tables(parts.last().map(String::as_str)),
         }
         return b.out;
     }
@@ -1851,5 +1878,23 @@ mod tests {
         assert_eq!(c.missing, [sref("x", "audit", None)]);
         let (c, _) = run_known("INSERT INTO AUDIT (|", &["public.audit"]);
         assert_eq!(c.missing, [sref("public", "audit", None)]);
+    }
+
+    #[test]
+    fn correlated_subquery_sees_outer_qualifiers() {
+        let sql =
+            "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.|)";
+        let c = run(sql);
+        assert_eq!(labels(&c, Kind::Column), ["id", "email", "name"]);
+        // Two levels out.
+        let sql = "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id IN \
+                   (SELECT 1 FROM logs l WHERE u.|))";
+        assert_eq!(labels(&run(sql), Kind::Column), ["id", "email", "name"]);
+        // The inner level wins on a shared alias.
+        let sql = "SELECT * FROM users x WHERE EXISTS (SELECT 1 FROM orders x WHERE x.|)";
+        assert_eq!(labels(&run(sql), Kind::Column), ["id", "user_id", "total"]);
+        // Bare columns: only the level of the cursor.
+        let sql = "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE |)";
+        assert_eq!(labels(&run(sql), Kind::Column), ["id", "user_id", "total"]);
     }
 }

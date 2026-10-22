@@ -14,7 +14,7 @@ use egui::{FontId, Galley, TextFormat};
 use crate::engine::sql::lexer::tokenize_spans;
 
 use super::theme::kind_color;
-use completion::Completion;
+use completion::{Completion, CompletionSource, Scope};
 
 /// Byte offset of the `chars`-th character (end of text when past it).
 pub fn char_to_byte(s: &str, chars: usize) -> usize {
@@ -158,8 +158,8 @@ pub fn cursor_and_selection(
 pub struct EditorContext<'a> {
     /// Columns of the console's last results (highlighting and completion).
     pub known_columns: &'a [String],
-    /// Tables of the console's connection; only called when completing.
-    pub tables: &'a dyn Fn() -> Vec<String>,
+    /// Tables and columns of the console's connection.
+    pub source: &'a dyn CompletionSource,
 }
 
 pub struct EditorOutput {
@@ -199,7 +199,10 @@ pub fn show(
         .show(ui);
     ui.data_mut(|d| d.insert_temp(cache_id, cache));
     let changed = output.response.changed();
-    completion.after_edit(ui, &output, text, id, &cx, triggered);
+    let scope = Scope::Script {
+        fallback_columns: cx.known_columns,
+    };
+    completion.after_edit(ui, &output, text, id, cx.source, scope, triggered);
 
     let (cursor, selection) =
         cursor_and_selection(ui.ctx(), id, text).unwrap_or((text.len(), None));
@@ -319,7 +322,6 @@ mod tests {
         let ctx = egui::Context::default();
         let cols = vec!["id".to_string(), "name".to_string()];
         let mut completion = Completion::default();
-        let tables = Vec::new;
         let id = egui::Id::new("bench_editor");
         let mut frame = || {
             let input = egui::RawInput {
@@ -340,7 +342,7 @@ mod tests {
                             &mut completion,
                             EditorContext {
                                 known_columns: &cols,
-                                tables: &tables,
+                                source: &completion::NoSource,
                             },
                         )
                     });

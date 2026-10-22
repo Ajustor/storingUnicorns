@@ -1,4 +1,5 @@
 pub mod app_state;
+mod columns;
 mod connect;
 mod key_handlers;
 pub mod ui;
@@ -103,8 +104,9 @@ pub async fn run(opts: crate::cli::TuiOptions) -> Result<()> {
     terminal.show_cursor()?;
 
     // Close any open connection
+    state.completion_columns.stop().await;
     if let Some(conn) = state.connection.take() {
-        conn.close().await;
+        columns::close(conn).await;
     }
 
     // Save config and queries on exit
@@ -167,6 +169,8 @@ async fn run_app<B: ratatui::backend::Backend>(
     loop {
         // Sign-in link, outcome of the connection being opened.
         connect::poll(state).await;
+        // Columns loaded for the completion.
+        columns::poll(state).await;
 
         // Detect modal open transition
         if !state.no_animations
@@ -1442,6 +1446,8 @@ fn update_schema_column(state: &mut AppState, new_column: services::ColumnDefini
 }
 
 pub(crate) async fn handle_refresh_tables(state: &mut AppState) {
+    // The schema may have changed: columns are loaded again when cited.
+    state.completion_columns.clear();
     if let Some(ref conn) = state.connection {
         match ops::query::refresh_schemas(conn).await {
             Ok(schemas) => {
@@ -1895,7 +1901,7 @@ async fn handle_schema_action(state: &mut AppState) {
                     Ok(_) => {
                         state.set_status(format!("Column '{}' added successfully", column.name));
                         // Cache already invalidated: refresh autocomplete
-                        state.current_table_context = None;
+                        state.completion_columns.clear();
                         if let Some(cols) = fetch_table_columns(state, &table_name).await {
                             state.known_columns = cols.iter().map(|c| c.name.clone()).collect();
                         }
@@ -1943,7 +1949,7 @@ async fn handle_schema_action(state: &mut AppState) {
                             original_name
                         ));
                         // Cache already invalidated: refresh autocomplete
-                        state.current_table_context = None;
+                        state.completion_columns.clear();
                         if let Some(cols) = fetch_table_columns(state, &table_name).await {
                             state.known_columns = cols.iter().map(|c| c.name.clone()).collect();
                         }
@@ -1984,7 +1990,7 @@ async fn handle_schema_action(state: &mut AppState) {
                     Ok(_) => {
                         state.set_status(format!("Column '{}' dropped successfully", column_name));
                         // Cache already invalidated: refresh autocomplete
-                        state.current_table_context = None;
+                        state.completion_columns.clear();
                         if let Some(cols) = fetch_table_columns(state, &table_name).await {
                             state.known_columns = cols.iter().map(|c| c.name.clone()).collect();
                         }
@@ -2034,7 +2040,7 @@ async fn handle_schema_action(state: &mut AppState) {
                         state
                             .set_status(format!("Column '{}' renamed to '{}'", old_name, new_name));
                         // Cache already invalidated: refresh autocomplete
-                        state.current_table_context = None;
+                        state.completion_columns.clear();
                         if let Some(cols) = fetch_table_columns(state, &table_name).await {
                             state.known_columns = cols.iter().map(|c| c.name.clone()).collect();
                         }
@@ -2061,23 +2067,6 @@ pub(crate) async fn fetch_table_columns(
             tracing::error!("Failed to fetch columns for {}: {}", table_name, e);
             state.set_status(format!("Failed to fetch columns: {}", e));
             None
-        }
-    }
-}
-
-/// Update completions with cached table columns
-pub(crate) async fn update_completions_from_context(state: &mut AppState) {
-    // Extract table name from current query
-    let query = state.query_input().to_string();
-    if let Some(table_name) = crate::tui::ui::sql_highlight::completion_context_table(&query) {
-        // Check if we need to fetch columns
-        if state.current_table_context.as_ref() != Some(&table_name) {
-            state.current_table_context = Some(table_name.clone());
-
-            // Fetch columns asynchronously
-            if let Some(columns) = fetch_table_columns(state, &table_name).await {
-                state.known_columns = columns.iter().map(|c| c.name.clone()).collect();
-            }
         }
     }
 }
@@ -3265,13 +3254,13 @@ mod tests {
 
     async fn debug_state() -> AppState {
         let mut state = AppState::new(AppConfig::default(), true, true);
-        state.connection = Some(
+        state.connection = Some(std::sync::Arc::new(
             sqlite_mem(&[
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
                 "INSERT INTO t (id, name) VALUES (1, 'a')",
             ])
             .await,
-        );
+        ));
         state.editing_table_name = Some("t".into());
         state.query_result = Some(QueryResult {
             columns: cols(),

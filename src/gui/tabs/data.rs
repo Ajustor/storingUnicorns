@@ -6,11 +6,14 @@ use std::sync::Arc;
 use egui::{Galley, Key, RichText};
 use egui_phosphor::regular as icon;
 
+use crate::engine::db::utils::split_qualified;
 use crate::engine::models::QueryResult;
 use crate::engine::ops::query::has_full_key;
 use crate::engine::ops::rows::NO_PRIMARY_KEY;
+use crate::engine::sql::completion::{BarMode, ColumnInfo, TableRef};
 use crate::engine::sql::paging::{toggle_order, DataQuery};
 use crate::engine::sql::statements::quote_ident;
+use crate::gui::editor::completion::{Completion, CompletionSource, Scope};
 use crate::gui::editor::HighlightCache;
 use crate::gui::grid::changes::PendingEdits;
 use crate::gui::grid::{self, GridAction, GridOptions, GridState};
@@ -125,10 +128,12 @@ pub struct DataTab {
     columns: Vec<String>,
     /// Sort arrow matching `query.order_by`.
     sort: Option<(usize, bool)>,
+    /// Completion popups of the WHERE and ORDER BY bars.
+    completions: [Completion; 2],
 }
 
 /// What the tab needs from the app to draw itself.
-pub struct DataContext {
+pub struct DataContext<'a> {
     pub tab: TabId,
     pub connected: bool,
     pub submitting: bool,
@@ -136,6 +141,45 @@ pub struct DataContext {
     pub loading: bool,
     /// Transaction mode of the connection.
     pub tx: TxView,
+    /// Tables and columns of the connection (completion of the bars).
+    pub source: &'a dyn CompletionSource,
+}
+
+/// The displayed table's columns: the connection's metadata, else those of
+/// the loaded page (when the metadata is not loaded, or lacks the table).
+struct TableSource<'a> {
+    inner: &'a dyn CompletionSource,
+    result: Option<&'a QueryResult>,
+}
+
+impl CompletionSource for TableSource<'_> {
+    fn quotes(&self) -> (char, char) {
+        self.inner.quotes()
+    }
+
+    fn tables(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn columns(&self, table: &TableRef) -> Option<Vec<ColumnInfo>> {
+        let loaded = self.inner.columns(table);
+        if loaded.as_ref().is_some_and(|c| !c.is_empty()) {
+            return loaded;
+        }
+        match self.result {
+            Some(r) if !r.columns.is_empty() => Some(
+                r.columns
+                    .iter()
+                    .map(|c| ColumnInfo {
+                        name: c.name.clone(),
+                        type_name: c.type_name.clone(),
+                        primary_key: c.is_primary_key,
+                    })
+                    .collect(),
+            ),
+            _ => loaded,
+        }
+    }
 }
 
 impl DataTab {
@@ -164,7 +208,30 @@ impl DataTab {
             needs_load: true,
             columns: Vec::new(),
             sort: None,
+            completions: Default::default(),
         }
+    }
+
+    /// The displayed table, for completion.
+    fn table_ref(&self) -> TableRef {
+        let (schema, name) = split_qualified(&self.table);
+        TableRef {
+            schema,
+            name,
+            alias: None,
+        }
+    }
+
+    /// Tables whose columns the bars' completion needs (taken once).
+    pub fn take_completion_requests(&mut self) -> Vec<TableRef> {
+        let [a, b] = &mut self.completions;
+        let mut out = a.take_requests();
+        for t in b.take_requests() {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+        out
     }
 
     /// Number of pages when the total is known.
@@ -444,49 +511,62 @@ impl DataTab {
         }
     }
 
-    /// `WHERE [ … ]  ORDER BY [ … ]`; Entrée applies both.
+    /// `WHERE [ … ]  ORDER BY [ … ]`; Entrée applies both (it accepts the
+    /// suggestion instead while a completion popup is open).
     fn filter_bar(&mut self, ui: &mut egui::Ui, cx: &DataContext) -> Option<DataAction> {
+        let table = self.table_ref();
+        let source = TableSource {
+            inner: cx.source,
+            result: self.result.as_ref(),
+        };
         let columns = &self.columns;
         let ids = [
             egui::Id::new(("data_where", cx.tab)),
             egui::Id::new(("data_order", cx.tab)),
         ];
         let cache_ids = ids.map(|id| id.with("highlight"));
-        let [mut where_cache, mut order_cache] = cache_ids.map(|id| {
+        let mut caches = cache_ids.map(|id| {
             ui.data(|d| d.get_temp::<HighlightCache>(id))
                 .unwrap_or_default()
         });
-        let mut where_layouter = |ui: &egui::Ui, text: &str, _wrap: f32| -> Arc<Galley> {
-            where_cache.layout(ui, text, columns, f32::INFINITY)
-        };
-        let mut order_layouter = |ui: &egui::Ui, text: &str, _wrap: f32| -> Arc<Galley> {
-            order_cache.layout(ui, text, columns, f32::INFINITY)
-        };
         let mut apply = false;
         ui.horizontal(|ui| {
             let width = ((ui.available_width() - 140.0) / 2.0).max(80.0);
-            ui.label(RichText::new("WHERE").monospace().strong());
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.filter_input)
-                    .id(ids[0])
+            let fields = [
+                ("WHERE", "id > 100", BarMode::Where, &mut self.filter_input),
+                (
+                    "ORDER BY",
+                    "id DESC",
+                    BarMode::OrderBy,
+                    &mut self.order_input,
+                ),
+            ];
+            let completions = self.completions.iter_mut().zip(caches.iter_mut());
+            for (i, ((label, hint, mode, text), (completion, cache))) in
+                fields.into_iter().zip(completions).enumerate()
+            {
+                let mut layouter = |ui: &egui::Ui, text: &str, _wrap: f32| -> Arc<Galley> {
+                    cache.layout(ui, text, columns, f32::INFINITY)
+                };
+                ui.label(RichText::new(label).monospace().strong());
+                // Navigation keys go to the popup while it is open.
+                let triggered = completion.intercept_keys(ui, text, ids[i]);
+                let out = egui::TextEdit::singleline(text)
+                    .id(ids[i])
                     .code_editor()
                     .desired_width(width)
-                    .hint_text("id > 100")
-                    .layouter(&mut where_layouter),
-            );
-            apply |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            ui.label(RichText::new("ORDER BY").monospace().strong());
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.order_input)
-                    .id(ids[1])
-                    .code_editor()
-                    .desired_width(width)
-                    .hint_text("id DESC")
-                    .layouter(&mut order_layouter),
-            );
-            apply |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    .hint_text(hint)
+                    .layouter(&mut layouter)
+                    .show(ui);
+                apply |= out.response.lost_focus() && ui.input(|inp| inp.key_pressed(Key::Enter));
+                let scope = Scope::Table {
+                    table: &table,
+                    mode,
+                };
+                completion.after_edit(ui, &out, text, ids[i], &source, scope, triggered);
+            }
         });
-        for (id, cache) in cache_ids.into_iter().zip([where_cache, order_cache]) {
+        for (id, cache) in cache_ids.into_iter().zip(caches) {
             ui.data_mut(|d| d.insert_temp(id, cache));
         }
         (apply && cx.connected && !cx.submitting).then(|| self.navigate(Nav::Apply))
@@ -738,5 +818,155 @@ mod tests {
             outcome: Ok(4321),
         });
         assert_eq!(t.summary().unwrap(), "page 2/9 · 500 lignes · 12 ms");
+    }
+
+    /// Draws the filter bar of `t` for one frame receiving `events`.
+    fn bar_frame(
+        ctx: &egui::Context,
+        t: &mut DataTab,
+        source: &dyn CompletionSource,
+        events: Vec<egui::Event>,
+    ) -> Option<DataAction> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut action = None;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let cx = DataContext {
+                    tab: 1,
+                    connected: true,
+                    submitting: false,
+                    loading: false,
+                    tx: TxView::Auto,
+                    source,
+                };
+                action = t.filter_bar(ui, &cx);
+            });
+        });
+        action
+    }
+
+    fn key(key: Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// No metadata loaded: the page's columns are offered.
+    struct Unloaded;
+
+    impl CompletionSource for Unloaded {
+        fn quotes(&self) -> (char, char) {
+            ('"', '"')
+        }
+        fn tables(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn columns(&self, _: &TableRef) -> Option<Vec<ColumnInfo>> {
+            None
+        }
+    }
+
+    #[test]
+    fn enter_accepts_the_suggestion_then_applies_the_filter() {
+        let ctx = egui::Context::default();
+        let mut t = tab_with_page();
+        bar_frame(&ctx, &mut t, &Unloaded, vec![]);
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(("data_where", 1u64))));
+        bar_frame(&ctx, &mut t, &Unloaded, vec![]);
+        let typed = bar_frame(
+            &ctx,
+            &mut t,
+            &Unloaded,
+            vec![egui::Event::Text("na".into())],
+        );
+        assert_eq!(typed, None);
+        assert_eq!(t.filter_input, "na");
+        let popup = &t.completions[0];
+        assert!(popup.open, "typing a word opens the popup");
+        assert_eq!(popup.items[0].label, "name");
+        assert_eq!(popup.items[0].detail, "INTEGER");
+
+        // Open popup: Entrée inserts the suggestion, nothing is applied.
+        let enter = || vec![key(Key::Enter, egui::Modifiers::NONE)];
+        assert_eq!(bar_frame(&ctx, &mut t, &Unloaded, enter()), None);
+        assert_eq!(t.filter_input, "name");
+        assert!(!t.completions[0].open);
+        // Closed popup: Entrée applies the filter.
+        t.filter_input.push_str(" = 'x'");
+        bar_frame(&ctx, &mut t, &Unloaded, vec![]);
+        assert_eq!(
+            bar_frame(&ctx, &mut t, &Unloaded, enter()),
+            Some(DataAction::Load { count: true })
+        );
+        assert_eq!(t.query.filter, "name = 'x'");
+    }
+
+    #[test]
+    fn ctrl_space_in_the_order_bar_offers_columns_and_directions() {
+        let ctx = egui::Context::default();
+        let mut t = tab_with_page();
+        bar_frame(&ctx, &mut t, &Unloaded, vec![]);
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(("data_order", 1u64))));
+        bar_frame(&ctx, &mut t, &Unloaded, vec![]);
+        bar_frame(
+            &ctx,
+            &mut t,
+            &Unloaded,
+            vec![key(Key::Space, egui::Modifiers::COMMAND)],
+        );
+        let labels: Vec<_> = t.completions[1]
+            .items
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            ["id", "name", "ASC", "DESC", "NULLS FIRST", "NULLS LAST"]
+        );
+        assert_eq!(t.completions[1].items[0].detail, "PK INTEGER");
+        // Escape closes the popup and keeps the text.
+        bar_frame(
+            &ctx,
+            &mut t,
+            &Unloaded,
+            vec![key(Key::Escape, egui::Modifiers::NONE)],
+        );
+        assert!(!t.completions[1].open);
+    }
+
+    #[test]
+    fn bars_request_the_table_columns_before_a_page_is_loaded() {
+        let ctx = egui::Context::default();
+        let mut t = DataTab::new("\"main\".\"users\"".into(), ('"', '"'));
+        bar_frame(&ctx, &mut t, &Unloaded, vec![]);
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new(("data_where", 1u64))));
+        bar_frame(&ctx, &mut t, &Unloaded, vec![]);
+        bar_frame(
+            &ctx,
+            &mut t,
+            &Unloaded,
+            vec![key(Key::Space, egui::Modifiers::COMMAND)],
+        );
+        let req = t.take_completion_requests();
+        assert_eq!(
+            req,
+            [TableRef {
+                schema: Some("main".into()),
+                name: "users".into(),
+                alias: None,
+            }]
+        );
+        assert!(t.take_completion_requests().is_empty(), "taken once");
     }
 }

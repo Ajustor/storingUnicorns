@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::sync::Arc;
 
 use crate::engine::services::export_import::{
     BatchExportState, BatchImportState, BatchTruncateState, ExportState, ImportState,
@@ -13,7 +14,9 @@ use crate::engine::models::{
 };
 use crate::engine::presets;
 use crate::engine::models::{display_cell, NULL_CELL};
+use crate::engine::sql::completion::{self, Suggestion, TableRef};
 use crate::engine::sql::statements::single_table_source;
+use crate::tui::columns::{self, ColumnStore};
 use crate::tui::ui::modals::SchemaAction;
 
 /// Text of a cell in the row editor: NULL is shown (and typed) as `NULL`.
@@ -615,7 +618,8 @@ impl NewConnectionState {
 pub struct AppState {
     pub config: AppConfig,
     pub active_panel: ActivePanel,
-    pub connection: Option<DatabaseConnection>,
+    /// Shared with the background loads of columns (`columns::request`).
+    pub connection: Option<Arc<DatabaseConnection>>,
     pub current_connection_config: Option<ConnectionConfig>,
 
     // Connection list state
@@ -644,16 +648,23 @@ pub struct AppState {
     pub query_editor_height: u16, // Height of query editor (default: 40)
 
     // Autocompletion state
-    pub completion_suggestions: Vec<String>,
+    pub completion_suggestions: Vec<Suggestion>,
     pub completion_selected: usize,
     pub show_completion: bool,
+    /// Completion asked for (Ctrl+Space) and not dismissed: refreshed when
+    /// the columns it waits for arrive.
+    pub completion_wanted: bool,
+    /// Tab, cursor and text the completion was asked for: columns arriving
+    /// after the user moved on don't open it.
+    pub completion_anchor: Option<(usize, usize, String)>,
+    /// Columns of the cited tables, for completion.
+    pub completion_columns: ColumnStore,
     pub known_columns: Vec<String>, // Columns from last query result
 
     // Table column cache for autocompletion
     pub table_cache: TableCache,
     #[allow(dead_code)]
     pub fetch_queue: FetchQueue,
-    pub current_table_context: Option<String>, // Table detected from current query
 
     // Results state
     pub query_result: Option<QueryResult>,
@@ -750,10 +761,12 @@ impl AppState {
             completion_suggestions: Vec::new(),
             completion_selected: 0,
             show_completion: false,
+            completion_wanted: false,
+            completion_anchor: None,
+            completion_columns: ColumnStore::default(),
             known_columns: Vec::new(),
             table_cache: TableCache::default(),
             fetch_queue: FetchQueue::default(),
-            current_table_context: None,
             query_result: None,
             result_sql: None,
             results_scroll: 0,
@@ -965,64 +978,101 @@ impl AppState {
         }
     }
 
-    /// Get all known table names for autocompletion
+    /// Known tables for completion: `schema.table`.
     pub fn get_known_tables(&self) -> Vec<String> {
-        let mut tables = Vec::new();
-        for schema in &self.schemas {
-            for table in &schema.tables {
-                tables.push(format!("{}.{}", schema.name, table));
-                tables.push(table.clone());
-            }
-        }
-        tables
+        self.schemas
+            .iter()
+            .flat_map(|schema| {
+                schema
+                    .tables
+                    .iter()
+                    .map(move |table| format!("{}.{}", schema.name, table))
+            })
+            .collect()
     }
-    /// Update completion suggestions based on current input
-    pub fn update_completions(&mut self) {
-        use crate::tui::ui::sql_highlight::get_completions;
 
+    /// Suggestions for the cursor, from the tables the statement cites
+    /// (their missing columns are loaded in the background).
+    fn compute_completions(&mut self) -> Vec<Suggestion> {
         let query = self.query_input().to_string();
         let cursor = self.cursor_position();
         let tables = self.get_known_tables();
+        let store = &self.completion_columns;
+        let columns = |t: &TableRef| store.get(t);
+        let cx = completion::Context {
+            quotes: self.get_quote_chars(),
+            tables: &tables,
+            columns: &columns,
+            fallback_columns: &self.known_columns,
+        };
+        let out = completion::complete(&query, cursor, &cx);
+        for table in &out.missing {
+            columns::request(self, table);
+        }
+        out.items
+    }
 
-        self.completion_suggestions = get_completions(&query, cursor, &self.known_columns, &tables);
+    /// Update completion suggestions based on current input
+    pub fn update_completions(&mut self) {
+        self.completion_suggestions = self.compute_completions();
         self.completion_selected = 0;
+        self.show_completion = !self.completion_suggestions.is_empty();
+        self.completion_wanted = true;
+        self.completion_anchor = Some(self.completion_position());
+    }
+
+    /// Where the editor is: tab, cursor and text.
+    fn completion_position(&self) -> (usize, usize, String) {
+        (
+            self.query_tabs.active_tab,
+            self.cursor_position(),
+            self.query_input().to_string(),
+        )
+    }
+
+    /// Whether the user is still where the completion was asked for (the
+    /// editor focused, same tab, cursor and text).
+    pub fn completion_still_wanted(&self) -> bool {
+        self.completion_wanted
+            && self.active_panel == ActivePanel::QueryEditor
+            && !self.is_dialog_open()
+            && self.completion_anchor.as_ref() == Some(&self.completion_position())
+    }
+
+    /// Recompute the suggestions asked for (columns arrived), keeping the
+    /// selected one when it is still offered.
+    pub fn refresh_completions(&mut self) {
+        let selected = self
+            .completion_suggestions
+            .get(self.completion_selected)
+            .map(|s| s.label.clone());
+        self.completion_suggestions = self.compute_completions();
+        self.completion_selected = selected
+            .and_then(|l| {
+                self.completion_suggestions
+                    .iter()
+                    .position(|s| s.label == l)
+            })
+            .unwrap_or(0);
         self.show_completion = !self.completion_suggestions.is_empty();
     }
 
-    /// Apply the selected completion
+    /// Apply the selected completion: it replaces the token before the cursor.
     pub fn apply_completion(&mut self) {
         if !self.show_completion || self.completion_suggestions.is_empty() {
             return;
         }
 
-        let suggestion = self.completion_suggestions[self.completion_selected].clone();
+        let insert = self.completion_suggestions[self.completion_selected]
+            .insert
+            .clone();
         let query = self.query_input().to_string();
-        let cursor = self.cursor_position();
+        let cursor = self.cursor_position().min(query.len());
+        // Same token the engine completed (quotes in strings / comments ignored).
+        let token_start = crate::engine::sql::completion::token_start(&query, cursor);
 
-        let before_cursor = &query[..cursor.min(query.len())];
-        let (token_start, _inner, quote_char) =
-            crate::tui::ui::sql_highlight::extract_token(before_cursor);
-
-        // If inside an open quote and the suggestion is unquoted inner text, wrap it.
-        let full_suggestion = if quote_char.is_some()
-            && !suggestion.starts_with(|c: char| c == '"' || c == '`' || c == '[')
-        {
-            match quote_char {
-                Some('[') => format!("[{}]", suggestion),
-                Some(q) => format!("{}{}{}", q, suggestion, q),
-                None => unreachable!(),
-            }
-        } else {
-            suggestion
-        };
-
-        let new_query = format!(
-            "{}{}{}",
-            &query[..token_start],
-            full_suggestion,
-            &query[cursor..]
-        );
-        let new_cursor = token_start + full_suggestion.len();
+        let new_query = format!("{}{}{}", &query[..token_start], insert, &query[cursor..]);
+        let new_cursor = token_start + insert.len();
 
         self.set_query(new_query);
         self.set_cursor_position(new_cursor);
@@ -1032,6 +1082,8 @@ impl AppState {
     /// Hide completion popup
     pub fn hide_completion(&mut self) {
         self.show_completion = false;
+        self.completion_wanted = false;
+        self.completion_anchor = None;
         self.completion_suggestions.clear();
         self.completion_selected = 0;
     }
@@ -1261,6 +1313,17 @@ impl AppState {
             }
         }
         None
+    }
+
+    /// The selected table of the tables panel, unquoted.
+    pub fn selected_table_ref(&self) -> Option<TableRef> {
+        let schema = self.schemas.get(self.selected_schema)?;
+        let table = schema.tables.get(self.selected_table.checked_sub(1)?)?;
+        schema.expanded.then(|| TableRef {
+            schema: Some(schema.name.clone()),
+            name: table.clone(),
+            alias: None,
+        })
     }
 
     /// Get quote characters for the current database type

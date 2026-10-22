@@ -41,11 +41,18 @@ impl History {
     }
 
     /// Missing or unreadable file → empty history (never fails the app).
+    /// A UTF-8 BOM (left by Notepad or Windows PowerShell 5) is skipped.
     pub fn load_from(path: PathBuf) -> Self {
-        let entries = fs::read_to_string(&path)
+        let stored: Vec<HistoryEntry> = fs::read_to_string(&path)
             .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
+            .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok())
             .unwrap_or_default();
+        // Entries stored before `push` normalised line endings may hold CRLF:
+        // normalise them and merge what becomes identical, like `push` does.
+        let mut entries = Vec::with_capacity(stored.len());
+        for entry in stored {
+            Self::push_into(&mut entries, entry);
+        }
         Self {
             entries,
             path,
@@ -53,22 +60,29 @@ impl History {
         }
     }
 
-    /// Newest last. Skips an entry identical (same sql + connection) to the
-    /// newest one (updates its `at`/`duration_ms`/`ok` instead). Keeps the
-    /// last `MAX`.
+    /// Newest last. Line endings are stored as `\n`. Skips an entry
+    /// identical (same sql + connection) to the newest one (updates its
+    /// `at`/`duration_ms`/`ok` instead). Keeps the last `MAX`.
     pub fn push(&mut self, entry: HistoryEntry) {
         self.generation += 1;
-        match self.entries.last_mut() {
+        Self::push_into(&mut self.entries, entry);
+    }
+
+    fn push_into(entries: &mut Vec<HistoryEntry>, mut entry: HistoryEntry) {
+        if entry.sql.contains('\r') {
+            entry.sql = entry.sql.replace("\r\n", "\n").replace('\r', "\n");
+        }
+        match entries.last_mut() {
             Some(last) if last.sql == entry.sql && last.connection == entry.connection => {
                 last.at = entry.at;
                 last.duration_ms = entry.duration_ms;
                 last.ok = entry.ok;
             }
-            _ => self.entries.push(entry),
+            _ => entries.push(entry),
         }
-        if self.entries.len() > Self::MAX {
-            let excess = self.entries.len() - Self::MAX;
-            self.entries.drain(..excess);
+        if entries.len() > Self::MAX {
+            let excess = entries.len() - Self::MAX;
+            entries.drain(..excess);
         }
     }
 
@@ -90,13 +104,18 @@ impl History {
             .collect()
     }
 
-    /// Indexes (for [`History::get`]) of the entries whose `sql` contains
-    /// `query` (case-insensitive; empty query → all), newest first.
+    /// Indexes (for [`History::get`]) of the entries whose `sql` or
+    /// connection name contain every word of `query` (case-insensitive;
+    /// blank query → all), newest first.
     pub fn search_indices(&self, query: &str) -> Vec<usize> {
-        let needle = query.to_lowercase();
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
         (0..self.entries.len())
             .rev()
-            .filter(|&i| needle.is_empty() || self.entries[i].sql.to_lowercase().contains(&needle))
+            .filter(|&i| {
+                let e = &self.entries[i];
+                let haystack = format!("{}\n{}", e.sql, e.connection).to_lowercase();
+                words.iter().all(|w| haystack.contains(w.as_str()))
+            })
             .collect()
     }
 
@@ -171,6 +190,88 @@ mod tests {
         // One writer's complete history, and no temporary file left behind.
         assert_eq!(History::load_from(path.clone()).search("").len(), 20);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn non_ascii_sql_round_trips_as_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.json");
+        let sql = "SELECT 'é ç à ù', '🦄', \"prénom\"\n\tFROM t";
+        let mut h = History::load_from(path.clone());
+        h.push(e(sql, 1));
+        h.save().unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            String::from_utf8(raw).unwrap().contains("'é ç à ù', '🦄'"),
+            "stored as plain UTF-8, not escaped"
+        );
+        assert_eq!(History::load_from(path).search("")[0].sql, sql);
+    }
+
+    #[test]
+    fn a_file_with_a_utf8_bom_still_loads() {
+        // Notepad and Windows PowerShell 5 write UTF-8 with a BOM, which
+        // serde_json rejects: the history came back empty and the next save
+        // overwrote it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.json");
+        let json = r#"[{"sql":"SELECT 'é'","connection":"c","at":1,"duration_ms":1,"ok":true}]"#;
+        std::fs::write(&path, format!("\u{feff}{json}")).unwrap();
+        let h = History::load_from(path);
+        assert_eq!(h.search("")[0].sql, "SELECT 'é'");
+    }
+
+    #[test]
+    fn load_normalizes_old_line_endings_and_merges_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.json");
+        let json = r#"[
+            {"sql":"SELECT 0","connection":"c","at":1,"duration_ms":1,"ok":true},
+            {"sql":"SELECT 1\r\nFROM t\rWHERE x","connection":"c","at":2,"duration_ms":1,"ok":true},
+            {"sql":"SELECT 1\nFROM t\nWHERE x","connection":"c","at":3,"duration_ms":5,"ok":false}
+        ]"#;
+        std::fs::write(&path, format!("\u{feff}{json}")).unwrap();
+        let mut h = History::load_from(path);
+        let all = h.search("");
+        assert_eq!(all.len(), 2, "duplicates merged");
+        assert_eq!(all[0].sql, "SELECT 1\nFROM t\nWHERE x");
+        assert_eq!((all[0].at, all[0].duration_ms, all[0].ok), (3, 5, false));
+        h.push(e("SELECT 1\nFROM t\nWHERE x", 4));
+        assert_eq!(h.search("").len(), 2, "re-running does not duplicate");
+    }
+
+    #[test]
+    fn push_normalizes_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = History::load_from(dir.path().join("h.json"));
+        h.push(e("SELECT 1\r\nFROM t\rWHERE x", 1));
+        assert_eq!(h.search("")[0].sql, "SELECT 1\nFROM t\nWHERE x");
+        h.push(e("SELECT 1\nFROM t\nWHERE x", 2));
+        assert_eq!(
+            h.search("").len(),
+            1,
+            "same query whatever its line endings"
+        );
+    }
+
+    #[test]
+    fn search_matches_every_word_in_the_sql_or_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = History::load_from(dir.path().join("h.json"));
+        let mut entry = e("SELECT *\nFROM clients\nWHERE ville = 'Besançon'", 1);
+        entry.connection = "Prod PostgreSQL".into();
+        h.push(entry);
+        h.push(e("SELECT * FROM commandes", 2));
+        assert_eq!(
+            h.search("clients besançon").len(),
+            1,
+            "words on several lines"
+        );
+        assert_eq!(h.search("BESANÇON").len(), 1, "case-insensitive, accents");
+        assert_eq!(h.search("prod clients").len(), 1, "connection name");
+        assert_eq!(h.search("postgresql").len(), 1);
+        assert_eq!(h.search("prod commandes").len(), 0, "every word must match");
+        assert_eq!(h.search("  ").len(), 2, "blank query → all");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
+use crate::gui::sessions::SessionSource;
 use crate::gui::tabs::console::ConsoleContext;
 use crate::gui::tabs::data::DataContext;
 use crate::gui::tabs::ddl::DdlAction;
@@ -118,7 +119,7 @@ impl App {
         let action = match &mut tab.kind {
             TabKind::Console(c) => {
                 let name = tab.connection.as_str();
-                let tables = || sessions.tables_of(name);
+                let source = SessionSource(sessions.get(name));
                 c.show(
                     ui,
                     ConsoleContext {
@@ -129,7 +130,7 @@ impl App {
                         connected: sessions.open.contains_key(name),
                         running: tab.runs.script.is_some(),
                         shortcuts,
-                        tables: &tables,
+                        source: &source,
                         tx: sessions.tx_view(name),
                     },
                 )
@@ -143,6 +144,7 @@ impl App {
                         submitting: tab.runs.submit.is_some(),
                         loading: tab.runs.page.is_some(),
                         tx: sessions.tx_view(&tab.connection),
+                        source: &SessionSource(sessions.get(&tab.connection)),
                     },
                 );
                 None
@@ -153,6 +155,20 @@ impl App {
             }
         };
         let id = tab.id;
+        // Columns the completion popups need: loaded like the explorer's.
+        let requests = match &mut tab.kind {
+            TabKind::Console(c) => c.completion.take_requests(),
+            TabKind::Data(d) => d.take_completion_requests(),
+            TabKind::Ddl(_) => Vec::new(),
+        };
+        if !requests.is_empty() {
+            let name = tab.connection.clone();
+            if let Some(s) = self.sessions.get_mut(&name) {
+                for t in &requests {
+                    s.request_columns(&mut self.worker, &name, t);
+                }
+            }
+        }
         if let Some(action) = action {
             self.console_action(index, action);
         }

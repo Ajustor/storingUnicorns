@@ -35,15 +35,20 @@ pub async fn handle_editor_keys(
             KeyAction::Consumed
         }
 
-        // Autocompletion: Dismiss with Escape
-        KeyCode::Esc if state.show_completion => {
+        // Autocompletion: Dismiss with Escape, also while it waits for
+        // columns with nothing shown (Escape then keeps its usual effect)
+        KeyCode::Esc if state.show_completion || state.completion_wanted => {
+            let shown = state.show_completion;
             state.hide_completion();
-            KeyAction::Consumed
+            if shown {
+                KeyAction::Consumed
+            } else {
+                KeyAction::NotHandled
+            }
         }
 
         // Autocompletion: Trigger with Ctrl+Space
         KeyCode::Char(' ') if modifiers.contains(KeyModifiers::CONTROL) => {
-            crate::tui::update_completions_from_context(state).await;
             state.update_completions();
             KeyAction::Consumed
         }
@@ -287,5 +292,101 @@ pub async fn handle_editor_keys(
         }
 
         _ => KeyAction::NotHandled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::engine::config::AppConfig;
+    use crate::engine::models::{ConnectionConfig, DatabaseType, SchemaInfo};
+    use crate::engine::ops::test_support::sqlite_mem;
+    use crate::tui::ActivePanel;
+
+    /// Ctrl+Space after `SELECT u.` while the columns of `users` load:
+    /// nothing shown yet.
+    async fn waiting_for_columns() -> AppState {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.current_connection_config = Some(ConnectionConfig {
+            db_type: DatabaseType::SQLite,
+            ..Default::default()
+        });
+        state.schemas = vec![SchemaInfo {
+            name: "main".into(),
+            tables: vec!["users".into()],
+            expanded: true,
+        }];
+        state.connection = Some(Arc::new(
+            sqlite_mem(&["CREATE TABLE users (id INTEGER PRIMARY KEY)"]).await,
+        ));
+        state.active_panel = ActivePanel::QueryEditor;
+        state.set_query("SELECT u. FROM users u".into());
+        state.set_cursor_position("SELECT u.".len());
+        handle_editor_keys(&mut state, KeyCode::Char(' '), KeyModifiers::CONTROL).await;
+        assert!(!state.show_completion && state.completion_wanted);
+        state
+    }
+
+    /// Poll until the columns arrived.
+    async fn settle(state: &mut AppState) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.completion_columns.is_loading() {
+            assert!(Instant::now() < deadline, "columns never arrived");
+            crate::tui::columns::poll(state).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn arriving_columns_open_the_completion_asked_for() {
+        let mut state = waiting_for_columns().await;
+        settle(&mut state).await;
+        assert!(state.show_completion);
+        assert_eq!(state.completion_suggestions[0].label, "id");
+    }
+
+    #[tokio::test]
+    async fn escape_on_an_empty_popup_keeps_arriving_columns_hidden() {
+        let mut state = waiting_for_columns().await;
+        let action = handle_editor_keys(&mut state, KeyCode::Esc, KeyModifiers::NONE).await;
+        assert!(matches!(action, KeyAction::NotHandled));
+        assert!(!state.completion_wanted);
+        settle(&mut state).await;
+        assert!(!state.show_completion);
+        assert!(state.completion_suggestions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn arriving_columns_stay_hidden_once_the_cursor_moved() {
+        let mut state = waiting_for_columns().await;
+        handle_editor_keys(&mut state, KeyCode::Right, KeyModifiers::NONE).await;
+        settle(&mut state).await;
+        assert!(!state.show_completion && !state.completion_wanted);
+        // Enter is a newline again.
+        handle_editor_keys(&mut state, KeyCode::Enter, KeyModifiers::NONE).await;
+        assert_eq!(state.query_input(), "SELECT u. \nFROM users u");
+    }
+
+    #[tokio::test]
+    async fn arriving_columns_stay_hidden_after_typing() {
+        let mut state = waiting_for_columns().await;
+        handle_editor_keys(&mut state, KeyCode::Char('x'), KeyModifiers::NONE).await;
+        settle(&mut state).await;
+        assert!(!state.show_completion && !state.completion_wanted);
+    }
+
+    #[tokio::test]
+    async fn arriving_columns_stay_hidden_in_another_panel() {
+        let mut state = waiting_for_columns().await;
+        state.active_panel = ActivePanel::Results;
+        settle(&mut state).await;
+        assert!(!state.show_completion && !state.completion_wanted);
+        // Back in the editor: still nothing popped up.
+        state.active_panel = ActivePanel::QueryEditor;
+        crate::tui::columns::poll(&mut state).await;
+        assert!(!state.show_completion);
     }
 }

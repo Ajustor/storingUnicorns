@@ -34,8 +34,17 @@ pub fn match_condition(
 }
 
 /// Values of `columns` in the current row, `None` when one is missing or
-/// NULL: a NULL key part links to nothing.
-fn key_values(columns: &[String], row: &dyn Fn(&str) -> Option<String>) -> Option<Vec<String>> {
+/// NULL (a NULL key part links to nothing) or when `targets` has an empty
+/// column name (an unresolved key: an implicit reference to a table
+/// without primary key).
+fn key_values(
+    columns: &[String],
+    targets: &[String],
+    row: &dyn Fn(&str) -> Option<String>,
+) -> Option<Vec<String>> {
+    if columns.iter().chain(targets).any(String::is_empty) {
+        return None;
+    }
     columns
         .iter()
         .map(|c| row(c).filter(|v| !is_null(v)))
@@ -45,13 +54,13 @@ fn key_values(columns: &[String], row: &dyn Fn(&str) -> Option<String>) -> Optio
 /// For an outgoing FK and the current row (column name → value): the
 /// referenced table (`fk.ref_table`, as given) and the condition selecting
 /// the referenced row. `None` when a referencing value is NULL (no linked
-/// row) or missing from the row.
+/// row) or missing from the row, or a column name is empty.
 pub fn follow(
     fk: &ForeignKeyInfo,
     row: &dyn Fn(&str) -> Option<String>,
     db: &DatabaseType,
 ) -> Option<(String, String)> {
-    let values = key_values(&fk.columns, row)?;
+    let values = key_values(&fk.columns, &fk.ref_columns, row)?;
     Some((
         fk.ref_table.clone(),
         match_condition(&fk.ref_columns, &values, &[], db),
@@ -60,13 +69,14 @@ pub fn follow(
 
 /// For an incoming FK and the current row (column name → value): the
 /// referencing table and the condition selecting the rows that point at it.
-/// `None` when a referenced value is NULL or missing (nothing can point at it).
+/// `None` when a referenced value is NULL or missing (nothing can point at
+/// it), or a column name is empty.
 pub fn referencing(
     fk: &IncomingForeignKey,
     row: &dyn Fn(&str) -> Option<String>,
     db: &DatabaseType,
 ) -> Option<(String, String)> {
-    let values = key_values(&fk.ref_columns, row)?;
+    let values = key_values(&fk.ref_columns, &fk.columns, row)?;
     Some((
         fk.table.clone(),
         match_condition(&fk.columns, &values, &[], db),
@@ -235,6 +245,29 @@ mod tests {
         assert_eq!(follow(&fk, &row(&cells), &DatabaseType::MySQL), None);
         let cells = [("ca", "1")];
         assert_eq!(follow(&fk, &row(&cells), &DatabaseType::MySQL), None);
+    }
+
+    #[test]
+    fn empty_column_names_link_nothing() {
+        // SQLite: implicit reference to a table without primary key.
+        let fk = ForeignKeyInfo {
+            name: String::new(),
+            columns: s(&["x"]),
+            ref_table: "main.p".into(),
+            ref_columns: s(&[""]),
+        };
+        let cells = [("x", "1"), ("", "1")];
+        assert_eq!(follow(&fk, &row(&cells), &DatabaseType::SQLite), None);
+        let incoming = IncomingForeignKey {
+            name: String::new(),
+            table: "main.c".into(),
+            columns: s(&["x"]),
+            ref_columns: s(&[""]),
+        };
+        assert_eq!(
+            referencing(&incoming, &row(&cells), &DatabaseType::SQLite),
+            None
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use sqlx::pool::PoolOptions;
 use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, Sqlite, SqlitePool, TypeInfo, ValueRef};
+use std::collections::HashMap;
 
 use crate::engine::models::{
     Column, ForeignKeyInfo, IncomingForeignKey, IndexInfo, QueryResult, SchemaInfo, NULL_CELL,
@@ -171,7 +172,16 @@ async fn table_info(
     table_name: &str,
 ) -> Result<Vec<(String, String, bool, i64)>> {
     let (schema, table) = split_qualified(table_name);
-    let rows: Vec<SqliteRow> = sqlx::query(&pragma_on(schema.as_deref(), "table_info", &table))
+    table_info_in(pool, schema.as_deref(), &table).await
+}
+
+/// `PRAGMA table_info` of `table` (unquoted) in `schema` (none: unqualified).
+async fn table_info_in(
+    pool: &SqlitePool,
+    schema: Option<&str>,
+    table: &str,
+) -> Result<Vec<(String, String, bool, i64)>> {
+    let rows: Vec<SqliteRow> = sqlx::query(&pragma_on(schema, "table_info", table))
         .fetch_all(pool)
         .await?;
     rows.iter()
@@ -276,52 +286,133 @@ pub async fn get_indexes(pool: &SqlitePool, table_name: &str) -> Result<Vec<Inde
     Ok(indexes)
 }
 
+/// A table's name and columns as declared, to canonicalise the names a
+/// foreign key gives (SQLite matches table and column names
+/// case-insensitively: `REFERENCES P(A)` points at `p(a)`) and to resolve
+/// implicit referenced columns (the primary key, in its order).
+#[derive(Default)]
+struct DeclaredTable {
+    /// Declared name; `None` when the table does not exist.
+    name: Option<String>,
+    columns: Vec<String>,
+    primary_key: Vec<String>,
+}
+
+impl DeclaredTable {
+    async fn load(pool: &SqlitePool, schema: &str, table: &str) -> Result<Self> {
+        let master = format!("\"{}\".sqlite_master", schema.replace('"', "\"\""));
+        let name: Option<(String,)> = sqlx::query_as(&format!(
+            "SELECT name FROM {master} WHERE type = 'table' AND name = ? COLLATE NOCASE"
+        ))
+        .bind(table)
+        .fetch_optional(pool)
+        .await?;
+        let info = table_info_in(pool, Some(schema), table).await?;
+        let mut pk: Vec<(i64, String)> = info
+            .iter()
+            .filter(|(_, _, _, pos)| *pos > 0)
+            .map(|(name, _, _, pos)| (*pos, name.clone()))
+            .collect();
+        pk.sort();
+        Ok(Self {
+            name: name.map(|(n,)| n),
+            columns: info.into_iter().map(|(name, ..)| name).collect(),
+            primary_key: pk.into_iter().map(|(_, n)| n).collect(),
+        })
+    }
+
+    /// The declared table name, or `table` as given when it does not exist.
+    fn table_name(&self, table: &str) -> String {
+        self.name.clone().unwrap_or_else(|| table.to_string())
+    }
+
+    /// The declared column matching `name` (ignoring ASCII case), or `name`.
+    fn column(&self, name: &str) -> String {
+        self.columns
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(name))
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// The referenced column at `position` of a key: `to` canonicalised, or
+    /// for an implicit `to` the primary key's column at that position (empty
+    /// when the table has no such primary key column).
+    fn referenced(&self, to: Option<&str>, position: usize) -> String {
+        match to {
+            Some(to) => self.column(to),
+            None => self.primary_key.get(position).cloned().unwrap_or_default(),
+        }
+    }
+}
+
+/// `table`'s `DeclaredTable`, loaded once into `cache`.
+async fn declared<'a>(
+    cache: &'a mut HashMap<String, DeclaredTable>,
+    pool: &SqlitePool,
+    schema: &str,
+    table: &str,
+) -> Result<&'a DeclaredTable> {
+    let key = table.to_lowercase();
+    if !cache.contains_key(&key) {
+        let loaded = DeclaredTable::load(pool, schema, table).await?;
+        cache.insert(key.clone(), loaded);
+    }
+    Ok(&cache[&key])
+}
+
 /// Get the foreign keys of a table (`PRAGMA foreign_key_list`, one row per
 /// column, grouped by `id`). SQLite does not expose constraint names, so
-/// `name` is empty.
+/// `name` is empty. The referenced table and the column names are spelled
+/// as declared; implicit referenced columns are the primary key.
 pub async fn get_foreign_keys(pool: &SqlitePool, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
     let (schema, table) = split_qualified(table_name);
-    let rows: Vec<SqliteRow> =
-        sqlx::query(&pragma_on(schema.as_deref(), "foreign_key_list", &table))
-            .fetch_all(pool)
-            .await?;
+    let schema = schema.unwrap_or_else(|| "main".to_string());
+    let rows: Vec<SqliteRow> = sqlx::query(&pragma_on(Some(&schema), "foreign_key_list", &table))
+        .fetch_all(pool)
+        .await?;
 
-    let mut keys: Vec<(i64, ForeignKeyInfo)> = Vec::new();
+    /// `(from, to)` column pairs of a key, `to` NULL when implicit.
+    type Pairs = Vec<(String, Option<String>)>;
+    // (id, referenced table, pairs)
+    let mut keys: Vec<(i64, String, Pairs)> = Vec::new();
     for row in rows {
         let id: i64 = row.try_get("id")?;
         let ref_table: String = row.try_get("table")?;
         let from: String = row.try_get("from")?;
         // NULL `to`: the referenced table's primary key, left implicit.
         let to: Option<String> = row.try_get("to")?;
-        let pos = match keys.iter().position(|(k, _)| *k == id) {
-            Some(pos) => pos,
-            None => {
-                keys.push((
-                    id,
-                    ForeignKeyInfo {
-                        name: String::new(),
-                        columns: Vec::new(),
-                        ref_table,
-                        ref_columns: Vec::new(),
-                    },
-                ));
-                keys.len() - 1
-            }
-        };
-        let fk = &mut keys[pos].1;
-        fk.columns.push(from);
-        fk.ref_columns.push(to.unwrap_or_default());
+        match keys.iter_mut().find(|(k, ..)| *k == id) {
+            Some((_, _, pairs)) => pairs.push((from, to)),
+            None => keys.push((id, ref_table, vec![(from, to)])),
+        }
     }
 
-    Ok(keys.into_iter().map(|(_, fk)| fk).collect())
+    let mut cache = HashMap::new();
+    let own = DeclaredTable::load(pool, &schema, &table).await?;
+    let mut out = Vec::with_capacity(keys.len());
+    for (_, ref_table, pairs) in keys {
+        let target = declared(&mut cache, pool, &schema, &ref_table).await?;
+        out.push(ForeignKeyInfo {
+            name: String::new(),
+            columns: pairs.iter().map(|(from, _)| own.column(from)).collect(),
+            ref_table: target.table_name(&ref_table),
+            ref_columns: pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (_, to))| target.referenced(to.as_deref(), i))
+                .collect(),
+        });
+    }
+    Ok(out)
 }
 
 /// Get the foreign keys of other tables pointing at a table:
 /// `pragma_foreign_key_list` of every table of the same database (`main`
 /// when the name is not qualified), keeping those whose `table` is this one
-/// (case-insensitively, like SQLite). A key that leaves the referenced
-/// columns implicit points at the primary key. SQLite does not expose
-/// constraint names, so `name` is empty; tables are `schema.table`.
+/// (case-insensitively, like SQLite). Column names are spelled as declared
+/// and implicit referenced columns are the primary key. SQLite does not
+/// expose constraint names, so `name` is empty; tables are `schema.table`.
 pub async fn get_incoming_foreign_keys(
     pool: &SqlitePool,
     table_name: &str,
@@ -341,8 +432,9 @@ pub async fn get_incoming_foreign_keys(
     .fetch_all(pool)
     .await?;
 
+    let target = DeclaredTable::load(pool, &schema, &table).await?;
+    let mut sources = HashMap::new();
     let mut keys: Vec<(String, i64, IncomingForeignKey)> = Vec::new();
-    let mut primary_key: Option<Vec<String>> = None;
     for row in rows {
         let src: String = row.try_get("src")?;
         let id: i64 = row.try_get("id")?;
@@ -361,29 +453,12 @@ pub async fn get_incoming_foreign_keys(
                 },
             ));
         }
-        let ref_column = match ref_column {
-            Some(c) => c,
-            None => {
-                if primary_key.is_none() {
-                    let mut pk: Vec<(i64, String)> = table_info(pool, table_name)
-                        .await?
-                        .into_iter()
-                        .filter(|(_, _, _, pos)| *pos > 0)
-                        .map(|(name, _, _, pos)| (pos, name))
-                        .collect();
-                    pk.sort();
-                    primary_key = Some(pk.into_iter().map(|(_, n)| n).collect());
-                }
-                let position = keys.last().map_or(0, |(_, _, fk)| fk.columns.len());
-                primary_key
-                    .as_ref()
-                    .and_then(|pk| pk.get(position).cloned())
-                    .unwrap_or_default()
-            }
-        };
+        let source = declared(&mut sources, pool, &schema, &src).await?;
         if let Some((_, _, fk)) = keys.last_mut() {
-            fk.columns.push(column);
-            fk.ref_columns.push(ref_column);
+            let position = fk.columns.len();
+            fk.columns.push(source.column(&column));
+            fk.ref_columns
+                .push(target.referenced(ref_column.as_deref(), position));
         }
     }
 

@@ -396,6 +396,64 @@ mod tests {
             .is_empty());
     }
 
+    /// SQLite gives key names as written in the `REFERENCES` clause (any
+    /// case) and leaves implicit referenced columns NULL: both directions
+    /// come back with the declared spelling and the primary key.
+    #[tokio::test]
+    async fn sqlite_keys_use_declared_names_and_the_primary_key() {
+        use crate::engine::sql::relations::{follow, referencing};
+        let conn = sqlite_mem(&[
+            "CREATE TABLE p (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (b, a))",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, pa INTEGER, x INTEGER, y INTEGER,              FOREIGN KEY (PA) REFERENCES P(A), FOREIGN KEY (x, y) REFERENCES p)",
+            "CREATE TABLE nopk (v INTEGER)",
+            "CREATE TABLE d (id INTEGER PRIMARY KEY, n INTEGER REFERENCES nopk)",
+        ])
+        .await;
+        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let out = conn.get_foreign_keys("c").await.unwrap();
+        let got: Vec<_> = out
+            .iter()
+            .map(|k| {
+                (
+                    k.ref_table.as_str(),
+                    k.columns.clone(),
+                    k.ref_columns.clone(),
+                )
+            })
+            .collect();
+        assert!(got.contains(&("p", v(&["pa"]), v(&["a"]))), "{got:?}");
+        assert!(
+            got.contains(&("p", v(&["x", "y"]), v(&["b", "a"]))),
+            "{got:?}"
+        );
+        let incoming = conn.get_incoming_foreign_keys("p").await.unwrap();
+        let got: Vec<_> = incoming
+            .iter()
+            .map(|k| (k.columns.clone(), k.ref_columns.clone()))
+            .collect();
+        assert!(got.contains(&(v(&["pa"]), v(&["a"]))), "{got:?}");
+        assert!(got.contains(&(v(&["x", "y"]), v(&["b", "a"]))), "{got:?}");
+        let row = |c: &str| Some(format!("{c}1"));
+        let simple = out.iter().find(|k| k.columns == ["pa"]).unwrap();
+        assert_eq!(
+            follow(simple, &row, &DatabaseType::SQLite).unwrap().1,
+            "\"a\" = 'pa1'"
+        );
+        let simple = incoming.iter().find(|k| k.columns == ["pa"]).unwrap();
+        assert_eq!(
+            referencing(simple, &row, &DatabaseType::SQLite).unwrap().1,
+            "\"pa\" = 'a1'"
+        );
+        // An implicit reference to a table without primary key: listed,
+        // but it selects nothing.
+        let to_nopk = conn.get_foreign_keys("d").await.unwrap();
+        assert_eq!(to_nopk[0].ref_columns, [""]);
+        assert_eq!(follow(&to_nopk[0], &row, &DatabaseType::SQLite), None);
+        let from_d = conn.get_incoming_foreign_keys("nopk").await.unwrap();
+        assert_eq!(from_d[0].ref_columns, [""]);
+        assert_eq!(referencing(&from_d[0], &row, &DatabaseType::SQLite), None);
+    }
+
     #[test]
     fn details_degrade_incoming_foreign_keys() {
         let d = assemble_details(

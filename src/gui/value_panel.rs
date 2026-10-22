@@ -364,9 +364,10 @@ fn focused_link(app: &App, key: CellKey) -> Option<ColumnLink> {
         .ok()?;
     let result = d.result.as_ref()?;
     let link = fk::link_of(&details.foreign_keys, &result.columns.get(col)?.name)?;
-    let value = d.row_values(row)?.into_iter().nth(col)?;
+    let value = d.saved_values(row)?.into_iter().nth(col)?;
     let saved = !d.grid.edits.is_deleted(row);
-    (fk::cell_link(Some(&link), is_null(&value), saved) == CellLink::Active).then_some(link)
+    let edited = d.grid.edits.is_edited(row, col);
+    (fk::cell_link(Some(&link), is_null(&value), saved, edited) == CellLink::Active).then_some(link)
 }
 
 /// What the preview asked for.

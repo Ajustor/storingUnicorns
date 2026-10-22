@@ -96,18 +96,19 @@ pub fn incoming_label(fk: &IncomingForeignKey) -> String {
 pub enum CellLink {
     /// Not a foreign key column.
     None,
-    /// A foreign key column whose value links nowhere (NULL, or a row not
-    /// saved yet).
+    /// A foreign key column whose value links nowhere (NULL, a row not
+    /// saved yet, or a key edited but not submitted).
     Inert,
     /// Clickable: the value is shown as a link, with its icon.
     Active,
 }
 
-/// See [`CellLink`]. `saved`: the row exists in the database.
-pub fn cell_link(link: Option<&ColumnLink>, null: bool, saved: bool) -> CellLink {
+/// See [`CellLink`]. `saved`: the row exists in the database; `edited`:
+/// the cell has a pending edit (links follow what the database holds).
+pub fn cell_link(link: Option<&ColumnLink>, null: bool, saved: bool, edited: bool) -> CellLink {
     match link {
         None => CellLink::None,
-        Some(_) if null || !saved => CellLink::Inert,
+        Some(_) if null || !saved || edited => CellLink::Inert,
         Some(_) => CellLink::Active,
     }
 }
@@ -527,10 +528,21 @@ mod tests {
     fn only_saved_non_null_fk_cells_are_links() {
         let fks = [fk(&["user_id"], "users", &["id"])];
         let link = link_of(&fks, "user_id");
-        assert_eq!(cell_link(link.as_ref(), false, true), CellLink::Active);
-        assert_eq!(cell_link(link.as_ref(), true, true), CellLink::Inert);
-        assert_eq!(cell_link(link.as_ref(), false, false), CellLink::Inert);
-        assert_eq!(cell_link(None, false, true), CellLink::None);
+        assert_eq!(
+            cell_link(link.as_ref(), false, true, false),
+            CellLink::Active
+        );
+        assert_eq!(cell_link(link.as_ref(), true, true, false), CellLink::Inert);
+        assert_eq!(
+            cell_link(link.as_ref(), false, false, false),
+            CellLink::Inert
+        );
+        assert_eq!(
+            cell_link(link.as_ref(), false, true, true),
+            CellLink::Inert,
+            "an edited key links nowhere until submitted"
+        );
+        assert_eq!(cell_link(None, false, true, false), CellLink::None);
     }
 
     #[test]

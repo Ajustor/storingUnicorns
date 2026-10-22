@@ -164,7 +164,7 @@ impl App {
         let TabKind::Data(d) = &tab.kind else {
             return;
         };
-        let (Some(result), Some(values)) = (&d.result, d.row_values(row)) else {
+        let (Some(result), Some(values)) = (&d.result, d.saved_values(row)) else {
             return;
         };
         let connection = tab.connection.clone();

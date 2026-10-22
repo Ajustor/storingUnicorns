@@ -234,18 +234,13 @@ impl DataTab {
         tab
     }
 
-    /// The values of row `r` as shown (pending edits applied).
-    pub fn row_values(&self, r: RowRef) -> Option<Vec<String>> {
-        let result = self.result.as_ref()?;
+    /// The values of saved row `r` as the database holds them (pending
+    /// edits ignored): what its links select.
+    pub fn saved_values(&self, r: RowRef) -> Option<Vec<String>> {
         let RowRef::Base(i) = r else {
             return None;
         };
-        result.rows.get(i)?;
-        Some(
-            (0..result.columns.len())
-                .map(|c| self.grid.edits.value(&result.rows, r, c).to_string())
-                .collect(),
-        )
+        self.result.as_ref()?.rows.get(i).cloned()
     }
 
     /// The displayed table, for completion.
@@ -669,18 +664,19 @@ mod tests {
     }
 
     #[test]
-    fn row_values_show_pending_edits_of_saved_rows() {
+    fn saved_values_ignore_pending_edits() {
         let mut t = DataTab::new("t".into(), ('"', '"'));
-        assert_eq!(t.row_values(RowRef::Base(0)), None, "nothing loaded");
+        assert_eq!(t.saved_values(RowRef::Base(0)), None, "nothing loaded");
         t.result = Some(page(2));
         let rows = t.result.as_ref().unwrap().rows.clone();
-        t.grid.edits.set(&rows, RowRef::Base(1), 1, "edited".into());
+        t.grid.edits.set(&rows, RowRef::Base(1), 0, "42".into());
+        // Links select what the database holds, not the unsaved key.
         assert_eq!(
-            t.row_values(RowRef::Base(1)),
-            Some(vec!["1".into(), "edited".into()])
+            t.saved_values(RowRef::Base(1)),
+            Some(vec!["1".into(), "x".into()])
         );
-        assert_eq!(t.row_values(RowRef::Base(5)), None);
-        assert_eq!(t.row_values(RowRef::New(0)), None, "not saved yet");
+        assert_eq!(t.saved_values(RowRef::Base(5)), None);
+        assert_eq!(t.saved_values(RowRef::New(0)), None, "not saved yet");
     }
 
     #[test]

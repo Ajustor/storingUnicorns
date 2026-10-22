@@ -280,7 +280,8 @@ pub fn show(
             let link = opts.links.get(c).and_then(Option::as_ref);
             let blank = state.edits.is_default(r, c) || is_null(state.edits.value(rows, r, c));
             let saved = matches!(r, RowRef::Base(_)) && !state.edits.is_deleted(r);
-            (fk::cell_link(link, blank, saved) == CellLink::Active
+            let edited = state.edits.is_edited(r, c);
+            (fk::cell_link(link, blank, saved, edited) == CellLink::Active
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter)))
             .then_some(GridAction::Follow {
                 row: r,
@@ -411,7 +412,8 @@ pub fn show(
                                     edits.is_default(r, c) || is_null(edits.value(rows, r, c));
                                 let saved = matches!(r, RowRef::Base(_)) && !deleted;
                                 let active = !edited_here
-                                    && fk::cell_link(link, blank, saved) == CellLink::Active;
+                                    && fk::cell_link(link, blank, saved, edits.is_edited(r, c))
+                                        == CellLink::Active;
                                 let mut icon_clicked = false;
                                 let (_, resp) = row.col(|ui| {
                                     let rect = ui.max_rect();

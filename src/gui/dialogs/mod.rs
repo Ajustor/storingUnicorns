@@ -6,6 +6,7 @@ pub mod transfer;
 
 use super::app::App;
 use super::history_popup::{HistoryAction, HistoryPopup};
+use super::modal::{self, MessageKind, ModalButton, ModalResponse, ModalSize, ModalSpec};
 use super::table_search::TableSearch;
 use super::tabs::console::RunKind;
 use super::tabs::{CloseRisk, TabId, TabKind};
@@ -63,6 +64,10 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     };
     let mut keep = true;
     let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
+        // Standard modals size themselves (`modal::ModalSize`).
+        if let Some(response) = standard_ui(app, ui, &dialog) {
+            return Some(response);
+        }
         ui.set_min_width(420.0);
         match &mut dialog {
             Dialog::Connection(form) => {
@@ -113,159 +118,30 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     keep = false;
                 }
             }
-            Dialog::DiscardEdits(id) => {
-                let id = *id;
-                ui.heading("Abandonner les modifications ?");
-                ui.label("Les modifications en attente seront perdues.");
-                ui.add_space(8.0);
-                let mut answer = None;
-                ui.horizontal(|ui| {
-                    if ui.button("Submit").clicked() {
-                        answer = Some(Discard::Submit);
-                    }
-                    if ui.button("Abandonner").clicked() {
-                        answer = Some(Discard::Drop);
-                    }
-                    if ui.button("Annuler").clicked() {
-                        answer = Some(Discard::Cancel);
-                    }
-                });
-                if let Some(answer) = answer {
-                    keep = false;
-                    answer_discard(app, id, answer);
-                }
-            }
-            Dialog::CloseTab { id, risk } => {
-                let id = *id;
-                if let Some(answer) = close_tab_ui(ui, *risk) {
-                    keep = false;
-                    match answer {
-                        Discard::Submit => app.submit_and_close(id),
-                        Discard::Drop => app.close_tab_id(id),
-                        Discard::Cancel => {}
-                    }
-                }
-            }
-            Dialog::ConfirmRerun { id, kind } => {
-                ui.heading("Abandonner les modifications ?");
-                ui.label(
-                    "L'exécution remplace les résultats non épinglés : \
-                     leurs modifications en attente seront perdues.",
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Abandonner").clicked() {
-                        app.run_console(*id, kind.clone());
-                        keep = false;
-                    }
-                    if ui.button("Annuler").clicked() {
-                        keep = false;
-                    }
-                });
-            }
-            Dialog::ConfirmQuit {
-                edits,
-                transactions,
-            } => {
-                ui.heading("Quitter ?");
-                if *edits > 0 {
-                    ui.label(format!(
-                        "{edits} onglet(s) ont des modifications non envoyées."
-                    ));
-                }
-                for (name, n) in transactions.iter() {
-                    ui.label(format!(
-                        "{name} : transaction non validée ({n} instruction(s)), \
-                         elle sera annulée."
-                    ));
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Fermer quand même").clicked() {
-                        app.quit_confirmed = true;
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        keep = false;
-                    }
-                    if ui.button("Annuler").clicked() {
-                        app.updater.cancel_restart();
-                        keep = false;
-                    }
-                });
-            }
-            Dialog::EndTx(name) => {
-                ui.heading("Terminer la transaction ?");
-                let n = app.sessions.get(name).map_or(0, |s| s.pending_statements());
-                ui.label(format!(
-                    "La transaction de {name} contient {n} instruction(s) non validée(s)."
-                ));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Commit").clicked() {
-                        app.end_tx_then_auto(name, true);
-                        keep = false;
-                    }
-                    if ui.button("Rollback").clicked() {
-                        app.end_tx_then_auto(name, false);
-                        keep = false;
-                    }
-                    if ui.button("Annuler").clicked() {
-                        keep = false;
-                    }
-                });
-            }
             Dialog::Structure(d) => keep = structure::ui(app, ui, d),
-            Dialog::ConfirmTruncate { connection, tables } => {
-                keep = transfer::confirm_truncate_ui(app, ui, connection, tables)
-            }
             Dialog::Batch(b) => keep = transfer::batch_ui(app, ui, b),
-            Dialog::ConfirmDeleteConnection(name) => {
-                ui.heading("Supprimer la connexion");
-                ui.label(format!(
-                    "Supprimer « {name} » ? Cette action est définitive."
-                ));
-                let tabs = app
-                    .tabs
-                    .list
-                    .iter()
-                    .filter(|t| &t.connection == name)
-                    .count();
-                if tabs > 0 {
-                    ui.label(format!(
-                        "Ses {tabs} onglet(s) seront fermés et ses consoles oubliées."
-                    ));
-                }
-                let pending = app.tabs.with_pending_edits(Some(name));
-                if pending > 0 {
-                    ui.colored_label(
-                        super::theme::ERROR,
-                        format!(
-                            "{pending} onglet(s) ont des modifications non envoyées : \
-                             elles seront perdues."
-                        ),
-                    );
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Supprimer").clicked() {
-                        app.delete_connection(name);
-                        keep = false;
-                    }
-                    if ui.button("Annuler").clicked() {
-                        keep = false;
-                    }
-                });
-            }
+            // Drawn by `standard_ui`.
+            Dialog::ConfirmDeleteConnection(_)
+            | Dialog::DiscardEdits(_)
+            | Dialog::CloseTab { .. }
+            | Dialog::ConfirmRerun { .. }
+            | Dialog::ConfirmQuit { .. }
+            | Dialog::EndTx(_)
+            | Dialog::ConfirmTruncate { .. } => {}
         }
+        None
     });
     // Escape or a click outside cancels the dialog.
-    if modal.should_close() {
-        match (keep, &dialog) {
-            (true, Dialog::DiscardEdits(id)) => answer_discard(app, *id, Discard::Cancel),
-            // The quit (maybe "Redémarrer maintenant") is cancelled.
-            (true, Dialog::ConfirmQuit { .. }) => app.updater.cancel_restart(),
-            _ => {}
+    let outside = modal.should_close();
+    match modal.inner {
+        Some(response) => {
+            if let Some(answer) = settle(response, outside) {
+                keep = false;
+                apply(app, ctx, effect(&dialog, answer));
+            }
         }
-        keep = false;
+        None if outside => keep = false,
+        None => {}
     }
     if let (false, Dialog::Connection(form)) = (keep, &mut dialog) {
         // Nobody waits for the test of a closed form any more: stop it (and
@@ -286,55 +162,253 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-/// Confirmation of the closing of a tab that would lose `risk`.
-fn close_tab_ui(ui: &mut egui::Ui, risk: CloseRisk) -> Option<Discard> {
-    let mut answer = None;
-    match risk {
-        CloseRisk::Console { text, edits } => {
-            ui.heading("Fermer la console ?");
-            if text {
-                ui.label("Son contenu sera perdu.");
+/// Buttons of the standard confirmations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Answer {
+    /// The (destructive or not) confirmed action.
+    Confirm,
+    /// "Submit" the pending edits first.
+    Submit,
+    /// Drop the pending edits.
+    Drop,
+    Commit,
+    Rollback,
+}
+
+/// The answer a standard dialog got this frame: `Some(None)` to cancel it
+/// (Annuler, ×, Escape, or a click outside: `outside`), `Some(Some(_))`
+/// for a button, `None` to keep it open. A button clicked in the frame
+/// wins over a click outside.
+fn settle(response: ModalResponse<Answer>, outside: bool) -> Option<Option<Answer>> {
+    match response {
+        ModalResponse::Button(a) => Some(Some(a)),
+        ModalResponse::Cancel => Some(None),
+        ModalResponse::None => outside.then_some(None),
+    }
+}
+
+/// Draw `dialog` if it is a standard one (confirmations); `None` otherwise.
+fn standard_ui(app: &mut App, ui: &mut egui::Ui, dialog: &Dialog) -> Option<ModalResponse<Answer>> {
+    let small = |title| ModalSpec::new(title, ModalSize::Small);
+    let response = match dialog {
+        Dialog::ConfirmDeleteConnection(name) => {
+            let tabs = app
+                .tabs
+                .list
+                .iter()
+                .filter(|t| &t.connection == name)
+                .count();
+            let pending = app.tabs.with_pending_edits(Some(name));
+            let warning = (pending > 0).then(|| {
+                format!(
+                    "{pending} onglet(s) ont des modifications non envoyées : \
+                     elles seront perdues."
+                )
+            });
+            modal::show(
+                ui,
+                small("Supprimer la connexion"),
+                |ui| {
+                    ui.label(format!(
+                        "Supprimer « {name} » ? Cette action est définitive."
+                    ));
+                    if tabs > 0 {
+                        ui.label(format!(
+                            "Ses {tabs} onglet(s) seront fermés et ses consoles oubliées."
+                        ));
+                    }
+                },
+                warning.as_deref().map(|w| (MessageKind::Error, w)),
+                &[ModalButton::danger("Supprimer", Answer::Confirm)],
+            )
+        }
+        Dialog::DiscardEdits(_) => discard_ui(
+            ui,
+            "Les modifications en attente seront perdues.",
+            "Appliquer, puis continuer si tout a réussi",
+        ),
+        Dialog::CloseTab {
+            risk: CloseRisk::Console { text, edits },
+            ..
+        } => {
+            let mut lines = vec![];
+            if *text {
+                lines.push("Son contenu sera perdu.");
             }
-            if edits {
-                ui.label(
+            if *edits {
+                lines.push(
                     "Des résultats ont des modifications non envoyées : elles seront perdues.",
                 );
             }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Fermer").clicked() {
-                    answer = Some(Discard::Drop);
-                }
-                if ui.button("Annuler").clicked() {
-                    answer = Some(Discard::Cancel);
-                }
-            });
+            modal::show(
+                ui,
+                small("Fermer la console ?"),
+                |ui| {
+                    for line in lines {
+                        ui.label(line);
+                    }
+                },
+                None,
+                &[ModalButton::danger("Fermer", Answer::Drop)],
+            )
         }
-        CloseRisk::DataEdits | CloseRisk::None => {
-            ui.heading("Abandonner les modifications ?");
-            ui.label("Les modifications en attente de cet onglet seront perdues.");
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Submit")
-                    .on_hover_text("Appliquer, puis fermer si tout a réussi")
-                    .clicked()
-                {
-                    answer = Some(Discard::Submit);
-                }
-                if ui.button("Abandonner").clicked() {
-                    answer = Some(Discard::Drop);
-                }
-                if ui.button("Annuler").clicked() {
-                    answer = Some(Discard::Cancel);
-                }
-            });
+        Dialog::CloseTab { .. } => discard_ui(
+            ui,
+            "Les modifications en attente de cet onglet seront perdues.",
+            "Appliquer, puis fermer si tout a réussi",
+        ),
+        Dialog::ConfirmRerun { .. } => modal::confirm(
+            ui,
+            "Abandonner les modifications ?",
+            "L'exécution remplace les résultats non épinglés : \
+             leurs modifications en attente seront perdues.",
+            &[],
+            ModalButton::danger("Abandonner", Answer::Confirm),
+        ),
+        Dialog::ConfirmQuit {
+            edits,
+            transactions,
+        } => {
+            let mut items = vec![];
+            if *edits > 0 {
+                items.push(format!(
+                    "{edits} onglet(s) ont des modifications non envoyées."
+                ));
+            }
+            items.extend(transactions.iter().map(|(name, n)| {
+                format!(
+                    "{name} : transaction non validée ({n} instruction(s)), \
+                     elle sera annulée."
+                )
+            }));
+            modal::confirm(
+                ui,
+                "Quitter ?",
+                "En quittant maintenant :",
+                &items,
+                ModalButton::danger("Quitter quand même", Answer::Confirm),
+            )
         }
+        Dialog::EndTx(name) => {
+            let n = app.sessions.get(name).map_or(0, |s| s.pending_statements());
+            modal::show(
+                ui,
+                small("Terminer la transaction ?"),
+                |ui| {
+                    ui.label(format!(
+                        "La transaction de {name} contient {n} instruction(s) non validée(s)."
+                    ));
+                },
+                None,
+                &[
+                    ModalButton::danger("Rollback", Answer::Rollback),
+                    ModalButton::primary("Commit", Answer::Commit),
+                ],
+            )
+        }
+        Dialog::ConfirmTruncate { connection, tables } => {
+            transfer::confirm_truncate_ui(ui, connection, tables).map(|()| Answer::Confirm)
+        }
+        Dialog::Connection(_)
+        | Dialog::History(_)
+        | Dialog::TableSearch(_)
+        | Dialog::Structure(_)
+        | Dialog::Batch(_) => return None,
+    };
+    Some(response)
+}
+
+/// "Abandonner les modifications ?": Submit them first, drop them, or
+/// cancel.
+fn discard_ui(ui: &mut egui::Ui, text: &str, submit_hint: &str) -> ModalResponse<Answer> {
+    modal::show(
+        ui,
+        ModalSpec::new("Abandonner les modifications ?", ModalSize::Small),
+        |ui| {
+            ui.label(text);
+        },
+        None,
+        &[
+            ModalButton::danger("Abandonner", Answer::Drop),
+            ModalButton::primary("Submit", Answer::Submit).hint(submit_hint),
+        ],
+    )
+}
+
+/// What answering a standard dialog does.
+#[derive(Debug, PartialEq)]
+enum Effect {
+    Nothing,
+    DeleteConnection(String),
+    AnswerDiscard(TabId, Discard),
+    SubmitAndClose(TabId),
+    CloseTab(TabId),
+    Rerun(TabId, RunKind),
+    Quit,
+    /// The quit (maybe "Redémarrer maintenant") is cancelled.
+    CancelRestart,
+    EndTx {
+        connection: String,
+        commit: bool,
+    },
+    Truncate {
+        connection: String,
+        tables: Vec<String>,
+    },
+}
+
+/// The effect of `answer` (`None`: cancelled) to `dialog`.
+fn effect(dialog: &Dialog, answer: Option<Answer>) -> Effect {
+    use Answer::*;
+    match (dialog, answer) {
+        (Dialog::ConfirmDeleteConnection(name), Some(Confirm)) => {
+            Effect::DeleteConnection(name.clone())
+        }
+        (Dialog::DiscardEdits(id), answer) => Effect::AnswerDiscard(
+            *id,
+            match answer {
+                Some(Submit) => Discard::Submit,
+                Some(Drop) => Discard::Drop,
+                _ => Discard::Cancel,
+            },
+        ),
+        (Dialog::CloseTab { id, .. }, Some(Submit)) => Effect::SubmitAndClose(*id),
+        (Dialog::CloseTab { id, .. }, Some(Drop)) => Effect::CloseTab(*id),
+        (Dialog::ConfirmRerun { id, kind }, Some(Confirm)) => Effect::Rerun(*id, kind.clone()),
+        (Dialog::ConfirmQuit { .. }, Some(Confirm)) => Effect::Quit,
+        (Dialog::ConfirmQuit { .. }, None) => Effect::CancelRestart,
+        (Dialog::EndTx(name), Some(a @ (Commit | Rollback))) => Effect::EndTx {
+            connection: name.clone(),
+            commit: a == Commit,
+        },
+        (Dialog::ConfirmTruncate { connection, tables }, Some(Confirm)) => Effect::Truncate {
+            connection: connection.clone(),
+            tables: tables.clone(),
+        },
+        _ => Effect::Nothing,
     }
-    answer
+}
+
+fn apply(app: &mut App, ctx: &egui::Context, effect: Effect) {
+    match effect {
+        Effect::Nothing => {}
+        Effect::DeleteConnection(name) => app.delete_connection(&name),
+        Effect::AnswerDiscard(id, answer) => answer_discard(app, id, answer),
+        Effect::SubmitAndClose(id) => app.submit_and_close(id),
+        Effect::CloseTab(id) => app.close_tab_id(id),
+        Effect::Rerun(id, kind) => app.run_console(id, kind),
+        Effect::Quit => {
+            app.quit_confirmed = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        Effect::CancelRestart => app.updater.cancel_restart(),
+        Effect::EndTx { connection, commit } => app.end_tx_then_auto(&connection, commit),
+        Effect::Truncate { connection, tables } => transfer::truncate(app, &connection, tables),
+    }
 }
 
 /// Answers to "Abandonner les modifications ?".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Discard {
     Submit,
     Drop,
@@ -365,5 +439,127 @@ pub fn handle_event(app: &mut App, ev: Event) {
             form.testing = false;
             form.test_result = Some(r);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_click_outside_cancels_unless_a_button_was_clicked() {
+        assert_eq!(settle(ModalResponse::None, false), None);
+        assert_eq!(settle(ModalResponse::None, true), Some(None));
+        assert_eq!(settle(ModalResponse::Cancel, false), Some(None));
+        assert_eq!(
+            settle(ModalResponse::Button(Answer::Drop), true),
+            Some(Some(Answer::Drop))
+        );
+    }
+
+    #[test]
+    fn cancelling_keeps_the_side_effects_of_each_confirmation() {
+        // The data tab stops waiting for an answer.
+        assert_eq!(
+            effect(&Dialog::DiscardEdits(7), None),
+            Effect::AnswerDiscard(7, Discard::Cancel)
+        );
+        // "Redémarrer maintenant" is cancelled with the quit.
+        let quit = Dialog::ConfirmQuit {
+            edits: 1,
+            transactions: vec![],
+        };
+        assert_eq!(effect(&quit, None), Effect::CancelRestart);
+        for dialog in [
+            Dialog::ConfirmDeleteConnection("prod".into()),
+            Dialog::CloseTab {
+                id: 3,
+                risk: CloseRisk::DataEdits,
+            },
+            Dialog::ConfirmRerun {
+                id: 3,
+                kind: RunKind::Script("select 1".into()),
+            },
+            Dialog::EndTx("prod".into()),
+            Dialog::ConfirmTruncate {
+                connection: "prod".into(),
+                tables: vec!["t".into()],
+            },
+        ] {
+            assert_eq!(effect(&dialog, None), Effect::Nothing);
+        }
+    }
+
+    #[test]
+    fn each_button_has_its_effect() {
+        assert_eq!(
+            effect(
+                &Dialog::ConfirmDeleteConnection("prod".into()),
+                Some(Answer::Confirm)
+            ),
+            Effect::DeleteConnection("prod".into())
+        );
+        assert_eq!(
+            effect(&Dialog::DiscardEdits(7), Some(Answer::Submit)),
+            Effect::AnswerDiscard(7, Discard::Submit)
+        );
+        assert_eq!(
+            effect(&Dialog::DiscardEdits(7), Some(Answer::Drop)),
+            Effect::AnswerDiscard(7, Discard::Drop)
+        );
+        let close = |risk| Dialog::CloseTab { id: 4, risk };
+        assert_eq!(
+            effect(&close(CloseRisk::DataEdits), Some(Answer::Submit)),
+            Effect::SubmitAndClose(4)
+        );
+        assert_eq!(
+            effect(
+                &close(CloseRisk::Console {
+                    text: true,
+                    edits: false
+                }),
+                Some(Answer::Drop)
+            ),
+            Effect::CloseTab(4)
+        );
+        let kind = RunKind::AtCursor {
+            text: "select 1".into(),
+            cursor: 2,
+        };
+        assert_eq!(
+            effect(
+                &Dialog::ConfirmRerun {
+                    id: 5,
+                    kind: kind.clone()
+                },
+                Some(Answer::Confirm)
+            ),
+            Effect::Rerun(5, kind)
+        );
+        let quit = Dialog::ConfirmQuit {
+            edits: 0,
+            transactions: vec![("prod".into(), 2)],
+        };
+        assert_eq!(effect(&quit, Some(Answer::Confirm)), Effect::Quit);
+        for (answer, commit) in [(Answer::Commit, true), (Answer::Rollback, false)] {
+            assert_eq!(
+                effect(&Dialog::EndTx("prod".into()), Some(answer)),
+                Effect::EndTx {
+                    connection: "prod".into(),
+                    commit
+                }
+            );
+        }
+        let truncate = Dialog::ConfirmTruncate {
+            connection: "prod".into(),
+            tables: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(
+            effect(&truncate, Some(Answer::Confirm)),
+            Effect::Truncate {
+                connection: "prod".into(),
+                tables: vec!["a".into(), "b".into()]
+            }
+        );
     }
 }

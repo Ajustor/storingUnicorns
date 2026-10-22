@@ -12,6 +12,7 @@ use crate::engine::ops::transfer::qualified;
 use crate::engine::services::export_import::{find_batch_csv, safe_file_stem, ExportFormat};
 
 use super::super::app::App;
+use super::super::modal::{self, ModalButton, ModalResponse, ModalSize, ModalSpec};
 use super::super::theme::ERROR;
 use super::Dialog;
 
@@ -155,47 +156,43 @@ pub fn open_batch(app: &mut App, connection: &str, kind: BatchKind, only: Option
     app.dialog = Some(Dialog::Batch(b));
 }
 
-/// Confirmation of a truncate; returns false when the dialog should close.
+/// Confirmation of a truncate (standard small modal).
 pub fn confirm_truncate_ui(
-    app: &mut App,
     ui: &mut egui::Ui,
     connection: &str,
     tables: &[String],
-) -> bool {
-    let mut keep = true;
-    ui.heading(format!("{} Vider les tables", icon::ERASER));
-    ui.label(RichText::new(connection).weak().small());
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new("Toutes les lignes des tables suivantes seront supprimées :").color(ERROR),
-    );
-    for t in tables.iter().take(12) {
-        ui.label(format!("• {}", display_qualified(t)));
-    }
-    if tables.len() > 12 {
-        ui.label(format!("… et {} autres", tables.len() - 12));
-    }
-    ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        let danger =
-            egui::Button::new(RichText::new("Vider").color(egui::Color32::WHITE)).fill(ERROR);
-        if ui.add(danger).clicked() {
-            match app.sessions.conn(connection) {
-                Some(conn) => {
-                    let op =
-                        app.worker
-                            .truncate_tables(connection.to_string(), conn, tables.to_vec());
-                    app.progress.update(op, 0, tables.len(), "tables");
-                }
-                None => app.not_connected(connection),
+) -> ModalResponse<()> {
+    modal::show(
+        ui,
+        ModalSpec::new("Vider les tables", ModalSize::Small).icon(icon::ERASER),
+        |ui| {
+            ui.label(RichText::new(connection).weak().small());
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Toutes les lignes des tables suivantes seront supprimées :")
+                    .color(ERROR),
+            );
+            for t in tables {
+                ui.label(format!("• {}", display_qualified(t)));
             }
-            keep = false;
+        },
+        None,
+        &[ModalButton::danger("Vider", ())],
+    )
+}
+
+/// Empty `tables` of `connection` (confirmed).
+pub fn truncate(app: &mut App, connection: &str, tables: Vec<String>) {
+    match app.sessions.conn(connection) {
+        Some(conn) => {
+            let n = tables.len();
+            let op = app
+                .worker
+                .truncate_tables(connection.to_string(), conn, tables);
+            app.progress.update(op, 0, n, "tables");
         }
-        if ui.button("Annuler").clicked() {
-            keep = false;
-        }
-    });
-    keep
+        None => app.not_connected(connection),
+    }
 }
 
 /// Batch export / import / truncate; returns false when it should close.

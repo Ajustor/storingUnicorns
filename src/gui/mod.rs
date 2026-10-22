@@ -4,6 +4,7 @@ mod dialogs;
 mod editor;
 mod explorer;
 mod history_popup;
+mod modal;
 mod persist;
 mod popup;
 mod rows;

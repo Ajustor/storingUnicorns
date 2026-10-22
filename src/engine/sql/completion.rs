@@ -1,11 +1,13 @@
 //! Context-aware SQL completion: the columns of the tables a statement
 //! references, chosen by the clause under the cursor (UI-agnostic, no I/O).
 //!
-//! Suggestions replace the token ending at the cursor as found by
-//! [`extract_token`] (a word, or an identifier whose opening quote is typed).
+//! Suggestions replace the token ending at the cursor: the trailing word
+//! (letters, digits, `_`), or an identifier from its typed opening quote.
+//! This is what `lexer::extract_token` finds, except that quote characters
+//! inside string literals and comments are not taken for opening quotes.
 
 use crate::engine::db::utils::split_qualified;
-use crate::engine::sql::lexer::{extract_token, is_keyword, keywords};
+use crate::engine::sql::lexer::{is_keyword, keywords};
 use crate::engine::sql::statements::{quote_ident, split_statements};
 
 /// A table referenced by a statement, names unquoted.
@@ -167,11 +169,6 @@ impl Tok {
     fn is_name(&self) -> bool {
         matches!(self.kind, T::Word | T::Quoted)
     }
-
-    /// Whether the cursor is inside this literal or comment.
-    fn holds(&self, cursor: usize) -> bool {
-        self.start < cursor && (cursor < self.end || (cursor == self.end && self.open))
-    }
 }
 
 fn word_char(c: char) -> bool {
@@ -253,6 +250,31 @@ fn lex(s: &str) -> Vec<Tok> {
         });
     }
     out
+}
+
+/// The token being typed at the end of `before`: (start, prefix, opening
+/// quote typed). The prefix is the trailing word (letters, digits, `_`),
+/// or the text after an opening identifier quote. `None` inside a string
+/// literal or a comment.
+fn current_token(before: &str) -> Option<(usize, String, Option<char>)> {
+    let end = before.len();
+    match lex(before).last() {
+        Some(t) if t.open && t.end == end && matches!(t.kind, T::Str | T::Comment) => None,
+        Some(t) if t.open && t.kind == T::Quoted => {
+            let q = before[t.start..].chars().next();
+            Some((t.start, before[t.start + 1..].to_string(), q))
+        }
+        Some(t) if t.end == end && matches!(t.kind, T::Word | T::Num) => {
+            let start = before[t.start..]
+                .char_indices()
+                .rev()
+                .take_while(|&(_, c)| c.is_alphanumeric() || c == '_')
+                .last()
+                .map_or(end, |(p, _)| t.start + p);
+            Some((start, before[start..].to_string(), None))
+        }
+        _ => Some((end, String::new(), None)),
+    }
 }
 
 /// Largest char boundary of `text` not after `cursor`.
@@ -884,13 +906,9 @@ pub fn complete(text: &str, cursor: usize, cx: &Context) -> Completions {
     let (s, e) = statement_at(text, cursor);
     let stmt_text = &text[s..e];
     let cur = cursor - s;
-    if lex(stmt_text)
-        .iter()
-        .any(|t| matches!(t.kind, T::Str | T::Comment) && t.holds(cur))
-    {
+    let Some((tstart, prefix, typed)) = current_token(&stmt_text[..cur]) else {
         return Completions::default();
-    }
-    let (tstart, prefix, typed) = extract_token(&stmt_text[..cur]);
+    };
     // An identifier whose opening quote is typed would swallow the rest of
     // the statement: analyse the text without it (same byte offsets).
     let blanked;
@@ -985,13 +1003,9 @@ pub fn complete_for_table(
     cx: &Context,
 ) -> Completions {
     let cur = floor_boundary(fragment, cursor);
-    if lex(fragment)
-        .iter()
-        .any(|t| matches!(t.kind, T::Str | T::Comment) && t.holds(cur))
-    {
+    let Some((_, prefix, typed)) = current_token(&fragment[..cur]) else {
         return Completions::default();
-    }
-    let (_, prefix, typed) = extract_token(&fragment[..cur]);
+    };
     let mut b = Builder {
         cx,
         prefix,
@@ -1690,5 +1704,52 @@ mod tests {
         assert_eq!(scope(sql), vec![t(None, "c", None)]);
         let sql = "SELECT * FROM (SELECT id FROM users UNION SELECT | FROM orders) x";
         assert_eq!(scope(sql), vec![t(None, "orders", None)]);
+    }
+
+    #[test]
+    fn quote_chars_in_strings_and_comments_are_ignored() {
+        for sql in [
+            r#"SELECT * FROM users WHERE name = 'a"b' AND |"#,
+            "SELECT * FROM users WHERE name = '[' AND |",
+            "SELECT * FROM users WHERE name = '`' AND |",
+            "-- the \"x
+ SELECT * FROM users WHERE |",
+            "/* [x */ SELECT * FROM users WHERE |",
+        ] {
+            let c = run(sql);
+            assert_eq!(labels(&c, Kind::Column), ["id", "email", "name"], "{sql}");
+            assert!(!labels(&c, Kind::Keyword).is_empty(), "{sql}");
+            assert_eq!(c.items[0].insert, "id", "{sql}");
+        }
+        let c = bar(r#"name = 'O"Brien' AND |"#, BarMode::Where, &tref("users"));
+        assert_eq!(labels(&c, Kind::Column), ["id", "email", "name"]);
+        assert_eq!(c.items[0].insert, "id");
+        let c = bar(r#"name = 'O"Brien' AND e|"#, BarMode::Where, &tref("users"));
+        assert_eq!(labels(&c, Kind::Column), ["email"]);
+    }
+
+    #[test]
+    fn current_token_rules() {
+        assert_eq!(current_token("SELECT em"), Some((7, "em".into(), None)));
+        assert_eq!(
+            current_token("SELECT \"em"),
+            Some((7, "em".into(), Some('"')))
+        );
+        assert_eq!(
+            current_token("SELECT [em"),
+            Some((7, "em".into(), Some('[')))
+        );
+        assert_eq!(
+            current_token("SELECT \"em\""),
+            Some((11, String::new(), None))
+        );
+        assert_eq!(current_token("SELECT u."), Some((9, String::new(), None)));
+        assert_eq!(current_token("SELECT 'a"), None);
+        assert_eq!(current_token("SELECT -- a"), None);
+        assert_eq!(
+            current_token("SELECT 'a' "),
+            Some((11, String::new(), None))
+        );
+        assert_eq!(current_token("x = é"), Some((4, "é".into(), None)));
     }
 }

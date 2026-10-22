@@ -363,8 +363,9 @@ async fn declared<'a>(
 
 /// Get the foreign keys of a table (`PRAGMA foreign_key_list`, one row per
 /// column, grouped by `id`). SQLite does not expose constraint names, so
-/// `name` is empty. The referenced table and the column names are spelled
-/// as declared; implicit referenced columns are the primary key.
+/// `name` is empty. The referenced table is qualified with the schema
+/// (`main` when the name is not qualified) and, like the column names,
+/// spelled as declared; implicit referenced columns are the primary key.
 pub async fn get_foreign_keys(pool: &SqlitePool, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
     let (schema, table) = split_qualified(table_name);
     let schema = schema.unwrap_or_else(|| "main".to_string());
@@ -396,7 +397,7 @@ pub async fn get_foreign_keys(pool: &SqlitePool, table_name: &str) -> Result<Vec
         out.push(ForeignKeyInfo {
             name: String::new(),
             columns: pairs.iter().map(|(from, _)| own.column(from)).collect(),
-            ref_table: target.table_name(&ref_table),
+            ref_table: format!("{schema}.{}", target.table_name(&ref_table)),
             ref_columns: pairs
                 .iter()
                 .enumerate()
@@ -720,7 +721,7 @@ mod tests {
         let fks = get_foreign_keys(&pool, weird).await.unwrap();
         assert_eq!(fks.len(), 1);
         assert_eq!(fks[0].columns, ["b", "a"]);
-        assert_eq!(fks[0].ref_table, "p");
+        assert_eq!(fks[0].ref_table, "main.p");
         let indexes = get_indexes(&pool, weird).await.unwrap();
         assert_eq!(indexes[0].columns, ["a"]);
 

@@ -147,20 +147,13 @@ pub async fn table_ddl(
             }
         }
         DatabaseType::Postgres | DatabaseType::SQLServer | DatabaseType::Azure => {
-            let mut details = table_details(conn, cache, table).await?;
+            // Referenced tables come qualified (`get_foreign_keys`), so the
+            // DDL does not depend on the search path.
+            let details = table_details(conn, cache, table).await?;
             if details.columns.is_empty() {
                 bail!("table {table} not found");
             }
             let quotes = quote_chars(db);
-            // A referenced table without schema lives in the table's schema:
-            // qualify it so the DDL does not depend on the search path.
-            if let (Some(schema), _) = split_qualified(table) {
-                for fk in &mut details.foreign_keys {
-                    if let (None, ref_table) = split_qualified(&fk.ref_table) {
-                        fk.ref_table = qualified(&schema, &ref_table, quotes);
-                    }
-                }
-            }
             Ok(generate_ddl(&quote_table(table, quotes), &details, quotes))
         }
     }
@@ -334,7 +327,7 @@ mod tests {
             .iter()
             .any(|i| i.name == "b_label" && i.columns == ["label"] && !i.unique));
         assert_eq!(d.foreign_keys.len(), 1);
-        assert_eq!(d.foreign_keys[0].ref_table, "a");
+        assert_eq!(d.foreign_keys[0].ref_table, "main.a");
         assert_eq!(d.foreign_keys[0].columns, ["a_id"]);
         let da = table_details(&conn, &cache, "a").await.unwrap();
         assert!(da.indexes.iter().any(|i| i.unique && i.columns == ["code"]));
@@ -421,9 +414,9 @@ mod tests {
                 )
             })
             .collect();
-        assert!(got.contains(&("p", v(&["pa"]), v(&["a"]))), "{got:?}");
+        assert!(got.contains(&("main.p", v(&["pa"]), v(&["a"]))), "{got:?}");
         assert!(
-            got.contains(&("p", v(&["x", "y"]), v(&["b", "a"]))),
+            got.contains(&("main.p", v(&["x", "y"]), v(&["b", "a"]))),
             "{got:?}"
         );
         let incoming = conn.get_incoming_foreign_keys("p").await.unwrap();
@@ -538,6 +531,32 @@ mod tests {
         );
         assert!(ddl.contains("CREATE INDEX \"ix_a\" ON \"b\" (\"a_id\");"));
         assert!(!ddl.contains("--"), "{ddl}");
+    }
+
+    /// `get_foreign_keys` qualifies referenced tables (`schema.table`, a
+    /// non-default Postgres schema included): the DDL quotes each part.
+    #[test]
+    fn generate_ddl_quotes_qualified_referenced_tables() {
+        use crate::engine::models::{Column, ForeignKeyInfo};
+        let d = TableDetails {
+            columns: vec![Column {
+                name: "a_id".into(),
+                type_name: "integer".into(),
+                nullable: true,
+                is_primary_key: false,
+            }],
+            foreign_keys: vec![ForeignKeyInfo {
+                name: "fk_a".into(),
+                columns: vec!["a_id".into()],
+                ref_table: "sales.A".into(),
+                ref_columns: vec!["id".into()],
+            }],
+            ..TableDetails::default()
+        };
+        let ddl = generate_ddl("\"sales\".\"b\"", &d, ('"', '"'));
+        assert!(ddl.contains("REFERENCES \"sales\".\"A\" (\"id\")"), "{ddl}");
+        let ddl = generate_ddl("[dbo].[b]", &d, ('[', ']'));
+        assert!(ddl.contains("REFERENCES [sales].[A] ([id])"), "{ddl}");
     }
 
     #[test]

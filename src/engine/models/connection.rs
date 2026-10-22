@@ -316,6 +316,7 @@ pub struct ForeignKeyInfo {
     pub name: String,
     /// Referencing columns of this table, in key order.
     pub columns: Vec<String>,
+    /// Referenced table, always qualified like `get_tables` (`schema.table`).
     pub ref_table: String,
     /// Referenced columns of `ref_table`, matching `columns` one to one.
     pub ref_columns: Vec<String>,

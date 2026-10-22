@@ -52,7 +52,8 @@ fn key_values(
 }
 
 /// For an outgoing FK and the current row (column name → value): the
-/// referenced table (`fk.ref_table`, as given) and the condition selecting
+/// referenced table (`fk.ref_table`, qualified `schema.table` as every
+/// engine's `get_foreign_keys` gives it) and the condition selecting
 /// the referenced row. `None` when a referencing value is NULL (no linked
 /// row) or missing from the row, or a column name is empty.
 pub fn follow(

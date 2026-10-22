@@ -253,7 +253,8 @@ async fn exercise(conn: &DatabaseConnection, d: &Dialect) {
     assert_eq!(fks[0].name, "child_parent_fk");
     assert_eq!(fks[0].columns, ["cb", "ca"], "FK columns in key order");
     assert_eq!(fks[0].ref_columns, ["a", "b"]);
-    assert_eq!(fks[0].ref_table, "parent");
+    // Qualified even in the table's own schema.
+    assert_eq!(fks[0].ref_table, format!("{}.parent", d.schema));
 
     let details = table_details(conn, &TableCache::default(), &child)
         .await
@@ -1296,7 +1297,11 @@ async fn check_incoming_fks(conn: &DatabaseConnection, db: DatabaseType, setup: 
         _ => None,
     };
     let outgoing = conn.get_foreign_keys(&q("su_it_fk1.child")).await.unwrap();
-    assert_eq!(outgoing.len(), 2);
+    let mut targets: Vec<_> = outgoing.iter().map(|k| k.ref_table.as_str()).collect();
+    targets.sort();
+    assert_eq!(targets, ["su_it_fk1.parent", "su_it_fk1.single"]);
+    let other = conn.get_foreign_keys(&q("su_it_fk2.other")).await.unwrap();
+    assert_eq!(other[0].ref_table, "su_it_fk1.single");
     for fk in &outgoing {
         let (table, condition) = follow(fk, &child_row, &db).unwrap();
         assert_eq!(count(table, condition).await, "1", "{fk:?}");

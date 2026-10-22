@@ -646,13 +646,13 @@ pub async fn get_indexes(client: &SqlServerClient, table_name: &str) -> Result<V
 }
 
 /// Get the foreign keys of a table from `sys.foreign_keys`. The referenced
-/// table is qualified with its schema when it lives in another one.
+/// table is always qualified with its schema (`schema.table`).
 pub async fn get_foreign_keys(
     client: &SqlServerClient,
     table_name: &str,
 ) -> Result<Vec<ForeignKeyInfo>> {
     let (schema, table) = split_table(table_name);
-    let query = "SELECT fk.name, pc.name, rs.name, rt.name, rc.name, s.name
+    let query = "SELECT fk.name, pc.name, rs.name, rt.name, rc.name
          FROM sys.foreign_keys fk
          JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
          JOIN sys.tables t ON t.object_id = fk.parent_object_id
@@ -676,16 +676,10 @@ pub async fn get_foreign_keys(
         let ref_schema: &str = row.try_get(2)?.unwrap_or("");
         let ref_table: &str = row.try_get(3)?.unwrap_or("");
         let ref_column: &str = row.try_get(4)?.unwrap_or("");
-        let own_schema: &str = row.try_get(5)?.unwrap_or("");
-        let ref_table = if ref_schema.eq_ignore_ascii_case(own_schema) {
-            ref_table.to_string()
-        } else {
-            format!("{ref_schema}.{ref_table}")
-        };
         out.push((
             name.to_string(),
             column.to_string(),
-            ref_table,
+            format!("{ref_schema}.{ref_table}"),
             ref_column.to_string(),
         ));
     }

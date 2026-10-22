@@ -328,13 +328,13 @@ pub async fn get_indexes(pool: &MySqlPool, table_name: &str) -> Result<Vec<Index
 
 /// Get the foreign keys of a table from `information_schema.KEY_COLUMN_USAGE`
 /// (current database when the name is not qualified). The referenced table
-/// is qualified with its schema when it lives in another one.
+/// is always qualified with its schema (`schema.table`).
 pub async fn get_foreign_keys(pool: &MySqlPool, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
     let (schema, table) = split_table(table_name);
 
-    let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
         "SELECT CAST(CONSTRAINT_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR),
-                CAST(TABLE_SCHEMA AS CHAR), CAST(REFERENCED_TABLE_SCHEMA AS CHAR),
+                CAST(REFERENCED_TABLE_SCHEMA AS CHAR),
                 CAST(REFERENCED_TABLE_NAME AS CHAR), CAST(REFERENCED_COLUMN_NAME AS CHAR)
          FROM information_schema.KEY_COLUMN_USAGE
          WHERE TABLE_SCHEMA = COALESCE(NULLIF(?, ''), DATABASE()) AND TABLE_NAME = ?
@@ -347,13 +347,13 @@ pub async fn get_foreign_keys(pool: &MySqlPool, table_name: &str) -> Result<Vec<
     .await?;
 
     Ok(group_foreign_keys(rows.into_iter().map(
-        |(name, column, own_schema, ref_schema, ref_table, ref_column)| {
-            let ref_table = if ref_schema == own_schema {
-                ref_table
-            } else {
-                format!("{ref_schema}.{ref_table}")
-            };
-            (name, column, ref_table, ref_column)
+        |(name, column, ref_schema, ref_table, ref_column)| {
+            (
+                name,
+                column,
+                format!("{ref_schema}.{ref_table}"),
+                ref_column,
+            )
         },
     )))
 }

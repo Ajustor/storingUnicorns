@@ -368,7 +368,7 @@ pub async fn get_indexes(pool: &PgPool, table_name: &str) -> Result<Vec<IndexInf
 
 /// Get the foreign keys of a table from `pg_constraint` (`conkey`/`confkey`
 /// keep the column pairing of multi-column keys). The referenced table is
-/// qualified with its schema when it lives in another schema.
+/// always qualified with its schema (`schema.table`).
 pub async fn get_foreign_keys(pool: &PgPool, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
     let (schema, table) = split_table(table_name);
 
@@ -380,8 +380,7 @@ pub async fn get_foreign_keys(pool: &PgPool, table_name: &str) -> Result<Vec<For
                     JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
                     ORDER BY k.ord
                 ),
-                CASE WHEN rn.nspname = n.nspname THEN rt.relname::text
-                     ELSE rn.nspname::text || '.' || rt.relname::text END,
+                rn.nspname::text || '.' || rt.relname::text,
                 ARRAY(
                     SELECT a.attname::text
                     FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)

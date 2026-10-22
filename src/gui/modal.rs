@@ -186,6 +186,7 @@ pub fn show<T: Clone>(
     let screen = ui.ctx().screen_rect();
     ui.set_width(spec.size.width(screen.width()));
     let popup_before = ui.memory(|m| m.any_popup_open());
+    let fresh = first_frame(ui, spec.title);
     let mut answer = ModalResponse::None;
 
     ui.horizontal(|ui| {
@@ -210,12 +211,15 @@ pub fn show<T: Clone>(
         let line = s.interact_size.y + s.item_spacing.y;
         let header = ui.min_rect().height() + s.item_spacing.y;
         let separator = 6.0 + s.item_spacing.y;
-        let message = if message.is_some() { line + 4.0 } else { 0.0 };
+        let message = message.map_or(0.0, |(_, text)| {
+            message_height(ui, text) + 4.0 + s.item_spacing.y
+        });
         header + separator + line + message + s.menu_margin.sum().y
     };
     egui::ScrollArea::vertical()
         .id_salt("modal-body")
         .max_height(body_max_height(screen.height(), chrome))
+        .min_scrolled_height(body_max_height(screen.height(), chrome))
         .auto_shrink([false, true])
         .show(ui, body);
     if let Some((kind, text)) = message {
@@ -226,7 +230,14 @@ pub fn show<T: Clone>(
             MessageKind::Success => text.color(SUCCESS),
             MessageKind::Info => text.weak(),
         };
-        ui.label(text);
+        // At most a few lines: a longer message scrolls.
+        egui::ScrollArea::vertical()
+            .id_salt("modal-message")
+            .max_height(message_max_height(ui))
+            // egui's default (64) would be taller than three lines.
+            .min_scrolled_height(message_max_height(ui))
+            .auto_shrink([false, true])
+            .show(ui, |ui| ui.label(text));
     }
     ui.separator();
     // One row exactly: a bare right-to-left layout would take (and centre
@@ -260,6 +271,7 @@ pub fn show<T: Clone>(
             i.key_pressed(Key::Enter) && i.modifiers.is_none(),
         )
     });
+    release_focus_behind(ui);
     let (focused, popup_after) = ui.memory(|m| (m.focused().is_some(), m.any_popup_open()));
     let popup_open = popup_before || popup_after;
     match key_outcome(
@@ -268,6 +280,7 @@ pub fn show<T: Clone>(
             enter,
             popup_open,
             focused,
+            fresh,
         },
         enter_target(buttons),
     ) {
@@ -281,6 +294,51 @@ pub fn show<T: Clone>(
             ModalResponse::Button(buttons[i].action.clone())
         }
     }
+}
+
+/// Whether this is the first frame the modal titled `title` is drawn:
+/// it was not drawn on the previous pass.
+fn first_frame(ui: &egui::Ui, title: &str) -> bool {
+    let id = egui::Id::new(ui.layer_id()).with("modal-pass").with(title);
+    let pass = ui.ctx().cumulative_pass_nr();
+    let last: Option<u64> = ui.data_mut(|d| {
+        let last = d.get_temp(id);
+        d.insert_temp(id, pass);
+        last
+    });
+    !matches!(last, Some(p) if p + 1 >= pass)
+}
+
+/// A widget behind the modal (a console, a grid cell) keeps the keyboard
+/// focus in egui: it would get the keys meant for the modal, and Enter
+/// would not reach the footer. Take it away (not while a popup, which has
+/// its own layer, is open).
+fn release_focus_behind(ui: &egui::Ui) {
+    let ctx = ui.ctx();
+    let Some(id) = ctx.memory(|m| m.focused()) else {
+        return;
+    };
+    let layer = ctx.read_response(id).map(|r| r.layer_id);
+    if layer != Some(ui.layer_id()) {
+        ctx.memory_mut(|m| m.surrender_focus(id));
+    }
+}
+
+/// Highest the message line grows (three lines) before it scrolls.
+fn message_max_height(ui: &egui::Ui) -> f32 {
+    3.0 * ui.text_style_height(&egui::TextStyle::Body)
+}
+
+/// Height of the message `text` wrapped to the modal's width, at most
+/// [`message_max_height`].
+fn message_height(ui: &egui::Ui, text: &str) -> f32 {
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Wrap),
+        ui.available_width(),
+        egui::TextStyle::Body,
+    );
+    galley.size().y.min(message_max_height(ui))
 }
 
 /// Standard confirmation (small): `text`, then `items` as a bullet list,
@@ -371,6 +429,9 @@ struct Keys {
     /// button): Enter is its own. A single-line text edit gives the focus
     /// up on Enter, so Enter there submits the modal.
     focused: bool,
+    /// First frame of the modal: an Enter now is the one that opened it
+    /// (e.g. in a field behind it), not an answer.
+    fresh: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,7 +449,7 @@ fn key_outcome(keys: Keys, primary: Option<usize>) -> KeyOutcome {
         return KeyOutcome::Cancel;
     }
     match primary {
-        Some(i) if keys.enter && !keys.focused => KeyOutcome::Button(i),
+        Some(i) if keys.enter && !keys.focused && !keys.fresh => KeyOutcome::Button(i),
         _ => KeyOutcome::None,
     }
 }
@@ -420,7 +481,13 @@ mod tests {
 
     #[test]
     fn egui_a_tall_body_scrolls_and_the_footer_stays_in_a_small_window() {
-        for (w, h) in [(720.0, 480.0), (1280.0, 800.0)] {
+        let long = "Erreur : la connexion a échoué. ".repeat(40);
+        for (w, h, message) in [
+            (720.0, 480.0, "Erreur"),
+            (1280.0, 800.0, "Erreur"),
+            // A long message is capped (it scrolls): the footer stays in view.
+            (720.0, 480.0, long.as_str()),
+        ] {
             let ctx = egui::Context::default();
             let mut footer = None;
             for _ in 0..3 {
@@ -441,7 +508,7 @@ mod tests {
                                     ui.label(format!("ligne {i}"));
                                 }
                             },
-                            Some((MessageKind::Error, "Erreur")),
+                            Some((MessageKind::Error, message)),
                             &buttons(),
                         );
                     });
@@ -452,10 +519,106 @@ mod tests {
             assert!(
                 rect.top() >= WINDOW_MARGIN / 2.0 - 1.0
                     && rect.bottom() <= h - WINDOW_MARGIN / 2.0 + 1.0,
-                "{w}x{h}: the modal {rect:?} fits in the window"
+                "{w}x{h} ({} chars): the modal {rect:?} fits in the window",
+                message.len()
             );
             assert!(rect.height() > h * 0.6, "{w}x{h}: the body uses the room");
         }
+    }
+
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>, f: impl FnMut(&egui::Context)) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, f);
+    }
+
+    #[test]
+    fn egui_the_enter_that_opens_a_modal_does_not_press_its_button() {
+        let ctx = egui::Context::default();
+        let field = egui::Id::new("where");
+        let mut text = "id > 100".to_string();
+        let mut open = false;
+        let mut answers = vec![];
+        for events in [vec![], vec![key(Key::Enter)], vec![key(Key::Enter)]] {
+            frame(&ctx, events, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let r = ui.add(egui::TextEdit::singleline(&mut text).id(field));
+                    if !open && !r.lost_focus() {
+                        r.request_focus();
+                    }
+                    // Like a data tab: Enter in the field asks to confirm.
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        open = true;
+                    }
+                });
+                if open {
+                    let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
+                        show(
+                            ui,
+                            ModalSpec::new("T", ModalSize::Small),
+                            |_| {},
+                            None,
+                            &buttons(),
+                        )
+                    });
+                    answers.push(modal.inner);
+                }
+            });
+        }
+        assert_eq!(
+            answers,
+            vec![ModalResponse::None, ModalResponse::Button(2)],
+            "first frame ignored, then Enter submits"
+        );
+    }
+
+    #[test]
+    fn egui_a_modal_takes_the_focus_from_the_widgets_behind_it() {
+        let ctx = egui::Context::default();
+        let console = egui::Id::new("console");
+        let mut text = String::from("select 1");
+        let mut answers = vec![];
+        for (n, events) in [vec![], vec![], vec![key(Key::Enter)]]
+            .into_iter()
+            .enumerate()
+        {
+            frame(&ctx, events, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let r = ui.add(egui::TextEdit::multiline(&mut text).id(console));
+                    if n == 0 {
+                        r.request_focus();
+                    }
+                });
+                if n > 0 {
+                    let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
+                        show(
+                            ui,
+                            ModalSpec::new("T", ModalSize::Small),
+                            |_| {},
+                            None,
+                            &buttons(),
+                        )
+                    });
+                    answers.push(modal.inner);
+                }
+            });
+            if n == 1 {
+                assert_eq!(
+                    ctx.memory(|m| m.focused()),
+                    None,
+                    "the console lost the focus"
+                );
+            }
+        }
+        assert_eq!(text, "select 1", "Enter did not leak to the console");
+        assert_eq!(answers, vec![ModalResponse::None, ModalResponse::Button(2)]);
     }
 
     #[test]
@@ -522,7 +685,19 @@ mod tests {
             enter,
             popup_open,
             focused,
+            fresh: false,
         };
+        // The frame a modal appears, the Enter that opened it is not for it.
+        let fresh = Keys {
+            fresh: true,
+            ..k(false, true, false, false)
+        };
+        assert_eq!(key_outcome(fresh, Some(0)), KeyOutcome::None);
+        let fresh_escape = Keys {
+            fresh: true,
+            ..k(true, false, false, false)
+        };
+        assert_eq!(key_outcome(fresh_escape, Some(0)), KeyOutcome::Cancel);
         assert_eq!(
             key_outcome(k(false, false, false, false), Some(0)),
             KeyOutcome::None

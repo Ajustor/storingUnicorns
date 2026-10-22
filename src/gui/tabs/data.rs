@@ -558,7 +558,12 @@ impl DataTab {
                     .hint_text(hint)
                     .layouter(&mut layouter)
                     .show(ui);
-                apply |= out.response.lost_focus() && ui.input(|inp| inp.key_pressed(Key::Enter));
+                // Consumed: the confirmation it may open must not see it.
+                apply |= out.response.lost_focus()
+                    && ui.input_mut(|inp| {
+                        let modifiers = inp.modifiers;
+                        inp.consume_key(modifiers, Key::Enter)
+                    });
                 let scope = Scope::Table {
                     table: &table,
                     mode,
@@ -847,6 +852,9 @@ mod tests {
                     source,
                 };
                 action = t.filter_bar(ui, &cx);
+                // Whether Enter is still there for what comes next (a dialog).
+                let left = ui.input(|i| i.key_pressed(Key::Enter));
+                ui.data_mut(|d| d.insert_temp(egui::Id::new("enter_left"), left));
             });
         });
         action
@@ -910,6 +918,12 @@ mod tests {
             Some(DataAction::Load { count: true })
         );
         assert_eq!(t.query.filter, "name = 'x'");
+        // The Enter is consumed: a confirmation opened by the apply (pending
+        // edits) does not take it as its answer.
+        assert_eq!(
+            ctx.data(|d| d.get_temp::<bool>(egui::Id::new("enter_left"))),
+            Some(false)
+        );
     }
 
     #[test]

@@ -243,6 +243,20 @@ impl DataTab {
         self.result.as_ref()?.rows.get(i).cloned()
     }
 
+    /// Cell `c` of saved row `r` as the database holds it, without copying
+    /// the row (drawn every frame).
+    pub fn saved_value(&self, r: RowRef, c: usize) -> Option<&str> {
+        let RowRef::Base(i) = r else {
+            return None;
+        };
+        self.result
+            .as_ref()?
+            .rows
+            .get(i)?
+            .get(c)
+            .map(String::as_str)
+    }
+
     /// The displayed table, for completion.
     fn table_ref(&self) -> TableRef {
         let (schema, name) = split_qualified(&self.table);
@@ -677,6 +691,9 @@ mod tests {
         );
         assert_eq!(t.saved_values(RowRef::Base(5)), None);
         assert_eq!(t.saved_values(RowRef::New(0)), None, "not saved yet");
+        assert_eq!(t.saved_value(RowRef::Base(1), 0), Some("1"));
+        assert_eq!(t.saved_value(RowRef::Base(1), 9), None);
+        assert_eq!(t.saved_value(RowRef::New(0), 0), None);
     }
 
     #[test]

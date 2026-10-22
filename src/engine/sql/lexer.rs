@@ -361,6 +361,16 @@ pub fn tokenize_spans(query: &str, known_columns: &[String]) -> Vec<(TokenKind, 
     tokens
 }
 
+/// The SQL keywords (upper case), in suggestion order.
+pub(crate) fn keywords() -> &'static [&'static str] {
+    SQL_KEYWORDS
+}
+
+/// Whether `word` is an SQL keyword, ignoring case.
+pub(crate) fn is_keyword(word: &str) -> bool {
+    word_sets().0.contains(word.to_uppercase().as_str())
+}
+
 /// Find the last whole-word occurrence of `kw` (uppercase) in `text` (uppercase).
 /// Returns the byte position just after the keyword, or None.
 fn last_keyword_pos(text: &str, kw: &str) -> Option<usize> {

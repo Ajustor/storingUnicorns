@@ -63,6 +63,12 @@ impl ColumnStore {
         self.loaded.insert(table.to_string(), columns);
     }
 
+    /// Whether a load is still running.
+    #[cfg(test)]
+    pub fn is_loading(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Forget everything (another connection, a schema changed).
     pub fn clear(&mut self) {
         for (_, task) in self.pending.drain(..) {
@@ -76,14 +82,23 @@ impl ColumnStore {
 /// Load the columns of `table` in the background, unless they are loaded,
 /// being loaded, failed before, or there is no connection.
 pub fn request(state: &mut AppState, table: &TableRef) {
-    // Cited without its schema: the one of the known table of that name.
+    // Spelled as the known table (`FROM USERS` loads `public.users`), its
+    // schema filled in when cited without one.
     let mut table = table.clone();
-    if table.schema.is_none() {
-        table.schema = state
-            .schemas
+    let known = state.schemas.iter().find_map(|s| {
+        let schema_ok = table
+            .schema
+            .as_ref()
+            .is_none_or(|want| want.eq_ignore_ascii_case(&s.name));
+        let name = s
+            .tables
             .iter()
-            .find(|s| s.tables.iter().any(|t| t.eq_ignore_ascii_case(&table.name)))
-            .map(|s| s.name.clone());
+            .find(|t| t.eq_ignore_ascii_case(&table.name))?;
+        schema_ok.then(|| (s.name.clone(), name.clone()))
+    });
+    if let Some((schema, name)) = known {
+        table.schema = Some(schema);
+        table.name = name;
     }
     let table = &table;
     let k = key(table);
@@ -284,6 +299,43 @@ mod tests {
             "{items:?}"
         );
         assert!(state.show_completion);
+    }
+
+    #[test]
+    fn unquoted_names_match_whatever_their_case() {
+        let mut state = editor("SELECT | FROM USERS");
+        state.completion_columns.insert("main.users", users());
+        state.update_completions();
+        let items = shown(&state);
+        assert!(items.iter().any(|(l, _)| l == "email"), "{items:?}");
+
+        let mut state = editor("SELECT | FROM MAIN.USERS");
+        state.completion_columns.insert("main.users", users());
+        state.update_completions();
+        let items = shown(&state);
+        assert!(items.iter().any(|(l, _)| l == "email"), "{items:?}");
+    }
+
+    #[tokio::test]
+    async fn a_table_cited_in_another_case_loads_under_its_known_name() {
+        let mut state = editor("SELECT | FROM USERS");
+        state.connection = Some(Arc::new(
+            sqlite_mem(&["CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)"]).await,
+        ));
+        state.update_completions();
+        let pending: Vec<&str> = state
+            .completion_columns
+            .pending
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(pending, ["main.users"]);
+        settle(&mut state).await;
+        let items = shown(&state);
+        assert!(
+            items.contains(&("email".into(), "TEXT".into())),
+            "{items:?}"
+        );
     }
 
     #[tokio::test]

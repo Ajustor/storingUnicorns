@@ -2,7 +2,9 @@ use anyhow::{bail, Result};
 
 use crate::engine::db::utils::split_qualified;
 use crate::engine::db::DatabaseConnection;
-use crate::engine::models::{Column, DatabaseType, TableDetails};
+use crate::engine::models::{
+    Column, DatabaseType, ForeignKeyInfo, IncomingForeignKey, IndexInfo, TableDetails,
+};
 use crate::engine::ops::transfer::qualified;
 use crate::engine::services::{
     table_cache::TableCache, ColumnDefinition, SchemaModification, SchemaService,
@@ -52,8 +54,8 @@ fn degrade<T>(r: Result<Vec<T>>) -> (Vec<T>, Option<String>) {
     }
 }
 
-/// Columns (through `cache`), indexes and foreign keys of `table`, fetched
-/// concurrently. Only the columns are required: servers that lack part of
+/// Columns (through `cache`), indexes, foreign keys and incoming foreign
+/// keys of `table`, fetched concurrently. Only the columns are required: servers that lack part of
 /// the catalog (CockroachDB, Redshift…) get empty index / key lists with
 /// the reason.
 pub async fn table_details(
@@ -61,19 +63,34 @@ pub async fn table_details(
     cache: &TableCache,
     table: &str,
 ) -> Result<TableDetails> {
-    let (columns, indexes, foreign_keys) = tokio::join!(
+    let (columns, indexes, foreign_keys, incoming) = tokio::join!(
         cached_columns(conn, cache, table),
         conn.get_indexes(table),
         conn.get_foreign_keys(table),
+        conn.get_incoming_foreign_keys(table),
     );
+    assemble_details(columns, indexes, foreign_keys, incoming)
+}
+
+/// `TableDetails` from the fetched parts: the columns are required, the
+/// other lists are degraded (empty + error text).
+fn assemble_details(
+    columns: Result<Vec<Column>>,
+    indexes: Result<Vec<IndexInfo>>,
+    foreign_keys: Result<Vec<ForeignKeyInfo>>,
+    incoming: Result<Vec<IncomingForeignKey>>,
+) -> Result<TableDetails> {
     let (indexes, indexes_error) = degrade(indexes);
     let (foreign_keys, foreign_keys_error) = degrade(foreign_keys);
+    let (incoming, incoming_error) = degrade(incoming);
     Ok(TableDetails {
         columns: columns?,
         indexes,
         foreign_keys,
         indexes_error,
         foreign_keys_error,
+        incoming,
+        incoming_error,
     })
 }
 
@@ -321,6 +338,99 @@ mod tests {
         assert_eq!(d.foreign_keys[0].columns, ["a_id"]);
         let da = table_details(&conn, &cache, "a").await.unwrap();
         assert!(da.indexes.iter().any(|i| i.unique && i.columns == ["code"]));
+    }
+
+    #[tokio::test]
+    async fn table_details_lists_incoming_foreign_keys() {
+        let conn = sqlite_mem(&[
+            "CREATE TABLE p (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b))",
+            "CREATE TABLE c1 (id INTEGER PRIMARY KEY, pa INTEGER, pb INTEGER, \
+             FOREIGN KEY (pb, pa) REFERENCES p (b, a))",
+            // Implicit referenced columns: the primary key, in its order.
+            "CREATE TABLE c2 (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, \
+             FOREIGN KEY (x, y) REFERENCES P)",
+            "CREATE TABLE s (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c3 (id INTEGER PRIMARY KEY, s1 INTEGER REFERENCES s(id), \
+             s2 INTEGER REFERENCES s(id), pa INTEGER, pb INTEGER, \
+             FOREIGN KEY (pa, pb) REFERENCES p (a, b))",
+            "ATTACH DATABASE ':memory:' AS aux",
+            "CREATE TABLE aux.s (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE aux.k (id INTEGER PRIMARY KEY, sid INTEGER REFERENCES s(id))",
+        ])
+        .await;
+        let cache = TableCache::default();
+        let d = table_details(&conn, &cache, "p").await.unwrap();
+        assert_eq!(d.incoming_error, None);
+        let got: Vec<_> = d
+            .incoming
+            .iter()
+            .map(|k| (k.table.as_str(), k.columns.clone(), k.ref_columns.clone()))
+            .collect();
+        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            [
+                ("main.c1", v(&["pb", "pa"]), v(&["b", "a"])),
+                ("main.c2", v(&["x", "y"]), v(&["a", "b"])),
+                ("main.c3", v(&["pa", "pb"]), v(&["a", "b"])),
+            ]
+        );
+        // Two keys of the same table to the same target stay separate.
+        let s = conn.get_incoming_foreign_keys("s").await.unwrap();
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert!(s
+            .iter()
+            .all(|k| k.table == "main.c3" && k.ref_columns == ["id"]));
+        // An attached schema lists its own tables, qualified with it.
+        let aux = conn
+            .get_incoming_foreign_keys("\"aux\".\"s\"")
+            .await
+            .unwrap();
+        assert_eq!(aux.len(), 1);
+        assert_eq!(aux[0].table, "aux.k");
+        assert_eq!(aux[0].columns, ["sid"]);
+        assert!(conn
+            .get_incoming_foreign_keys("c1")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn details_degrade_incoming_foreign_keys() {
+        let d = assemble_details(
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![]),
+            Err(anyhow::anyhow!("no pg_constraint")),
+        )
+        .unwrap();
+        assert!(d.incoming.is_empty());
+        assert_eq!(d.incoming_error.as_deref(), Some("no pg_constraint"));
+        assert_eq!(d.foreign_keys_error, None);
+        let d = assemble_details(
+            Ok(vec![]),
+            Err(anyhow::anyhow!("i")),
+            Err(anyhow::anyhow!("f")),
+            Ok(vec![IncomingForeignKey {
+                name: "fk".into(),
+                table: "s.t".into(),
+                columns: vec!["x".into()],
+                ref_columns: vec!["id".into()],
+            }]),
+        )
+        .unwrap();
+        assert_eq!(d.incoming.len(), 1);
+        assert_eq!(d.incoming_error, None);
+        assert_eq!(d.indexes_error.as_deref(), Some("i"));
+        // The columns stay required.
+        assert!(assemble_details(
+            Err(anyhow::anyhow!("c")),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(vec![])
+        )
+        .is_err());
     }
 
     #[test]

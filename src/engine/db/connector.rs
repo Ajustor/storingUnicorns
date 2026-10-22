@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::engine::models::{
-    ConnectionConfig, DatabaseType, DbAuthMethod, ForeignKeyInfo, IndexInfo, QueryResult,
-    SchemaInfo,
+    ConnectionConfig, DatabaseType, DbAuthMethod, ForeignKeyInfo, IncomingForeignKey, IndexInfo,
+    QueryResult, SchemaInfo,
 };
 
 pub use super::sqlserver::SqlServerClient;
@@ -383,6 +383,28 @@ impl DatabaseConnection {
             }
             DatabaseConnection::Azure(client) => {
                 sqlserver::get_foreign_keys(client, table_name).await
+            }
+        }
+    }
+
+    /// Foreign keys of other tables pointing at a table (referencing tables
+    /// qualified as `schema.table`).
+    pub async fn get_incoming_foreign_keys(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<IncomingForeignKey>> {
+        match self {
+            DatabaseConnection::Postgres(pool) => {
+                postgres::get_incoming_foreign_keys(pool, table_name).await
+            }
+            DatabaseConnection::MySQL(pool) => {
+                mysql::get_incoming_foreign_keys(pool, table_name).await
+            }
+            DatabaseConnection::SQLite(pool) => {
+                sqlite::get_incoming_foreign_keys(pool, table_name).await
+            }
+            DatabaseConnection::SQLServer(client) | DatabaseConnection::Azure(client) => {
+                sqlserver::get_incoming_foreign_keys(client, table_name).await
             }
         }
     }

@@ -6,7 +6,9 @@ use sqlx::{Database, Either, Executor, IntoArguments};
 
 #[cfg(test)]
 use crate::engine::models::NULL_CELL;
-use crate::engine::models::{is_null, Column, DatabaseType, ForeignKeyInfo, IndexInfo, SchemaInfo};
+use crate::engine::models::{
+    is_null, Column, DatabaseType, ForeignKeyInfo, IncomingForeignKey, IndexInfo, SchemaInfo,
+};
 use crate::engine::sql::statements::{quote_chars, quote_ident, split_statements};
 
 /// Execute `query` exactly once and collect both its rows and its
@@ -346,6 +348,30 @@ pub fn group_foreign_keys(
     keys
 }
 
+/// Build incoming foreign keys from one row per column pair, `(constraint,
+/// referencing table, referencing column, referenced column)`, ordered so
+/// that the columns of a constraint are consecutive and in key order.
+pub fn group_incoming_foreign_keys(
+    rows: impl IntoIterator<Item = (String, String, String, String)>,
+) -> Vec<IncomingForeignKey> {
+    let mut keys: Vec<IncomingForeignKey> = Vec::new();
+    for (name, table, column, ref_column) in rows {
+        match keys.last_mut() {
+            Some(last) if last.name == name && last.table == table => {
+                last.columns.push(column);
+                last.ref_columns.push(ref_column);
+            }
+            _ => keys.push(IncomingForeignKey {
+                name,
+                table,
+                columns: vec![column],
+                ref_columns: vec![ref_column],
+            }),
+        }
+    }
+    keys
+}
+
 /// SQL literal for `value` in column `col`: `NULL` for `NULL_CELL`. For
 /// numeric types a number is left unquoted and an empty value is NULL;
 /// anything else (the text "NULL" and the empty string included) is a quoted
@@ -376,7 +402,7 @@ fn sql_literal(col: &Column, value: &str) -> String {
 }
 
 /// `"col" = <literal>`, or `"col" IS NULL` for a NULL value.
-fn where_part(col: &Column, value: &str, quote_start: char, quote_end: char) -> String {
+pub(crate) fn where_part(col: &Column, value: &str, quote_start: char, quote_end: char) -> String {
     let literal = sql_literal(col, value);
     let name = quote_ident(&col.name, (quote_start, quote_end));
     if literal == "NULL" {
@@ -605,6 +631,23 @@ mod tests {
         assert_eq!(fks[0].columns, ["x", "y"]);
         assert_eq!(fks[0].ref_columns, ["px", "py"]);
         assert_eq!(fks[1].ref_table, "q");
+    }
+
+    #[test]
+    fn groups_incoming_foreign_keys_by_table_and_constraint() {
+        let s = |v: &str| v.to_string();
+        let fks = group_incoming_foreign_keys([
+            (s("fk"), s("s.a"), s("x"), s("px")),
+            (s("fk"), s("s.a"), s("y"), s("py")),
+            // Same constraint name on another table (Postgres allows it).
+            (s("fk"), s("s.b"), s("z"), s("px")),
+        ]);
+        assert_eq!(fks.len(), 2);
+        assert_eq!(fks[0].table, "s.a");
+        assert_eq!(fks[0].columns, ["x", "y"]);
+        assert_eq!(fks[0].ref_columns, ["px", "py"]);
+        assert_eq!(fks[1].table, "s.b");
+        assert_eq!(fks[1].columns, ["z"]);
     }
 
     #[test]

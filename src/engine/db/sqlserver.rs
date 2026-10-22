@@ -8,15 +8,15 @@ use tokio::sync::{Mutex, MutexGuard};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::engine::models::{
-    Column, ConnectionConfig, DatabaseType, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
-    NULL_CELL,
+    Column, ConnectionConfig, DatabaseType, ForeignKeyInfo, IncomingForeignKey, IndexInfo,
+    QueryResult, SchemaInfo, NULL_CELL,
 };
 
 use crate::engine::sql::statements::split_statements;
 
 use super::utils::{
-    group_foreign_keys, group_indexes, group_tables_by_schema, is_dml, leading_keyword,
-    skip_leading_comments, split_qualified,
+    group_foreign_keys, group_incoming_foreign_keys, group_indexes, group_tables_by_schema, is_dml,
+    leading_keyword, skip_leading_comments, split_qualified,
 };
 
 /// A tiberius client over TCP.
@@ -690,6 +690,49 @@ pub async fn get_foreign_keys(
         ));
     }
     Ok(group_foreign_keys(out))
+}
+
+/// Get the foreign keys of other tables pointing at a table, from
+/// `sys.foreign_keys` + `sys.foreign_key_columns` (`referenced_object_id` =
+/// the table). The referencing table is always qualified with its schema
+/// (`schema.table`).
+pub async fn get_incoming_foreign_keys(
+    client: &SqlServerClient,
+    table_name: &str,
+) -> Result<Vec<IncomingForeignKey>> {
+    let (schema, table) = split_table(table_name);
+    let query = "SELECT fk.name, s.name, t.name, pc.name, rc.name
+         FROM sys.foreign_keys fk
+         JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+         JOIN sys.tables t ON t.object_id = fk.parent_object_id
+         JOIN sys.schemas s ON s.schema_id = t.schema_id
+         JOIN sys.columns pc
+              ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+         JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id
+         JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
+         JOIN sys.columns rc
+              ON rc.object_id = fkc.referenced_object_id
+             AND rc.column_id = fkc.referenced_column_id
+         WHERE rs.name = COALESCE(@P1, SCHEMA_NAME()) AND rt.name = @P2
+         ORDER BY s.name, t.name, fk.name, fkc.constraint_column_id";
+
+    let rows = query_rows(client, query, &schema, &table).await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: &str = row.try_get(0)?.unwrap_or("");
+        let own_schema: &str = row.try_get(1)?.unwrap_or("");
+        let own_table: &str = row.try_get(2)?.unwrap_or("");
+        let column: &str = row.try_get(3)?.unwrap_or("");
+        let ref_column: &str = row.try_get(4)?.unwrap_or("");
+        out.push((
+            name.to_string(),
+            format!("{own_schema}.{own_table}"),
+            column.to_string(),
+            ref_column.to_string(),
+        ));
+    }
+    Ok(group_incoming_foreign_keys(out))
 }
 
 /// Test the connection

@@ -3,7 +3,7 @@ use sqlx::pool::PoolOptions;
 use sqlx::{sqlite::SqliteRow, Column as SqlxColumn, Row, Sqlite, SqlitePool, TypeInfo, ValueRef};
 
 use crate::engine::models::{
-    Column, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo, NULL_CELL,
+    Column, ForeignKeyInfo, IncomingForeignKey, IndexInfo, QueryResult, SchemaInfo, NULL_CELL,
 };
 
 use super::utils::{fetch_rows_and_result, is_dml, split_qualified, TxConnection};
@@ -314,6 +314,80 @@ pub async fn get_foreign_keys(pool: &SqlitePool, table_name: &str) -> Result<Vec
     }
 
     Ok(keys.into_iter().map(|(_, fk)| fk).collect())
+}
+
+/// Get the foreign keys of other tables pointing at a table:
+/// `pragma_foreign_key_list` of every table of the same database (`main`
+/// when the name is not qualified), keeping those whose `table` is this one
+/// (case-insensitively, like SQLite). A key that leaves the referenced
+/// columns implicit points at the primary key. SQLite does not expose
+/// constraint names, so `name` is empty; tables are `schema.table`.
+pub async fn get_incoming_foreign_keys(
+    pool: &SqlitePool,
+    table_name: &str,
+) -> Result<Vec<IncomingForeignKey>> {
+    let (schema, table) = split_qualified(table_name);
+    let schema = schema.unwrap_or_else(|| "main".to_string());
+    let quoted_schema = format!("\"{}\"", schema.replace('"', "\"\""));
+    let schema_literal = schema.replace('\'', "''");
+    let rows: Vec<SqliteRow> = sqlx::query(&format!(
+        "SELECT m.name AS src, f.id AS id, f.\"from\" AS col, f.\"to\" AS ref_col
+         FROM {quoted_schema}.sqlite_master m
+         JOIN pragma_foreign_key_list(m.name, '{schema_literal}') f
+         WHERE m.type = 'table' AND f.\"table\" = ? COLLATE NOCASE
+         ORDER BY m.name, f.id, f.seq"
+    ))
+    .bind(&table)
+    .fetch_all(pool)
+    .await?;
+
+    let mut keys: Vec<(String, i64, IncomingForeignKey)> = Vec::new();
+    let mut primary_key: Option<Vec<String>> = None;
+    for row in rows {
+        let src: String = row.try_get("src")?;
+        let id: i64 = row.try_get("id")?;
+        let column: String = row.try_get("col")?;
+        // NULL `to`: the referenced table's primary key, left implicit.
+        let ref_column: Option<String> = row.try_get("ref_col")?;
+        if !matches!(keys.last(), Some((s, i, _)) if *s == src && *i == id) {
+            keys.push((
+                src.clone(),
+                id,
+                IncomingForeignKey {
+                    name: String::new(),
+                    table: format!("{schema}.{src}"),
+                    columns: Vec::new(),
+                    ref_columns: Vec::new(),
+                },
+            ));
+        }
+        let ref_column = match ref_column {
+            Some(c) => c,
+            None => {
+                if primary_key.is_none() {
+                    let mut pk: Vec<(i64, String)> = table_info(pool, table_name)
+                        .await?
+                        .into_iter()
+                        .filter(|(_, _, _, pos)| *pos > 0)
+                        .map(|(name, _, _, pos)| (pos, name))
+                        .collect();
+                    pk.sort();
+                    primary_key = Some(pk.into_iter().map(|(_, n)| n).collect());
+                }
+                let position = keys.last().map_or(0, |(_, _, fk)| fk.columns.len());
+                primary_key
+                    .as_ref()
+                    .and_then(|pk| pk.get(position).cloned())
+                    .unwrap_or_default()
+            }
+        };
+        if let Some((_, _, fk)) = keys.last_mut() {
+            fk.columns.push(column);
+            fk.ref_columns.push(ref_column);
+        }
+    }
+
+    Ok(keys.into_iter().map(|(_, _, fk)| fk).collect())
 }
 
 /// Test the connection

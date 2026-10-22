@@ -4,8 +4,8 @@ use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{postgres::PgRow, Column as SqlxColumn, PgPool, Postgres, Row, TypeInfo};
 
 use crate::engine::models::{
-    Column, ConnectionConfig, DbAuthMethod, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
-    SslMode, NULL_CELL,
+    Column, ConnectionConfig, DbAuthMethod, ForeignKeyInfo, IncomingForeignKey, IndexInfo,
+    QueryResult, SchemaInfo, SslMode, NULL_CELL,
 };
 
 use super::utils::{fetch_rows_and_result, group_tables_by_schema, split_qualified, TxConnection};
@@ -408,6 +408,55 @@ pub async fn get_foreign_keys(pool: &PgPool, table_name: &str) -> Result<Vec<For
             name,
             columns,
             ref_table,
+            ref_columns,
+        })
+        .collect())
+}
+
+/// Get the foreign keys of other tables pointing at a table, from
+/// `pg_constraint` (`confrelid` = the table). The referencing table is
+/// always qualified with its schema (`schema.table`).
+pub async fn get_incoming_foreign_keys(
+    pool: &PgPool,
+    table_name: &str,
+) -> Result<Vec<IncomingForeignKey>> {
+    let (schema, table) = split_table(table_name);
+
+    let rows: Vec<(String, String, Vec<String>, Vec<String>)> = sqlx::query_as(
+        "SELECT c.conname::text,
+                n.nspname::text || '.' || t.relname::text,
+                ARRAY(
+                    SELECT a.attname::text
+                    FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+                    ORDER BY k.ord
+                ),
+                ARRAY(
+                    SELECT a.attname::text
+                    FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+                    JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum
+                    ORDER BY k.ord
+                )
+         FROM pg_constraint c
+         JOIN pg_class t ON t.oid = c.conrelid
+         JOIN pg_namespace n ON n.oid = t.relnamespace
+         JOIN pg_class rt ON rt.oid = c.confrelid
+         JOIN pg_namespace rn ON rn.oid = rt.relnamespace
+         WHERE c.contype = 'f' AND rn.nspname = COALESCE($1, current_schema())
+           AND rt.relname = $2
+         ORDER BY n.nspname, t.relname, c.conname",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(name, table, columns, ref_columns)| IncomingForeignKey {
+            name,
+            table,
+            columns,
             ref_columns,
         })
         .collect())

@@ -4,13 +4,13 @@ use sqlx::pool::PoolOptions;
 use sqlx::{mysql::MySqlRow, Column as SqlxColumn, MySql, MySqlPool, Row, TypeInfo};
 
 use crate::engine::models::{
-    Column, ConnectionConfig, DbAuthMethod, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
-    SslMode, NULL_CELL,
+    Column, ConnectionConfig, DbAuthMethod, ForeignKeyInfo, IncomingForeignKey, IndexInfo,
+    QueryResult, SchemaInfo, SslMode, NULL_CELL,
 };
 
 use super::utils::{
-    fetch_rows_and_result, group_foreign_keys, group_indexes, group_tables_by_schema,
-    split_qualified, TxConnection,
+    fetch_rows_and_result, group_foreign_keys, group_incoming_foreign_keys, group_indexes,
+    group_tables_by_schema, split_qualified, TxConnection,
 };
 
 /// Options built field by field: no URL, so any character works in the
@@ -354,6 +354,42 @@ pub async fn get_foreign_keys(pool: &MySqlPool, table_name: &str) -> Result<Vec<
                 format!("{ref_schema}.{ref_table}")
             };
             (name, column, ref_table, ref_column)
+        },
+    )))
+}
+
+/// Get the foreign keys of other tables pointing at a table, from
+/// `information_schema.KEY_COLUMN_USAGE` (`REFERENCED_TABLE_*` = the table,
+/// current database when the name is not qualified). The referencing table
+/// is always qualified with its schema (`schema.table`).
+pub async fn get_incoming_foreign_keys(
+    pool: &MySqlPool,
+    table_name: &str,
+) -> Result<Vec<IncomingForeignKey>> {
+    let (schema, table) = split_table(table_name);
+
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT CAST(CONSTRAINT_NAME AS CHAR), CAST(TABLE_SCHEMA AS CHAR),
+                CAST(TABLE_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR),
+                CAST(REFERENCED_COLUMN_NAME AS CHAR)
+         FROM information_schema.KEY_COLUMN_USAGE
+         WHERE REFERENCED_TABLE_SCHEMA = COALESCE(NULLIF(?, ''), DATABASE())
+           AND REFERENCED_TABLE_NAME = ?
+         ORDER BY TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(group_incoming_foreign_keys(rows.into_iter().map(
+        |(name, own_schema, own_table, column, ref_column)| {
+            (
+                name,
+                format!("{own_schema}.{own_table}"),
+                column,
+                ref_column,
+            )
         },
     )))
 }

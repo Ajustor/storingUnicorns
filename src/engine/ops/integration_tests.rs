@@ -1202,3 +1202,208 @@ async fn integration_gcp_iam_token_renewal() {
         .await
         .unwrap();
 }
+
+/// Incoming foreign keys and the row-matching conditions, on two schemas
+/// `s1` / `s2` (MySQL: databases) that `setup` (re)creates with:
+/// `s1.single (id)`, `s1.parent (a, b)` keyed on `(a, b)`, `s1.child` with
+/// `child_single_fk (pid) → single (id)` and `child_parent_fk (cb, ca) →
+/// parent (a, b)`, `s2.other` with `other_single_fk (sid) → s1.single (id)`;
+/// one row each: `single.id = 1`, `parent = (1, 2)`, `child = (pid 1, ca 2,
+/// cb 1)`, `other.sid = 1`.
+async fn check_incoming_fks(conn: &DatabaseConnection, db: DatabaseType, setup: &[&str]) {
+    use crate::engine::db::utils::split_qualified;
+    use crate::engine::sql::relations::{follow, referencing};
+
+    for sql in setup {
+        exec(conn, sql).await;
+    }
+    let quotes = quote_chars(&db);
+    let q = |name: &str| match split_qualified(name) {
+        (Some(schema), table) => qualified(&schema, &table, quotes),
+        (None, table) => qualified("su_it_fk1", &table, quotes),
+    };
+    let count = |table: String, condition: String| async move {
+        scalar(
+            conn,
+            &format!("SELECT COUNT(*) FROM {} WHERE {condition}", q(&table)),
+        )
+        .await
+    };
+
+    // Simple key, referenced from its own schema and from another one.
+    let single = conn
+        .get_incoming_foreign_keys(&q("su_it_fk1.single"))
+        .await
+        .unwrap();
+    let got: Vec<_> = single
+        .iter()
+        .map(|k| {
+            (
+                k.name.as_str(),
+                k.table.as_str(),
+                k.columns.clone(),
+                k.ref_columns.clone(),
+            )
+        })
+        .collect();
+    let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        got,
+        [
+            (
+                "child_single_fk",
+                "su_it_fk1.child",
+                v(&["pid"]),
+                v(&["id"])
+            ),
+            (
+                "other_single_fk",
+                "su_it_fk2.other",
+                v(&["sid"]),
+                v(&["id"])
+            ),
+        ]
+    );
+    for fk in &single {
+        let row = |c: &str| (c == "id").then(|| "1".to_string());
+        let (table, condition) = referencing(fk, &row, &db).unwrap();
+        assert_eq!(count(table, condition).await, "1", "{fk:?}");
+    }
+
+    // Composite key, in key order (not column order), through the details.
+    let details = table_details(conn, &TableCache::default(), &q("su_it_fk1.parent"))
+        .await
+        .unwrap();
+    assert_eq!(details.incoming_error, None);
+    assert_eq!(details.incoming.len(), 1, "{:?}", details.incoming);
+    let fk = &details.incoming[0];
+    assert_eq!(fk.name, "child_parent_fk");
+    assert_eq!(fk.table, "su_it_fk1.child");
+    assert_eq!(fk.columns, ["cb", "ca"]);
+    assert_eq!(fk.ref_columns, ["a", "b"]);
+    let parent_row = |c: &str| match c {
+        "a" => Some("1".to_string()),
+        "b" => Some("2".to_string()),
+        _ => None,
+    };
+    let (table, condition) = referencing(fk, &parent_row, &db).unwrap();
+    assert_eq!(count(table, condition).await, "1");
+
+    // Following the child's outgoing keys finds the referenced rows.
+    let child_row = |c: &str| match c {
+        "pid" | "cb" => Some("1".to_string()),
+        "ca" => Some("2".to_string()),
+        _ => None,
+    };
+    let outgoing = conn.get_foreign_keys(&q("su_it_fk1.child")).await.unwrap();
+    assert_eq!(outgoing.len(), 2);
+    for fk in &outgoing {
+        let (table, condition) = follow(fk, &child_row, &db).unwrap();
+        assert_eq!(count(table, condition).await, "1", "{fk:?}");
+    }
+
+    // Nothing points at the leaf tables.
+    assert!(conn
+        .get_incoming_foreign_keys(&q("su_it_fk2.other"))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_incoming_fks_postgres() {
+    let Some(dsn) = env("SU_IT_PG") else {
+        eprintln!("SU_IT_PG not set, skipping");
+        return;
+    };
+    let conn = DatabaseConnection::Postgres(sqlx::PgPool::connect(&dsn).await.unwrap());
+    check_incoming_fks(
+        &conn,
+        DatabaseType::Postgres,
+        &[
+            "DROP SCHEMA IF EXISTS su_it_fk2 CASCADE",
+            "DROP SCHEMA IF EXISTS su_it_fk1 CASCADE",
+            "CREATE SCHEMA su_it_fk1",
+            "CREATE SCHEMA su_it_fk2",
+            "CREATE TABLE su_it_fk1.single (id INT PRIMARY KEY)",
+            "CREATE TABLE su_it_fk1.parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b))",
+            "CREATE TABLE su_it_fk1.child (id INT PRIMARY KEY, ca INT, cb INT, pid INT, \
+             CONSTRAINT child_single_fk FOREIGN KEY (pid) REFERENCES su_it_fk1.single (id), \
+             CONSTRAINT child_parent_fk FOREIGN KEY (cb, ca) REFERENCES su_it_fk1.parent (a, b))",
+            "CREATE TABLE su_it_fk2.other (id INT PRIMARY KEY, sid INT, \
+             CONSTRAINT other_single_fk FOREIGN KEY (sid) REFERENCES su_it_fk1.single (id))",
+            "INSERT INTO su_it_fk1.single VALUES (1)",
+            "INSERT INTO su_it_fk1.parent VALUES (1, 2)",
+            "INSERT INTO su_it_fk1.child VALUES (1, 2, 1, 1)",
+            "INSERT INTO su_it_fk2.other VALUES (1, 1)",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_incoming_fks_mysql() {
+    let Some(dsn) = env("SU_IT_MYSQL") else {
+        eprintln!("SU_IT_MYSQL not set, skipping");
+        return;
+    };
+    let conn = DatabaseConnection::MySQL(sqlx::MySqlPool::connect(&dsn).await.unwrap());
+    check_incoming_fks(
+        &conn,
+        DatabaseType::MySQL,
+        &[
+            "DROP DATABASE IF EXISTS su_it_fk2",
+            "DROP DATABASE IF EXISTS su_it_fk1",
+            "CREATE DATABASE su_it_fk1",
+            "CREATE DATABASE su_it_fk2",
+            "CREATE TABLE su_it_fk1.single (id INT PRIMARY KEY)",
+            "CREATE TABLE su_it_fk1.parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b))",
+            "CREATE TABLE su_it_fk1.child (id INT PRIMARY KEY, ca INT, cb INT, pid INT, \
+             CONSTRAINT child_single_fk FOREIGN KEY (pid) REFERENCES su_it_fk1.single (id), \
+             CONSTRAINT child_parent_fk FOREIGN KEY (cb, ca) REFERENCES su_it_fk1.parent (a, b))",
+            "CREATE TABLE su_it_fk2.other (id INT PRIMARY KEY, sid INT, \
+             CONSTRAINT other_single_fk FOREIGN KEY (sid) REFERENCES su_it_fk1.single (id))",
+            "INSERT INTO su_it_fk1.single VALUES (1)",
+            "INSERT INTO su_it_fk1.parent VALUES (1, 2)",
+            "INSERT INTO su_it_fk1.child VALUES (1, 2, 1, 1)",
+            "INSERT INTO su_it_fk2.other VALUES (1, 1)",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_incoming_fks_mssql() {
+    let Some(spec) = env("SU_IT_MSSQL") else {
+        eprintln!("SU_IT_MSSQL not set, skipping");
+        return;
+    };
+    let conn = DatabaseConnection::connect(&mssql_config(&spec))
+        .await
+        .unwrap();
+    check_incoming_fks(
+        &conn,
+        DatabaseType::SQLServer,
+        &[
+            "DROP TABLE IF EXISTS su_it_fk2.other, su_it_fk1.child, su_it_fk1.parent, \
+             su_it_fk1.single",
+            "IF SCHEMA_ID('su_it_fk1') IS NULL EXEC('CREATE SCHEMA su_it_fk1')",
+            "IF SCHEMA_ID('su_it_fk2') IS NULL EXEC('CREATE SCHEMA su_it_fk2')",
+            "CREATE TABLE su_it_fk1.single (id INT PRIMARY KEY)",
+            "CREATE TABLE su_it_fk1.parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b))",
+            "CREATE TABLE su_it_fk1.child (id INT PRIMARY KEY, ca INT, cb INT, pid INT, \
+             CONSTRAINT child_single_fk FOREIGN KEY (pid) REFERENCES su_it_fk1.single (id), \
+             CONSTRAINT child_parent_fk FOREIGN KEY (cb, ca) REFERENCES su_it_fk1.parent (a, b))",
+            "CREATE TABLE su_it_fk2.other (id INT PRIMARY KEY, sid INT, \
+             CONSTRAINT other_single_fk FOREIGN KEY (sid) REFERENCES su_it_fk1.single (id))",
+            "INSERT INTO su_it_fk1.single VALUES (1)",
+            "INSERT INTO su_it_fk1.parent VALUES (1, 2)",
+            "INSERT INTO su_it_fk1.child VALUES (1, 2, 1, 1)",
+            "INSERT INTO su_it_fk2.other VALUES (1, 1)",
+        ],
+    )
+    .await;
+}

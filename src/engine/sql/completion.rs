@@ -361,6 +361,14 @@ enum Item {
     Group(usize),
 }
 
+/// A table reference as written: quoted names match known tables exactly,
+/// bare ones ignoring case.
+#[derive(Debug, Clone)]
+struct Ref {
+    table: TableRef,
+    quoted: bool,
+}
+
 /// Where the cursor is, clause-wise.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Clause {
@@ -496,9 +504,9 @@ impl<'t> Stmt<'t> {
         names
     }
 
-    /// A possibly qualified name starting at token `i`: (schema, name) and
-    /// the index after it.
-    fn qualified_at(&self, i: usize) -> Option<(Option<String>, String, usize)> {
+    /// A possibly qualified name starting at token `i`, and the index after
+    /// it.
+    fn qualified_at(&self, i: usize) -> Option<(Ref, usize)> {
         if !self.toks.get(i)?.is_name() {
             return None;
         }
@@ -508,7 +516,13 @@ impl<'t> Stmt<'t> {
         }
         let raw = &self.text[self.toks[i].start..self.toks[last].end];
         let (schema, name) = split_qualified(raw);
-        Some((schema, name, last + 1))
+        let quoted = (i..=last).any(|k| self.toks[k].kind == T::Quoted);
+        let table = TableRef {
+            schema,
+            name,
+            alias: None,
+        };
+        Some((Ref { table, quoted }, last + 1))
     }
 
     fn ends_ref(&self, i: usize) -> bool {
@@ -516,7 +530,7 @@ impl<'t> Stmt<'t> {
     }
 
     /// Table references of a level.
-    fn table_refs(&self, items: &[Item]) -> Vec<TableRef> {
+    fn table_refs(&self, items: &[Item]) -> Vec<Ref> {
         let tok = |k: usize| match items.get(k) {
             Some(Item::Tok(i)) => Some(*i),
             _ => None,
@@ -543,7 +557,7 @@ impl<'t> Stmt<'t> {
                     // Derived table: no known columns.
                     Some(Item::Group(_)) => j += 1,
                     Some(Item::Tok(i)) if !self.ends_ref(*i) => {
-                        let Some((schema, name, next)) = self.qualified_at(*i) else {
+                        let Some((r, next)) = self.qualified_at(*i) else {
                             break;
                         };
                         // Skip the items of the name.
@@ -553,11 +567,7 @@ impl<'t> Stmt<'t> {
                         if calls && matches!(items.get(j), Some(Item::Group(_))) {
                             j += 1; // table function
                         } else {
-                            table = Some(TableRef {
-                                schema,
-                                name,
-                                alias: None,
-                            });
+                            table = Some(r);
                         }
                     }
                     _ => break,
@@ -570,7 +580,7 @@ impl<'t> Stmt<'t> {
                 if let Some(i) = alias {
                     j += 1;
                     if let Some(t) = table.as_mut() {
-                        t.alias = Some(self.name(i));
+                        t.table.alias = Some(self.name(i));
                     }
                 }
                 refs.extend(table);
@@ -585,10 +595,10 @@ impl<'t> Stmt<'t> {
     }
 
     /// `refs` without the CTE names.
-    fn without_ctes(&self, mut refs: Vec<TableRef>) -> Vec<TableRef> {
+    fn without_ctes(&self, mut refs: Vec<Ref>) -> Vec<Ref> {
         let ctes = self.cte_names();
         refs.retain(|r| {
-            r.schema.is_some() || !ctes.iter().any(|c| c.eq_ignore_ascii_case(&r.name))
+            r.table.schema.is_some() || !ctes.iter().any(|c| c.eq_ignore_ascii_case(&r.table.name))
         });
         refs
     }
@@ -615,7 +625,7 @@ impl<'t> Stmt<'t> {
     }
 
     /// Tables of the level of `cursor`, CTE names left out.
-    fn tables_in_scope(&self, cursor: usize) -> Vec<TableRef> {
+    fn tables_in_scope(&self, cursor: usize) -> Vec<Ref> {
         self.without_ctes(self.table_refs(&self.branch(self.scope_opener(cursor), cursor)))
     }
 
@@ -657,7 +667,7 @@ impl<'t> Stmt<'t> {
 
     /// `JOIN t USING (…|`: the tables joined so far, the one of the JOIN
     /// last.
-    fn using_tables(&self, cursor: usize) -> Option<Vec<TableRef>> {
+    fn using_tables(&self, cursor: usize) -> Option<Vec<Ref>> {
         let o = *self.enclosing(cursor).first()?;
         let using = o.checked_sub(1).filter(|&k| self.is(k, "USING"))?;
         let items: Vec<Item> = self
@@ -671,7 +681,7 @@ impl<'t> Stmt<'t> {
     }
 
     /// `INSERT INTO t (…|`: the table whose column list holds the cursor.
-    fn insert_columns_table(&self, cursor: usize) -> Option<TableRef> {
+    fn insert_columns_table(&self, cursor: usize) -> Option<Ref> {
         let o = *self.enclosing(cursor).first()?;
         // Walk back over `name(.name)*` to the INTO.
         let mut k = o.checked_sub(1)?;
@@ -684,12 +694,7 @@ impl<'t> Stmt<'t> {
         if k == 0 || !self.is(k - 1, "INTO") {
             return None;
         }
-        let (schema, name, _) = self.qualified_at(k)?;
-        Some(TableRef {
-            schema,
-            name,
-            alias: None,
-        })
+        self.qualified_at(k).map(|(r, _)| r)
     }
 }
 
@@ -704,6 +709,42 @@ struct Builder<'c, 'a> {
 }
 
 impl Builder<'_, '_> {
+    /// `r` as known to the connection: the known table it names (its
+    /// schema filled in) when exactly one matches, else as written.
+    fn canonical(&self, r: &Ref) -> TableRef {
+        let t = &r.table;
+        let eq = |a: &str, b: &str| {
+            if r.quoted {
+                a == b
+            } else {
+                a.eq_ignore_ascii_case(b)
+            }
+        };
+        let mut found = self
+            .cx
+            .tables
+            .iter()
+            .map(|f| split_qualified(f))
+            .filter(|(s, n)| {
+                eq(n, &t.name)
+                    && t.schema
+                        .as_deref()
+                        .is_none_or(|ts| s.as_deref().is_some_and(|s| eq(s, ts)))
+            });
+        match (found.next(), found.next()) {
+            (Some((schema, name)), None) => TableRef {
+                schema: schema.or_else(|| t.schema.clone()),
+                name,
+                alias: t.alias.clone(),
+            },
+            _ => t.clone(),
+        }
+    }
+
+    fn canonical_all(&self, refs: &[Ref]) -> Vec<TableRef> {
+        refs.iter().map(|r| self.canonical(r)).collect()
+    }
+
     /// Columns of `table`, or `None` (and the table noted missing).
     fn load(&mut self, table: &TableRef) -> Option<Vec<ColumnInfo>> {
         let cols = (self.cx.columns)(table);
@@ -949,7 +990,7 @@ pub fn complete(text: &str, cursor: usize, cx: &Context) -> Completions {
     }
 
     let opener = stmt.scope_opener(cur);
-    let scope = stmt.tables_in_scope(cur);
+    let scope = b.canonical_all(&stmt.tables_in_scope(cur));
     let clause = stmt.clause(chain, opener);
 
     if !parts.is_empty() {
@@ -962,11 +1003,13 @@ pub fn complete(text: &str, cursor: usize, cx: &Context) -> Completions {
         }
         return b.out;
     }
-    if let Some(t) = stmt.insert_columns_table(cur) {
+    if let Some(r) = stmt.insert_columns_table(cur) {
+        let t = b.canonical(&r);
         b.columns_of(&t);
         return b.out;
     }
-    if let Some(tables) = stmt.using_tables(cur) {
+    if let Some(refs) = stmt.using_tables(cur) {
+        let tables = b.canonical_all(&refs);
         b.shared_columns(&tables);
         return b.out;
     }
@@ -991,7 +1034,11 @@ pub fn complete(text: &str, cursor: usize, cx: &Context) -> Completions {
 pub fn tables_in_scope(text: &str, cursor: usize) -> Vec<TableRef> {
     let cursor = floor_boundary(text, cursor);
     let (s, e) = statement_at(text, cursor);
-    Stmt::new(&text[s..e]).tables_in_scope(cursor - s)
+    Stmt::new(&text[s..e])
+        .tables_in_scope(cursor - s)
+        .into_iter()
+        .map(|r| r.table)
+        .collect()
 }
 
 /// For a single-table context (data view filter / order bar).
@@ -1751,5 +1798,58 @@ mod tests {
             Some((11, String::new(), None))
         );
         assert_eq!(current_token("x = é"), Some((4, "é".into(), None)));
+    }
+
+    fn run_known(s: &str, known: &[&str]) -> (Completions, Vec<TableRef>) {
+        let (text, c) = at(s);
+        let tables: Vec<String> = known.iter().map(|t| t.to_string()).collect();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let columns = |t: &TableRef| {
+            asked.borrow_mut().push(t.clone());
+            columns(t)
+        };
+        let cx = Context {
+            quotes: PG,
+            tables: &tables,
+            columns: &columns,
+            fallback_columns: &[],
+        };
+        let out = complete(&text, c, &cx);
+        (out, asked.into_inner())
+    }
+
+    fn sref(schema: &str, name: &str, alias: Option<&str>) -> TableRef {
+        TableRef {
+            schema: Some(schema.into()),
+            name: name.into(),
+            alias: alias.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn scope_refs_are_resolved_against_known_tables() {
+        let (c, asked) = run_known("SELECT | FROM USERS", &["public.users"]);
+        assert_eq!(asked, [sref("public", "users", None)]);
+        assert_eq!(labels(&c, Kind::Column), ["id", "email", "name"]);
+        let (_, asked) = run_known("SELECT | FROM users u", &["public.users", "public.orders"]);
+        assert_eq!(asked, [sref("public", "users", Some("u"))]);
+        let (c, _) = run_known("SELECT | FROM Audit", &["public.audit"]);
+        assert_eq!(c.missing, [sref("public", "audit", None)]);
+        // Quoted names match exactly.
+        let (c, _) = run_known(r#"SELECT | FROM "Audit""#, &["public.audit"]);
+        assert_eq!(c.missing, [tref("Audit")]);
+        let (c, _) = run_known(
+            r#"SELECT | FROM "Audit""#,
+            &["public.Audit", "public.audit"],
+        );
+        assert_eq!(c.missing, [sref("public", "Audit", None)]);
+        // Ambiguous: left as written.
+        let (c, _) = run_known("SELECT | FROM audit", &["a.audit", "b.audit"]);
+        assert_eq!(c.missing, [tref("audit")]);
+        // The schema written must match.
+        let (c, _) = run_known("SELECT | FROM x.audit", &["public.audit"]);
+        assert_eq!(c.missing, [sref("x", "audit", None)]);
+        let (c, _) = run_known("INSERT INTO AUDIT (|", &["public.audit"]);
+        assert_eq!(c.missing, [sref("public", "audit", None)]);
     }
 }

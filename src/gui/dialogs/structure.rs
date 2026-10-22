@@ -207,11 +207,27 @@ pub fn ui(app: &App, ui: &mut egui::Ui, d: &mut StructureDialog) -> ModalRespons
     with_goto(response, d)
 }
 
-/// A link clicked in the body (`goto`) answers like a button.
+/// Why the links to other tables are disabled: following one replaces
+/// the dialog, which would drop the pending column change.
+fn links_lock(d: &StructureDialog) -> Option<&'static str> {
+    if d.applying {
+        Some("Modification en cours…")
+    } else if d.edit.is_some() {
+        Some("Appliquez ou annulez la modification en cours d'abord")
+    } else {
+        None
+    }
+}
+
+/// A link clicked in the body (`goto`) answers like a button, unless the
+/// links are locked (`links_lock`).
 fn with_goto(
     response: ModalResponse<StructureAction>,
-    d: &StructureDialog,
+    d: &mut StructureDialog,
 ) -> ModalResponse<StructureAction> {
+    if links_lock(d).is_some() {
+        d.goto = None;
+    }
     match (&response, &d.goto) {
         (ModalResponse::None, Some(_)) => ModalResponse::Button(StructureAction::Goto),
         _ => response,
@@ -277,15 +293,17 @@ fn body(ui: &mut egui::Ui, d: &mut StructureDialog, content: Content) {
                 .id_salt("structure_columns_scroll")
                 .max_height(320.0)
                 .show(ui, |ui| {
+                    let lock = links_lock(d);
                     let mut grid = ColumnsGrid {
                         details,
                         sqlite,
                         applying: d.applying,
+                        lock,
                         edit: &mut d.edit,
                         goto: &mut d.goto,
                     };
                     grid.show(ui);
-                    links_sections(ui, details, &mut d.goto);
+                    links_sections(ui, details, lock, &mut d.goto);
                 });
             if ui
                 .add_enabled(
@@ -375,6 +393,8 @@ struct ColumnsGrid<'a> {
     details: &'a TableDetails,
     sqlite: bool,
     applying: bool,
+    /// Why the links are disabled, if they are.
+    lock: Option<&'static str>,
     edit: &'a mut Option<ColumnEdit>,
     goto: &'a mut Option<String>,
 }
@@ -410,13 +430,15 @@ impl ColumnsGrid<'_> {
                     match &link {
                         Some(l) => {
                             let text = format!("→ {}", l.target);
+                            let link = egui::Link::new(RichText::new(text).color(color));
                             if ui
-                                .link(RichText::new(text).color(color))
+                                .add_enabled(self.lock.is_none(), link)
                                 .on_hover_text(format!(
                                     "{} · ouvrir la structure de {}",
                                     l.tooltip(),
                                     l.table
                                 ))
+                                .on_disabled_hover_text(self.lock.unwrap_or_default())
                                 .clicked()
                             {
                                 *self.goto = Some(fks[l.fk].ref_table.clone());
@@ -489,15 +511,22 @@ fn incoming_line(fk: &IncomingForeignKey) -> String {
 
 /// The keys, each once: "Clés étrangères" (outgoing) and "Référencée par"
 /// (incoming). A click opens the linked table's structure.
-fn links_sections(ui: &mut egui::Ui, d: &TableDetails, goto: &mut Option<String>) {
+fn links_sections(
+    ui: &mut egui::Ui,
+    d: &TableDetails,
+    lock: Option<&'static str>,
+    goto: &mut Option<String>,
+) {
     let color = fk::link_color(ui.visuals().dark_mode);
     let mut link = |ui: &mut egui::Ui, text: String, table: &str| {
+        let link = egui::Link::new(RichText::new(format!("{} {text}", icon::LINK)).color(color));
         if ui
-            .link(RichText::new(format!("{} {text}", icon::LINK)).color(color))
+            .add_enabled(lock.is_none(), link)
             .on_hover_text(format!(
                 "Ouvrir la structure de {}",
                 display_qualified(table)
             ))
+            .on_disabled_hover_text(lock.unwrap_or_default())
             .clicked()
         {
             *goto = Some(table.to_string());
@@ -703,14 +732,35 @@ mod tests {
     #[test]
     fn a_clicked_link_answers_like_a_button() {
         let mut d = dialog(None);
-        assert_eq!(with_goto(ModalResponse::None, &d), ModalResponse::None);
+        assert_eq!(with_goto(ModalResponse::None, &mut d), ModalResponse::None);
         d.goto = Some("users".into());
         assert_eq!(
-            with_goto(ModalResponse::None, &d),
+            with_goto(ModalResponse::None, &mut d),
             ModalResponse::Button(StructureAction::Goto)
         );
         // Closing the dialog in the same frame wins.
-        assert_eq!(with_goto(ModalResponse::Cancel, &d), ModalResponse::Cancel);
+        assert_eq!(
+            with_goto(ModalResponse::Cancel, &mut d),
+            ModalResponse::Cancel
+        );
+    }
+
+    #[test]
+    fn links_are_locked_while_a_column_change_is_pending() {
+        let mut d = dialog(None);
+        assert_eq!(links_lock(&d), None);
+        let mut editing = dialog(Some(filled()));
+        assert!(links_lock(&editing).is_some());
+        editing.goto = Some("users".into());
+        assert_eq!(
+            with_goto(ModalResponse::None, &mut editing),
+            ModalResponse::None,
+            "the pending change is kept"
+        );
+        assert_eq!(editing.goto, None);
+        assert!(editing.edit.is_some());
+        d.applying = true;
+        assert_eq!(links_lock(&d), Some("Modification en cours…"));
     }
 
     #[test]

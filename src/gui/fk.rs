@@ -155,12 +155,13 @@ pub fn header_marks(column: &Column, link: Option<&ColumnLink>) -> (HeaderMarks,
 }
 
 /// Foreground of FK markers and links: the accent, lightened on dark
-/// backgrounds so it stays readable.
+/// backgrounds and darkened on light ones, so it stays readable (at least
+/// 4.5:1, small badge text included).
 pub fn link_color(dark: bool) -> Color32 {
     if dark {
         ACCENT.lerp_to_gamma(Color32::WHITE, 0.25)
     } else {
-        ACCENT.lerp_to_gamma(Color32::BLACK, 0.15)
+        ACCENT.lerp_to_gamma(Color32::BLACK, 0.35)
     }
 }
 
@@ -537,6 +538,37 @@ mod tests {
                 fk: None
             }
         );
+    }
+
+    /// WCAG contrast ratio of two opaque colours.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let lum = |c: Color32| {
+            let ch = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+        };
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn link_colour_is_readable_on_both_themes() {
+        let light = egui::Visuals::light();
+        for bg in [Color32::WHITE, light.panel_fill, light.window_fill] {
+            let c = contrast(link_color(false), bg);
+            assert!(c >= 4.5, "light: {c:.2} on {bg:?}");
+        }
+        let dark = egui::Visuals::dark();
+        for bg in [dark.panel_fill, dark.window_fill, dark.extreme_bg_color] {
+            let c = contrast(link_color(true), bg);
+            assert!(c >= 4.5, "dark: {c:.2} on {bg:?}");
+        }
     }
 
     #[test]

@@ -19,9 +19,12 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
   actions destructives en rouge. Leur largeur dépend de leur rôle et ne dépasse
   jamais la fenêtre. `Entrée` déclenche l'action principale (jamais une action
   destructive, et pas dans un champ multiligne ni une liste déroulante
-  ouverte) ; `Échap`, **×** ou un clic hors de la fenêtre annulent, partout.
-- Les erreurs, le test de connexion en cours et son résultat s'affichent sur
-  une ligne au-dessus des boutons.
+  ouverte, ni avec la touche `Entrée` qui vient d'ouvrir la fenêtre) ;
+  `Échap`, **×** ou un clic hors de la fenêtre annulent, partout (sauf si une
+  liste déroulante est ouverte : `Échap` la ferme d'abord). Les touches ne
+  partent plus vers la console ou la grille restée derrière la fenêtre.
+- Les erreurs, le test de connexion en cours et son résultat s'affichent juste
+  au-dessus des boutons (un message long défile).
 - Libellés : **Quitter quand même** (au lieu de « Fermer quand même ») pour
   quitter avec des modifications ou des transactions en attente ; pour terminer
   une transaction, **Commit** est l'action principale et **Rollback** est en
@@ -30,6 +33,8 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
   **Supprimer**, **Fermer**) et du traitement par lot (**Exporter**,
   **Importer**, **Vider…**) sont dans la barre du bas ; ce qui manque pour
   lancer un traitement par lot est indiqué au-dessus du bouton.
+- **Vider les tables** : la confirmation liste maintenant toutes les tables à
+  vider (la liste défile ; elle s'arrêtait à 12).
 
 ## [0.16.0] - 2026-10-22
 

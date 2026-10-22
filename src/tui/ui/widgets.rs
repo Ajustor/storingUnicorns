@@ -763,19 +763,29 @@ fn render_completion_popup(
     let popup_x = editor_area.x + 1 + visual_col as u16;
     let popup_y = editor_area.y + 2 + visual_line as u16;
 
-    // Calculate popup dimensions
-    let max_width = state
+    // Size to the content (label, then the dimmed detail), within the
+    // terminal.
+    let screen = frame.area();
+    let label_width = state
         .completion_suggestions
         .iter()
-        .map(|s| s.len())
+        .map(|s| s.label.chars().count())
         .max()
-        .unwrap_or(10) as u16
-        + 4;
-    let popup_width = max_width.min(30);
+        .unwrap_or(0);
+    let detail_width = state
+        .completion_suggestions
+        .iter()
+        .map(|s| s.detail.chars().count())
+        .max()
+        .unwrap_or(0);
+    let gap = if detail_width > 0 { 2 } else { 0 };
+    let content = label_width + gap + detail_width;
+    // Borders, a space on each side; at least the title.
+    let popup_width = ((content + 4).max(15) as u16).min(screen.width);
     let popup_height = (state.completion_suggestions.len() as u16 + 2).min(8);
 
     // Ensure popup fits on screen
-    let popup_x = popup_x.min(editor_area.x + editor_area.width - popup_width - 1);
+    let popup_x = popup_x.min(screen.right().saturating_sub(popup_width));
     let popup_y = if popup_y + popup_height > editor_area.y + editor_area.height {
         // Show above cursor if not enough space below
         (editor_area.y + 1 + visual_line as u16).saturating_sub(popup_height)
@@ -788,7 +798,8 @@ fn render_completion_popup(
         y: popup_y,
         width: popup_width,
         height: popup_height,
-    };
+    }
+    .intersection(screen);
 
     // Clear the area behind the popup
     frame.render_widget(Clear, popup_area);
@@ -797,11 +808,18 @@ fn render_completion_popup(
     let items: Vec<ListItem> = state
         .completion_suggestions
         .iter()
-        .map(|suggestion| {
-            ListItem::new(Line::from(Span::styled(
-                format!(" {} ", suggestion),
-                Style::default().fg(Color::White),
-            )))
+        .map(|s| {
+            let pad = label_width - s.label.chars().count();
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {}{} ", s.label, " ".repeat(pad)),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!(" {}", s.detail),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
         })
         .collect();
 
@@ -1345,5 +1363,79 @@ mod tests {
         let bar = screen(|f| render_status_bar(f, f.area(), &state));
         let version = concat!(" v", env!("CARGO_PKG_VERSION"), " | Disconnected");
         assert!(bar.starts_with(version), "{bar}");
+    }
+
+    /// The editor on `SELECT u.| FROM users u` with the columns of `users`
+    /// suggested, drawn on a `width` x 12 terminal: its rows and the buffer.
+    fn completion_popup(width: u16) -> (Vec<String>, ratatui::buffer::Buffer) {
+        use crate::engine::models::{DatabaseType, SchemaInfo};
+        use crate::engine::sql::completion::ColumnInfo;
+
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.current_connection_config = Some(ConnectionConfig {
+            db_type: DatabaseType::SQLite,
+            ..Default::default()
+        });
+        state.schemas = vec![SchemaInfo {
+            name: "main".into(),
+            tables: vec!["users".into()],
+            expanded: true,
+        }];
+        state.active_panel = ActivePanel::QueryEditor;
+        state.set_query("SELECT u. FROM users u".into());
+        state.set_cursor_position("SELECT u.".len());
+        let col = |name: &str, ty: &str, pk| ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            primary_key: pk,
+        };
+        state.completion_columns.insert(
+            "main.users",
+            vec![col("id", "int", true), col("email", "varchar(255)", false)],
+        );
+        state.update_completions();
+        assert!(state.show_completion);
+
+        let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+        let registry = ClickableRegistry::new();
+        terminal
+            .draw(|f| render_query_editor(f, f.area(), &state, &registry))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = buffer
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        (rows, buffer)
+    }
+
+    #[test]
+    fn the_completion_popup_shows_each_type_dimmed_and_fits_its_content() {
+        let (rows, buffer) = completion_popup(80);
+        let y = rows.iter().position(|r| r.contains("email")).unwrap();
+        let row = &rows[y];
+        assert!(row.contains(" email  varchar(255) "), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains(" id     PK int ")),
+            "{rows:#?}"
+        );
+        // The type is dimmed.
+        let x = row.find("varchar").unwrap() as u16;
+        assert_eq!(buffer[(x, y as u16)].fg, Color::DarkGray);
+        // Label, gap, widest type, a space each side and the borders.
+        let top = &rows[y - 2];
+        let start = top.find('┌').unwrap();
+        let width = top[start..].chars().take_while(|&c| c != '┐').count() + 1;
+        assert_eq!(width, "email".len() + 2 + "varchar(255)".len() + 4, "{top}");
+    }
+
+    #[test]
+    fn the_completion_popup_stays_within_a_narrow_terminal() {
+        let (rows, _) = completion_popup(18);
+        let top = rows.iter().find(|r| r.contains('┌') && r.contains("Compl"));
+        let top = top.unwrap_or_else(|| panic!("{rows:#?}"));
+        assert!(top.ends_with('┐'), "{rows:#?}");
+        assert_eq!(top.chars().count(), 18);
     }
 }

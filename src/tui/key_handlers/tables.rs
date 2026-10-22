@@ -17,9 +17,10 @@ pub async fn handle_tables_keys(
             if state.selected_table == 0 {
                 state.toggle_schema();
             } else if let Some(table_name) = state.get_selected_table_full_name() {
-                // Pre-fetch columns for autocompletion (async, cached)
-                let _ = crate::tui::fetch_table_columns(state, &table_name).await;
-                state.current_table_context = Some(table_name.clone());
+                // Load its columns for the completion (in the background).
+                if let Some(table) = state.selected_table_ref() {
+                    crate::tui::columns::request(state, &table);
+                }
 
                 let query = if let Some(ref config) = state.current_connection_config {
                     match config.db_type {

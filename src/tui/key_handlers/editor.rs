@@ -43,7 +43,6 @@ pub async fn handle_editor_keys(
 
         // Autocompletion: Trigger with Ctrl+Space
         KeyCode::Char(' ') if modifiers.contains(KeyModifiers::CONTROL) => {
-            crate::tui::update_completions_from_context(state).await;
             state.update_completions();
             KeyAction::Consumed
         }

@@ -370,13 +370,10 @@ pub fn render_tables_panel(
         };
 
         let hidden_mark = if hidden { " [hidden]" } else { "" };
-        // Redis: the keys loaded (none until the database is unfolded).
+        // Redis: the keys loaded, else the server's count.
         let count = match nosql::redis_db(&schema.name) {
-            Some(db) if engine == Some(DatabaseType::Redis) => state
-                .nosql
-                .redis
-                .get(&db)
-                .map(|k| format!(" ({} clés)", k.keys.len()))
+            Some(db) if engine == Some(DatabaseType::Redis) => nosql::key_count(state, db)
+                .map(|n| format!(" ({n} clés)"))
                 .unwrap_or_default(),
             _ => format!(" ({table_count})"),
         };

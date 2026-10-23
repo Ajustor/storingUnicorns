@@ -1524,6 +1524,9 @@ pub(crate) async fn handle_refresh_tables(state: &mut AppState) {
             Ok(schemas) => {
                 let total_tables: usize = schemas.iter().map(|s| s.tables.len()).sum();
                 state.set_schemas(schemas);
+                if nosql::is_redis(state) {
+                    nosql::load_key_counts(state).await;
+                }
                 let status = match nosql::engine(state) {
                     Some(crate::engine::models::DatabaseType::MongoDB) => format!(
                         "{} base(s), {} collection(s)",

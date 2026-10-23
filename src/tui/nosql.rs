@@ -37,6 +37,9 @@ const KEY_SEPARATOR: char = ':';
 pub struct NoSqlUi {
     /// Keys loaded per Redis database (index).
     pub redis: HashMap<u8, RedisKeys>,
+    /// Keys per Redis database (`INFO keyspace`, empty ones absent), once
+    /// read.
+    pub key_counts: Option<std::collections::BTreeMap<u8, u64>>,
     /// Where the rows of the shown result come from: editable when set.
     pub source: Option<Source>,
     /// A question waiting for its `(o/N)` answer.
@@ -109,10 +112,19 @@ pub fn is_redis(state: &AppState) -> bool {
 
 /// The index of a Redis database listed as `db3`.
 pub fn redis_db(schema: &str) -> Option<u8> {
-    schema.strip_prefix("db")?.parse().ok()
+    redis::db_index(schema)
 }
 
 // ---------------------------------------------------------------- commands
+
+/// The console command emptying a collection (`deleteMany({})`).
+pub fn clear_command(coll: &str) -> String {
+    mongo::shell::command_to_shell(&mongo::shell::MongoCommand::Delete {
+        coll: coll.to_string(),
+        filter: Document::new(),
+        many: true,
+    })
+}
 
 /// The console command Enter on a collection runs.
 pub fn collection_command(coll: &str) -> String {
@@ -123,7 +135,7 @@ pub fn collection_command(coll: &str) -> String {
 /// The console command reading a key of type `kind`; `None` for a module
 /// type (no generic read).
 pub fn key_read_command(key: &[u8], kind: &RedisType) -> Option<String> {
-    let k = redis_quote(key);
+    let k = redis::cli::quote_arg(key);
     Some(match kind {
         RedisType::String => format!("GET {k}"),
         RedisType::Hash => format!("HGETALL {k}"),
@@ -135,62 +147,10 @@ pub fn key_read_command(key: &[u8], kind: &RedisType) -> Option<String> {
     })
 }
 
-/// One argument of a Redis console line (redis-cli quoting): bare when it
-/// is plain, else between double quotes with `\"`, `\\`, `\n`, `\r`, `\t`
-/// and `\xHH` for the other control or non-UTF-8 bytes.
-pub fn redis_quote(arg: &[u8]) -> String {
-    let plain = !arg.is_empty()
-        && std::str::from_utf8(arg).is_ok_and(|s| {
-            s.chars()
-                .all(|c| !c.is_whitespace() && !c.is_control() && !matches!(c, '"' | '\'' | '\\'))
-        });
-    if plain {
-        return String::from_utf8_lossy(arg).into_owned();
-    }
-    let mut out = String::from("\"");
-    let mut rest = arg;
-    while !rest.is_empty() {
-        let (valid, bad) = match std::str::from_utf8(rest) {
-            Ok(s) => (s, 0),
-            Err(e) => {
-                let (ok, _) = rest.split_at(e.valid_up_to());
-                // Safe: checked by from_utf8 up to there.
-                (
-                    std::str::from_utf8(ok).unwrap_or(""),
-                    e.error_len().unwrap_or(rest.len() - e.valid_up_to()),
-                )
-            }
-        };
-        for c in valid.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c if c.is_control() => {
-                    let mut buf = [0; 4];
-                    for b in c.encode_utf8(&mut buf).bytes() {
-                        out.push_str(&format!("\\x{b:02x}"));
-                    }
-                }
-                c => out.push(c),
-            }
-        }
-        let after = valid.len();
-        for b in &rest[after..after + bad] {
-            out.push_str(&format!("\\x{b:02x}"));
-        }
-        rest = &rest[after + bad..];
-    }
-    out.push('"');
-    out
-}
-
 /// The text of an argv (debug mode, previews).
 pub fn argv_text(argv: &[Vec<u8>]) -> String {
     argv.iter()
-        .map(|a| redis_quote(a))
+        .map(|a| redis::cli::quote_arg(a))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -348,6 +308,31 @@ pub fn toggle_group(state: &mut AppState, db: u8, prefix: &str) {
     }
     let idx = state.selected_schema;
     sync_redis_schema(state, idx);
+}
+
+/// Read how many keys each Redis database holds (shown before their keys
+/// are scanned); unknown when the server refuses `INFO`.
+pub async fn load_key_counts(state: &mut AppState) {
+    let Some(conn) = state.connection.clone() else {
+        return;
+    };
+    state.nosql.key_counts = match conn.redis() {
+        Ok(c) => redis::key_counts(c).await.ok(),
+        Err(_) => None,
+    };
+}
+
+/// The number of keys shown next to Redis database `db`: the keys loaded,
+/// else its `INFO keyspace` count.
+pub fn key_count(state: &AppState, db: u8) -> Option<u64> {
+    if let Some(k) = state.nosql.redis.get(&db) {
+        return Some(k.keys.len() as u64);
+    }
+    state
+        .nosql
+        .key_counts
+        .as_ref()
+        .map(|c| c.get(&db).copied().unwrap_or(0))
 }
 
 /// SCAN `pattern` in database `db` until done or `MAX_KEYS` keys.
@@ -596,16 +581,11 @@ pub fn current_scope(state: &AppState) -> NoSqlScope {
     }
 }
 
-/// The unit to run for the cursor: the engine's, else the cursor's line
-/// when it holds something.
+/// The unit to run for the cursor (`nosql::unit_at`: the one holding it,
+/// or ending right before it); `None` when the text has none (blank,
+/// comments).
 pub fn unit_range(db: &DatabaseType, text: &str, cursor: usize) -> Option<Range<usize>> {
-    let cursor = cursor.min(text.len());
-    if let Some(r) = nosql::unit_at(db, text, cursor) {
-        return Some(r);
-    }
-    let start = text[..cursor].rfind('\n').map_or(0, |p| p + 1);
-    let end = text[cursor..].find('\n').map_or(text.len(), |p| cursor + p);
-    (!text[start..end].trim().is_empty()).then_some(start..end)
+    nosql::unit_at(db, text, cursor.min(text.len()))
 }
 
 /// What F5 / Ctrl+Enter run.
@@ -869,8 +849,7 @@ pub async fn confirmed(state: &mut AppState) {
             let Some(conn) = state.connection.clone() else {
                 return;
             };
-            let name = serde_json::to_string(&coll.coll).unwrap_or_default();
-            let command = format!("db.getCollection({name}).deleteMany({{}})");
+            let command = clear_command(&coll.coll);
             let mut scope = NoSqlScope {
                 database: coll.db.clone(),
             };
@@ -963,167 +942,68 @@ pub fn row_changes(old: Option<&[String]>, new: Option<&[String]>) -> RowChanges
     changes
 }
 
-/// The fields of a stream entry.
-pub type StreamFields = Vec<(Vec<u8>, Vec<u8>)>;
-
-/// Fields of a stream entry typed in the row editor: a JSON object
-/// (`{"f": "v"}`) or `champ valeur` pairs separated by blanks.
-pub fn stream_fields(text: &str) -> Result<StreamFields, String> {
-    let text = text.trim();
-    if text.starts_with('{') {
-        let value: serde_json::Value =
-            serde_json::from_str(text).map_err(|e| format!("Champs JSON invalides : {e}"))?;
-        let obj = value
-            .as_object()
-            .ok_or("Champs : un objet JSON est attendu")?;
-        return Ok(obj
-            .iter()
-            .map(|(k, v)| {
-                let v = v.as_str().map_or_else(|| v.to_string(), str::to_string);
-                (k.as_bytes().to_vec(), v.into_bytes())
-            })
-            .collect());
-    }
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.is_empty() || !words.len().is_multiple_of(2) {
-        return Err("Champs : des paires « champ valeur » sont attendues".into());
-    }
-    Ok(words
-        .chunks(2)
-        .map(|p| (p[0].as_bytes().to_vec(), p[1].as_bytes().to_vec()))
-        .collect())
-}
-
-/// The edits of one row of a Redis value shown by the console: `old` →
-/// `new` (an update), `new` alone (an element added) or `old` alone (an
-/// element removed). `index` is the row's position (list index); the
-/// element / field is the first cell, the value the last; `parse` reads a
-/// cell's text (`redis::parse_display`).
-pub fn key_row_edits(
-    kind: &RedisType,
-    index: usize,
-    old: Option<&[String]>,
-    new: Option<&[String]>,
-    parse: &dyn Fn(&str) -> Result<Vec<u8>, String>,
-) -> Result<Vec<KeyEdit>, String> {
-    let first = |row: &[String]| row.first().cloned().unwrap_or_default();
-    let last = |row: &[String]| row.last().cloned().unwrap_or_default();
-    let pair = |row: &[String]| -> Result<(String, String), String> {
-        if row.len() < 2 {
-            return Err("Deux colonnes attendues (élément, valeur)".into());
-        }
-        Ok((first(row), last(row)))
+/// The value a console grid of `kind` shows (`redis::value_result` shape),
+/// as the `ValuePage` `redis::grid_edits` checks rows against: list
+/// elements from the `valeur` column (`#` counted from 0, as `LRANGE k 0
+/// 99` reads them); the other types only need their kind.
+pub fn grid_page(kind: &RedisType, result: &QueryResult) -> Result<redis::ValuePage, String> {
+    let value = match kind {
+        RedisType::String => RedisValue::String(Vec::new()),
+        RedisType::List => RedisValue::List(
+            result
+                .rows
+                .iter()
+                .map(|r| redis::parse_display(r.get(1).map_or("", String::as_str)))
+                .collect::<Result<_, _>>()?,
+        ),
+        RedisType::Set => RedisValue::Set(Vec::new()),
+        RedisType::ZSet => RedisValue::ZSet(Vec::new()),
+        RedisType::Hash => RedisValue::Hash(Vec::new()),
+        RedisType::Stream => RedisValue::Stream(Vec::new()),
+        RedisType::Other(t) => return Err(format!("Type {t} en lecture seule")),
     };
-    let score = |text: &str| -> Result<f64, String> {
-        text.trim()
-            .parse::<f64>()
-            .map_err(|_| format!("Score invalide : {text}"))
-    };
-    let index = i64::try_from(index).map_err(|_| "Index trop grand".to_string())?;
-    Ok(match (kind, old, new) {
-        (_, None, None) => Vec::new(),
-        (RedisType::String, _, Some(n)) => vec![KeyEdit::SetString(parse(&last(n))?)],
-        (RedisType::String, Some(_), None) => vec![KeyEdit::Delete],
-        (RedisType::List, Some(_), Some(n)) => vec![KeyEdit::ListSet {
-            index,
-            value: parse(&last(n))?,
-        }],
-        (RedisType::List, None, Some(n)) => vec![KeyEdit::ListPush {
-            left: false,
-            value: parse(&last(n))?,
-        }],
-        (RedisType::List, Some(_), None) => vec![KeyEdit::ListRemove { index }],
-        (RedisType::Set, Some(o), Some(n)) => {
-            if last(o) == last(n) {
-                Vec::new()
-            } else {
-                vec![
-                    KeyEdit::SetRemove(parse(&last(o))?),
-                    KeyEdit::SetAdd(parse(&last(n))?),
-                ]
-            }
-        }
-        (RedisType::Set, None, Some(n)) => vec![KeyEdit::SetAdd(parse(&last(n))?)],
-        (RedisType::Set, Some(o), None) => vec![KeyEdit::SetRemove(parse(&last(o))?)],
-        (RedisType::ZSet, Some(o), Some(n)) => {
-            let (old_member, _) = pair(o)?;
-            let (member, s) = pair(n)?;
-            let add = KeyEdit::ZAdd {
-                member: parse(&member)?,
-                score: score(&s)?,
-            };
-            if old_member == member {
-                vec![add]
-            } else {
-                vec![KeyEdit::ZRemove(parse(&old_member)?), add]
-            }
-        }
-        (RedisType::ZSet, None, Some(n)) => {
-            let (member, s) = pair(n)?;
-            vec![KeyEdit::ZAdd {
-                member: parse(&member)?,
-                score: score(&s)?,
-            }]
-        }
-        (RedisType::ZSet, Some(o), None) => vec![KeyEdit::ZRemove(parse(&first(o))?)],
-        (RedisType::Hash, Some(o), Some(n)) => {
-            let (old_field, _) = pair(o)?;
-            let (field, value) = pair(n)?;
-            let set = KeyEdit::HSet {
-                field: parse(&field)?,
-                value: parse(&value)?,
-            };
-            if old_field == field {
-                vec![set]
-            } else {
-                vec![KeyEdit::HDel(parse(&old_field)?), set]
-            }
-        }
-        (RedisType::Hash, None, Some(n)) => {
-            let (field, value) = pair(n)?;
-            vec![KeyEdit::HSet {
-                field: parse(&field)?,
-                value: parse(&value)?,
-            }]
-        }
-        (RedisType::Hash, Some(o), None) => vec![KeyEdit::HDel(parse(&first(o))?)],
-        (RedisType::Stream, Some(_), Some(_)) => {
-            return Err(
-                "Une entrée de flux ne se modifie pas : la supprimer puis en ajouter une".into(),
-            )
-        }
-        (RedisType::Stream, None, Some(n)) => {
-            let (id, fields) = pair(n)?;
-            let id = id.trim();
-            vec![KeyEdit::XAdd {
-                id: (!id.is_empty() && id != "*").then(|| id.to_string()),
-                fields: stream_fields(&fields)?,
-            }]
-        }
-        (RedisType::Stream, Some(o), None) => vec![KeyEdit::XDel(first(o))],
-        (RedisType::Other(t), _, _) => return Err(format!("Type {t} en lecture seule")),
+    Ok(redis::ValuePage {
+        total: value.len() as u64,
+        value,
+        next: None,
     })
 }
 
-/// The text of an edit in debug mode: its command, or the edit itself
-/// while the engine can't build it.
-pub fn edit_preview(key: &[u8], edit: &KeyEdit) -> String {
-    let argv = redis::edit_to_command(key, edit);
-    if argv.is_empty() {
-        format!("{edit:?}")
-    } else {
-        argv_text(&argv)
+/// The edits of one row of a Redis value shown by the console (see
+/// `row_changes`), by `redis::grid_edits`; deleting the row of a string
+/// deletes the key.
+pub fn key_edits(
+    key: &[u8],
+    kind: &RedisType,
+    result: &QueryResult,
+    old: Option<&[String]>,
+    new: Option<&[String]>,
+) -> Result<Vec<KeyEdit>, String> {
+    if *kind == RedisType::String && new.is_none() && old.is_some() {
+        return Ok(vec![KeyEdit::Delete]);
     }
+    let page = grid_page(kind, result)?;
+    let info = KeyInfo {
+        key: key.to_vec(),
+        kind: kind.clone(),
+        ttl: None,
+        size: None,
+    };
+    redis::grid_edits(&info, &page, &row_changes(old, new))
+}
+
+/// The text of an edit in debug mode: its commands, one per line.
+pub fn edit_preview(key: &[u8], edit: &KeyEdit) -> String {
+    redis::edit_to_commands(key, edit)
+        .iter()
+        .map(|argv| argv_text(argv))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The text of a document change in debug mode.
 pub fn change_preview(coll: &CollectionRef, change: &DocChange) -> String {
-    let shell = mongo::change_to_shell(coll, change);
-    if shell.is_empty() {
-        format!("{coll} : {change:?}")
-    } else {
-        shell
-    }
+    mongo::change_to_shell(coll, change)
 }
 
 /// The selected row of the result and its source, when it can be edited.
@@ -1225,6 +1105,8 @@ enum Target {
         db: u8,
         key: Vec<u8>,
         kind: RedisType,
+        /// The grid shown (`redis::value_result` shape).
+        result: QueryResult,
     },
 }
 
@@ -1235,7 +1117,12 @@ fn target(state: &AppState) -> Option<Target> {
             coll,
             page: DocPage { result, docs },
         },
-        Source::Key { db, key, kind } => Target::Key { db, key, kind },
+        Source::Key { db, key, kind } => Target::Key {
+            db,
+            key,
+            kind,
+            result,
+        },
     })
 }
 
@@ -1292,15 +1179,13 @@ async fn write_row(
                 }
             }
         }
-        Target::Key { db, key, kind } => {
-            let index = state.selected_row;
-            let edits = match key_row_edits(
-                &kind,
-                index,
-                old.as_deref(),
-                new.as_deref(),
-                &redis::parse_display,
-            ) {
+        Target::Key {
+            db,
+            key,
+            kind,
+            result,
+        } => {
+            let edits = match key_edits(&key, &kind, &result, old.as_deref(), new.as_deref()) {
                 Ok(e) => e,
                 Err(e) => {
                     state.set_status(format!("Modification refusée : {e}"));
@@ -1423,15 +1308,9 @@ pub struct JsonView {
     pub scroll: usize,
 }
 
-/// A document in shell syntax, indented (relaxed extended JSON while the
-/// engine can't print it).
+/// A document in shell syntax, indented.
 pub fn document_text(doc: &Document) -> String {
-    let shell = mongo::shell::to_shell(&Bson::Document(doc.clone()), true);
-    if !shell.is_empty() {
-        return shell;
-    }
-    let json = Bson::Document(doc.clone()).into_relaxed_extjson();
-    serde_json::to_string_pretty(&json).unwrap_or_default()
+    mongo::shell::to_shell(&Bson::Document(doc.clone()), true)
 }
 
 /// A cell as JSON: null, a JSON object / array it holds, else its text.
@@ -1550,15 +1429,9 @@ pub fn index_line(i: &MongoIndex) -> String {
     format!("{}  {keys}{flags}", i.name)
 }
 
-/// A document on one line (shell syntax, else relaxed extended JSON).
+/// A document on one line, in shell syntax.
 pub fn compact_document(doc: &Document) -> String {
-    let shell = mongo::shell::to_shell(&Bson::Document(doc.clone()), false);
-    if !shell.is_empty() {
-        return shell;
-    }
-    Bson::Document(doc.clone())
-        .into_relaxed_extjson()
-        .to_string()
+    mongo::shell::to_shell(&Bson::Document(doc.clone()), false)
 }
 
 /// Open the indexes of `coll`.

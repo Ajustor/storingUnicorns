@@ -137,10 +137,6 @@ fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
-fn bytes(s: &str) -> Result<Vec<u8>, String> {
-    Ok(s.as_bytes().to_vec())
-}
-
 // ---------------------------------------------------------------- commands
 
 #[test]
@@ -176,16 +172,21 @@ fn enter_on_a_key_reads_it_by_type() {
 
 #[test]
 fn keys_are_quoted_like_redis_cli() {
-    assert_eq!(redis_quote(b"user:1"), "user:1");
-    assert_eq!(redis_quote(b"caf\xc3\xa9"), "café");
-    assert_eq!(redis_quote(b"a b"), "\"a b\"");
-    assert_eq!(redis_quote(b""), "\"\"");
-    assert_eq!(redis_quote(b"say \"hi\"\n"), r#""say \"hi\"\n""#);
-    assert_eq!(redis_quote(b"x\\y"), r#""x\\y""#);
-    assert_eq!(redis_quote(b"\xff\x00a"), r#""\xff\x00a""#);
+    let quoted = redis::cli::quote_arg(b"a b");
+    assert!(quoted.starts_with('"'), "{quoted}");
     assert_eq!(
-        argv_text(&[b"SET".to_vec(), b"k 1".to_vec(), b"v".to_vec()]),
-        r#"SET "k 1" v"#
+        key_read_command(b"a b", &RedisType::String).unwrap(),
+        format!("GET {quoted}")
+    );
+    // The console reads it back as one argument.
+    let line = key_read_command(b"a \"b\"\xff", &RedisType::Hash).unwrap();
+    assert_eq!(
+        redis::cli::tokenize(&line).unwrap(),
+        [b"HGETALL".to_vec(), b"a \"b\"\xff".to_vec()]
+    );
+    assert_eq!(
+        argv_text(&[b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]),
+        "SET k v"
     );
 }
 
@@ -292,12 +293,13 @@ async fn enter_on_a_key_runs_its_read_command_in_its_database() {
         state.query_tabs.current_tab().nosql_scope.as_deref(),
         Some("0")
     );
-    // The engine stub fails: said, no panic.
+    // No server: the engine's error is said, nothing is shown.
     assert!(
-        state.status_message.contains("non implémenté"),
+        state.status_message.starts_with("Erreur"),
         "{}",
         state.status_message
     );
+    assert!(state.query_result.is_none());
 }
 
 #[tokio::test]
@@ -358,13 +360,14 @@ async fn sql_only_keys_say_why_they_do_nothing() {
     handle_tables_keys(&mut state, KeyCode::Char('s'), KeyModifiers::NONE).await;
     assert_eq!(state.dialog_mode, DialogMode::None);
     assert!(state.status_message.contains("Sélectionner une collection"));
-    // On a collection: its indexes (the stub's error shown inside).
+    // On a collection: its indexes (no server: the error shown inside).
     state.selected_table = 1;
     handle_tables_keys(&mut state, KeyCode::Char('s'), KeyModifiers::NONE).await;
     assert_eq!(state.dialog_mode, DialogMode::Indexes);
     let view = state.nosql.indexes.as_ref().unwrap();
     assert_eq!(view.coll.to_string(), "shop.users");
-    assert!(view.error.as_deref().unwrap().contains("non implémenté"));
+    assert!(view.error.is_some());
+    assert!(view.indexes.is_empty());
 }
 
 #[tokio::test]
@@ -410,13 +413,21 @@ async fn redis_n_and_slash_open_the_new_key_and_pattern_forms() {
 // ---------------------------------------------------------------- console
 
 #[test]
-fn ctrl_enter_runs_the_unit_or_the_line_of_the_cursor() {
-    let text = "GET a\n\nSET b 1\n";
+fn ctrl_enter_runs_the_unit_of_the_cursor() {
+    let text = "GET a\n\nSET b 1\n# note\n";
     let db = DatabaseType::Redis;
+    for cursor in [0, 2, 5, 7, 10, 100] {
+        assert_eq!(
+            unit_range(&db, text, cursor),
+            nosql::unit_at(&db, text, cursor),
+            "cursor {cursor}"
+        );
+    }
     assert_eq!(unit_range(&db, text, 2), Some(0..5));
-    assert_eq!(unit_range(&db, text, 7), Some(7..14));
-    assert_eq!(unit_range(&db, text, 6), None, "a blank line");
-    assert_eq!(unit_range(&db, text, 100), None);
+    assert_eq!(unit_range(&db, text, 9), Some(7..14));
+    // Nothing to run: no unit at all.
+    assert_eq!(unit_range(&db, "# a comment\n\n", 3), None);
+    assert_eq!(unit_range(&DatabaseType::MongoDB, "  ", 1), None);
 }
 
 #[tokio::test]
@@ -487,13 +498,18 @@ async fn f5_runs_the_console_through_the_engine() {
     state.set_query("db.users.find({})".into());
     crate::tui::handle_execute_query(&mut state).await;
     assert_eq!(state.dialog_mode, DialogMode::None);
+    // The engine's error (no database chosen, or no server), never the
+    // SQL runner's « Query error ».
     assert!(
-        state.status_message.starts_with("Erreur : MongoDB"),
+        state.status_message.starts_with("Erreur"),
         "{}",
         state.status_message
     );
-    // The SQL runner is never used: no « Query error ».
     assert!(!state.status_message.contains("Query"));
+    // Nothing to run: said before reaching the engine.
+    state.set_query("  ".into());
+    crate::tui::handle_execute_query(&mut state).await;
+    assert_eq!(state.status_message, "Rien à exécuter");
 }
 
 // ---------------------------------------------------------------- confirmations
@@ -644,122 +660,87 @@ fn row_edits_become_row_changes_for_doc_changes() {
 
 #[test]
 fn row_edits_of_each_redis_type() {
-    let edits = |kind: RedisType, i, old: Option<&[&str]>, new: Option<&[&str]>| {
-        let old = old.map(strings);
-        let new = new.map(strings);
-        key_row_edits(&kind, i, old.as_deref(), new.as_deref(), &bytes)
-    };
     let b = |s: &str| s.as_bytes().to_vec();
+    let grid = |v: RedisValue| redis::value_result(&v);
+    let edit = |kind: RedisType, r: &QueryResult, row: usize, new: Option<Vec<String>>| {
+        let old = r.rows.get(row).cloned();
+        key_edits(b"k", &kind, r, old.as_deref(), new.as_deref())
+    };
+    let set_cell = |r: &QueryResult, row: usize, col: usize, text: &str| {
+        let mut new = r.rows[row].clone();
+        new[col] = text.into();
+        Some(new)
+    };
+
+    let s = grid(RedisValue::String(b("a")));
     assert_eq!(
-        edits(RedisType::String, 0, Some(&["a"]), Some(&["b"])).unwrap(),
+        edit(RedisType::String, &s, 0, set_cell(&s, 0, 0, "b")).unwrap(),
         [KeyEdit::SetString(b("b"))]
     );
+    // Deleting the only row of a string deletes the key.
     assert_eq!(
-        edits(RedisType::String, 0, Some(&["a"]), None).unwrap(),
+        edit(RedisType::String, &s, 0, None).unwrap(),
         [KeyEdit::Delete]
     );
+
+    let l = grid(RedisValue::List(vec![b("x"), b("y"), b("z")]));
     assert_eq!(
-        edits(RedisType::List, 3, Some(&["4", "a"]), Some(&["4", "b"])).unwrap(),
+        edit(RedisType::List, &l, 1, set_cell(&l, 1, 1, "Y")).unwrap(),
         [KeyEdit::ListSet {
-            index: 3,
-            value: b("b")
+            index: 1,
+            value: b("Y")
         }]
     );
     assert_eq!(
-        edits(RedisType::List, 0, None, Some(&["", "z"])).unwrap(),
-        [KeyEdit::ListPush {
-            left: false,
-            value: b("z")
-        }]
-    );
-    assert_eq!(
-        edits(RedisType::List, 2, Some(&["3", "a"]), None).unwrap(),
+        edit(RedisType::List, &l, 2, None).unwrap(),
         [KeyEdit::ListRemove { index: 2 }]
     );
     assert_eq!(
-        edits(RedisType::Set, 0, Some(&["0", "a"]), Some(&["0", "b"])).unwrap(),
-        [KeyEdit::SetRemove(b("a")), KeyEdit::SetAdd(b("b"))]
-    );
-    assert!(edits(RedisType::Set, 0, Some(&["a"]), Some(&["a"]))
-        .unwrap()
-        .is_empty());
-    assert_eq!(
-        edits(RedisType::ZSet, 0, Some(&["m", "1"]), Some(&["m", "2.5"])).unwrap(),
-        [KeyEdit::ZAdd {
-            member: b("m"),
-            score: 2.5
+        key_edits(b"k", &RedisType::List, &l, None, Some(&strings(&["", "w"]))).unwrap(),
+        [KeyEdit::ListPush {
+            left: false,
+            value: b("w")
         }]
     );
+
+    let h = grid(RedisValue::Hash(vec![(b("f"), b("1"))]));
     assert_eq!(
-        edits(RedisType::ZSet, 0, Some(&["m", "1"]), Some(&["n", "1"])).unwrap(),
-        [
-            KeyEdit::ZRemove(b("m")),
-            KeyEdit::ZAdd {
-                member: b("n"),
-                score: 1.0
-            }
-        ]
-    );
-    assert!(edits(RedisType::ZSet, 0, None, Some(&["m", "x"]))
-        .unwrap_err()
-        .contains("Score invalide"));
-    assert_eq!(
-        edits(RedisType::Hash, 0, Some(&["f", "1"]), Some(&["f", "2"])).unwrap(),
+        edit(RedisType::Hash, &h, 0, set_cell(&h, 0, 1, "2")).unwrap(),
         [KeyEdit::HSet {
             field: b("f"),
             value: b("2")
         }]
     );
     assert_eq!(
-        edits(RedisType::Hash, 0, Some(&["f", "1"]), Some(&["g", "1"])).unwrap(),
-        [
-            KeyEdit::HDel(b("f")),
-            KeyEdit::HSet {
-                field: b("g"),
-                value: b("1")
-            }
-        ]
-    );
-    assert_eq!(
-        edits(RedisType::Hash, 0, Some(&["f", "1"]), None).unwrap(),
+        edit(RedisType::Hash, &h, 0, None).unwrap(),
         [KeyEdit::HDel(b("f"))]
     );
+
+    let z = grid(RedisValue::ZSet(vec![(b("m"), 1.0)]));
     assert_eq!(
-        edits(RedisType::Stream, 0, None, Some(&["*", "a 1 b 2"])).unwrap(),
-        [KeyEdit::XAdd {
-            id: None,
-            fields: vec![(b("a"), b("1")), (b("b"), b("2"))]
+        edit(RedisType::ZSet, &z, 0, set_cell(&z, 0, 1, "2.5")).unwrap(),
+        [KeyEdit::ZAdd {
+            member: b("m"),
+            score: 2.5
         }]
     );
+
+    let set = grid(RedisValue::Set(vec![b("a")]));
     assert_eq!(
-        edits(RedisType::Stream, 0, None, Some(&["5-1", r#"{"a": "1"}"#])).unwrap(),
-        [KeyEdit::XAdd {
-            id: Some("5-1".into()),
-            fields: vec![(b("a"), b("1"))]
-        }]
+        edit(RedisType::Set, &set, 0, set_cell(&set, 0, 0, "b")).unwrap(),
+        [KeyEdit::SetRemove(b("a")), KeyEdit::SetAdd(b("b"))]
     );
+
+    let x = grid(RedisValue::Stream(vec![redis::StreamEntry {
+        id: "1-0".into(),
+        fields: vec![(b("a"), b("1"))],
+    }]));
     assert_eq!(
-        edits(RedisType::Stream, 0, Some(&["5-1", "a 1"]), None).unwrap(),
-        [KeyEdit::XDel("5-1".into())]
+        edit(RedisType::Stream, &x, 0, None).unwrap(),
+        [KeyEdit::XDel("1-0".into())]
     );
-    assert!(edits(
-        RedisType::Stream,
-        0,
-        Some(&["5-1", "a"]),
-        Some(&["5-1", "b"])
-    )
-    .is_err());
-    assert!(edits(RedisType::Other("ReJSON-RL".into()), 0, None, Some(&["x"])).is_err());
-    // A cell the parser refuses refuses the edit.
-    let refuse = |_: &str| -> Result<Vec<u8>, String> { Err("\\x invalide".into()) };
-    assert!(key_row_edits(
-        &RedisType::String,
-        0,
-        None,
-        Some(&strings(&["\\x"])),
-        &refuse
-    )
-    .is_err());
+    assert!(edit(RedisType::Stream, &x, 0, set_cell(&x, 0, 0, "2-0")).is_err());
+    assert!(edit(RedisType::Other("ReJSON-RL".into()), &s, 0, None).is_err());
 }
 
 fn hash_source() -> Source {
@@ -832,7 +813,8 @@ async fn debug_mode_never_writes() {
     for mut state in [redis_state(), mongo_state().await] {
         state.debug_mode = true;
         state.query_result = Some(result(&["_id", "name"], &[&["1", "Ann"]]));
-        state.nosql.source = Some(if is_redis(&state) {
+        let redis = is_redis(&state);
+        state.nosql.source = Some(if redis {
             hash_source()
         } else {
             Source::Collection {
@@ -848,33 +830,45 @@ async fn debug_mode_never_writes() {
         state.editing_row.as_mut().unwrap()[1] = "Bob".into();
         crate::tui::handle_save_row(&mut state).await;
         assert_eq!(state.dialog_mode, DialogMode::None);
-        let status = state.status_message.clone();
-        // The commands in the editor, or the engine's refusal (its stub):
-        // never an attempt to write.
         assert!(
-            status.starts_with("Debug :") || status.starts_with("Modification refusée"),
-            "{status}"
+            state.status_message.starts_with("Debug :"),
+            "{}",
+            state.status_message
         );
-        assert!(!status.contains("Échec"), "{status}");
-        if status.starts_with("Debug :") {
-            assert_ne!(state.query_input(), "before");
-        }
+        // The commands are in the editor instead.
+        let shown = state.query_input().to_string();
+        assert!(
+            if redis {
+                shown.starts_with("HSET user:1 1 Bob")
+            } else {
+                shown.contains("users") && shown.contains("Bob")
+            },
+            "{shown}"
+        );
         assert_eq!(state.query_result.as_ref().unwrap().rows[0][1], "Ann");
     }
 }
 
 #[test]
-fn edit_previews_fall_back_while_the_engine_cannot_print() {
-    let edit = KeyEdit::HDel(b"f".to_vec());
-    let text = edit_preview(b"k", &edit);
-    assert!(text == "HDEL k f" || text.contains("HDel"), "{text}");
+fn edit_previews_show_every_command() {
+    let text = edit_preview(b"k", &KeyEdit::HDel(b"f".to_vec()));
+    assert_eq!(text, "HDEL k f");
+    // A list removal takes two commands.
+    let text = edit_preview(b"k", &KeyEdit::ListRemove { index: 3 });
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines[0].starts_with("LSET k 3 "), "{text}");
+    assert!(lines[1].starts_with("LREM k "), "{text}");
     let coll = CollectionRef {
         db: "shop".into(),
         coll: "users".into(),
     };
-    let change = DocChange::Delete { id: Bson::Int32(1) };
-    let text = change_preview(&coll, &change);
-    assert!(text.contains("users"), "{text}");
+    let text = change_preview(&coll, &DocChange::Delete { id: Bson::Int32(1) });
+    assert!(
+        text.contains("users") && text.contains("deleteOne"),
+        "{text}"
+    );
+    assert!(clear_command("fs.chunks").contains("deleteMany({})"));
 }
 
 // ---------------------------------------------------------------- JSON view
@@ -1363,4 +1357,45 @@ async fn running_a_transfer_reports_the_engine_error() {
     transfer::run(&mut terminal, &mut state).await;
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\n1\n");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn destructive_commands_are_confirmed_before_running() {
+    let mut state = mongo_state().await;
+    state.query_tabs.current_tab_mut().nosql_scope = Some("shop".into());
+    state.set_query("db.users.find({})\ndb.users.deleteMany({})".into());
+    crate::tui::handle_execute_query(&mut state).await;
+    assert_eq!(state.dialog_mode, DialogMode::NoSqlConfirm);
+    let confirm = state.nosql.confirm.as_ref().unwrap();
+    assert_eq!(confirm.lines.len(), 1, "{:?}", confirm.lines);
+    assert!(
+        confirm.lines[0].contains("deleteMany"),
+        "{:?}",
+        confirm.lines
+    );
+    // Ctrl+Enter on the harmless line runs it without asking.
+    state.close_dialog();
+    state.set_cursor_position(3);
+    crate::tui::handle_execute_current_query(&mut state).await;
+    assert_eq!(state.dialog_mode, DialogMode::None);
+    // Redis: FLUSHALL is asked for too.
+    let mut state = redis_state();
+    state.set_query("FLUSHALL".into());
+    crate::tui::handle_execute_query(&mut state).await;
+    assert_eq!(state.dialog_mode, DialogMode::NoSqlConfirm);
+}
+
+#[tokio::test]
+async fn redis_databases_show_their_key_counts() {
+    let mut state = redis_state();
+    assert_eq!(key_count(&state, 1), None, "unknown before INFO");
+    state.nosql.key_counts = Some([(1, 1234)].into_iter().collect());
+    assert_eq!(key_count(&state, 1), Some(1234));
+    assert_eq!(key_count(&state, 2), Some(0), "empty databases are absent");
+    // Once scanned, the keys loaded.
+    load_tree(&mut state);
+    assert_eq!(key_count(&state, 0), Some(3));
+    // No server: unknown, not an error.
+    load_key_counts(&mut state).await;
+    assert_eq!(state.nosql.key_counts, None);
 }

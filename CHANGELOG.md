@@ -7,6 +7,24 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Corrections
+
+- **Scripts SQL Server / Azure** : un script (**Tout**, `F5` ou une sélection)
+  s'exécute désormais comme dans SSMS, en lots T-SQL séparés par les lignes
+  `GO` (`GO 5` répète le lot). Les variables déclarées dans le script sont
+  visibles de toutes ses instructions, y compris un `SELECT` placé après le
+  `COMMIT` (« Must declare the scalar variable » ne survient plus). Chaque jeu
+  de résultats ouvre son propre onglet, un `SELECT` vide garde ses colonnes, et
+  une erreur indique la ligne du script (`… (ligne 37 du script)`). Un lot
+  ouvrant une transaction s'exécute avec `XACT_ABORT ON` et est annulé en cas
+  d'erreur ; une transaction laissée ouverte à la fin du script est annulée et
+  signalée. Le mode transaction manuelle suit les mêmes lots.
+- **Nombre de lignes affectées** : sous `SET NOCOUNT ON` (ou quand le serveur
+  ne donne pas de compte), la console affiche « Exécuté » au lieu d'un
+  trompeur « 0 lignes affectées ».
+
 ## [0.18.0] - 2026-10-23
 
 ### Nouveautés

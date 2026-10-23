@@ -1,5 +1,6 @@
 mod edit_row;
 mod export_import;
+mod folder_prompt;
 mod new_connection;
 mod schema_dialog;
 
@@ -8,6 +9,7 @@ pub use export_import::{
     render_batch_export_dialog, render_batch_import_dialog, render_batch_truncate_dialog,
     render_delete_row_confirm, render_export_dialog, render_import_dialog, render_truncate_confirm,
 };
+pub use folder_prompt::{folder_prompt_rect, render_folder_prompt};
 pub use new_connection::{connection_dialog_rect, render_new_connection_dialog};
 pub use schema_dialog::{render_schema_dialog, SchemaAction};
 

@@ -12,6 +12,7 @@ use ratatui::{
 use super::clickable::{ClickableRegistry, ClickableType};
 use super::layout::PanelType;
 use crate::engine::models::display_cell;
+use crate::tui::folders::ConnRow;
 use crate::tui::{ActivePanel, AppState};
 
 fn panel_style(active: bool) -> Style {
@@ -138,12 +139,20 @@ pub fn render_connections_panel(
     };
 
     let visible_height = inner_area.height as usize;
-    let scroll_offset = state.connections_scroll;
+    let rows = state.connection_rows();
+    let cursor = state.connection_cursor(&rows);
+    // The cursor stays visible, whatever the mouse wheel scrolled.
+    let scroll_offset = if cursor < state.connections_scroll {
+        cursor
+    } else if visible_height > 0 && cursor >= state.connections_scroll + visible_height {
+        cursor + 1 - visible_height
+    } else {
+        state.connections_scroll
+    };
+    let connected = state.current_connection_config.as_ref().map(|c| &c.name);
 
-    // Register each visible connection item
-    for (display_idx, (i, _conn)) in state
-        .config
-        .connections
+    let mut items: Vec<ListItem> = Vec::new();
+    for (display_idx, (i, row)) in rows
         .iter()
         .enumerate()
         .skip(scroll_offset)
@@ -156,42 +165,53 @@ pub fn render_connections_panel(
             width: inner_area.width,
             height: 1,
         };
-        registry.register(item_rect, ClickableType::Connection(i));
-    }
-
-    // Build items with scroll offset
-    let items: Vec<ListItem> = state
-        .config
-        .connections
-        .iter()
-        .enumerate()
-        .skip(scroll_offset)
-        .take(visible_height)
-        .map(|(i, conn)| {
-            let style = if i == state.selected_connection && is_active {
-                highlight_style()
-            } else {
-                Style::default()
-            };
-
-            let connected_marker =
-                if state.current_connection_config.as_ref().map(|c| &c.name) == Some(&conn.name) {
+        let selected = i == cursor && is_active;
+        let indent = "  ".repeat(row.depth());
+        match row {
+            ConnRow::Folder {
+                path,
+                name,
+                collapsed,
+                count,
+                ..
+            } => {
+                registry.register(item_rect, ClickableType::ConnectionFolder(path.clone()));
+                let icon = if *collapsed { "▶" } else { "▼" };
+                let style = if selected {
+                    highlight_style()
+                } else {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                };
+                items.push(ListItem::new(format!("{indent}{icon} {name}/ ({count})")).style(style));
+            }
+            ConnRow::Connection { index, .. } => {
+                registry.register(item_rect, ClickableType::Connection(*index));
+                let conn = &state.config.connections[*index];
+                let marker = if connected == Some(&conn.name) {
                     "● "
                 } else {
                     "  "
                 };
+                let style = if selected {
+                    highlight_style()
+                } else {
+                    Style::default()
+                };
+                items.push(
+                    ListItem::new(format!(
+                        "{indent}{marker}{} ({})",
+                        conn.name,
+                        conn.display_type()
+                    ))
+                    .style(style),
+                );
+            }
+        }
+    }
 
-            ListItem::new(format!(
-                "{}{} ({})",
-                connected_marker,
-                conn.name,
-                conn.display_type()
-            ))
-            .style(style)
-        })
-        .collect();
-
-    let total = state.config.connections.len();
+    let total = rows.len();
     let title = if total == 0 {
         " Connections (none) ".to_string()
     } else if total > visible_height {
@@ -215,7 +235,7 @@ pub fn render_connections_panel(
         .highlight_style(highlight_style());
 
     // Adjust selection for scroll offset
-    let visible_selection = state.selected_connection.saturating_sub(scroll_offset);
+    let visible_selection = cursor.saturating_sub(scroll_offset);
     let mut list_state = ListState::default();
     list_state.select(Some(visible_selection));
 
@@ -315,8 +335,12 @@ pub fn render_tables_panel(
             && is_active
             && !state.tables_filter_active;
         let expand_icon = if schema.expanded { "▼" } else { "▶" };
+        // Only listed with `show_hidden_schemas`: greyed.
+        let hidden = state.is_schema_hidden(&schema.name);
         let schema_style = if is_schema_selected {
             highlight_style()
+        } else if hidden {
+            Style::default().fg(Color::DarkGray)
         } else {
             Style::default().fg(Color::Yellow)
         };
@@ -327,9 +351,13 @@ pub fn render_tables_panel(
             filtered_tables.len()
         };
 
+        let hidden_mark = if hidden { " [hidden]" } else { "" };
         all_items.push((
-            ListItem::new(format!("{} {} ({})", expand_icon, schema.name, table_count))
-                .style(schema_style),
+            ListItem::new(format!(
+                "{} {} ({}){}",
+                expand_icon, schema.name, table_count, hidden_mark
+            ))
+            .style(schema_style),
             Some((*schema_idx, None)),
         ));
 
@@ -342,6 +370,8 @@ pub fn render_tables_panel(
                     && !state.tables_filter_active;
                 let table_style = if is_table_selected {
                     highlight_style()
+                } else if hidden {
+                    Style::default().fg(Color::DarkGray)
                 } else {
                     Style::default()
                 };

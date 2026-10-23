@@ -230,6 +230,7 @@ pub fn compute_modal_area(frame_area: Rect, dialog_mode: DialogMode) -> Rect {
         DialogMode::DeleteRowConfirm | DialogMode::TruncateConfirm => {
             centered_rect(50, 20, frame_area)
         }
+        DialogMode::FolderPrompt => crate::tui::ui::modals::folder_prompt_rect(frame_area),
         DialogMode::BatchTruncate => centered_rect(60, 70, frame_area),
         DialogMode::None => Rect::default(),
     }

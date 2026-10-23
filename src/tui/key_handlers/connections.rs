@@ -7,7 +7,46 @@ use super::KeyAction;
 
 /// Handle keyboard events for the Connections panel.
 pub async fn handle_connections_keys(state: &mut AppState, key_code: KeyCode) -> KeyAction {
+    let on_folder = state.selected_folder.is_some();
     match key_code {
+        // Fold / unfold the folder under the cursor
+        KeyCode::Enter | KeyCode::Char(' ') if on_folder => {
+            state.toggle_selected_folder();
+            KeyAction::Consumed
+        }
+        KeyCode::Left => {
+            state.connections_left();
+            KeyAction::Consumed
+        }
+        KeyCode::Right => {
+            state.connections_right();
+            KeyAction::Consumed
+        }
+
+        // New folder (under the cursor's folder)
+        KeyCode::Char('f') => {
+            state.open_new_folder_prompt();
+            KeyAction::Consumed
+        }
+
+        // Move the connection to a folder (a folder: rename it)
+        KeyCode::Char('m') => {
+            state.open_move_prompt();
+            KeyAction::Consumed
+        }
+
+        // Rename the folder
+        KeyCode::Char('r') | KeyCode::Char('e') if on_folder => {
+            state.open_rename_folder_prompt();
+            KeyAction::Consumed
+        }
+
+        // Delete the folder (its content moves up one level)
+        KeyCode::Char('d') if on_folder => {
+            state.delete_selected_folder();
+            KeyAction::Consumed
+        }
+
         // Connect to selected database
         KeyCode::Enter => {
             // The event loop opens it in the background (`connect::start`).
@@ -48,6 +87,12 @@ pub async fn handle_connections_keys(state: &mut AppState, key_code: KeyCode) ->
                     && state.selected_connection > 0
                 {
                     state.selected_connection -= 1;
+                }
+                // The cursor stays on a visible line.
+                let rows = state.connection_rows();
+                let pos = state.connection_cursor(&rows);
+                if let Some(row) = rows.get(pos).cloned() {
+                    state.select_connection_row(&row);
                 }
                 state.set_status(format!("Deleted connection: {}", name));
             }

@@ -1,6 +1,7 @@
 pub mod app_state;
 mod columns;
 mod connect;
+pub mod folders;
 mod key_handlers;
 pub mod ui;
 
@@ -377,8 +378,14 @@ async fn handle_mouse_event(
         match clicked_item {
             Some(ClickableType::Connection(idx)) => {
                 state.active_panel = ActivePanel::Connections;
+                state.selected_folder = None;
                 state.selected_connection = idx;
                 connect::start(state);
+            }
+            Some(ClickableType::ConnectionFolder(path)) => {
+                state.active_panel = ActivePanel::Connections;
+                state.selected_folder = Some(path);
+                state.toggle_selected_folder();
             }
             Some(ClickableType::Schema(schema_idx)) => {
                 state.active_panel = ActivePanel::Tables;
@@ -431,8 +438,13 @@ async fn handle_mouse_event(
             Some(ClickableType::Connection(idx)) => {
                 state.active_panel = ActivePanel::Connections;
                 if idx < state.config.connections.len() {
+                    state.selected_folder = None;
                     state.selected_connection = idx;
                 }
+            }
+            Some(ClickableType::ConnectionFolder(path)) => {
+                state.active_panel = ActivePanel::Connections;
+                state.selected_folder = Some(path);
             }
             Some(ClickableType::Schema(schema_idx)) => {
                 state.active_panel = ActivePanel::Tables;
@@ -506,9 +518,12 @@ fn handle_scroll(
     let item = registry.find_at(x, y);
 
     match item {
-        Some(ClickableType::Connection(_)) | Some(ClickableType::Panel(PanelType::Connections)) => {
-            // Scroll connections list
-            let max_scroll = state.config.connections.len().saturating_sub(1);
+        Some(ClickableType::Connection(_))
+        | Some(ClickableType::ConnectionFolder(_))
+        | Some(ClickableType::Panel(PanelType::Connections)) => {
+            // Scroll connections list (folders included)
+            let rows = state.connection_rows();
+            let max_scroll = rows.len().saturating_sub(1);
             if direction > 0 {
                 // Scroll down
                 if state.connections_scroll < max_scroll {
@@ -519,8 +534,10 @@ fn handle_scroll(
                 state.connections_scroll = state.connections_scroll.saturating_sub(1);
             }
             // Keep selection visible
-            if state.selected_connection < state.connections_scroll {
-                state.selected_connection = state.connections_scroll;
+            if state.connection_cursor(&rows) < state.connections_scroll {
+                if let Some(row) = rows.get(state.connections_scroll) {
+                    state.select_connection_row(row);
+                }
             }
         }
         Some(ClickableType::Schema(_))
@@ -674,6 +691,10 @@ fn handle_dialog_input(state: &mut AppState, key: KeyCode, modifiers: KeyModifie
                     .batch_truncate_state
                     .as_ref()
                     .is_some_and(|b| b.tables.iter().any(|(_, _, s)| *s))
+        }
+        DialogMode::FolderPrompt => {
+            state.handle_folder_prompt_key(key);
+            false
         }
         DialogMode::None => false,
     }

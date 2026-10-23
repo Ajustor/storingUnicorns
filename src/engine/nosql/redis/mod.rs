@@ -1269,7 +1269,7 @@ pub fn grid_edits(
                 .map(|row| Ok((list_index(page, row)?, cell_bytes(row.get(1), "valeur")?)))
                 .collect::<Result<Vec<_>, String>>()?;
             // From the last: a removal doesn't move the ones before it.
-            indexes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            indexes.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
             indexes.dedup_by_key(|(i, _)| *i);
             removals.extend(
                 indexes

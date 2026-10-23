@@ -517,7 +517,7 @@ mod tests {
             assert!(text.contains("$numberLong"), "{text}");
             let (docs, errors) = read_documents(&text, format, &opts()).unwrap();
             assert!(errors.is_empty(), "{errors:?}");
-            assert_eq!(docs, [d.clone()], "{format:?}");
+            assert_eq!(docs, std::slice::from_ref(&d), "{format:?}");
         }
         // Relaxed files (mongoexport's default) still read.
         let relaxed = "{\"a\": 1, \"b\": 1.5, \"c\": {\"$date\": \"2024-01-02T03:04:05Z\"}}\n";

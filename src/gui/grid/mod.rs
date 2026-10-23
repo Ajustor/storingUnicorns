@@ -12,9 +12,12 @@ use egui_phosphor::regular as icon;
 use crate::engine::models::{display_cell, is_null, Column, QueryResult, NULL_CELL};
 use crate::engine::ops::rows::detect_system_columns;
 use crate::gui::fk::{self, CellLink, ColumnLink};
+use crate::gui::shortcuts::{hint_here, is_mac, label_here};
 use crate::gui::theme::{ACCENT, ERROR, SUCCESS};
 
 use changes::{PendingEdits, RowRef};
+pub use state::FOLLOW_LINK;
+use state::{delete_row, edit_cell, ADD_ROW, REVERT, SUBMIT};
 use view::{display_pos, next_sort, row_ref};
 
 /// A row as tab-separated values (tabs and newlines inside cells become spaces).
@@ -282,7 +285,7 @@ pub fn show(
             let saved = matches!(r, RowRef::Base(_)) && !state.edits.is_deleted(r);
             let edited = state.edits.is_edited(r, c);
             (fk::cell_link(link, blank, saved, edited) == CellLink::Active
-                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::Enter)))
+                && ctx.input_mut(|i| i.consume_shortcut(&FOLLOW_LINK)))
             .then_some(GridAction::Follow {
                 row: r,
                 col: c,
@@ -605,8 +608,9 @@ fn link_cell(ui: &mut egui::Ui, text: RichText, link: &ColumnLink, selected: boo
     // Selected: underlined, so it still reads as a link.
     let hovered = selected || ui.rect_contains_pointer(ui.max_rect());
     let hint = format!(
-        "{} · clic sur l'icône : aperçu (Alt+Entrée) · {} : ouvrir dans un onglet",
+        "{} · clic sur l'icône : aperçu ({}) · {} : ouvrir dans un onglet",
         link.tooltip(),
+        label_here(&FOLLOW_LINK),
         fk::tab_click_here()
     );
     let clicked = ui
@@ -651,7 +655,11 @@ fn context_menu(ui: &mut egui::Ui, m: &MenuCell, action: &mut Option<CellAction>
     if let Some(link) = m.link {
         item(
             ui,
-            format!("{} Voir la ligne liée (Alt+Entrée)", icon::LINK),
+            format!(
+                "{} Voir la ligne liée ({})",
+                icon::LINK,
+                label_here(&FOLLOW_LINK)
+            ),
             CellAction::Follow(r, c, false),
         );
         item(
@@ -704,7 +712,11 @@ fn context_menu(ui: &mut egui::Ui, m: &MenuCell, action: &mut Option<CellAction>
     if !deleted {
         item(
             ui,
-            format!("{} Modifier (F2)", icon::PENCIL_SIMPLE),
+            format!(
+                "{} Modifier ({})",
+                icon::PENCIL_SIMPLE,
+                hint_here(&edit_cell(is_mac()))
+            ),
             CellAction::Edit(r, c),
         );
         item(
@@ -727,13 +739,17 @@ fn context_menu(ui: &mut egui::Ui, m: &MenuCell, action: &mut Option<CellAction>
     }
     item(
         ui,
-        format!("{} Ajouter une ligne (Alt+Inser)", icon::PLUS),
+        format!("{} Ajouter une ligne ({})", icon::PLUS, hint_here(&ADD_ROW)),
         CellAction::AddRow,
     );
     let label = if deleted {
         format!("{} Annuler la suppression", icon::ARROW_COUNTER_CLOCKWISE)
     } else {
-        format!("{} Supprimer la ligne (Ctrl+Suppr)", icon::TRASH)
+        format!(
+            "{} Supprimer la ligne ({})",
+            icon::TRASH,
+            hint_here(delete_row(is_mac()))
+        )
     };
     item(ui, label, CellAction::ToggleDelete(r));
 }
@@ -752,7 +768,7 @@ fn footer(
             // Also the only way to add the first row of an empty table.
             if ui
                 .small_button(RichText::new(icon::PLUS).color(SUCCESS))
-                .on_hover_text("Ajouter une ligne (Alt+Inser)")
+                .on_hover_text(format!("Ajouter une ligne ({})", hint_here(&ADD_ROW)))
                 .clicked()
             {
                 *cell_action = Some(CellAction::AddRow);
@@ -763,7 +779,10 @@ fn footer(
                     selected.is_some(),
                     egui::Button::new(RichText::new(icon::MINUS).color(ERROR)).small(),
                 )
-                .on_hover_text("Supprimer la ligne sélectionnée (Ctrl+Suppr)")
+                .on_hover_text(format!(
+                    "Supprimer la ligne sélectionnée ({})",
+                    hint_here(delete_row(is_mac()))
+                ))
                 .clicked()
             {
                 if let Some(r) = selected {
@@ -800,14 +819,20 @@ fn footer(
         }
         if ui
             .button(RichText::new(format!("{} Submit", icon::CHECK)).color(SUCCESS))
-            .on_hover_text("Appliquer dans une transaction (Ctrl+Entrée)")
+            .on_hover_text(format!(
+                "Appliquer dans une transaction ({})",
+                label_here(&SUBMIT)
+            ))
             .clicked()
         {
             action = GridAction::Submit;
         }
         if ui
             .button(format!("{} Revert", icon::ARROW_COUNTER_CLOCKWISE))
-            .on_hover_text("Abandonner les modifications (Ctrl+Z)")
+            .on_hover_text(format!(
+                "Abandonner les modifications ({})",
+                label_here(&REVERT)
+            ))
             .clicked()
         {
             state.revert();

@@ -267,7 +267,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui.label(RichText::new(format!("→ {}", l.target)).color(color));
             if ui
                 .button(format!("{} Voir la ligne liée", icon::LINK))
-                .on_hover_text("Aperçu ici (Alt+Entrée dans la grille)")
+                .on_hover_text(format!(
+                    "Aperçu ici ({} dans la grille)",
+                    crate::gui::shortcuts::label_here(&crate::gui::grid::FOLLOW_LINK)
+                ))
                 .clicked()
             {
                 follow = Some((tab, row, col, false));

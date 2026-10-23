@@ -14,6 +14,7 @@ use crate::engine::ops::rows::RowChanges;
 use crate::engine::sql::format::format_sql;
 use crate::gui::editor::completion::{Completion, CompletionSource};
 use crate::gui::editor::{self, EditorContext};
+use crate::gui::shortcuts;
 use crate::gui::theme::{self, ACCENT, ERROR};
 use crate::gui::tx::{self, TxAction, TxView};
 
@@ -32,6 +33,30 @@ pub const MAX_ROWS: usize = 1000;
 
 pub const RUN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
 pub const RUN_ALL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
+/// « Tout exécuter » without F5, which needs fn on Mac keyboards.
+pub const RUN_ALL_ENTER: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Enter);
+
+/// The « Tout exécuter » keys, the one shown on `mac` first.
+pub fn run_all_keys(mac: bool) -> [KeyboardShortcut; 2] {
+    if mac {
+        [RUN_ALL_ENTER, RUN_ALL]
+    } else {
+        [RUN_ALL, RUN_ALL_ENTER]
+    }
+}
+
+/// Consume this frame's run keys: (run the statement, run everything).
+/// ⌘⇧↩ also matches ⌘↩ (egui ignores an extra Shift), so it is consumed
+/// first. The Enter ones belong to the editor (`editor_keys`), F5 to the
+/// whole console.
+fn run_keys(input: &mut egui::InputState, editor_keys: bool) -> (bool, bool) {
+    let all_enter = editor_keys && input.consume_shortcut(&RUN_ALL_ENTER);
+    let run = editor_keys && input.consume_shortcut(&RUN);
+    let f5 = input.consume_shortcut(&RUN_ALL);
+    (run, all_enter || f5)
+}
+
 pub const FORMAT: KeyboardShortcut = KeyboardShortcut::new(
     Modifiers {
         alt: true,
@@ -134,15 +159,6 @@ pub struct ConsoleContext<'a> {
     pub source: &'a dyn CompletionSource,
     /// Transaction mode of the connection.
     pub tx: TxView,
-}
-
-/// Whether this frame's input carries typed text. On Windows AltGr is
-/// reported as Ctrl+Alt, so typing `€` (AltGr+E on AZERTY) also looks like
-/// Ctrl+Alt+E: such a key is a character, not a shortcut.
-pub fn typed_text(events: &[egui::Event]) -> bool {
-    events
-        .iter()
-        .any(|e| matches!(e, egui::Event::Text(t) if !t.is_empty()))
 }
 
 /// Whether Escape cancels the running query: only from the editor or with
@@ -379,15 +395,20 @@ impl ConsoleTab {
         // focus, or nothing has (they must not steal keys from other fields).
         let editor_keys = ctx.memory(|m| m.focused().is_none_or(|f| f == id));
         let pressed = |s: &KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(s));
-        // AltGr+key: a character for the focused field, not a shortcut.
-        let typed = ctx.input(|i| typed_text(&i.events));
+        // AltGr+key off macOS: a character, not a shortcut; on macOS the
+        // character Option made alongside ⌥⌘ is dropped.
+        let mac = shortcuts::is_mac();
+        let cmd_alt =
+            |s: &KeyboardShortcut| ctx.input_mut(|i| shortcuts::consume_cmd_alt(i, s, mac));
         let mut action = None;
-        if !typed && pressed(&HISTORY) {
+        if cmd_alt(&HISTORY) {
             action = Some(ConsoleAction::History(String::new()));
         }
-        if editor_keys && !typed && pressed(&FORMAT) {
+        if editor_keys && cmd_alt(&FORMAT) {
             self.format(&ctx, cx.tab);
         }
+        // Consumed while running too: a run at a time per console.
+        let (run, run_all) = ctx.input_mut(|i| run_keys(i, editor_keys));
         if cx.running {
             let focused = ctx.memory(|m| m.focused());
             if escape_cancels(focused, id, self.completion.open, self.grid_editing())
@@ -395,17 +416,12 @@ impl ConsoleTab {
             {
                 action = Some(ConsoleAction::Cancel);
             }
-            // A run at a time per console; swallow run keys meanwhile.
-            if editor_keys {
-                pressed(&RUN);
-            }
-            pressed(&RUN_ALL);
             return action;
         }
-        if editor_keys && pressed(&RUN) && cx.connected {
+        if run && cx.connected {
             action = self.run_current().or(action);
         }
-        if pressed(&RUN_ALL) && cx.connected {
+        if run_all && cx.connected {
             action = self.run_all().or(action);
         }
         action
@@ -420,7 +436,10 @@ impl ConsoleTab {
                     can_run,
                     egui::Button::new(format!("{} Exécuter", icon::PLAY)),
                 )
-                .on_hover_text("Sélection ou instruction au curseur (Ctrl+Entrée)")
+                .on_hover_text(format!(
+                    "Sélection ou instruction au curseur ({})",
+                    shortcuts::label_here(&RUN)
+                ))
                 .clicked()
             {
                 action = self.run_current();
@@ -430,7 +449,10 @@ impl ConsoleTab {
                     can_run,
                     egui::Button::new(format!("{} Tout", icon::FAST_FORWARD)),
                 )
-                .on_hover_text("Tout le script (F5)")
+                .on_hover_text(format!(
+                    "Tout le script ({})",
+                    shortcuts::hint_here(&run_all_keys(shortcuts::is_mac()))
+                ))
                 .clicked()
             {
                 action = self.run_all();
@@ -453,14 +475,20 @@ impl ConsoleTab {
             ui.separator();
             if ui
                 .button(format!("{} Formater", icon::MAGIC_WAND))
-                .on_hover_text("Formater la sélection ou tout (Ctrl+Alt+L)")
+                .on_hover_text(format!(
+                    "Formater la sélection ou tout ({})",
+                    shortcuts::label_here(&FORMAT)
+                ))
                 .clicked()
             {
                 self.format(ui.ctx(), cx.tab);
             }
             if ui
                 .button(format!("{} Historique", icon::CLOCK_COUNTER_CLOCKWISE))
-                .on_hover_text("Requêtes exécutées (Ctrl+Alt+E)")
+                .on_hover_text(format!(
+                    "Requêtes exécutées ({})",
+                    shortcuts::label_here(&HISTORY)
+                ))
                 .clicked()
             {
                 action = Some(ConsoleAction::History(String::new()));
@@ -533,17 +561,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn altgr_characters_are_not_shortcuts() {
-        let key = egui::Event::Key {
-            key: Key::E,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: HISTORY.modifiers,
-        };
-        assert!(!typed_text(std::slice::from_ref(&key)), "a real Ctrl+Alt+E");
-        assert!(typed_text(&[key, egui::Event::Text("€".into())]), "AltGr+E");
-        assert!(!typed_text(&[egui::Event::Text(String::new())]));
+    fn run_all_enter_runs_everything_not_the_statement() {
+        use crate::gui::shortcuts::test_support::{frame, press};
+        for mac in [true, false] {
+            let keys =
+                |s: &KeyboardShortcut, editor| frame(vec![press(s, mac)], |i| run_keys(i, editor));
+            assert_eq!(keys(&RUN_ALL_ENTER, true), (false, true), "mac: {mac}");
+            assert_eq!(keys(&RUN, true), (true, false));
+            assert_eq!(keys(&RUN_ALL, true), (false, true));
+            // Outside the editor only F5 is the console's.
+            assert_eq!(keys(&RUN_ALL_ENTER, false), (false, false));
+            assert_eq!(keys(&RUN, false), (false, false));
+            assert_eq!(keys(&RUN_ALL, false), (false, true));
+        }
+    }
+
+    #[test]
+    fn run_all_shows_the_key_every_keyboard_has() {
+        use crate::gui::shortcuts::hint;
+        assert_eq!(hint(&run_all_keys(true), true), "⇧⌘↩");
+        assert_eq!(hint(&run_all_keys(false), false), "F5 / Ctrl+Maj+Entrée");
+        assert_eq!(shortcuts::label(&FORMAT, true), "⌥⌘L");
+        assert_eq!(shortcuts::label(&HISTORY, false), "Ctrl+Alt+E");
+        assert_eq!(shortcuts::label(&RUN, true), "⌘↩");
     }
 
     #[test]

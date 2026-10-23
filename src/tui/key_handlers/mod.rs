@@ -1,5 +1,6 @@
 mod connections;
 mod editor;
+mod fallbacks;
 mod filter;
 mod global;
 mod results;
@@ -7,6 +8,7 @@ mod tables;
 
 pub use connections::handle_connections_keys;
 pub use editor::handle_editor_keys;
+pub use fallbacks::resolve as resolve_fallback;
 pub use filter::handle_filter_keys;
 pub use global::handle_global_keys;
 pub use results::handle_results_keys;

@@ -97,7 +97,15 @@ impl ConsoleTab {
     /// SQL in the history.
     fn log_view(&self, ui: &mut egui::Ui, id: egui::Id) -> Option<ConsoleAction> {
         if self.log.is_empty() {
-            ui.label(RichText::new("Exécutez une requête (Ctrl+Entrée) ou le script (F5).").weak());
+            let mac = crate::gui::shortcuts::is_mac();
+            ui.label(
+                RichText::new(format!(
+                    "Exécutez une requête ({}) ou le script ({}).",
+                    crate::gui::shortcuts::label(&super::RUN, mac),
+                    crate::gui::shortcuts::hint(&super::run_all_keys(mac), mac)
+                ))
+                .weak(),
+            );
             return None;
         }
         let mut action = None;

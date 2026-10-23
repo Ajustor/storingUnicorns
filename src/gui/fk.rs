@@ -91,18 +91,17 @@ pub fn incoming_label(fk: &IncomingForeignKey) -> String {
     )
 }
 
-/// The click that opens a link in a new tab (`modifiers.command`): Cmd on
+/// The click that opens a link in a new tab (`modifiers.command`): ⌘ on
 /// macOS, Ctrl elsewhere.
-pub fn tab_click(mac: bool) -> &'static str {
-    if mac {
-        "Cmd+clic"
-    } else {
-        "Ctrl+clic"
-    }
+pub fn tab_click(mac: bool) -> String {
+    let modifier = crate::gui::shortcuts::modifiers_label(egui::Modifiers::COMMAND, mac);
+    // « Ctrl+ » already ends with the separator.
+    let sep = if mac { "+" } else { "" };
+    format!("{modifier}{sep}clic")
 }
 
 /// [`tab_click`] for this platform.
-pub fn tab_click_here() -> &'static str {
+pub fn tab_click_here() -> String {
     tab_click(cfg!(target_os = "macos"))
 }
 
@@ -573,7 +572,7 @@ mod tests {
 
     #[test]
     fn the_new_tab_click_is_named_for_the_platform() {
-        assert_eq!(tab_click(true), "Cmd+clic");
+        assert_eq!(tab_click(true), "⌘+clic");
         assert_eq!(tab_click(false), "Ctrl+clic");
     }
 

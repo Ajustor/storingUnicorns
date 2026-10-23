@@ -79,8 +79,9 @@ From the sources: `cargo run` (GUI) or `cargo run -- tui`.
 
 - Expanding a connection in the explorer connects it; double-clicking a table
   opens its data editor.
-- `Ctrl+Entrée` in a console runs the selection, otherwise the statement (or the
-  whole `BEGIN … COMMIT` block) at the cursor; `F5` runs the whole script.
+- `Ctrl+Entrée` (`⌘↩` on macOS) in a console runs the selection, otherwise the
+  statement (or the whole `BEGIN … COMMIT` block) at the cursor; `F5` or
+  `Ctrl+Maj+Entrée` (`⇧⌘↩`) runs the whole script.
 - Result tabs are replaced at each run, except pinned ones.
 - `Échap` cancels the running query (a transaction block is rolled back by the
   database), the cell being edited, or closes the dialog.
@@ -110,12 +111,13 @@ résultat :
   utilisation ; la liste se complète dès qu'elles arrivent, sans bloquer la
   saisie.
 
-Touches : `Ctrl+Espace` ouvre la liste, `↑` / `↓` choisissent, `Entrée` ou `Tab`
+Touches : `Ctrl+Espace` (`⌃Espace` sur macOS, où `⌘Espace` est Spotlight ;
+`Ctrl+Espace` ou `Ctrl+K` dans l'interface terminal) ouvre la liste, `↑` / `↓` choisissent, `Entrée` ou `Tab`
 valident (la suggestion remplace le mot en cours), `Échap` ferme.
 
 ### Historique des requêtes
 
-`Ctrl+Alt+E` ouvre l'historique : chaque entrée affiche un résumé de la requête,
+`Ctrl+Alt+E` (`⌥⌘E` sur macOS) ouvre l'historique : chaque entrée affiche un résumé de la requête,
 sa **connexion**, l'**heure** et la **durée** d'exécution. Un volet d'**aperçu**
 montre le SQL complet avec sa coloration. La recherche porte sur le SQL et sur
 le nom de la connexion. **Insérer** place la requête dans la console, **Copier**
@@ -131,7 +133,7 @@ et la complétion ; les colonnes de clé primaire sont marquées d'une clé.
   `Alt+Entrée`) affiche la ligne liée dans le panneau de valeur : fil d'Ariane,
   bouton **Retour**, ses propres clés étrangères cliquables pour continuer, et
   la liste **Référencée par** (les lignes d'autres tables qui pointent vers
-  elle). `Ctrl+clic` sur le lien, ou **Ouvrir dans un onglet**, ouvre un nouvel
+  elle). `Ctrl+clic` (`⌘+clic` sur macOS) sur le lien, ou **Ouvrir dans un onglet**, ouvre un nouvel
   onglet « table (filtre) » filtré sur cette ligne.
 - Si la clé ne correspond à aucune ligne, l'aperçu indique que la clé est
   orpheline.
@@ -181,21 +183,27 @@ affiche les schémas masqués (en grisé).
 
 ### Raccourcis (GUI)
 
-| Touche                      | Action                                                   |
-|-----------------------------|----------------------------------------------------------|
-| `Ctrl+Entrée`               | Console : exécuter la sélection / l'instruction au curseur ; grille : Submit |
-| `F5`                        | Exécuter tout le script                                  |
-| `Échap`                     | Annuler la requête en cours / l'édition de cellule / fermer la modale |
-| `Ctrl+Alt+L`                | Formater le SQL                                          |
-| `Ctrl+Alt+E`                | Historique des requêtes (recherche, aperçu, Insérer / Copier) |
-| `Ctrl+N`                    | Rechercher une table                                     |
-| `Ctrl+T` / `Ctrl+W`         | Nouvelle console (connexion courante) / fermer l'onglet  |
-| `Ctrl+S`                    | Enregistrer les consoles                                 |
-| `Ctrl+Espace`               | Autocomplétion contextuelle (console, barres WHERE / ORDER BY) |
-| `F2` / double-clic          | Éditer la cellule                                        |
-| `Alt+Entrée`                | Cellule FK : voir la ligne liée dans le panneau de valeur |
-| `Alt+Insert` / `Ctrl+Suppr` | Ajouter / supprimer une ligne                            |
-| `Ctrl+R`                    | Rafraîchir (explorateur ou données)                      |
+Les infobulles et menus affichent les touches de la plateforme (`⌥⌘L` sur
+macOS, `Ctrl+Alt+L` ailleurs).
+
+| Windows / Linux                 | macOS                    | Action                                                   |
+|---------------------------------|--------------------------|----------------------------------------------------------|
+| `Ctrl+Entrée`                   | `⌘↩`                     | Console : exécuter la sélection / l'instruction au curseur ; grille : Submit |
+| `F5` / `Ctrl+Maj+Entrée`        | `⇧⌘↩` / `F5`             | Exécuter tout le script                                  |
+| `Échap`                         | `Échap`                  | Annuler la requête en cours / l'édition de cellule / fermer la modale |
+| `Ctrl+Alt+L`                    | `⌥⌘L`                    | Formater le SQL                                          |
+| `Ctrl+Alt+E`                    | `⌥⌘E`                    | Historique des requêtes (recherche, aperçu, Insérer / Copier) |
+| `Ctrl+N`                        | `⌘N`                     | Rechercher une table                                     |
+| `Ctrl+T` / `Ctrl+W`             | `⌘T` / `⌘W`              | Nouvelle console (connexion courante) / fermer l'onglet  |
+| `Ctrl+S`                        | `⌘S`                     | Enregistrer les consoles                                 |
+| `Ctrl+Espace`                   | `⌃Espace`                | Autocomplétion contextuelle (console, barres WHERE / ORDER BY) |
+| `F2` / `Entrée` / double-clic   | `↩` / `F2` / double-clic | Éditer la cellule                                        |
+| `Alt+Entrée`                    | `⌥↩`                     | Cellule FK : voir la ligne liée dans le panneau de valeur |
+| `Ctrl+clic`                     | `⌘+clic`                 | Cellule FK : ouvrir la ligne liée dans un onglet         |
+| `Ctrl+I` / `Alt+Inser`          | `⌘I`                     | Ajouter une ligne                                        |
+| `Ctrl+Suppr`                    | `⌘⌫` / `⌘⌦`              | Supprimer (ou rétablir) la ligne                         |
+| `Ctrl+Z`                        | `⌘Z`                     | Grille : abandonner les modifications                    |
+| `Ctrl+R`                        | `⌘R`                     | Rafraîchir (explorateur ou données)                      |
 
 ## Raccourcis (TUI)
 
@@ -219,11 +227,25 @@ affiche les schémas masqués (en grisé).
 | `←` / `→`   | Connections (folder) | Fold / unfold           |
 | `h`         | Tables         | Hide / show the selected schema |
 | `H`         | Tables         | Show hidden schemas (greyed)   |
-| `F5`        | Any            | Execute query                  |
+| `F5` / `Ctrl+G` | Any        | Execute the whole editor       |
+| `Ctrl+Enter` / `Ctrl+E` | Query editor | Execute the statement at the cursor |
+| `Ctrl+Space` / `Ctrl+K` | Query editor | Completion             |
+| `F6` / `Ctrl+O` | Any        | Export the results             |
+| `F7` / `Ctrl+L` | Any        | Import a CSV                   |
+| `Shift+F6` / `E` | Any / Tables | Batch export                |
+| `Shift+F7` / `I` | Any / Tables | Batch import                |
+| `Alt+=` `Alt+-` / `+` `-` | Any / outside editor | Resize the panels |
+| `Ctrl+T` / `Ctrl+W` | Any / Query editor | New tab / close tab |
+| `Ctrl+S`    | Any            | Save the queries               |
 | `Ctrl+R`    | Any            | Refresh tables                 |
 | `?`         | Any            | Show help in status bar        |
 | `q`         | Outside editor | Quit                           |
 | `Ctrl+Q`    | Any            | Force quit                     |
+
+The second key of each pair works in default macOS terminals (Terminal.app,
+iTerm2), where F-keys need `fn`, `Ctrl+Enter` arrives as `Enter`,
+`Ctrl+Space` switches the input source and Option types characters instead
+of acting as Alt.
 
 ### New Connection Dialog
 

@@ -2,10 +2,56 @@
 
 use super::changes::RowRef;
 use crate::engine::models::{display_cell, is_null, QueryResult};
-use egui::{Key, Modifiers};
+use egui::{Key, KeyboardShortcut, Modifiers};
 
 use super::view::{display_pos, row_ref};
 use super::{first_input_column, GridAction, GridState};
+
+const fn ks(modifiers: Modifiers, key: Key) -> KeyboardShortcut {
+    KeyboardShortcut::new(modifiers, key)
+}
+
+// Grid shortcuts; in a list, the one shown on macOS first (`shortcuts::hint`).
+
+/// Add a row: ⌘I / Ctrl+I exists on every keyboard, Insert not on Mac ones.
+pub const ADD_ROW: [KeyboardShortcut; 2] = [
+    ks(Modifiers::COMMAND, Key::I),
+    ks(Modifiers::ALT, Key::Insert),
+];
+/// Apply the pending edits.
+pub const SUBMIT: KeyboardShortcut = ks(Modifiers::COMMAND, Key::Enter);
+/// Drop the pending edits.
+pub const REVERT: KeyboardShortcut = ks(Modifiers::COMMAND, Key::Z);
+/// Preview the row a link cell points to.
+pub const FOLLOW_LINK: KeyboardShortcut = ks(Modifiers::ALT, Key::Enter);
+
+/// Delete (or restore) the focused row: ⌘⌫ on macOS, where the forward
+/// Delete key needs fn (⌘⌦ still works); Ctrl+Suppr elsewhere.
+pub fn delete_row(mac: bool) -> &'static [KeyboardShortcut] {
+    const MAC: [KeyboardShortcut; 2] = [
+        ks(Modifiers::COMMAND, Key::Backspace),
+        ks(Modifiers::COMMAND, Key::Delete),
+    ];
+    const OTHERS: [KeyboardShortcut; 1] = [ks(Modifiers::COMMAND, Key::Delete)];
+    if mac {
+        &MAC
+    } else {
+        &OTHERS
+    }
+}
+
+/// Edit the focused cell: Enter shown on macOS (F2 needs fn there).
+pub fn edit_cell(mac: bool) -> [KeyboardShortcut; 2] {
+    let (f2, enter) = (
+        ks(Modifiers::NONE, Key::F2),
+        ks(Modifiers::NONE, Key::Enter),
+    );
+    if mac {
+        [enter, f2]
+    } else {
+        [f2, enter]
+    }
+}
 
 impl GridState {
     /// The owner replaced the result (refresh, new page): drop the edits
@@ -110,7 +156,7 @@ impl GridState {
         }
     }
 
-    /// Alt+Insert: a new row, editing its first cell that the database
+    /// [`ADD_ROW`]: a new row, editing its first cell that the database
     /// does not seem to fill itself (`detect_system_columns`: only a hint,
     /// any cell can be typed).
     pub(super) fn add_row(&mut self, ctx: &egui::Context, result: &QueryResult) {
@@ -163,7 +209,7 @@ impl GridState {
         let (escape, submit, enter, back, tab) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::Escape),
-                i.consume_key(Modifiers::COMMAND, Key::Enter),
+                i.consume_shortcut(&SUBMIT),
                 i.consume_key(Modifiers::NONE, Key::Enter),
                 i.consume_key(Modifiers::SHIFT, Key::Tab),
                 i.consume_key(Modifiers::NONE, Key::Tab),
@@ -200,6 +246,20 @@ impl GridState {
         result: &QueryResult,
         editable: bool,
     ) -> GridAction {
+        self.grid_keys_on(ctx, result, editable, crate::gui::shortcuts::is_mac())
+    }
+
+    /// [`Self::grid_keys`] with the keys of the platform (`mac`).
+    fn grid_keys_on(
+        &mut self,
+        ctx: &egui::Context,
+        result: &QueryResult,
+        editable: bool,
+        mac: bool,
+    ) -> GridAction {
+        let any = |keys: &[KeyboardShortcut]| {
+            ctx.input_mut(|i| crate::gui::shortcuts::consume_any(i, keys))
+        };
         let ncols = result.columns.len();
         let key = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         let moves = [
@@ -228,21 +288,21 @@ impl GridState {
         if !editable {
             return GridAction::None;
         }
-        if key(Modifiers::ALT, Key::Insert) {
+        if any(&ADD_ROW) {
             self.add_row(ctx, result);
             return GridAction::None;
         }
         if let Some((r, c)) = self.selected {
-            if key(Modifiers::NONE, Key::F2) || key(Modifiers::NONE, Key::Enter) {
-                self.start_edit(ctx, &result.rows, r, c);
-            } else if key(Modifiers::COMMAND, Key::Delete) {
+            if any(delete_row(mac)) {
                 self.toggle_delete(r);
+            } else if any(&edit_cell(mac)) {
+                self.start_edit(ctx, &result.rows, r, c);
             }
         }
-        if key(Modifiers::COMMAND, Key::Enter) && !self.edits.is_empty() {
+        if any(&[SUBMIT]) && !self.edits.is_empty() {
             return GridAction::Submit;
         }
-        if key(Modifiers::COMMAND, Key::Z) && !self.edits.is_empty() {
+        if any(&[REVERT]) && !self.edits.is_empty() {
             self.revert();
             return GridAction::Revert;
         }
@@ -350,6 +410,82 @@ mod tests {
         g.commit_edit(&result.rows);
         let c = g.edits.to_row_changes(&result.rows);
         assert_eq!(c.inserts, vec![vec![Some("42".into()), None, None]]);
+    }
+
+    /// One frame of `pressed` (as sent on `mac`) through the grid's keys.
+    fn grid_frame(
+        g: &mut GridState,
+        result: &QueryResult,
+        pressed: &KeyboardShortcut,
+        mac: bool,
+    ) -> GridAction {
+        use crate::gui::shortcuts::test_support::press;
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![press(pressed, mac)],
+            ..Default::default()
+        };
+        let mut action = GridAction::None;
+        let _ = ctx.run(input, |ctx| action = g.grid_keys_on(ctx, result, true, mac));
+        action
+    }
+
+    #[test]
+    fn row_keys_exist_on_mac_and_pc_keyboards() {
+        let result = QueryResult {
+            columns: vec![Column {
+                name: "name".into(),
+                type_name: "text".into(),
+                nullable: true,
+                is_primary_key: false,
+            }],
+            rows: col(&["a", "b"]),
+            ..Default::default()
+        };
+        let cmd = |k| ks(Modifiers::COMMAND, k);
+        let on = |r| GridState {
+            selected: Some((RowRef::Base(r), 0)),
+            ..Default::default()
+        };
+        for mac in [true, false] {
+            // ⌘I / Ctrl+I and Alt+Insert add a row.
+            for add in ADD_ROW {
+                let mut g = GridState::default();
+                grid_frame(&mut g, &result, &add, mac);
+                assert_eq!(g.edits.new_rows(), 1, "{add:?} mac: {mac}");
+            }
+            // ⌘⌫ deletes on macOS only; ⌘⌦ / Ctrl+Suppr everywhere.
+            for (key, deletes) in [(Key::Backspace, mac), (Key::Delete, true)] {
+                let mut g = on(1);
+                grid_frame(&mut g, &result, &cmd(key), mac);
+                assert_eq!(
+                    g.edits.is_deleted(RowRef::Base(1)),
+                    deletes,
+                    "{key:?} mac: {mac}"
+                );
+                assert!(g.editing.is_none());
+            }
+            // Plain Backspace does nothing; Enter and F2 edit the cell.
+            let mut g = on(0);
+            grid_frame(&mut g, &result, &ks(Modifiers::NONE, Key::Backspace), mac);
+            assert!(g.edits.is_empty() && g.editing.is_none());
+            for edit in edit_cell(mac) {
+                let mut g = on(0);
+                grid_frame(&mut g, &result, &edit, mac);
+                assert!(g.editing.is_some(), "{edit:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn grid_hints_name_the_keys_of_the_platform() {
+        use crate::gui::shortcuts::hint;
+        assert_eq!(hint(&ADD_ROW, true), "⌘I");
+        assert_eq!(hint(&ADD_ROW, false), "Ctrl+I / Alt+Inser");
+        assert_eq!(hint(delete_row(true), true), "⌘⌫");
+        assert_eq!(hint(delete_row(false), false), "Ctrl+Suppr");
+        assert_eq!(hint(&edit_cell(true), true), "↩");
+        assert_eq!(hint(&edit_cell(false), false), "F2 / Entrée");
     }
 
     #[test]

@@ -657,7 +657,7 @@ pub fn render_query_editor(
     let title = if state.has_selection() {
         " Query Editor [Ctrl+C:Copy | Ctrl+X:Cut | Ctrl+A:Select All] "
     } else {
-        " Query Editor [F5/Ctrl+Enter | Ctrl+Space:Complete | Shift+Arrow:Select] "
+        " Query Editor [F5/Ctrl+G | Ctrl+Enter/Ctrl+E | Ctrl+Space/Ctrl+K:Complete | Shift+Arrow:Select] "
     };
 
     // Single pass: compute cursor position, total visual lines, and editor scroll

@@ -76,6 +76,8 @@ pub enum DialogMode {
     Import,
     BatchExport,
     BatchImport,
+    /// Path of a connection folder (`folder_prompt`).
+    FolderPrompt,
 }
 
 /// Fields in the new connection dialog
@@ -251,6 +253,10 @@ pub struct NewConnectionState {
     pub color: Option<[u8; 3]>,
     /// PostgreSQL / MySQL sign-in; kept while another engine is chosen.
     pub db_auth: DbAuthMethod,
+    /// Kept so that editing a connection doesn't move it out of its folder.
+    pub folder: Option<String>,
+    /// Kept so that editing a connection doesn't show its hidden schemas.
+    pub hidden_schemas: Vec<String>,
 }
 
 impl Default for NewConnectionState {
@@ -274,6 +280,8 @@ impl Default for NewConnectionState {
             ssl_ca: String::new(),
             color: None,
             db_auth: DbAuthMethod::default(),
+            folder: None,
+            hidden_schemas: Vec::new(),
         }
     }
 }
@@ -377,8 +385,8 @@ impl NewConnectionState {
             flavor: self.flavor.filter(|f| f.driver() == self.db_type),
             // The default method is left out, as in older files.
             db_auth: self.gcp_iam().then_some(DbAuthMethod::GcpIam),
-            folder: None,
-            hidden_schemas: Vec::new(),
+            folder: self.folder.clone(),
+            hidden_schemas: self.hidden_schemas.clone(),
         }
     }
 
@@ -420,6 +428,8 @@ impl NewConnectionState {
                 .unwrap_or_default(),
             color: conn.color,
             db_auth: conn.effective_db_auth(),
+            folder: conn.folder.clone(),
+            hidden_schemas: conn.hidden_schemas.clone(),
         }
     }
 
@@ -626,7 +636,17 @@ pub struct AppState {
 
     // Connection list state
     pub selected_connection: usize,
+    /// Folder under the cursor; `None`: the cursor is on `selected_connection`.
+    pub selected_folder: Option<String>,
+    /// Folders folded in the Connections panel (for the session).
+    pub collapsed_folders: std::collections::HashSet<String>,
     pub connections_scroll: usize,
+    pub folder_prompt: Option<crate::tui::folders::FolderPrompt>,
+    /// Show the hidden schemas (greyed) in the Tables panel.
+    pub show_hidden_schemas: bool,
+    /// Configuration writes asked for (`persist_config`).
+    #[cfg(test)]
+    pub config_saves: usize,
 
     // Tables list state
     pub tables: Vec<String>,
@@ -746,7 +766,13 @@ impl AppState {
             connection: None,
             current_connection_config: None,
             selected_connection: 0,
+            selected_folder: None,
+            collapsed_folders: Default::default(),
             connections_scroll: 0,
+            folder_prompt: None,
+            show_hidden_schemas: false,
+            #[cfg(test)]
+            config_saves: 0,
             tables: Vec::new(),
             schemas: Vec::new(),
             selected_schema: 0,
@@ -814,7 +840,11 @@ impl AppState {
     }
 
     pub fn open_new_connection_dialog(&mut self) {
-        self.new_connection = NewConnectionState::default();
+        self.new_connection = NewConnectionState {
+            // Created in the folder of the cursor.
+            folder: self.cursor_folder(),
+            ..Default::default()
+        };
         self.editing_connection_index = None;
         self.dialog_mode = DialogMode::NewConnection;
     }
@@ -839,6 +869,7 @@ impl AppState {
         self.import_state = None;
         self.batch_export_state = None;
         self.batch_import_state = None;
+        self.folder_prompt = None;
     }
 
     pub fn is_dialog_open(&self) -> bool {
@@ -980,10 +1011,11 @@ impl AppState {
         }
     }
 
-    /// Known tables for completion: `schema.table`.
+    /// Known tables for completion: `schema.table`, but the hidden schemas'.
     pub fn get_known_tables(&self) -> Vec<String> {
         self.schemas
             .iter()
+            .filter(|schema| !self.is_schema_hidden(&schema.name))
             .flat_map(|schema| {
                 schema
                     .tables
@@ -1139,12 +1171,7 @@ impl AppState {
 
     pub fn select_next(&mut self) {
         match self.active_panel {
-            ActivePanel::Connections => {
-                if !self.config.connections.is_empty() {
-                    self.selected_connection =
-                        (self.selected_connection + 1) % self.config.connections.len();
-                }
-            }
+            ActivePanel::Connections => self.move_connection_cursor(true),
             ActivePanel::Tables => {
                 self.navigate_tables(true);
             }
@@ -1162,14 +1189,7 @@ impl AppState {
 
     pub fn select_prev(&mut self) {
         match self.active_panel {
-            ActivePanel::Connections => {
-                if !self.config.connections.is_empty() {
-                    self.selected_connection = self
-                        .selected_connection
-                        .checked_sub(1)
-                        .unwrap_or(self.config.connections.len() - 1);
-                }
-            }
+            ActivePanel::Connections => self.move_connection_cursor(false),
             ActivePanel::Tables => {
                 self.navigate_tables(false);
             }
@@ -1242,7 +1262,7 @@ impl AppState {
     /// Build a flat list of navigable items from filtered schemas.
     /// Each item is (schema_idx, table_original_idx) where table_original_idx is 0 for schema headers
     /// and original_table_index + 1 for tables.
-    fn build_filtered_nav_items(&self) -> Vec<(usize, usize)> {
+    pub(crate) fn build_filtered_nav_items(&self) -> Vec<(usize, usize)> {
         let filtered = self.get_filtered_schemas();
         let mut items = Vec::new();
         for (schema_idx, schema, filtered_tables) in &filtered {
@@ -1513,9 +1533,12 @@ impl AppState {
 
     // ========== Filter Methods ==========
 
-    /// Get filtered tables based on current filter
+    /// Get filtered tables based on current filter, the hidden schemas left
+    /// out unless `show_hidden_schemas`.
     pub fn get_filtered_schemas(&self) -> Vec<(usize, &SchemaInfo, Vec<(usize, &String)>)> {
         let filter = self.tables_filter.to_lowercase();
+        let shown =
+            |schema: &&SchemaInfo| self.show_hidden_schemas || !self.is_schema_hidden(&schema.name);
 
         if filter.is_empty() {
             // No filter, return all schemas with all tables
@@ -1523,6 +1546,7 @@ impl AppState {
                 .schemas
                 .iter()
                 .enumerate()
+                .filter(|(_, schema)| shown(schema))
                 .map(|(idx, schema)| {
                     let tables: Vec<(usize, &String)> = schema.tables.iter().enumerate().collect();
                     (idx, schema, tables)
@@ -1534,6 +1558,7 @@ impl AppState {
         self.schemas
             .iter()
             .enumerate()
+            .filter(|(_, schema)| shown(schema))
             .filter_map(|(schema_idx, schema)| {
                 // Check if schema name matches
                 let schema_matches = schema.name.to_lowercase().contains(&filter);

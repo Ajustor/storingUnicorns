@@ -78,6 +78,18 @@ pub async fn handle_tables_keys(
             KeyAction::Consumed
         }
 
+        // Hide the schema under the cursor (or show it again)
+        KeyCode::Char('h') => {
+            state.toggle_selected_schema_hidden();
+            KeyAction::Consumed
+        }
+
+        // Show / hide the hidden schemas (greyed)
+        KeyCode::Char('H') => {
+            state.toggle_show_hidden_schemas();
+            KeyAction::Consumed
+        }
+
         // Activate filter mode
         KeyCode::Char('/') => {
             state.tables_filter_active = true;

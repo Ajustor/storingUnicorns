@@ -5,8 +5,13 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClickableType {
     Connection(usize),
+    /// A connection folder, by path.
+    ConnectionFolder(String),
     Schema(usize),
-    Table { schema_idx: usize, table_idx: usize },
+    Table {
+        schema_idx: usize,
+        table_idx: usize,
+    },
     QueryEditor,
     QueryTab(usize),
     ResultRow(usize),

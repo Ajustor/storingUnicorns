@@ -274,13 +274,20 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                     }
 
+                    // macOS-friendly fallbacks stand for the keys they replace.
+                    let (code, modifiers) = key_handlers::resolve_fallback(
+                        key.code,
+                        key.modifiers,
+                        state.active_panel,
+                    );
+
                     // Dispatch to panel-specific handler, then fall through to global
                     let panel_result = match state.active_panel {
                         ActivePanel::Connections => {
-                            let r = key_handlers::handle_connections_keys(state, key.code).await;
+                            let r = key_handlers::handle_connections_keys(state, code).await;
                             // Enter on a connection opens it in the background.
                             if r == key_handlers::KeyAction::NotHandled
-                                && key.code == KeyCode::Enter
+                                && code == KeyCode::Enter
                             {
                                 connect::start(state);
                                 key_handlers::KeyAction::Consumed
@@ -289,22 +296,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                         ActivePanel::Tables => {
-                            key_handlers::handle_tables_keys(state, key.code, key.modifiers).await
+                            key_handlers::handle_tables_keys(state, code, modifiers).await
                         }
                         ActivePanel::QueryEditor => {
-                            key_handlers::handle_editor_keys(state, key.code, key.modifiers).await
+                            key_handlers::handle_editor_keys(state, code, modifiers).await
                         }
                         ActivePanel::Results => {
-                            key_handlers::handle_results_keys(state, key.code).await
+                            key_handlers::handle_results_keys(state, code).await
                         }
                     };
 
                     // If panel didn't handle it, try global shortcuts
                     if panel_result == key_handlers::KeyAction::NotHandled
                         // An Esc no panel used cancels the connection being opened.
-                        && !(key.code == KeyCode::Esc && connect::cancel(state))
+                        && !(code == KeyCode::Esc && connect::cancel(state))
                     {
-                        key_handlers::handle_global_keys(state, key.code, key.modifiers).await;
+                        key_handlers::handle_global_keys(state, code, modifiers).await;
                     }
                 }
                 Event::Mouse(mouse) => {

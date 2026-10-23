@@ -174,7 +174,7 @@ pub async fn handle_global_keys(
         // Help
         KeyCode::Char('?') => {
             state.set_status(
-                "Help: Tab=switch panels, Enter=connect/select/fold, F5=execute, n=new, d=delete, m=move, f=folder, h=hide schema, q=quit",
+                "Help: Tab=switch panels, Enter=connect/select/fold, F5/Ctrl+G=execute, Ctrl+Enter/Ctrl+E=run current, n=new, d=delete, m=move, f=folder, h=hide schema, q=quit",
             );
             KeyAction::Consumed
         }

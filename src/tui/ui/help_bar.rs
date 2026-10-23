@@ -28,7 +28,7 @@ fn connections_help(state: &AppState) -> Vec<(&'static str, &'static str)> {
             ("m", "Move"),
             ("f", "New folder"),
             ("Tab", "Next panel"),
-            ("F6/F7", "Exp/Imp"),
+            ("F6/F7 Ctrl+O/L", "Exp/Imp"),
         ]
     }
 }
@@ -42,7 +42,8 @@ fn tables_help() -> Vec<(&'static str, &'static str)> {
         ("s", "Schema"),
         ("t", "Truncate"),
         ("h/H", "Hide/Show hidden"),
-        ("F6/F7", "Exp/Imp"),
+        ("E/I", "Batch exp/imp"),
+        ("F6/F7 Ctrl+O/L", "Exp/Imp"),
     ]
 }
 
@@ -53,7 +54,7 @@ fn query_editor_help(state: &AppState) -> Vec<(&'static str, &'static str)> {
             ("↑/↓", "Navigate"),
             ("Enter", "Accept"),
             ("Esc", "Dismiss"),
-            ("Ctrl+Space", "Refresh"),
+            ("Ctrl+Space/K", "Refresh"),
         ]
     } else if state.has_selection() {
         vec![
@@ -64,12 +65,13 @@ fn query_editor_help(state: &AppState) -> Vec<(&'static str, &'static str)> {
         ]
     } else {
         vec![
-            ("F5", "Execute"),
-            ("Ctrl+↵", "Run current"),
+            ("F5/Ctrl+G", "Execute"),
+            ("Ctrl+↵/E", "Run current"),
+            ("Ctrl+Space/K", "Complete"),
             ("Ctrl+T", "New tab"),
             ("Ctrl+W", "Close tab"),
-            ("F6", "Export"),
-            ("F7", "Import"),
+            ("F6/Ctrl+O", "Export"),
+            ("F7/Ctrl+L", "Import"),
         ]
     }
 }
@@ -82,7 +84,7 @@ fn results_help() -> Vec<(&'static str, &'static str)> {
         ("Enter", "Edit"),
         ("d/Del", "Delete"),
         ("a", "Add row"),
-        ("F6/F7", "Exp/Imp"),
+        ("F6/F7 Ctrl+O/L", "Exp/Imp"),
     ]
 }
 

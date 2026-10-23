@@ -11,7 +11,7 @@ pub async fn handle_editor_keys(
     modifiers: KeyModifiers,
 ) -> KeyAction {
     match key_code {
-        // Execute current query at cursor: Ctrl+Enter
+        // Execute current query at cursor: Ctrl+Enter (Ctrl+E, see fallbacks)
         KeyCode::Enter if modifiers.contains(KeyModifiers::CONTROL) => {
             crate::tui::handle_execute_current_query(state).await;
             KeyAction::Consumed
@@ -47,7 +47,7 @@ pub async fn handle_editor_keys(
             }
         }
 
-        // Autocompletion: Trigger with Ctrl+Space
+        // Autocompletion: Trigger with Ctrl+Space (Ctrl+K, see fallbacks)
         KeyCode::Char(' ') if modifiers.contains(KeyModifiers::CONTROL) => {
             state.update_completions();
             KeyAction::Consumed
@@ -338,6 +338,39 @@ mod tests {
             crate::tui::columns::poll(state).await;
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// Ctrl+K (completion) and Ctrl+E (run the statement) reach the editor
+    /// like Ctrl+Space and Ctrl+Enter, which macOS terminals may not send.
+    #[tokio::test]
+    async fn mac_terminal_fallbacks_reach_the_editor() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.active_panel = ActivePanel::QueryEditor;
+        state.set_query("SEL".into());
+        state.set_cursor_position(3);
+        let (code, mods) = super::super::resolve_fallback(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+            state.active_panel,
+        );
+        handle_editor_keys(&mut state, code, mods).await;
+        assert!(state.show_completion, "Ctrl+K completes");
+        assert_eq!(state.query_input(), "SEL", "nothing typed");
+        state.hide_completion();
+        // Not connected: Ctrl+E tries to run, nothing is typed.
+        let (code, mods) = super::super::resolve_fallback(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL,
+            state.active_panel,
+        );
+        let action = handle_editor_keys(&mut state, code, mods).await;
+        assert_eq!(action, KeyAction::Consumed);
+        assert_eq!(state.query_input(), "SEL");
+        assert!(
+            state.status_message.contains("Not connected"),
+            "{}",
+            state.status_message
+        );
     }
 
     #[tokio::test]

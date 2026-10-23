@@ -419,6 +419,40 @@ db.users.find({_id: 1}, {})"#,
         r#"db.types.insertOne({_id: 1, l: NumberLong(5), i: 5, d: 1.0, m: NumberDecimal("1.50"), t: ISODate("2024-01-02T03:04:05.678Z")})"#,
     )
     .await;
+    // CSV keeps an empty string (`""`) apart from null / missing (empty).
+    run(
+        &conn,
+        r#"db.empties.insertMany([{_id: 1, note: "", n: null}, {_id: 2, note: "x"}])"#,
+    )
+    .await;
+    let path = dir.path().join("empties.csv");
+    export_collection(
+        c,
+        &coll("empties"),
+        "",
+        &path,
+        TransferFormat::Csv,
+        |_, _, _| {},
+    )
+    .await
+    .unwrap();
+    import_collection(
+        c,
+        &coll("empties_csv"),
+        &path,
+        TransferFormat::Csv,
+        &ImportOptions::default(),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        all_docs(c, "empties_csv").await,
+        [
+            doc! { "_id": 1, "note": "" },
+            doc! { "_id": 2, "note": "x" }
+        ]
+    );
     let typed = all_docs(c, "types").await;
     assert_eq!(typed[0].get("l"), Some(&Bson::Int64(5)));
     for format in [TransferFormat::Json, TransferFormat::JsonLines] {

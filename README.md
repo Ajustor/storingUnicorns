@@ -231,7 +231,9 @@ Azure Cosmos DB et Amazon DocumentDB (par leur API MongoDB).
   JSON ; à l'import, types déduits (**Tout garder en texte** pour s'en
   passer, **Reconnaître les dates ISO**), `_id` de 24 caractères
   hexadécimaux lu comme `ObjectId`. `null` et champ absent s'exportent tous
-  deux vides.
+  deux vides (et reviennent absents) ; une chaîne vide s'écrit `""` et se
+  relit comme telle. JSON / JSON Lines : JSON étendu canonique, chaque type
+  est conservé (`NumberLong`, `Decimal128`, dates…).
 
 Limites : un **Submit n'est pas atomique** (les écritures sont envoyées une à
 une, sans transaction : en cas d'erreur, le message indique combien ont été

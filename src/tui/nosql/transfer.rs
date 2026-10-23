@@ -12,7 +12,7 @@ use crate::engine::models::{DatabaseType, QueryResult, SchemaInfo, NULL_CELL};
 use crate::engine::nosql::mongo::{self, CollectionRef};
 use crate::engine::nosql::redis;
 use crate::engine::nosql::{is_absent, ImportOptions, Source, TransferFormat};
-use crate::engine::services::export_import::{batch_file_name, export_to_csv};
+use crate::engine::services::export_import::{batch_file_name, export_to_csv_quoting_empty};
 use crate::tui::{AppState, DialogMode};
 
 /// What the modal transfers.
@@ -467,7 +467,7 @@ fn edit_text(text: &mut String, cursor: &mut usize, key: KeyCode) {
 }
 
 /// The shown result as a file: the documents of a collection (canonical
-/// extended JSON, types kept), else the rows as objects; CSV as `export_to_csv` (a
+/// extended JSON, types kept), else the rows as objects; CSV as `export_to_csv_quoting_empty` (a
 /// missing field empty, like null).
 pub fn results_file(
     result: &QueryResult,
@@ -483,7 +483,7 @@ pub fn results_file(
                 }
             }
         }
-        return export_to_csv(&r);
+        return export_to_csv_quoting_empty(&r);
     }
     let values: Vec<serde_json::Value> = match docs {
         Some(docs) if docs.len() == result.rows.len() => docs

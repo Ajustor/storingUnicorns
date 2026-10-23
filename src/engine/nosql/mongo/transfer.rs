@@ -16,7 +16,9 @@ use super::{mongo_error, CollectionRef, MongoClient};
 use crate::engine::models::{Column, QueryResult, NULL_CELL};
 use crate::engine::nosql::{ImportOptions, TransferFormat};
 use crate::engine::ops::transfer::ImportStats;
-use crate::engine::services::export_import::{export_to_csv, parse_csv};
+use crate::engine::services::export_import::{
+    export_to_csv_quoting_empty, parse_csv_marking_quoted_empty, QUOTED_EMPTY,
+};
 
 /// Documents per import batch.
 const BATCH: usize = 1000;
@@ -50,8 +52,10 @@ fn csv_cell(v: &Bson, top_id: bool) -> String {
 }
 
 /// CSV grid: nested fields as dotted paths (`a.b`), arrays (and empty
-/// objects) as relaxed extended JSON, null as an empty field; `_id` first,
-/// then the paths by first appearance. A missing field is empty too.
+/// objects) as relaxed extended JSON, null and missing fields as
+/// `NULL_CELL` (an empty field), an empty string as "" (written `""` by
+/// `export_to_csv_quoting_empty`); `_id` first, then the paths by first
+/// appearance.
 pub fn flatten_paths(docs: &[Document]) -> QueryResult {
     fn walk(out: &mut Vec<(String, String)>, doc: &Document, prefix: &str) {
         for (k, v) in doc {
@@ -106,7 +110,7 @@ pub fn flatten_paths(docs: &[Document]) -> QueryResult {
             .map(|cells| {
                 order
                     .iter()
-                    .map(|p| cells.get(p).cloned().unwrap_or_default())
+                    .map(|p| cells.get(p).cloned().unwrap_or_else(|| NULL_CELL.into()))
                     .collect()
             })
             .collect(),
@@ -218,7 +222,7 @@ fn insert_path(doc: &mut Document, path: &[&str], value: Bson) -> Result<(), ()>
 }
 
 /// A CSV row as a document: dotted paths → nested objects; an empty field
-/// = absent; inference (unless `keep_strings`): integer → Int32/Int64,
+/// = absent, `""` (`QUOTED_EMPTY`) = an empty string; inference (unless `keep_strings`): integer → Int32/Int64,
 /// decimal → Double, true/false → Bool, `null` → Null, `[`/`{` valid JSON
 /// (extended JSON) → array/object, ISO 8601 → Date when `parse_dates`,
 /// else a string; an `_id` of 24 hex digits → ObjectId.
@@ -239,13 +243,18 @@ pub fn csv_row_to_doc(
         if cell.is_empty() {
             continue;
         }
+        let value = if cell == QUOTED_EMPTY {
+            Bson::String(String::new())
+        } else {
+            infer(column, cell, opts)
+        };
         let segments: Vec<&str> = column.split('.').collect();
         let path = if segments.iter().any(|s| s.is_empty()) {
             vec![column.as_str()]
         } else {
             segments
         };
-        insert_path(&mut doc, &path, infer(column, cell, opts))
+        insert_path(&mut doc, &path, value)
             .map_err(|_| format!("conflit de chemins sur la colonne « {column} »"))?;
     }
     Ok(doc)
@@ -298,7 +307,8 @@ pub(crate) fn read_documents(
             }
         }
         TransferFormat::Csv => {
-            let (columns, rows) = parse_csv(content).map_err(|e| anyhow::anyhow!(e))?;
+            let (columns, rows) =
+                parse_csv_marking_quoted_empty(content).map_err(|e| anyhow::anyhow!(e))?;
             for (i, row) in rows.iter().enumerate() {
                 match csv_row_to_doc(&columns, row, opts) {
                     Ok(d) => docs.push(d),
@@ -322,7 +332,7 @@ pub(crate) fn write_documents(docs: &[Document], format: TransferFormat) -> Stri
             format!("[\n{}\n]\n", items.join(",\n"))
         }
         TransferFormat::JsonLines => docs.iter().map(|d| json(d) + "\n").collect(),
-        TransferFormat::Csv => export_to_csv(&flatten_paths(docs)),
+        TransferFormat::Csv => export_to_csv_quoting_empty(&flatten_paths(docs)),
     }
 }
 
@@ -510,8 +520,7 @@ mod tests {
             assert_eq!(docs, [d.clone()], "{format:?}");
         }
         // Relaxed files (mongoexport's default) still read.
-        let relaxed = "{\"a\": 1, \"b\": 1.5, \"c\": {\"$date\": \"2024-01-02T03:04:05Z\"}}
-";
+        let relaxed = "{\"a\": 1, \"b\": 1.5, \"c\": {\"$date\": \"2024-01-02T03:04:05Z\"}}\n";
         let (docs, _) = read_documents(relaxed, TransferFormat::JsonLines, &opts()).unwrap();
         assert_eq!(docs[0].get("a"), Some(&Bson::Int32(1)));
         assert!(matches!(docs[0].get("c"), Some(Bson::DateTime(_))));
@@ -550,15 +559,44 @@ mod tests {
                 "[\"x\",1]".into()
             ]
         );
-        assert_eq!(r.rows[0][5], "");
+        assert_eq!(r.rows[0][5], NULL_CELL, "missing");
         assert_eq!(r.rows[1][0], "2");
         assert_eq!(r.rows[1][5], NULL_CELL);
         assert_eq!(r.rows[1][6], format!("{{\"$oid\":\"{}\"}}", oid.to_hex()));
         assert_eq!(r.rows[1][7], "{}");
         assert_eq!(r.rows[1][8], "1970-01-01T00:00:00.000Z");
-        let csv = export_to_csv(&r);
+        let csv = export_to_csv_quoting_empty(&r);
         assert!(csv.starts_with("_id,name,addr.city,"));
         assert!(csv.contains(",,"), "null and missing are empty: {csv}");
+        assert!(!csv.contains(",\"\","), "no empty string here: {csv}");
+    }
+
+    #[test]
+    fn csv_keeps_empty_strings_apart_from_null_and_missing() {
+        let docs = vec![
+            doc! { "_id": 1, "note": "", "n": Bson::Null, "x": 1 },
+            doc! { "_id": 2, "x": 2 },
+        ];
+        let csv = write_documents(&docs, TransferFormat::Csv);
+        assert_eq!(csv, "_id,note,n,x\n1,\"\",,1\n2,,,2\n");
+        let (back, errors) = read_documents(&csv, TransferFormat::Csv, &opts()).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        // The empty string survives; null and missing both come back missing.
+        assert_eq!(
+            back,
+            [
+                doc! { "_id": 1, "note": "", "x": 1 },
+                doc! { "_id": 2, "x": 2 }
+            ]
+        );
+        // Even with every value kept as text.
+        let text = ImportOptions {
+            keep_strings: true,
+            ..opts()
+        };
+        let (back, _) = read_documents(&csv, TransferFormat::Csv, &text).unwrap();
+        assert_eq!(back[0].get("note"), Some(&Bson::String(String::new())));
+        assert!(!back[1].contains_key("note"));
     }
 
     #[test]

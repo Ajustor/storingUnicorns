@@ -42,7 +42,8 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
   **5 000 clés** par base ; l'onglet **Clés** et un motif plus précis
   permettent d'aller au-delà.
 - CSV MongoDB : `null` et champ absent s'exportent tous deux vides ; à
-  l'import, une cellule vide donne un champ absent.
+  l'import, une cellule vide donne un champ absent (une chaîne vide, écrite
+  `""`, est conservée).
 
 ## [0.18.4] - 2026-10-23
 

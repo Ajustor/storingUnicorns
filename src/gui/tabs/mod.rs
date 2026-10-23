@@ -268,6 +268,8 @@ pub fn persisted_consoles(tabs: &Tabs, pending: &[QueryTab]) -> QueryTabsState {
             cursor_position: c.cursor,
             is_modified: false,
             connection: Some(t.connection.clone()),
+            // Set by the NoSQL consoles (plan 13, Task 4).
+            nosql_scope: None,
         }),
         _ => None,
     });

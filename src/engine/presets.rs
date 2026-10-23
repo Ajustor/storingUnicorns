@@ -79,14 +79,28 @@ pub struct ParsedUrl {
     pub ssl_mode: Option<SslMode>,
     pub ssl_ca: Option<std::path::PathBuf>,
     pub flavor: Option<Flavor>,
+    /// MongoDB: the whole connection string without its password (hosts,
+    /// options), saved as `ConnectionConfig::uri`.
+    pub uri: Option<String>,
 }
 
-const URL_ERROR: &str =
-    "URL non reconnue : schéma attendu postgres://, postgresql://, mysql:// ou mariadb://";
+const URL_ERROR: &str = "URL non reconnue : schéma attendu postgres://, postgresql://, \
+     mysql://, mariadb://, mongodb://, mongodb+srv://, redis:// ou rediss://";
 
 /// Parse `postgres(ql)://`, `mysql://` or `mariadb://` URLs as providers
-/// give them (`user:pass@host:port/db?sslmode=require`).
+/// give them (`user:pass@host:port/db?sslmode=require`), `redis(s)://` URLs
+/// and MongoDB connection strings (`parse_mongo_uri`).
 pub fn parse_url(input: &str) -> Result<ParsedUrl, String> {
+    let input = input.trim();
+    let scheme = input
+        .split_once("://")
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match scheme.as_str() {
+        "mongodb" | "mongodb+srv" => return parse_mongo_uri(input),
+        "redis" | "rediss" => return parse_redis_url(input),
+        _ => {}
+    }
     let url = url::Url::parse(input.trim()).map_err(|_| URL_ERROR.to_string())?;
     let (db_type, scheme_flavor) = match url.scheme() {
         "postgres" | "postgresql" => (DatabaseType::Postgres, None),
@@ -138,7 +152,136 @@ pub fn parse_url(input: &str) -> Result<ParsedUrl, String> {
         ssl_mode,
         ssl_ca,
         flavor,
+        uri: None,
     })
+}
+
+/// `redis://[user[:password]@]host[:port][/db]`, `rediss://` = TLS verified
+/// (`#insecure`: not verified). The database is an index from 0 to 15.
+fn parse_redis_url(input: &str) -> Result<ParsedUrl, String> {
+    let url = url::Url::parse(input).map_err(|_| URL_ERROR.to_string())?;
+    let tls = url.scheme() == "rediss";
+    let host = match url.host() {
+        Some(url::Host::Ipv6(ip)) => ip.to_string(),
+        Some(h) => decode(&h.to_string()),
+        None => String::new(),
+    };
+    if host.is_empty() {
+        return Err("URL sans hôte".into());
+    }
+    let username = Some(decode(url.username())).filter(|u| !u.is_empty());
+    let password = url.password().map(decode);
+    let database = Some(decode(url.path().trim_start_matches('/'))).filter(|d| !d.is_empty());
+    if let Some(db) = &database {
+        if !db.parse::<u8>().is_ok_and(|n| n <= 15) {
+            return Err(format!("Base Redis invalide : « {db} » (0 à 15)"));
+        }
+    }
+    let ssl_mode = match (tls, url.fragment() == Some("insecure")) {
+        (false, _) => None,
+        (true, true) => Some(SslMode::Require),
+        (true, false) => Some(SslMode::VerifyFull),
+    };
+    Ok(ParsedUrl {
+        db_type: DatabaseType::Redis,
+        host: Some(host),
+        port: url.port(),
+        username,
+        password,
+        database,
+        ssl_mode,
+        ssl_ca: None,
+        flavor: None,
+        uri: None,
+    })
+}
+
+/// A MongoDB connection string (`mongodb://` or `mongodb+srv://`, possibly
+/// several hosts): kept whole in `uri` without its password, which goes to
+/// `password`; `host` / `port` are the first host's, `database` the path.
+fn parse_mongo_uri(input: &str) -> Result<ParsedUrl, String> {
+    let (uri, password) = split_uri_password(input);
+    let rest = uri.split_once("://").map_or("", |(_, r)| r);
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let (userinfo, hosts) = authority.rsplit_once('@').unwrap_or(("", authority));
+    let first = hosts.split(',').next().unwrap_or("");
+    if first.is_empty() {
+        return Err("URL sans hôte".into());
+    }
+    let (host, port) = if let Some(v6) = first.strip_prefix('[') {
+        let (ip, after) = v6.split_once(']').unwrap_or((v6, ""));
+        (ip.to_string(), after.strip_prefix(':'))
+    } else {
+        match first.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), Some(p)),
+            None => (first.to_string(), None),
+        }
+    };
+    let port = match port {
+        Some(p) => Some(
+            p.parse::<u16>()
+                .map_err(|_| format!("Port invalide : « {p} »"))?,
+        ),
+        None => None,
+    };
+    let username = Some(decode(userinfo)).filter(|u| !u.is_empty());
+    let path = tail.strip_prefix('/').unwrap_or("");
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let database = Some(decode(path)).filter(|d| !d.is_empty());
+    Ok(ParsedUrl {
+        db_type: DatabaseType::MongoDB,
+        host: Some(decode(&host)),
+        port,
+        username,
+        password,
+        database,
+        ssl_mode: None,
+        ssl_ca: None,
+        flavor: None,
+        uri: Some(uri),
+    })
+}
+
+/// `uri` without the password of its userinfo, and that password decoded
+/// (`mongodb://u:p%40ss@h/` → (`mongodb://u@h/`, `p@ss`)).
+pub fn split_uri_password(uri: &str) -> (String, Option<String>) {
+    let uri = uri.trim();
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return (uri.to_string(), None);
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let Some((userinfo, hosts)) = authority.rsplit_once('@') else {
+        return (uri.to_string(), None);
+    };
+    match userinfo.split_once(':') {
+        Some((user, password)) => (
+            format!("{scheme}://{user}@{hosts}{tail}"),
+            Some(decode(password)),
+        ),
+        None => (uri.to_string(), None),
+    }
+}
+
+/// `uri` (saved without a password) with `password` put back, percent-encoded,
+/// after its username; unchanged when it has no username.
+#[allow(dead_code)] // used by the MongoDB engine (plan 13, Task 2)
+pub fn uri_with_password(uri: &str, password: &str) -> String {
+    let (uri, _) = split_uri_password(uri);
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return uri;
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    match authority.rsplit_once('@') {
+        Some((user, hosts)) if !user.is_empty() => {
+            let encoded =
+                percent_encoding::utf8_percent_encode(password, percent_encoding::NON_ALPHANUMERIC);
+            format!("{scheme}://{user}:{encoded}@{hosts}{tail}")
+        }
+        _ => uri,
+    }
 }
 
 /// Whether the userinfo of `input` ends with `:` (`user:@host`): an
@@ -352,10 +495,111 @@ mod tests {
 
     #[test]
     fn rejects_unknown_or_broken_urls() {
-        let e = parse_url("redis://localhost").unwrap_err();
+        let e = parse_url("ftp://localhost").unwrap_err();
         assert!(e.contains("postgres://"), "{e}");
         assert!(parse_url("postgres://").is_err());
         assert!(parse_url("not a url").is_err());
         assert!(parse_url("").is_err());
+    }
+
+    #[test]
+    fn redis_urls() {
+        let p = parse_url("redis://app:p%40ss@cache.local:6380/3").unwrap();
+        assert_eq!(p.db_type, DatabaseType::Redis);
+        assert_eq!(p.host.as_deref(), Some("cache.local"));
+        assert_eq!(p.port, Some(6380));
+        assert_eq!(p.username.as_deref(), Some("app"));
+        assert_eq!(p.password.as_deref(), Some("p@ss"));
+        assert_eq!(p.database.as_deref(), Some("3"));
+        assert_eq!(p.ssl_mode, None);
+        assert_eq!(p.uri, None);
+        // Password only (`AUTH pw`).
+        let p = parse_url("redis://:pw@h").unwrap();
+        assert_eq!(p.username, None);
+        assert_eq!(p.password.as_deref(), Some("pw"));
+        assert_eq!(p.port, None);
+        assert_eq!(p.database, None);
+        let p = parse_url("rediss://h:6380").unwrap();
+        assert_eq!(p.ssl_mode, Some(SslMode::VerifyFull));
+        let p = parse_url("rediss://h/0#insecure").unwrap();
+        assert_eq!(p.ssl_mode, Some(SslMode::Require));
+        assert!(parse_url("redis://h/16").is_err());
+        assert!(parse_url("redis://h/x").is_err());
+        assert!(parse_url("REDIS://h").is_ok());
+    }
+
+    #[test]
+    fn mongo_uris_keep_everything_but_the_password() {
+        let p = parse_url(
+            "mongodb+srv://jane:p%40ss%3Aw%2Frd@cluster0.abc.mongodb.net/shop?retryWrites=true&w=majority",
+        )
+        .unwrap();
+        assert_eq!(p.db_type, DatabaseType::MongoDB);
+        assert_eq!(p.password.as_deref(), Some("p@ss:w/rd"));
+        assert_eq!(p.username.as_deref(), Some("jane"));
+        assert_eq!(p.host.as_deref(), Some("cluster0.abc.mongodb.net"));
+        assert_eq!(p.port, None);
+        assert_eq!(p.database.as_deref(), Some("shop"));
+        assert_eq!(
+            p.uri.as_deref(),
+            Some("mongodb+srv://jane@cluster0.abc.mongodb.net/shop?retryWrites=true&w=majority")
+        );
+        // Several hosts are kept; the first one fills host / port.
+        let p = parse_url("mongodb://u:p@a.local:27018,b.local:27019/?replicaSet=rs0").unwrap();
+        assert_eq!(p.host.as_deref(), Some("a.local"));
+        assert_eq!(p.port, Some(27018));
+        assert_eq!(p.database, None);
+        assert_eq!(
+            p.uri.as_deref(),
+            Some("mongodb://u@a.local:27018,b.local:27019/?replicaSet=rs0")
+        );
+        let p = parse_url("mongodb://[::1]:27017").unwrap();
+        assert_eq!(p.host.as_deref(), Some("::1"));
+        assert_eq!(p.port, Some(27017));
+        assert_eq!(p.password, None);
+        let p = parse_url("mongodb://h").unwrap();
+        assert_eq!(p.uri.as_deref(), Some("mongodb://h"));
+        assert!(parse_url("mongodb://").is_err());
+        assert!(parse_url("mongodb://h:port/").is_err());
+    }
+
+    #[test]
+    fn uri_passwords_are_split_and_put_back() {
+        assert_eq!(
+            split_uri_password("mongodb://u:p%40ss@h/db"),
+            ("mongodb://u@h/db".to_string(), Some("p@ss".to_string()))
+        );
+        assert_eq!(
+            split_uri_password("mongodb://u@h/"),
+            ("mongodb://u@h/".to_string(), None)
+        );
+        assert_eq!(
+            split_uri_password("mongodb://h/?a=b@c"),
+            ("mongodb://h/?a=b@c".to_string(), None)
+        );
+        assert_eq!(
+            split_uri_password("not a uri"),
+            ("not a uri".to_string(), None)
+        );
+        let back = uri_with_password("mongodb://u@h/db?x=1", "p@ss:w/rd");
+        assert_eq!(back, "mongodb://u:p%40ss%3Aw%2Frd@h/db?x=1");
+        assert_eq!(
+            split_uri_password(&back),
+            (
+                "mongodb://u@h/db?x=1".to_string(),
+                Some("p@ss:w/rd".to_string())
+            )
+        );
+        // No username: nothing to attach the password to.
+        assert_eq!(uri_with_password("mongodb://h/", "x"), "mongodb://h/");
+    }
+
+    #[test]
+    fn unknown_schemes_name_every_accepted_one() {
+        let e = parse_url("ftp://h").unwrap_err();
+        assert!(
+            e.contains("mongodb+srv://") && e.contains("rediss://"),
+            "{e}"
+        );
     }
 }

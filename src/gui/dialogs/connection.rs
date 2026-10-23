@@ -142,6 +142,8 @@ fn default_port(t: &DatabaseType) -> &'static str {
         DatabaseType::MySQL => "3306",
         DatabaseType::SQLite => "",
         DatabaseType::SQLServer | DatabaseType::Azure => "1433",
+        DatabaseType::MongoDB => "27017",
+        DatabaseType::Redis => "6379",
     }
 }
 
@@ -498,6 +500,9 @@ impl ConnectionForm {
             // The default method is left out, as in older files.
             db_auth: iam.then_some(DbAuthMethod::GcpIam),
             folder,
+            // MongoDB settings: the form's fields come with plan 13, Task 4.
+            uri: None,
+            auth_source: None,
             hidden_schemas: self.hidden_schemas.clone(),
         })
     }
@@ -1473,7 +1478,7 @@ mod tests {
         assert_eq!(f.flavor, Some(Flavor::Supabase));
         assert!(f.url.is_empty());
 
-        f.url = "redis://x".into();
+        f.url = "ftp://x".into();
         assert!(f.apply_url().is_err());
         assert_eq!(f.host, "db.abc.supabase.co"); // untouched
     }

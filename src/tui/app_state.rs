@@ -387,6 +387,9 @@ impl NewConnectionState {
             db_auth: self.gcp_iam().then_some(DbAuthMethod::GcpIam),
             folder: self.folder.clone(),
             hidden_schemas: self.hidden_schemas.clone(),
+            // MongoDB settings: the dialog's fields come with plan 13, Task 5.
+            uri: None,
+            auth_source: None,
         }
     }
 
@@ -494,6 +497,8 @@ impl NewConnectionState {
             DatabaseType::SQLite => DatabaseType::SQLServer,
             DatabaseType::SQLServer => DatabaseType::Azure,
             DatabaseType::Azure => DatabaseType::Postgres,
+            // Not offered by the dialog yet (plan 13, Task 5).
+            DatabaseType::MongoDB | DatabaseType::Redis => DatabaseType::Postgres,
         });
     }
 
@@ -621,6 +626,14 @@ impl NewConnectionState {
             DatabaseType::Azure => {
                 self.port = String::from("1433");
                 self.host = String::from("servername.database.windows.net");
+            }
+            DatabaseType::MongoDB => {
+                self.port = String::from("27017");
+                self.host = String::from("localhost");
+            }
+            DatabaseType::Redis => {
+                self.port = String::from("6379");
+                self.host = String::from("localhost");
             }
         };
     }
@@ -1679,7 +1692,7 @@ mod tests {
         assert_eq!(nc.port, "3306");
         assert!(nc.url.is_empty());
 
-        nc.url = "redis://x".into();
+        nc.url = "ftp://x".into();
         assert!(nc.apply_url().is_err());
         assert_eq!(nc.host, "aws.connect.psdb.cloud"); // untouched
     }

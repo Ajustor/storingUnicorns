@@ -138,7 +138,11 @@ impl<DB: Database> Drop for TxConnection<DB> {
 /// `(begin, commit)` statements for the dialect.
 pub fn transaction_bounds(db: &DatabaseType) -> (&'static str, &'static str) {
     match db {
-        DatabaseType::Postgres | DatabaseType::SQLite => ("BEGIN", "COMMIT"),
+        // MongoDB / Redis: never asked (`execute_checked_batch` refuses them).
+        DatabaseType::Postgres
+        | DatabaseType::SQLite
+        | DatabaseType::MongoDB
+        | DatabaseType::Redis => ("BEGIN", "COMMIT"),
         DatabaseType::MySQL => ("START TRANSACTION", "COMMIT"),
         DatabaseType::SQLServer | DatabaseType::Azure => ("BEGIN TRANSACTION", "COMMIT"),
     }
@@ -380,7 +384,11 @@ fn quote_string(value: &str, db: &DatabaseType) -> String {
     match db {
         DatabaseType::MySQL => format!("'{}'", escaped.replace('\\', "\\\\")),
         DatabaseType::SQLServer | DatabaseType::Azure => format!("N'{escaped}'"),
-        DatabaseType::Postgres | DatabaseType::SQLite => format!("'{escaped}'"),
+        // MongoDB / Redis: no SQL is generated for them.
+        DatabaseType::Postgres
+        | DatabaseType::SQLite
+        | DatabaseType::MongoDB
+        | DatabaseType::Redis => format!("'{escaped}'"),
     }
 }
 

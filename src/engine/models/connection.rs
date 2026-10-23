@@ -36,9 +36,34 @@ pub enum DatabaseType {
     SQLite,
     SQLServer,
     Azure,
+    MongoDB,
+    Redis,
+}
+
+/// What kind of engine a `DatabaseType` is: SQL code paths only run for `Sql`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Sql,
+    /// MongoDB (and its compatible services).
+    Document,
+    /// Redis (and Valkey).
+    KeyValue,
 }
 
 impl DatabaseType {
+    pub fn family(&self) -> Family {
+        match self {
+            DatabaseType::MongoDB => Family::Document,
+            DatabaseType::Redis => Family::KeyValue,
+            _ => Family::Sql,
+        }
+    }
+
+    /// Whether the engine speaks SQL (every engine but MongoDB and Redis).
+    pub fn is_sql(&self) -> bool {
+        self.family() == Family::Sql
+    }
+
     /// Whether scripts run as T-SQL batches split on `GO`
     /// (`ops::query::run_script`): SQL Server and Azure.
     pub fn runs_tsql_batches(&self) -> bool {
@@ -54,6 +79,8 @@ impl std::fmt::Display for DatabaseType {
             DatabaseType::SQLite => write!(f, "SQLite"),
             DatabaseType::SQLServer => write!(f, "SQL Server"),
             DatabaseType::Azure => write!(f, "Azure SQL"),
+            DatabaseType::MongoDB => write!(f, "MongoDB"),
+            DatabaseType::Redis => write!(f, "Redis"),
         }
     }
 }
@@ -202,6 +229,14 @@ pub struct ConnectionConfig {
     /// completion, by their exact listed name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_schemas: Vec<String>,
+    /// MongoDB: the whole connection string, without its password (kept in
+    /// `password`); `None` = built from host / port / username.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// MongoDB authentication database (`authSource`); `None` = the URI's,
+    /// else `admin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<String>,
 }
 
 impl ConnectionConfig {
@@ -218,6 +253,47 @@ impl ConnectionConfig {
             (DbAuthMethod::GcpIam, SslMode::Disable | SslMode::Prefer) => SslMode::Require,
             _ => mode,
         }
+    }
+
+    /// MongoDB / Redis TLS: `None` = plain connection, `Some(verify)` = TLS,
+    /// verifying the server certificate when `verify`. From `ssl_mode`
+    /// (`Disable`/`Prefer` = none, `Require` = not verified, `VerifyCa` /
+    /// `VerifyFull` = verified), except that a MongoDB URI wins: `mongodb+srv`
+    /// or `tls=true` turn TLS on, `tls=false` turns it off,
+    /// `tlsInsecure` / `tlsAllowInvalidCertificates=true` skip verification.
+    /// Always `None` for the SQL engines.
+    pub fn nosql_tls(&self) -> Option<bool> {
+        if self.db_type.is_sql() {
+            return None;
+        }
+        let from_mode = match self.ssl_mode.unwrap_or_default() {
+            SslMode::Disable | SslMode::Prefer => None,
+            SslMode::Require => Some(false),
+            SslMode::VerifyCa | SslMode::VerifyFull => Some(true),
+        };
+        let uri = match (&self.db_type, self.uri.as_deref()) {
+            (DatabaseType::MongoDB, Some(uri)) if !uri.trim().is_empty() => uri.trim(),
+            _ => return from_mode,
+        };
+        let srv = uri
+            .get(..14)
+            .is_some_and(|s| s.eq_ignore_ascii_case("mongodb+srv://"));
+        let mut tls = None;
+        let mut insecure = false;
+        let query = uri.split_once('?').map_or("", |(_, q)| q);
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let on = value.eq_ignore_ascii_case("true");
+            match key.to_ascii_lowercase().as_str() {
+                "tls" | "ssl" => tls = Some(on),
+                "tlsinsecure" | "tlsallowinvalidcertificates" => insecure |= on,
+                _ => {}
+            }
+        }
+        if !tls.unwrap_or(srv || from_mode.is_some()) {
+            return None;
+        }
+        Some(!insecure && from_mode != Some(false))
     }
 
     /// The authentication method, `Password` for the engines without a
@@ -283,6 +359,42 @@ impl ConnectionConfig {
                     self.database
                 )
             }
+            DatabaseType::MongoDB => match self.uri.as_deref().map(str::trim) {
+                // Saved without its password; stripped again in case it was
+                // typed into the file by hand.
+                Some(uri) if !uri.is_empty() => crate::engine::presets::split_uri_password(uri).0,
+                _ => format!(
+                    "mongodb://{}{}:{}/{}",
+                    self.user_at(),
+                    self.host.as_deref().unwrap_or("localhost"),
+                    self.port.unwrap_or(27017),
+                    self.database
+                ),
+            },
+            DatabaseType::Redis => format!(
+                "{}://{}{}:{}/{}",
+                if self.nosql_tls().is_some() {
+                    "rediss"
+                } else {
+                    "redis"
+                },
+                self.user_at(),
+                self.host.as_deref().unwrap_or("localhost"),
+                self.port.unwrap_or(6379),
+                if self.database.is_empty() {
+                    "0"
+                } else {
+                    &self.database
+                }
+            ),
+        }
+    }
+
+    /// `user@` for display URLs, empty without a username.
+    fn user_at(&self) -> String {
+        match self.username.as_deref() {
+            Some(u) if !u.is_empty() => format!("{u}@"),
+            _ => String::new(),
         }
     }
 }
@@ -307,6 +419,8 @@ impl Default for ConnectionConfig {
             db_auth: None,
             folder: None,
             hidden_schemas: Vec::new(),
+            uri: None,
+            auth_source: None,
         }
     }
 }
@@ -698,5 +812,210 @@ username = \"u\"",
     #[test]
     fn query_result_defaults_to_not_truncated() {
         assert!(!QueryResult::default().truncated);
+    }
+
+    #[test]
+    fn nosql_types_serialize_by_name_and_family() {
+        assert_eq!(
+            serde_json::to_string(&DatabaseType::MongoDB).unwrap(),
+            "\"MongoDB\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DatabaseType::Redis).unwrap(),
+            "\"Redis\""
+        );
+        assert_eq!(DatabaseType::MongoDB.to_string(), "MongoDB");
+        assert_eq!(DatabaseType::Redis.to_string(), "Redis");
+        assert_eq!(DatabaseType::MongoDB.family(), Family::Document);
+        assert_eq!(DatabaseType::Redis.family(), Family::KeyValue);
+        for sql in [
+            DatabaseType::Postgres,
+            DatabaseType::MySQL,
+            DatabaseType::SQLite,
+            DatabaseType::SQLServer,
+            DatabaseType::Azure,
+        ] {
+            assert_eq!(sql.family(), Family::Sql);
+            assert!(sql.is_sql());
+        }
+        assert!(!DatabaseType::MongoDB.is_sql() && !DatabaseType::Redis.is_sql());
+        assert!(!DatabaseType::MongoDB.runs_tsql_batches());
+    }
+
+    #[test]
+    fn config_without_uri_or_auth_source_loads_and_they_are_not_written_empty() {
+        let c: ConnectionConfig =
+            toml::from_str("name = \"x\"\ndb_type = \"Postgres\"\ndatabase = \"d\"").unwrap();
+        assert_eq!(c.uri, None);
+        assert_eq!(c.auth_source, None);
+        let text = toml::to_string(&c).unwrap();
+        assert!(
+            !text.contains("uri") && !text.contains("auth_source"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn mongo_config_round_trips() {
+        let c = ConnectionConfig {
+            name: "atlas".into(),
+            db_type: DatabaseType::MongoDB,
+            uri: Some("mongodb+srv://jane@cluster0.abc.mongodb.net/?retryWrites=true".into()),
+            auth_source: Some("admin".into()),
+            password: Some("s3cr3t".into()),
+            database: "shop".into(),
+            ..Default::default()
+        };
+        let text = toml::to_string(&c).unwrap();
+        assert!(text.contains("db_type = \"MongoDB\""), "{text}");
+        let back: ConnectionConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back, c);
+        let redis = ConnectionConfig {
+            db_type: DatabaseType::Redis,
+            database: "3".into(),
+            ..Default::default()
+        };
+        let back: ConnectionConfig = toml::from_str(&toml::to_string(&redis).unwrap()).unwrap();
+        assert_eq!(back, redis);
+    }
+
+    #[test]
+    fn nosql_tls_from_the_ssl_mode_and_the_uri() {
+        let cfg = |db_type: DatabaseType, ssl_mode, uri: Option<&str>| ConnectionConfig {
+            db_type,
+            ssl_mode,
+            uri: uri.map(str::to_string),
+            ..Default::default()
+        };
+        use DatabaseType::{MongoDB, Postgres, Redis};
+        for db in [MongoDB, Redis] {
+            assert_eq!(cfg(db.clone(), None, None).nosql_tls(), None);
+            assert_eq!(
+                cfg(db.clone(), Some(SslMode::Disable), None).nosql_tls(),
+                None
+            );
+            assert_eq!(
+                cfg(db.clone(), Some(SslMode::Prefer), None).nosql_tls(),
+                None
+            );
+            assert_eq!(
+                cfg(db.clone(), Some(SslMode::Require), None).nosql_tls(),
+                Some(false)
+            );
+            assert_eq!(
+                cfg(db.clone(), Some(SslMode::VerifyCa), None).nosql_tls(),
+                Some(true)
+            );
+            assert_eq!(
+                cfg(db.clone(), Some(SslMode::VerifyFull), None).nosql_tls(),
+                Some(true)
+            );
+        }
+        // SQL engines: never.
+        assert_eq!(
+            cfg(Postgres, Some(SslMode::VerifyFull), None).nosql_tls(),
+            None
+        );
+        // The MongoDB URI wins.
+        let srv = Some("mongodb+srv://u@c.example.net/");
+        assert_eq!(cfg(MongoDB, None, srv).nosql_tls(), Some(true));
+        assert_eq!(
+            cfg(MongoDB, Some(SslMode::Require), srv).nosql_tls(),
+            Some(false)
+        );
+        assert_eq!(
+            cfg(
+                MongoDB,
+                None,
+                Some("mongodb+srv://c.example.net/?tls=false")
+            )
+            .nosql_tls(),
+            None
+        );
+        assert_eq!(
+            cfg(MongoDB, None, Some("mongodb://h/?ssl=true")).nosql_tls(),
+            Some(true)
+        );
+        assert_eq!(
+            cfg(
+                MongoDB,
+                Some(SslMode::VerifyFull),
+                Some("mongodb://h/?tls=false")
+            )
+            .nosql_tls(),
+            None
+        );
+        assert_eq!(
+            cfg(
+                MongoDB,
+                None,
+                Some("mongodb://h/?TLS=true&tlsAllowInvalidCertificates=true")
+            )
+            .nosql_tls(),
+            Some(false)
+        );
+        assert_eq!(
+            cfg(
+                MongoDB,
+                None,
+                Some("mongodb://h/?tlsInsecure=true&tls=true")
+            )
+            .nosql_tls(),
+            Some(false)
+        );
+        assert_eq!(
+            cfg(MongoDB, Some(SslMode::VerifyFull), Some("mongodb://h/")).nosql_tls(),
+            Some(true)
+        );
+        // A blank URI is no URI.
+        assert_eq!(cfg(MongoDB, None, Some("  ")).nosql_tls(), None);
+    }
+
+    #[test]
+    fn nosql_connection_strings_never_contain_the_password() {
+        let mongo = ConnectionConfig {
+            db_type: DatabaseType::MongoDB,
+            username: Some("jane".into()),
+            password: Some("s3cr3t".into()),
+            port: Some(27017),
+            database: "shop".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            mongo.to_connection_string(),
+            "mongodb://jane@localhost:27017/shop"
+        );
+        let typed = ConnectionConfig {
+            uri: Some("mongodb://jane:s3cr3t@a:1,b:2/shop?replicaSet=rs".into()),
+            ..mongo.clone()
+        };
+        assert_eq!(
+            typed.to_connection_string(),
+            "mongodb://jane@a:1,b:2/shop?replicaSet=rs"
+        );
+        let anonymous = ConnectionConfig {
+            username: None,
+            ..mongo
+        };
+        assert_eq!(
+            anonymous.to_connection_string(),
+            "mongodb://localhost:27017/shop"
+        );
+        let redis = ConnectionConfig {
+            db_type: DatabaseType::Redis,
+            host: Some("cache".into()),
+            port: Some(6380),
+            username: Some("app".into()),
+            password: Some("s3cr3t".into()),
+            database: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(redis.to_connection_string(), "redis://app@cache:6380/0");
+        let tls = ConnectionConfig {
+            ssl_mode: Some(SslMode::VerifyFull),
+            database: "2".into(),
+            ..redis
+        };
+        assert_eq!(tls.to_connection_string(), "rediss://app@cache:6380/2");
     }
 }

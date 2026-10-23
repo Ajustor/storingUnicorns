@@ -3,6 +3,7 @@
 pub mod config;
 pub mod db;
 pub mod models;
+pub mod nosql;
 pub mod ops;
 pub mod presets;
 pub mod secrets;

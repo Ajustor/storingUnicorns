@@ -9,4 +9,6 @@ pub mod tx;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
+mod nosql_guards;
+#[cfg(test)]
 pub(crate) mod test_support;

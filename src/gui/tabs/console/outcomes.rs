@@ -84,14 +84,7 @@ impl ResultTab {
     /// The key writes of `changes` (edits of this result's grid) when its
     /// rows are the value of a Redis key: the database, the key and the
     /// edits (`redis::console_edits`, on the grid shown).
-    pub fn key_writes(
-        &self,
-        changes: &crate::engine::ops::rows::RowChanges,
-    ) -> Option<(
-        u8,
-        Vec<u8>,
-        Result<Vec<crate::engine::nosql::redis::KeyEdit>, String>,
-    )> {
+    pub fn key_writes(&self, changes: &crate::engine::ops::rows::RowChanges) -> Option<KeyWrites> {
         let Some(Source::Key { db, key, kind }) = &self.source else {
             return None;
         };
@@ -128,6 +121,14 @@ impl ResultTab {
         self.source = source;
     }
 }
+
+/// The database, the key and the edits (or why they can't be made) of a
+/// Redis value grid's Submit (`ResultTab::key_writes`).
+pub type KeyWrites = (
+    u8,
+    Vec<u8>,
+    Result<Vec<crate::engine::nosql::redis::KeyEdit>, String>,
+);
 
 /// Connection result tab `r` must be submitted to / refreshed from, when it
 /// is open (`open`); else the error to report.

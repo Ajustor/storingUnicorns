@@ -1071,7 +1071,7 @@ fn key_count_label(keys: Option<(u64, bool)>) -> String {
     let digits = n.to_string();
     let mut grouped = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             grouped.push('\u{202f}');
         }
         grouped.push(c);

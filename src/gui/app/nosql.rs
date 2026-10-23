@@ -655,6 +655,11 @@ impl App {
                     }
                 }
             }
+            Event::KeyCounts { name, counts } => {
+                if let Some(s) = self.sessions.get_mut(&name) {
+                    s.key_counts = counts;
+                }
+            }
             Event::Indexes {
                 name,
                 coll,

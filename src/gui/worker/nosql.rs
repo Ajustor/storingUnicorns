@@ -395,6 +395,17 @@ impl Worker {
         run
     }
 
+    /// Keys per database of Redis connection `name` (explorer counts).
+    pub fn key_counts(&self, name: String, conn: Conn) {
+        self.spawn(async move {
+            let counts = match conn.redis() {
+                Ok(c) => redis::key_counts(c).await.ok(),
+                Err(_) => None,
+            };
+            Event::KeyCounts { name, counts }
+        });
+    }
+
     /// Run an administration task of connection `name`.
     pub fn nosql_task(&self, name: String, conn: Conn, task: NoSqlTask) {
         self.spawn(async move {
@@ -996,7 +1007,7 @@ mod tests {
             _ => None,
         });
         assert_eq!(applied, Ok(1));
-        w.read_key(1, conn, 15, b"su_it:gui:l".to_vec(), 0, 500);
+        w.read_key(1, conn.clone(), 15, b"su_it:gui:l".to_vec(), 0, 500);
         let (_, page) = wait_for(&mut w, |ev| match ev {
             Event::KeyValue { outcome, .. } => Some(outcome.expect("read").expect("exists")),
             _ => None,
@@ -1005,5 +1016,13 @@ mod tests {
             page.value,
             redis::RedisValue::List(vec![b"a".to_vec(), b"b".to_vec(), b"C".to_vec()])
         );
+
+        // The explorer's counts (INFO keyspace).
+        w.key_counts("it".into(), conn);
+        let counts = wait_for(&mut w, |ev| match ev {
+            Event::KeyCounts { counts, .. } => Some(counts),
+            _ => None,
+        });
+        assert!(counts.expect("INFO keyspace")[&15] >= 2);
     }
 }

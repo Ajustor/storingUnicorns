@@ -199,6 +199,12 @@ pub enum Event {
         run: RunId,
         outcome: Result<ScanPage, String>,
     },
+    /// Keys per database of Redis connection `name` (`INFO keyspace`);
+    /// `None` when the server refuses INFO.
+    KeyCounts {
+        name: String,
+        counts: Option<std::collections::BTreeMap<u8, u64>>,
+    },
     /// The indexes of `coll` (index dialog).
     Indexes {
         name: String,

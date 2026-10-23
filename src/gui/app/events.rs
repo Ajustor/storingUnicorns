@@ -20,6 +20,9 @@ impl App {
     fn on_connected(&mut self, session: Session) {
         let name = session.config.name.clone();
         self.sessions.errors.remove(&name);
+        if session.config.db_type == crate::engine::models::DatabaseType::Redis {
+            self.worker.key_counts(name.clone(), session.conn.clone());
+        }
         self.sessions.open.insert(name.clone(), session);
         match self.sign_ins.take_warning() {
             Some(warning) => self.info(format!("Connecté à {name}. {warning}")),
@@ -100,9 +103,10 @@ impl App {
                 }
             }
             ev @ (Event::Script { .. } | Event::NoSqlScript { .. }) => self.on_script(ev),
-            ev @ (Event::Keys { .. } | Event::Indexes { .. } | Event::NoSqlDone { .. }) => {
-                self.on_nosql_event(ev)
-            }
+            ev @ (Event::Keys { .. }
+            | Event::KeyCounts { .. }
+            | Event::Indexes { .. }
+            | Event::NoSqlDone { .. }) => self.on_nosql_event(ev),
             ev @ Event::Submitted { .. } if self.is_console(&ev) => self.on_console_submitted(ev),
             ev @ (Event::Page { .. }
             | Event::Count { .. }

@@ -50,6 +50,9 @@ pub struct Session {
     pub keys_loading: HashMap<u8, RunId>,
     /// The names of the keys listed (Redis completion), kept with them.
     pub key_names: Vec<String>,
+    /// Redis: keys per database from `INFO keyspace` (empty databases
+    /// absent); `None` until known, or when INFO is refused.
+    pub key_counts: Option<std::collections::BTreeMap<u8, u64>>,
 }
 
 /// The keys of a Redis database listed by the explorer.
@@ -78,6 +81,7 @@ impl Session {
             redis_keys: HashMap::new(),
             keys_loading: HashMap::new(),
             key_names: Vec::new(),
+            key_counts: None,
         }
     }
 
@@ -91,6 +95,21 @@ impl Session {
     pub fn load_keys(&mut self, worker: &mut Worker, name: &str, db: u8) {
         let run = worker.explorer_keys(name.to_string(), self.conn.clone(), db);
         self.keys_loading.insert(db, run);
+        // The keys changed maybe: their counts too.
+        worker.key_counts(name.to_string(), self.conn.clone());
+    }
+
+    /// The key count the explorer shows for Redis database `db`, and
+    /// whether it is a lower bound: `INFO keyspace` when the server gives
+    /// it, else the keys listed (capped); `None` when neither is known.
+    pub fn key_count(&self, db: u8) -> Option<(u64, bool)> {
+        if let Some(counts) = &self.key_counts {
+            return Some((counts.get(&db).copied().unwrap_or(0), false));
+        }
+        match self.redis_keys.get(&db) {
+            Some(Ok(set)) => Some((set.keys.len() as u64, set.more)),
+            _ => None,
+        }
     }
 
     /// Compute `key_names` again (the listed keys changed).
@@ -461,6 +480,35 @@ mod tests {
                 s("dev", "main", "t"),
             ]
         );
+    }
+
+    #[test]
+    fn redis_key_counts_prefer_info_keyspace() {
+        let config = ConnectionConfig {
+            db_type: crate::engine::models::DatabaseType::Redis,
+            ..Default::default()
+        };
+        let conn = Arc::new(crate::engine::ops::test_support::redis_offline());
+        let mut s = Session::new(config, conn, Vec::new());
+        assert_eq!(s.key_count(0), None, "nothing known yet");
+        let set = KeySet {
+            keys: vec![
+                crate::engine::nosql::redis::KeyInfo {
+                    key: b"a".to_vec(),
+                    kind: crate::engine::nosql::redis::RedisType::String,
+                    ttl: None,
+                    size: None,
+                };
+                3
+            ],
+            more: true,
+        };
+        s.redis_keys.insert(0, Ok(set));
+        // INFO refused: the keys listed, a lower bound.
+        assert_eq!(s.key_count(0), Some((3, true)));
+        s.key_counts = Some([(0, 12_345)].into_iter().collect());
+        assert_eq!(s.key_count(0), Some((12_345, false)));
+        assert_eq!(s.key_count(4), Some((0, false)), "absent = empty");
     }
 
     #[test]

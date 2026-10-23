@@ -840,9 +840,7 @@ fn row_contents(
                     open,
                     hidden,
                     family: session.map_or(Family::Sql, |s| s.config.db_type.family()),
-                    more: redis_db(schema)
-                        .and_then(|db| session?.redis_keys.get(&db))
-                        .is_some_and(|k| k.as_ref().is_ok_and(|k| k.more)),
+                    keys: redis_db(schema).and_then(|db| session?.key_count(db)),
                 };
                 schema_row(ui, &row, actions);
             }
@@ -1059,8 +1057,28 @@ struct SchemaRow<'a> {
     /// Hidden, shown greyed (« Afficher les schémas masqués »).
     hidden: bool,
     family: Family,
-    /// Redis: the explorer lists only the first keys.
-    more: bool,
+    /// Redis: the key count (`Session::key_count`) and whether it is a
+    /// lower bound; `None` when not known yet.
+    keys: Option<(u64, bool)>,
+}
+
+/// « 1 234 clés », « 5 000+ clés » (keys listed up to the explorer's
+/// limit), nothing while unknown.
+fn key_count_label(keys: Option<(u64, bool)>) -> String {
+    let Some((n, more)) = keys else {
+        return String::new();
+    };
+    let digits = n.to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push('\u{202f}');
+        }
+        grouped.push(c);
+    }
+    let plus = if more { "+" } else { "" };
+    let s = if n == 1 && !more { "" } else { "s" };
+    format!("{grouped}{plus} clé{s}")
 }
 
 fn schema_row(ui: &mut egui::Ui, row: &SchemaRow, actions: &mut Vec<Action>) {
@@ -1076,9 +1094,7 @@ fn schema_row(ui: &mut egui::Ui, row: &SchemaRow, actions: &mut Vec<Action>) {
     }
     let label = clickable(ui, text);
     let count = match row.family {
-        // Keys listed so far (the first ones only when `more`).
-        Family::KeyValue if row.more => format!("{}+ clés", row.count),
-        Family::KeyValue => format!("{} clé{}", row.count, if row.count == 1 { "" } else { "s" }),
+        Family::KeyValue => key_count_label(row.keys),
         _ => row.count.to_string(),
     };
     ui.label(RichText::new(count).weak().small());
@@ -1763,6 +1779,19 @@ fn item_row(ui: &mut egui::Ui, d: &TableDetails, group: Group, index: usize, mon
 mod tests {
     use super::*;
     use crate::engine::models::SchemaInfo;
+
+    #[test]
+    fn redis_key_counts_are_grouped_and_bounded() {
+        assert_eq!(key_count_label(None), "");
+        assert_eq!(key_count_label(Some((0, false))), "0 clés");
+        assert_eq!(key_count_label(Some((1, false))), "1 clé");
+        assert_eq!(key_count_label(Some((1234, false))), "1\u{202f}234 clés");
+        assert_eq!(key_count_label(Some((5000, true))), "5\u{202f}000+ clés");
+        assert_eq!(
+            key_count_label(Some((1_234_567, false))),
+            "1\u{202f}234\u{202f}567 clés"
+        );
+    }
 
     #[test]
     fn dragging_by_an_edge_scrolls_towards_it() {

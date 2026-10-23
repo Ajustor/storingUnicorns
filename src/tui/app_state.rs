@@ -376,6 +376,8 @@ impl NewConnectionState {
             },
             flavor: self.flavor.filter(|f| f.driver() == self.db_type),
             // The default method is left out, as in older files.
+            folder: None,
+            hidden_schemas: Vec::new(),
             db_auth: self.gcp_iam().then_some(DbAuthMethod::GcpIam),
         }
     }

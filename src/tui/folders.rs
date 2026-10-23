@@ -270,6 +270,14 @@ impl AppState {
         let result = match &prompt.kind {
             FolderPromptKind::MoveConnection(name) => {
                 let target = (!input.trim_matches(folders::SEP).trim().is_empty()).then_some(input);
+                // A new folder is made explicit first, so that it stays once
+                // empty (as in the GUI); "already exists" is ignored, an
+                // invalid path is reported by the move.
+                if let Some(t) = target {
+                    if !self.config.folder_exists(t) {
+                        let _ = self.config.create_folder(t);
+                    }
+                }
                 self.config.move_connection(name, target).map(|()| {
                     let folder = self
                         .config
@@ -386,6 +394,41 @@ impl AppState {
     }
 
     // ========== Hidden schemas ==========
+
+    /// Schemas loaded (connection, refresh): the cursor goes to the first
+    /// line drawn, a hidden schema's being left out.
+    pub fn set_schemas(&mut self, schemas: Vec<crate::engine::models::SchemaInfo>) {
+        self.schemas = schemas;
+        self.tables = Vec::new(); // Clear legacy flat list
+        self.tables_scroll = 0;
+        (self.selected_schema, self.selected_table) = self
+            .build_filtered_nav_items()
+            .first()
+            .copied()
+            .unwrap_or((0, 0));
+    }
+
+    /// Whether the cursor of the Tables panel is on a line drawn.
+    pub fn table_selection_visible(&self) -> bool {
+        self.build_filtered_nav_items()
+            .contains(&(self.selected_schema, self.selected_table))
+    }
+
+    /// Connection `previous` was saved as `saved`: if it is the open one,
+    /// its name, folder and hidden schemas follow.
+    pub fn connection_edited(
+        &mut self,
+        previous: &crate::engine::models::ConnectionConfig,
+        saved: &crate::engine::models::ConnectionConfig,
+    ) {
+        if let Some(current) = self.current_connection_config.as_mut() {
+            if current.name == previous.name {
+                current.name = saved.name.clone();
+                current.folder = saved.folder.clone();
+                current.hidden_schemas = saved.hidden_schemas.clone();
+            }
+        }
+    }
 
     /// Whether the open connection hides `schema`.
     pub fn is_schema_hidden(&self, schema: &str) -> bool {
@@ -843,5 +886,114 @@ mod tests {
             s.new_connection.to_config().folder.as_deref(),
             Some("Empty")
         );
+    }
+
+    /// `audit` (hidden) listed before `public`, as a refresh loads them.
+    fn audit_hidden() -> AppState {
+        let mut s = state();
+        s.config.connections[0].hidden_schemas = vec!["audit".into()];
+        s.current_connection_config = Some(s.config.connections[0].clone());
+        s.active_panel = crate::tui::ActivePanel::Tables;
+        s
+    }
+
+    fn schemas(names: &[&str]) -> Vec<SchemaInfo> {
+        names
+            .iter()
+            .map(|n| SchemaInfo {
+                name: n.to_string(),
+                tables: vec![format!("{n}_t")],
+                expanded: false,
+            })
+            .collect()
+    }
+
+    fn press_tables(s: &mut AppState, key: crossterm::event::KeyCode) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(crate::tui::key_handlers::handle_tables_keys(
+            s,
+            key,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    #[test]
+    fn loaded_schemas_put_the_cursor_on_the_first_visible_one() {
+        let mut s = audit_hidden();
+        s.set_schemas(schemas(&["audit", "public"]));
+        assert_eq!((s.selected_schema, s.selected_table), (1, 0));
+        // Nothing hidden: the first schema.
+        let mut s = state();
+        s.set_schemas(schemas(&["audit", "public"]));
+        assert_eq!((s.selected_schema, s.selected_table), (0, 0));
+    }
+
+    #[test]
+    fn keys_do_nothing_on_a_schema_that_is_not_drawn() {
+        use crossterm::event::KeyCode;
+        let mut s = audit_hidden();
+        s.schemas = schemas(&["audit", "public"]);
+        s.selected_schema = 0; // audit, hidden: not drawn
+        s.selected_table = 0;
+        assert!(!s.table_selection_visible());
+        press_tables(&mut s, KeyCode::Char('h'));
+        assert_eq!(s.config.connections[0].hidden_schemas, ["audit"]);
+        assert_eq!(s.config_saves, 0);
+        press_tables(&mut s, KeyCode::Enter);
+        press_tables(&mut s, KeyCode::Char(' '));
+        assert!(!s.schemas[0].expanded);
+
+        // On the visible one, they work.
+        s.selected_schema = 1;
+        assert!(s.table_selection_visible());
+        press_tables(&mut s, KeyCode::Char(' '));
+        assert!(s.schemas[1].expanded);
+    }
+
+    #[test]
+    fn renaming_the_open_connection_keeps_h_working() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut s = audit_hidden();
+        s.schemas = schemas(&["audit", "public"]);
+        s.open_edit_connection_dialog(0);
+        s.new_connection.name = "local2".into();
+        crate::tui::handle_dialog_input(&mut s, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(s.dialog_mode, DialogMode::None);
+        let current = s.current_connection_config.as_ref().unwrap();
+        assert_eq!(current.name, "local2");
+        assert_eq!(current.hidden_schemas, ["audit"]);
+
+        s.selected_schema = 1;
+        s.toggle_selected_schema_hidden();
+        assert_eq!(s.config.connections[0].hidden_schemas, ["audit", "public"]);
+        assert_eq!(
+            s.current_connection_config.as_ref().unwrap().hidden_schemas,
+            ["audit", "public"]
+        );
+    }
+
+    #[test]
+    fn moving_to_a_new_folder_creates_it_explicitly() {
+        let mut s = state();
+        s.selected_connection = 0;
+        s.open_move_prompt();
+        s.folder_prompt.as_mut().unwrap().input = "Ops/Tmp".into();
+        s.apply_folder_prompt();
+        assert!(s.config.folders.contains(&"Ops/Tmp".to_string()));
+        // Kept once empty.
+        s.open_move_prompt();
+        s.folder_prompt.as_mut().unwrap().input.clear();
+        s.apply_folder_prompt();
+        assert!(s.config.folders.contains(&"Ops/Tmp".to_string()));
+        assert!(labels(&s).contains(&"  [Ops/Tmp]".to_string()));
+
+        // An existing folder: no error, no duplicate.
+        s.open_move_prompt();
+        s.folder_prompt.as_mut().unwrap().input = "Clients".into();
+        s.apply_folder_prompt();
+        assert_eq!(s.dialog_mode, DialogMode::None);
+        assert_eq!(s.config.connections[0].folder.as_deref(), Some("Clients"));
     }
 }

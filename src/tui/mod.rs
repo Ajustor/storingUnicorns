@@ -778,6 +778,7 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
                     // Unless another connection (another base of the server) uses it.
                     db::entra_interactive::forget_unless_used(&previous, &state.config.connections);
                 }
+                state.connection_edited(&previous, &config);
                 let dropped = connect::edited(state, &previous, &config);
                 state.close_dialog();
                 state.set_status(if dropped {
@@ -1473,10 +1474,7 @@ pub(crate) async fn handle_refresh_tables(state: &mut AppState) {
         match ops::query::refresh_schemas(conn).await {
             Ok(schemas) => {
                 let total_tables: usize = schemas.iter().map(|s| s.tables.len()).sum();
-                state.schemas = schemas;
-                state.tables = Vec::new(); // Clear legacy flat list
-                state.selected_schema = 0;
-                state.selected_table = 0;
+                state.set_schemas(schemas);
                 state.set_status(format!(
                     "Loaded {} schemas, {} tables",
                     state.schemas.len(),

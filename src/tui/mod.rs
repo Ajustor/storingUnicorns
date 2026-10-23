@@ -3,6 +3,7 @@ mod columns;
 mod connect;
 pub mod folders;
 mod key_handlers;
+pub mod nosql;
 pub mod ui;
 
 use crate::engine::{config, db, services};
@@ -259,6 +260,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 DialogMode::BatchTruncate => {
                                     handle_batch_truncate(terminal, state).await
                                 }
+                                DialogMode::NoSqlConfirm => nosql::confirmed(state).await,
+                                DialogMode::NoSqlForm => nosql::submit_form(state).await,
+                                DialogMode::Indexes => nosql::reload_indexes(state).await,
+                                DialogMode::NoSqlTransfer => {
+                                    nosql::transfer::run(terminal, state).await
+                                }
                                 _ => {}
                             }
                         }
@@ -398,7 +405,12 @@ async fn handle_mouse_event(
                 state.active_panel = ActivePanel::Tables;
                 state.selected_schema = schema_idx;
                 state.selected_table = 0;
-                state.toggle_schema();
+                if nosql::engine(state).is_some() {
+                    // Unfolding a Redis database scans its keys.
+                    nosql::tables_enter(state).await;
+                } else {
+                    state.toggle_schema();
+                }
             }
             Some(ClickableType::Table {
                 schema_idx,
@@ -408,8 +420,10 @@ async fn handle_mouse_event(
                 state.selected_schema = schema_idx;
                 state.selected_table = table_idx + 1;
 
-                // Generate SELECT query
-                if let Some(table_name) = state.get_selected_table_full_name() {
+                // MongoDB / Redis: what Enter does (documents, key).
+                if nosql::engine(state).is_some() {
+                    nosql::tables_enter(state).await;
+                } else if let Some(table_name) = state.get_selected_table_full_name() {
                     let query = if let Some(ref config) = state.current_connection_config {
                         match config.db_type {
                             crate::engine::models::DatabaseType::SQLServer => {
@@ -431,7 +445,11 @@ async fn handle_mouse_event(
                 if let Some(ref result) = state.query_result {
                     if row_idx < result.rows.len() {
                         state.selected_row = row_idx;
-                        state.open_edit_row_dialog();
+                        if nosql::engine(state).is_some() {
+                            nosql::open_row_editor(state, false);
+                        } else {
+                            state.open_edit_row_dialog();
+                        }
                     }
                 }
             }
@@ -703,6 +721,21 @@ fn handle_dialog_input(state: &mut AppState, key: KeyCode, modifiers: KeyModifie
             state.handle_folder_prompt_key(key);
             false
         }
+        DialogMode::NoSqlConfirm => match nosql::confirm_answer(key) {
+            Some(true) => true,
+            Some(false) => {
+                nosql::declined(state);
+                false
+            }
+            None => false,
+        },
+        DialogMode::JsonView => {
+            nosql::json_view_key(state, key);
+            false
+        }
+        DialogMode::Indexes => nosql::indexes_key(state, key) == nosql::IndexKey::Reload,
+        DialogMode::NoSqlForm => nosql::form_key(state, key),
+        DialogMode::NoSqlTransfer => nosql::transfer::key(state, key),
         DialogMode::None => false,
     }
 }
@@ -731,7 +764,7 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
             nc.cursor_position = nc.get_active_field_value().len();
         }
         KeyCode::Left if nc.active_field == ConnectionField::DbType => {
-            nc.cycle_db_type();
+            nc.cycle_db_type_back();
         }
         KeyCode::Right if nc.active_field == ConnectionField::DbType => {
             nc.cycle_db_type();
@@ -774,8 +807,15 @@ fn handle_connection_dialog(state: &mut AppState, key: KeyCode, _modifiers: KeyM
                 state.set_status(e);
                 return;
             }
-            let config = nc.to_config();
+            let mut config = nc.config_moving_password();
             let name = config.name.clone();
+            // A new MongoDB connection hides the server's own databases.
+            if state.editing_connection_index.is_none()
+                && config.db_type == crate::engine::models::DatabaseType::MongoDB
+                && config.hidden_schemas.is_empty()
+            {
+                config.hidden_schemas = vec!["config".into(), "local".into()];
+            }
 
             if let Some(index) = state.editing_connection_index {
                 // Editing existing connection
@@ -1477,16 +1517,30 @@ fn update_schema_column(state: &mut AppState, new_column: services::ColumnDefini
 pub(crate) async fn handle_refresh_tables(state: &mut AppState) {
     // The schema may have changed: columns are loaded again when cited.
     state.completion_columns.clear();
+    // Redis keys are scanned again when their database is unfolded.
+    state.nosql.redis.clear();
     if let Some(ref conn) = state.connection {
         match ops::query::refresh_schemas(conn).await {
             Ok(schemas) => {
                 let total_tables: usize = schemas.iter().map(|s| s.tables.len()).sum();
                 state.set_schemas(schemas);
-                state.set_status(format!(
-                    "Loaded {} schemas, {} tables",
-                    state.schemas.len(),
-                    total_tables
-                ));
+                let status = match nosql::engine(state) {
+                    Some(crate::engine::models::DatabaseType::MongoDB) => format!(
+                        "{} base(s), {} collection(s)",
+                        state.schemas.len(),
+                        total_tables
+                    ),
+                    Some(_) => format!(
+                        "{} base(s) : Entrée sur une base pour lire ses clés",
+                        state.schemas.len()
+                    ),
+                    None => format!(
+                        "Loaded {} schemas, {} tables",
+                        state.schemas.len(),
+                        total_tables
+                    ),
+                };
+                state.set_status(status);
             }
             Err(e) => {
                 state.set_status(format!("Failed to fetch tables: {}", e));
@@ -1496,6 +1550,9 @@ pub(crate) async fn handle_refresh_tables(state: &mut AppState) {
 }
 
 pub(crate) async fn handle_execute_query(state: &mut AppState) {
+    if nosql::engine(state).is_some() {
+        return nosql::execute(state, nosql::RunWhat::All).await;
+    }
     if state.connection.is_none() {
         state.set_status("Not connected. Select a connection and press Enter.");
         return;
@@ -1521,6 +1578,9 @@ pub(crate) async fn handle_execute_query(state: &mut AppState) {
 
 /// Execute only the SQL statement (or transaction block) at the cursor.
 pub(crate) async fn handle_execute_current_query(state: &mut AppState) {
+    if nosql::engine(state).is_some() {
+        return nosql::execute(state, nosql::RunWhat::AtCursor).await;
+    }
     if state.connection.is_none() {
         state.set_status("Not connected. Select a connection and press Enter.");
         return;
@@ -1577,6 +1637,8 @@ fn show_result(
 ) {
     state.query_result = Some(result);
     state.result_sql = sql;
+    // A NoSQL run sets the source of its rows after this.
+    state.nosql.source = None;
     state.update_known_columns(); // Update columns for autocompletion
     state.compute_col_widths(); // Cache column widths once
     state.selected_row = 0;
@@ -1654,6 +1716,9 @@ pub(crate) fn move_cursor_down(state: &mut AppState) {
 
 /// Get the quote characters for the current database type
 async fn handle_save_row(state: &mut AppState) {
+    if nosql::engine(state).is_some() {
+        return nosql::save_row(state).await;
+    }
     // Get required data for update
     let table_name = match &state.editing_table_name {
         Some(name) => name.clone(),
@@ -1765,6 +1830,9 @@ async fn handle_save_row(state: &mut AppState) {
 }
 
 async fn handle_insert_row(state: &mut AppState) {
+    if nosql::engine(state).is_some() {
+        return nosql::insert_row(state).await;
+    }
     // Get required data for insert
     let table_name = match &state.editing_table_name {
         Some(name) => name.clone(),
@@ -3449,6 +3517,50 @@ mod tests {
         assert_eq!(saved.ssl_mode, Some(SslMode::Require));
         assert_eq!(saved.color, Some([9, 9, 9]));
         assert_eq!(saved.host.as_deref(), Some("db.abc.supabase.co"));
+    }
+
+    #[test]
+    fn connection_dialog_saves_a_mongodb_uri_and_hides_its_own_databases() {
+        use crate::engine::models::DatabaseType;
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        let key = |state: &mut AppState, k: KeyCode| {
+            handle_dialog_input(state, k, KeyModifiers::NONE);
+        };
+        state.open_new_connection_dialog();
+        key(&mut state, KeyCode::Tab); // URL
+        for c in "mongodb://ann:s%3Acret@db1:27017/shop".chars() {
+            key(&mut state, KeyCode::Char(c));
+        }
+        key(&mut state, KeyCode::Enter); // fills, doesn't save
+        assert!(state.config.connections.is_empty());
+        assert_eq!(state.new_connection.db_type, DatabaseType::MongoDB);
+        assert_eq!(state.new_connection.password, "s:cret");
+        // The type field cycles with ←/→, MongoDB / Redis included.
+        key(&mut state, KeyCode::Tab);
+        assert_eq!(state.new_connection.active_field, ConnectionField::DbType);
+        while state.new_connection.active_field != ConnectionField::AuthSource {
+            key(&mut state, KeyCode::Tab);
+        }
+        for c in "admin".chars() {
+            key(&mut state, KeyCode::Char(c));
+        }
+        key(&mut state, KeyCode::Enter);
+        assert_eq!(state.config.connections.len(), 1);
+        let saved = state.config.connections[0].clone();
+        assert_eq!(saved.db_type, DatabaseType::MongoDB);
+        assert_eq!(saved.uri.as_deref(), Some("mongodb://ann@db1:27017/shop"));
+        assert_eq!(saved.password.as_deref(), Some("s:cret"));
+        assert_eq!(saved.auth_source.as_deref(), Some("admin"));
+        assert_eq!(saved.hidden_schemas, ["config", "local"]);
+
+        // Editing keeps it all, and doesn't hide them again once shown.
+        state.config.connections[0].hidden_schemas.clear();
+        state.open_edit_connection_dialog(0);
+        key(&mut state, KeyCode::Enter);
+        let edited = &state.config.connections[0];
+        assert_eq!(edited.uri, saved.uri);
+        assert_eq!(edited.auth_source, saved.auth_source);
+        assert!(edited.hidden_schemas.is_empty());
     }
 
     #[test]

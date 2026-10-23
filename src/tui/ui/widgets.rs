@@ -11,9 +11,20 @@ use ratatui::{
 
 use super::clickable::{ClickableRegistry, ClickableType};
 use super::layout::PanelType;
-use crate::engine::models::display_cell;
+use crate::engine::models::{display_cell, DatabaseType};
+use crate::engine::nosql::is_absent;
 use crate::tui::folders::ConnRow;
-use crate::tui::{ActivePanel, AppState};
+use crate::tui::{nosql, ActivePanel, AppState};
+
+/// A cell of the results grid: NULL as `NULL`, a field missing from a
+/// document (`ABSENT_CELL`) as a greyed « — ».
+fn grid_cell(cell: &str) -> ratatui::widgets::Cell<'_> {
+    if is_absent(cell) {
+        ratatui::widgets::Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray)))
+    } else {
+        ratatui::widgets::Cell::from(display_cell(cell))
+    }
+}
 
 fn panel_style(active: bool) -> Style {
     if active {
@@ -324,6 +335,13 @@ pub fn render_tables_panel(
 
     // Get filtered schemas and tables
     let filtered_schemas = state.get_filtered_schemas();
+    let engine = nosql::engine(state);
+    // What the panel lists: tables, collections or keys.
+    let panel_name = match engine {
+        Some(DatabaseType::MongoDB) => "Collections",
+        Some(_) => "Clés",
+        None => "Tables",
+    };
 
     // Build all items from filtered schemas
     let mut all_items: Vec<(ListItem, Option<(usize, Option<usize>)>)> = Vec::new();
@@ -352,10 +370,20 @@ pub fn render_tables_panel(
         };
 
         let hidden_mark = if hidden { " [hidden]" } else { "" };
+        // Redis: the keys loaded (none until the database is unfolded).
+        let count = match nosql::redis_db(&schema.name) {
+            Some(db) if engine == Some(DatabaseType::Redis) => state
+                .nosql
+                .redis
+                .get(&db)
+                .map(|k| format!(" ({} clés)", k.keys.len()))
+                .unwrap_or_default(),
+            _ => format!(" ({table_count})"),
+        };
         all_items.push((
             ListItem::new(format!(
-                "{} {} ({}){}",
-                expand_icon, schema.name, table_count, hidden_mark
+                "{} {}{}{}",
+                expand_icon, schema.name, count, hidden_mark
             ))
             .style(schema_style),
             Some((*schema_idx, None)),
@@ -453,16 +481,18 @@ pub fn render_tables_panel(
         " Tables (not connected) ".to_string()
     } else if total_items > visible_height {
         format!(
-            " Tables [{}-{}/{}]{} ",
+            " {panel_name} [{}-{}/{}]{} ",
             scroll_offset + 1,
             (scroll_offset + visible_height).min(total_items),
             total_items,
             filter_indicator
         )
     } else if !filter_indicator.is_empty() {
-        format!(" Tables{} ", filter_indicator)
+        format!(" {panel_name}{} ", filter_indicator)
+    } else if engine == Some(DatabaseType::Redis) {
+        " Clés [/ motif SCAN] ".to_string()
     } else {
-        " Tables [/ to filter] ".to_string()
+        format!(" {panel_name} [/ to filter] ")
     };
 
     let list = List::new(items).block(
@@ -638,9 +668,12 @@ pub fn render_query_editor(
     let cursor_position = state.cursor_position();
 
     // Use syntax highlighting with selection support
+    let engine = nosql::engine(state);
     let highlighted_content = if query_input.is_empty() && !is_active {
         vec![Line::from(Span::styled(
-            "-- Enter SQL query here...",
+            engine
+                .as_ref()
+                .map_or("-- Enter SQL query here...", nosql::editor_placeholder),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
@@ -655,9 +688,23 @@ pub fn render_query_editor(
     };
 
     let title = if state.has_selection() {
-        " Query Editor [Ctrl+C:Copy | Ctrl+X:Cut | Ctrl+A:Select All] "
+        " Query Editor [Ctrl+C:Copy | Ctrl+X:Cut | Ctrl+A:Select All] ".to_string()
+    } else if let Some(db) = &engine {
+        // The console's current database (`use` / `SELECT` change it).
+        let scope = nosql::current_scope(state).database;
+        let scope = if scope.is_empty() {
+            "aucune".to_string()
+        } else if *db == DatabaseType::Redis {
+            format!("db{scope}")
+        } else {
+            scope
+        };
+        format!(
+            " Console {db} — base : {scope} [F5/Ctrl+G tout | Ctrl+Enter/Ctrl+E commande | Ctrl+Space/Ctrl+K compléter] "
+        )
     } else {
         " Query Editor [F5/Ctrl+G | Ctrl+Enter/Ctrl+E | Ctrl+Space/Ctrl+K:Complete | Shift+Arrow:Select] "
+            .to_string()
     };
 
     // Single pass: compute cursor position, total visual lines, and editor scroll
@@ -1055,9 +1102,9 @@ pub fn render_results_panel(
                     } else {
                         Style::default()
                     };
-                    let cells: Vec<&str> = row[visible_col_range.clone()]
+                    let cells: Vec<ratatui::widgets::Cell> = row[visible_col_range.clone()]
                         .iter()
-                        .map(|s| display_cell(s))
+                        .map(|s| grid_cell(s))
                         .collect();
                     Row::new(cells).style(style)
                 })
@@ -1078,11 +1125,11 @@ pub fn render_results_panel(
                     } else {
                         Style::default()
                     };
-                    let cells: Vec<&str> = row
+                    let cells: Vec<ratatui::widgets::Cell> = row
                         .get(visible_col_range.clone())
                         .unwrap_or(&[])
                         .iter()
-                        .map(|s| display_cell(s))
+                        .map(|s| grid_cell(s))
                         .collect();
                     Row::new(cells).style(style)
                 })

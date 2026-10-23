@@ -754,6 +754,12 @@ async fn integration_redis_auth() {
     };
     let err = connect(&wrong).await.err().unwrap().to_string();
     assert!(err.contains("authentification"), "{err}");
+    // A SQL form's default user is not sent (`AUTH postgres …` fails).
+    let stale = ConnectionConfig {
+        username: Some("postgres".into()),
+        ..config.clone()
+    };
+    connect(&stale).await.unwrap();
     let none = ConnectionConfig {
         password: None,
         username: None,

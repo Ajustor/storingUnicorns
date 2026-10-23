@@ -430,6 +430,11 @@ impl ConnectionForm {
         {
             self.database.clear();
         }
+        // No driver default user for MongoDB / Redis (`AUTH postgres …`,
+        // a SCRAM sign-in as "postgres").
+        if !t.is_sql() && presets::is_default_user(&self.username) {
+            self.username.clear();
+        }
         self.db_type = t;
     }
 
@@ -521,8 +526,12 @@ impl ConnectionForm {
             .port
             .map(|n| n.to_string())
             .unwrap_or_else(|| default_port(&self.db_type).to_string());
-        if let Some(u) = p.username {
-            self.username = u;
+        match p.username {
+            Some(u) => self.username = u,
+            // MongoDB / Redis: a URL without a user signs in without one
+            // (not as the user typed for another engine).
+            None if !self.db_type.is_sql() => self.username.clear(),
+            None => {}
         }
         if let Some(pw) = p.password {
             self.password = pw;
@@ -1924,6 +1933,41 @@ mod tests {
         assert!(!f.uri.contains("p%40ss") && f.uri.contains("h2:27017"));
         assert_eq!(f.password, "p@ss");
         assert_eq!(f.hidden_schemas, ["config", "local"]);
+    }
+
+    #[test]
+    fn nosql_connections_drop_the_sql_default_user() {
+        // A new form starts as PostgreSQL, user "postgres".
+        for t in [DatabaseType::MongoDB, DatabaseType::Redis] {
+            let mut f = ConnectionForm::new(None);
+            f.name = "n".into();
+            assert_eq!(f.username, "postgres");
+            f.set_db_type(t.clone());
+            assert_eq!(f.username, "", "{t:?}");
+            f.host = "h".into();
+            assert_eq!(f.validate(&[]).unwrap().username, None, "{t:?}");
+        }
+        // A user typed by hand stays.
+        let mut f = ConnectionForm::new(None);
+        f.username = "alice".into();
+        f.set_db_type(DatabaseType::Redis);
+        assert_eq!(f.username, "alice");
+        // A URL without a user: none, even after another engine's.
+        let mut f = ConnectionForm::new(None);
+        f.name = "cache".into();
+        f.username = "alice".into();
+        f.url = "redis://:secret@cache.local:6380/2".into();
+        f.apply_url().unwrap();
+        assert_eq!((f.username.as_str(), f.password.as_str()), ("", "secret"));
+        let c = f.validate(&[]).unwrap();
+        assert_eq!(c.username, None);
+        assert_eq!(c.password.as_deref(), Some("secret"));
+        // A SQL URL without a user keeps the typed one, as before.
+        let mut f = ConnectionForm::new(None);
+        f.username = "alice".into();
+        f.url = "postgres://db.local/app".into();
+        f.apply_url().unwrap();
+        assert_eq!(f.username, "alice");
     }
 
     #[test]

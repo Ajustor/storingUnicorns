@@ -259,7 +259,8 @@ pub async fn connect(config: &ConnectionConfig) -> Result<RedisClient> {
     let port = config.port.unwrap_or(6379);
     let db = parse_db(&config.database, 0)?;
     let mut settings = RedisConnectionInfo::default().set_db(i64::from(db));
-    if let Some(user) = config.username.as_deref().filter(|u| !u.is_empty()) {
+    // Not a SQL form's default user (see `effective_username`).
+    if let Some(user) = config.effective_username().filter(|u| !u.is_empty()) {
         settings = settings.set_username(user);
     }
     if let Some(password) = config.password.as_deref().filter(|p| !p.is_empty()) {

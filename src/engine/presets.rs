@@ -243,6 +243,12 @@ fn parse_mongo_uri(input: &str) -> Result<ParsedUrl, String> {
     })
 }
 
+/// A SQL driver's default user (PostgreSQL, MySQL, SQL Server), cleared
+/// when the form switches to an engine without one (MongoDB, Redis).
+pub fn is_default_user(user: &str) -> bool {
+    matches!(user.trim(), "postgres" | "root" | "sa")
+}
+
 /// `uri` without the password of its userinfo, and that password decoded
 /// (`mongodb://u:p%40ss@h/` → (`mongodb://u@h/`, `p@ss`)).
 pub fn split_uri_password(uri: &str) -> (String, Option<String>) {

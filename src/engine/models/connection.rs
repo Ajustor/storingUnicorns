@@ -258,12 +258,21 @@ impl ConnectionConfig {
     /// The username the connection signs in with: none for a MongoDB
     /// connection string, which carries its own user (a username left in
     /// the config, e.g. `Default`'s "postgres", is stale).
+    /// Redis: none either for `ConnectionConfig::default()`'s "postgres"
+    /// or SQL Server's "sa", left by a form (`AUTH postgres …` would fail
+    /// where `AUTH …` works); a real ACL user is never named so.
     pub fn effective_username(&self) -> Option<&str> {
         let uri = self.uri.as_deref().is_some_and(|u| !u.trim().is_empty());
         if self.db_type == DatabaseType::MongoDB && uri {
             return None;
         }
-        self.username.as_deref()
+        let user = self.username.as_deref();
+        if self.db_type == DatabaseType::Redis
+            && user.is_some_and(|u| matches!(u.trim(), "postgres" | "sa"))
+        {
+            return None;
+        }
+        user
     }
 
     /// MongoDB / Redis TLS: `None` = plain connection, `Some(verify)` = TLS,
@@ -599,6 +608,15 @@ mod tests {
             Some("postgres"),
             "SQL engines unchanged"
         );
+        let redis = |user: &str| ConnectionConfig {
+            db_type: DatabaseType::Redis,
+            username: Some(user.into()),
+            ..Default::default()
+        };
+        assert_eq!(redis("postgres").effective_username(), None);
+        assert_eq!(redis("sa").effective_username(), None);
+        assert_eq!(redis("app").effective_username(), Some("app"));
+        assert_eq!(redis("default").effective_username(), Some("default"));
     }
 
     #[test]

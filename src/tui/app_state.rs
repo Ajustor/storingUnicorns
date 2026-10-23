@@ -8,7 +8,7 @@ use crate::engine::models::{
     AzureAuthMethod, ConnectionConfig, DatabaseType, DbAuthMethod, Flavor, QueryResult, SchemaInfo,
     SslMode,
 };
-use crate::engine::presets;
+use crate::engine::presets::{self, is_default_user};
 use crate::engine::services::export_import::{
     BatchExportState, BatchImportState, BatchTruncateState, ExportState, ImportState,
 };
@@ -239,11 +239,6 @@ pub fn uses_tls(db_type: &DatabaseType) -> bool {
 /// and MongoDB / Redis (TLS, `ConnectionConfig::nosql_tls`).
 pub fn shows_ssl(db_type: &DatabaseType) -> bool {
     uses_tls(db_type) || !db_type.is_sql()
-}
-
-/// A driver's default user, cleared for the engines without one.
-fn is_default_user(user: &str) -> bool {
-    matches!(user.trim(), "postgres" | "root" | "sa")
 }
 
 /// A SQL driver's default database, cleared for MongoDB (every database).
@@ -675,8 +670,11 @@ impl NewConnectionState {
         if let Some(n) = p.port {
             self.port = n.to_string();
         }
-        if let Some(u) = p.username {
-            self.username = u;
+        match p.username {
+            Some(u) => self.username = u,
+            // MongoDB / Redis: a URL without a user signs in without one.
+            None if !self.db_type.is_sql() => self.username.clear(),
+            None => {}
         }
         if let Some(pw) = p.password {
             self.password = pw;
@@ -2256,6 +2254,18 @@ mod tests {
         assert_eq!(back.url, nc.url);
         assert_eq!(back.auth_source, "admin");
         assert_eq!(back.to_config(), c);
+    }
+
+    #[test]
+    fn a_nosql_url_without_user_clears_the_typed_one() {
+        let mut nc = NewConnectionState {
+            username: "alice".into(),
+            url: "redis://:secret@cache.local:6380/2".into(),
+            ..Default::default()
+        };
+        nc.apply_url().unwrap();
+        assert_eq!((nc.username.as_str(), nc.password.as_str()), ("", "secret"));
+        assert_eq!(nc.to_config().username, None);
     }
 
     #[test]

@@ -19,6 +19,10 @@ desktop GUI (egui) and a terminal UI (ratatui) sharing the same engine.
   - Cloud SQL PostgreSQL / MySQL: your Google account through `gcloud`, no
     password, tokens renewed by themselves (see
     [IAM Google Cloud](#iam-google-cloud-cloud-sql))
+- MongoDB (Atlas `mongodb+srv://`, Cosmos DB and DocumentDB through their
+  MongoDB API) and Redis / Valkey, in the GUI and the TUI: explorer, document
+  and key editors, shell-syntax / command console, JSON and CSV transfers (see
+  [MongoDB](#mongodb) and [Redis](#redis))
 - **GUI** (default) with DataGrip ergonomics:
   - several connections open at once, each with its own colour (dot on its tabs)
   - database explorer: connection → schemas → tables → columns / keys / indexes,
@@ -181,6 +185,96 @@ Pour alléger l'explorateur, on peut **masquer des schémas** d'une connexion
 Dans l'interface terminal : `h` masque / démasque le schéma sélectionné, `H`
 affiche les schémas masqués (en grisé).
 
+### MongoDB
+
+Types de connexion **MongoDB** : MongoDB, MongoDB Atlas (`mongodb+srv://`),
+Azure Cosmos DB et Amazon DocumentDB (par leur API MongoDB).
+
+- **Connexion** : bascule **URI** (`mongodb://…` ou `mongodb+srv://…`, un mot
+  de passe collé dans l'URI est déplacé dans **Mot de passe** et n'est jamais
+  enregistré dans l'URI) ou **Paramètres** (hôte, port 27017, utilisateur,
+  mot de passe, base d'authentification `admin`, base par défaut — vide =
+  toutes). TLS : désactivé, activé, ou activé sans vérifier le certificat,
+  plus un certificat CA (DocumentDB : `global-bundle.pem`) ; les certificats du
+  système sont reconnus. Les bases `config` et `local` sont masquées d'office.
+- **Explorateur** : bases → collections → « Champs (échantillon) » (200
+  documents, chemins pointés sur 3 niveaux) et « Index ». Menus : nouvelle
+  collection, console, agrégation, index, export / import, **Vider la
+  collection…** (`deleteMany({})`), supprimer la collection ou la base.
+- **Onglet Documents** : barres **Filtre**, **Tri** et **Projection** en
+  syntaxe shell (`{age: {$gt: 30}}`, complétion des champs et des opérateurs),
+  pages de 500 documents et total ; la grille montre les champs de premier
+  niveau (objets et tableaux en syntaxe shell compacte, champ absent « — »
+  grisé, distinct de `null`) et s'édite comme une table SQL : modifications en
+  attente puis **Submit** / **Revert**. **+ Document**, **Éditer le
+  document…** (éditeur JSON / shell validé à la frappe), **Dupliquer**,
+  **Copier en JSON**. Mode **Agrégation** : pipeline, **Ajouter une étape**
+  (`$match`, `$group`, `$lookup`…), résultat en lecture seule, **Copier comme
+  commande console**.
+- **Console** : syntaxe du shell `mongosh` sans JavaScript : `use base`,
+  `show dbs`, `db.coll.find(…).sort(…).limit(…)`, `findOne`, `aggregate`,
+  `countDocuments`, `distinct`, `insertOne/Many`, `updateOne/Many`,
+  `replaceOne`, `deleteOne/Many`, `createIndex`, `dropIndex`, `getIndexes`,
+  `drop`, `db.createCollection`, `db.runCommand({…})`… et les constructeurs
+  (`ObjectId("…")`, `ISODate("…")`, `NumberLong(…)`, `UUID("…")`…) ; le JSON
+  étendu de `mongoexport` se relit. Sélecteur **Base :** suivi par `use`,
+  **Formater**, complétion. Les commandes destructives (`deleteMany({})`,
+  `updateMany({}, …)`, `drop()`, `dropDatabase()`…) demandent confirmation
+  avant l'envoi. Les résultats d'un `find` sont modifiables comme une grille
+  de documents.
+- **Index…** : liste (clés, unique, sparse, TTL, filtre partiel, caché) et
+  création / suppression.
+- **Export / import** : JSON (tableau), JSON Lines ou CSV, une ou plusieurs
+  collections (fichiers `base.collection.json`) ; import par lots de 1 000,
+  avec **Remplacer les documents de même _id** (sinon un `_id` existant compte
+  comme une erreur). CSV : champs imbriqués aplatis en `a.b`, tableaux en
+  JSON ; à l'import, types déduits (**Tout garder en texte** pour s'en
+  passer, **Reconnaître les dates ISO**), `_id` de 24 caractères
+  hexadécimaux lu comme `ObjectId`. `null` et champ absent s'exportent tous
+  deux vides.
+
+Limites : un **Submit n'est pas atomique** (les écritures sont envoyées une à
+une, sans transaction : en cas d'erreur, le message indique combien ont été
+appliquées) ; pas d'authentification X.509 / AWS / Kerberos ; pas de BSON
+binaire (`mongodump` / `mongorestore`) ; pas de mode transaction manuel, de DDL
+ni de clés étrangères.
+
+### Redis
+
+Types de connexion **Redis** (et Valkey, compatible) : hôte, port 6379,
+utilisateur ACL facultatif, mot de passe, base 0–15, TLS comme MongoDB ; une
+URL `redis://` / `rediss://` remplit le formulaire.
+
+- **Explorateur** : `db0 (1 234 clés)` (compte de `INFO keyspace`, sinon les
+  clés listées) → clés groupées par préfixe `:` (`user: (120)`), avec l'icône
+  du type et l'expiration. Les clés sont listées par `SCAN` (jamais `KEYS`),
+  **5 000 au plus** par base : au-delà, l'onglet **Clés** les parcourt. Menus :
+  parcourir les clés, nouvelle clé, console, export / import, **Vider la
+  base…** (`FLUSHDB`, confirmé) ; sur une clé : ouvrir, renommer, expiration,
+  copier le nom, supprimer.
+- **Onglet Clés** : motif (`user:*`), filtre de type, grille clé / type / TTL /
+  taille, **Charger plus** ; à droite, la valeur de la clé choisie, modifiable
+  selon son type : string (texte, aperçu JSON), list, set, zset, hash, stream
+  (ajout `XADD *`, suppression), pages de 500 éléments ; TTL (« persistante »
+  ou secondes), renommer (refusé si le nom existe), supprimer. Les noms et
+  valeurs binaires s'affichent et se saisissent comme dans `redis-cli`
+  (`"\xff\x00"`).
+- **Console** : commandes brutes, une par ligne (guillemets et échappements de
+  `redis-cli`) ; `SELECT n` change la base de la console, `MULTI` / `EXEC`
+  fonctionnent dans un script, `KEYS motif` est exécuté par un `SCAN`.
+  `FLUSHALL`, `FLUSHDB`, `CONFIG SET`, `SHUTDOWN`… demandent confirmation ;
+  `SUBSCRIBE`, `MONITOR` et les commandes bloquantes sans délai sont refusées.
+  La lecture d'une clé (`GET`, `HGETALL`, `LRANGE`, `SMEMBERS`, `ZRANGE …
+  WITHSCORES`, `XRANGE`, `HSCAN`…) se modifie directement dans la grille du
+  résultat, puis **Submit**.
+- **Export / import** : JSON (`[{key, type, ttl, value}]`, binaire en
+  `{"$base64": …}`) ou CSV (`key,type,ttl,value`), avec **Écraser les clés
+  existantes**.
+
+Limites : pas de Redis Cluster ni Sentinel ; parcours limité à 5 000 clés par
+base dans l'explorateur ; les types de modules (`ReJSON-RL`…) sont en lecture
+seule.
+
 ### Raccourcis (GUI)
 
 Les infobulles et menus affichent les touches de la plateforme (`⌥⌘L` sur
@@ -246,6 +340,33 @@ The second key of each pair works in default macOS terminals (Terminal.app,
 iTerm2), where F-keys need `fn`, `Ctrl+Enter` arrives as `Enter`,
 `Ctrl+Space` switches the input source and Option types characters instead
 of acting as Alt.
+
+### MongoDB et Redis
+
+Le cycle **Type** du formulaire propose MongoDB et Redis ; **URL** accepte
+`mongodb://`, `mongodb+srv://`, `redis://` et `rediss://`.
+
+| Key         | Context                | Action                                          |
+|-------------|------------------------|-------------------------------------------------|
+| `Enter`     | Tables (collection)    | Run `db.getCollection("c").find({}).limit(100)` |
+| `s`         | Tables (collection)    | Indexes (`n` new, `d` drop)                     |
+| `t`         | Tables (collection)    | Empty the collection (`deleteMany({})`, confirmed) |
+| `Enter`     | Tables (Redis key)     | Read the key (`GET`, `HGETALL`, `LRANGE k 0 99`…) |
+| `Enter`     | Tables (Redis prefix)  | Fold / unfold the `prefix:` group               |
+| `/`         | Tables (Redis)         | SCAN pattern (5 000 keys at most)               |
+| `n`         | Tables (Redis)         | New key                                         |
+| `t`         | Tables (Redis database)| `FLUSHDB` (confirmed)                           |
+| `Enter` / `a` / `d` | Results        | Edit / add / delete a document or an element    |
+| `v`         | Results                | Document / value as JSON                        |
+| `x` / `F6`  | Results                | Export the result (JSON, JSON Lines, CSV)       |
+| `E` / `I`   | Tables                 | Collections ↔ JSON / JSON Lines / CSV files; Redis database ↔ JSON / CSV |
+
+The editor runs MongoDB shell commands or Redis commands (`F5` all,
+`Ctrl+Enter` the one at the cursor), asks `(o/N)` before a destructive one,
+and completes collections, fields, operators, commands and keys. The current
+database (`use` / `SELECT`) is shown in its title. With `-d`, edits show the
+commands they would send instead of running them. The database panel shows
+each Redis database's key count (`INFO keyspace`).
 
 ### New Connection Dialog
 

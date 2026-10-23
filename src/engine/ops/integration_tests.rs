@@ -15,6 +15,14 @@
 //!   only accepts TLS (`hostssl` + `hostnossl ... reject`), user `postgres`,
 //!   password `a@b:c/d#e?f%g`, certificate for `localhost` signed by the CA.
 //!
+//! MongoDB and Redis have their own tests, with the servers to start, in
+//! `engine/nosql/mongo/integration_tests.rs` (`SU_IT_MONGO`,
+//! `SU_IT_MONGO_AUTH`) and `engine/nosql/redis/integration_tests.rs`
+//! (`SU_IT_REDIS`, `SU_IT_REDIS_AUTH`); the GUI worker's
+//! `integration_mongo_worker` / `integration_redis_worker` read
+//! `SU_IT_MONGO` / `SU_IT_REDIS` too. Run them all with
+//! `cargo test -- --ignored integration`.
+//!
 //! Servers for the last three (from Git Bash on Windows, prefix the
 //! CockroachDB line with `MSYS_NO_PATHCONV=1`):
 //!

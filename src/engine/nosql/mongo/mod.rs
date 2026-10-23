@@ -578,6 +578,12 @@ pub async fn aggregate(
             Bson::Document(d) => vec![d],
             _ => anyhow::bail!("Pipeline : tableau d'étapes attendu"),
         };
+    // Writes to a collection: only from the console, which confirms them.
+    if let Some(stage) = shell::writing_stage(&stages) {
+        anyhow::bail!(
+            "Pipeline : l'étape {stage} écrit dans une collection ; l'exécuter depuis la console              (confirmation demandée)"
+        );
+    }
     let cursor = c
         .client
         .database(&coll.db)

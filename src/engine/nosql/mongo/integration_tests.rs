@@ -343,6 +343,14 @@ db.users.find({_id: 1}, {})"#,
         .unwrap();
     assert_eq!(capped.docs.len(), 2);
     assert!(capped.result.truncated);
+    // A pipeline writing to a collection is refused outside the console.
+    let e = aggregate(c, &coll("users"), "[{$out: \"users_copy\"}]", 10)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("$out") && e.contains("console"), "{e}");
+    let names = c.client.database(DB).list_collection_names().await.unwrap();
+    assert!(!names.contains(&"users_copy".to_string()), "{names:?}");
     let out = run(
         &conn,
         "db.users.aggregate([{$count: \"n\"}], {allowDiskUse: true})",
@@ -390,6 +398,13 @@ db.users.find({_id: 1}, {})"#,
     assert!(list_indexes(c, &coll("missing")).await.unwrap().is_empty());
 
     // --- danger: reported, not run ----------------------------------------------
+    let w = nosql::warnings(
+        &conn.db_type(),
+        "db.users.aggregate([{$merge: {into: \"users\"}}])",
+        None,
+    );
+    assert_eq!(w.len(), 1);
+    assert!(w[0].reason.contains("$merge"), "{w:?}");
     let script = "db.users.find()\ndb.users.deleteMany({})";
     let w = nosql::warnings(&conn.db_type(), script, None);
     assert_eq!(w.len(), 1);

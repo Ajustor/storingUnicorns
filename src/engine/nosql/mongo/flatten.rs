@@ -279,6 +279,13 @@ pub fn doc_changes(page: &DocPage, changes: &RowChanges) -> Result<Vec<DocChange
             if c.name == "_id" {
                 return Err("_id n'est pas modifiable".into());
             }
+            // `$set: {"a.b": …}` would write the path a → b, not this field.
+            if c.name.contains('.') || c.name.starts_with('$') {
+                return Err(format!(
+                    "le champ « {} » ne se modifie pas dans la grille (nom avec « . » ou « $ ») :                      utiliser l'éditeur JSON",
+                    c.name
+                ));
+            }
             let current = doc.get(&c.name);
             match cell_to_bson(current, after).map_err(|e| format!("{} : {e}", c.name))? {
                 Some(value) => out.push(DocChange::Set {
@@ -638,6 +645,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("plusieurs documents"), "{e}");
+    }
+
+    #[test]
+    fn dotted_or_dollar_field_names_are_not_edited_as_paths() {
+        let docs = vec![doc! { "_id": 1, "a.b": 1, "$x": 2 }];
+        let p = DocPage {
+            result: flatten(&docs),
+            docs,
+        };
+        let row = p.result.rows[0].clone();
+        for name in ["a.b", "$x"] {
+            let col = p
+                .result
+                .columns
+                .iter()
+                .position(|c| c.name == name)
+                .unwrap();
+            let mut edited = row.clone();
+            edited[col] = "9".into();
+            let e = doc_changes(
+                &p,
+                &RowChanges {
+                    updates: vec![(row.clone(), edited)],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(e.contains(name) && e.contains("éditeur JSON"), "{e}");
+        }
     }
 
     #[test]

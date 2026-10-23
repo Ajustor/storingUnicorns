@@ -753,6 +753,16 @@ fn dangerous_commands() {
     }
     assert_eq!(d("db.runCommand({ping: 1})"), None);
     assert_eq!(d("db.u.find()"), None);
+    // Aggregations writing to a collection.
+    let out = d("db.u.aggregate([{$match: {}}, {$out: \"copy\"}])").unwrap();
+    assert!(out.contains("$out") && out.contains("u"), "{out}");
+    assert!(d("db.u.aggregate([{$merge: {into: \"t\"}}])")
+        .unwrap()
+        .contains("$merge"));
+    assert_eq!(
+        d("db.u.aggregate([{$match: {}}, {$group: {_id: 1}}])"),
+        None
+    );
 }
 
 #[test]

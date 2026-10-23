@@ -1801,6 +1801,11 @@ pub fn danger(cmd: &MongoCommand) -> Option<String> {
             Some(format!("Supprime la collection {coll} et ses index"))
         }
         MongoCommand::DropDatabase => Some("Supprime la base courante".into()),
+        MongoCommand::Aggregate { coll, pipeline, .. } => writing_stage(pipeline).map(|stage| {
+            format!(
+                "L'étape {stage} de l'agrégation sur {coll} écrit dans une collection                  (la remplace ou la modifie)"
+            )
+        }),
         MongoCommand::DropIndex {
             coll,
             index: Bson::String(name),
@@ -1819,6 +1824,16 @@ pub fn danger(cmd: &MongoCommand) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The first `$out` / `$merge` stage of a pipeline (they write the results
+/// to a collection, replacing or changing it).
+pub fn writing_stage(pipeline: &[Document]) -> Option<&'static str> {
+    pipeline.iter().find_map(|stage| {
+        ["$out", "$merge"]
+            .into_iter()
+            .find(|s| stage.contains_key(*s))
+    })
 }
 
 // ---------------------------------------------------------------------------

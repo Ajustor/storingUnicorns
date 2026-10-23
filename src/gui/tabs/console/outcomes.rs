@@ -568,6 +568,7 @@ mod tests {
             edits.unwrap(),
             [KeyEdit::ListSet {
                 index: 2,
+                old: b"c".to_vec(),
                 value: b"C".to_vec()
             }]
         );

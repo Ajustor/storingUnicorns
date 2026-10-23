@@ -758,6 +758,7 @@ mod tests {
                 ValuePage {
                     value: v,
                     total: 1,
+                    from: 0,
                     next: None,
                 },
             ))),

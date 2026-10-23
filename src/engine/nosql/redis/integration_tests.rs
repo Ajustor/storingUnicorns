@@ -290,9 +290,13 @@ async fn integration_redis_each_key_edit() {
         vec![
             KeyEdit::ListSet {
                 index: 1,
+                old: b("x"),
                 value: b("y"),
             },
-            KeyEdit::ListRemove { index: 2 },
+            KeyEdit::ListRemove {
+                index: 2,
+                old: b("a"),
+            },
             KeyEdit::ListPush {
                 left: true,
                 value: b("first"),
@@ -318,13 +322,79 @@ async fn integration_redis_each_key_edit() {
                 left: false,
                 value: b("z"),
             },
-            KeyEdit::ListRemove { index: 99 },
+            KeyEdit::ListRemove {
+                index: 99,
+                old: b("a"),
+            },
         ],
     )
     .await
     .unwrap_err()
     .to_string();
     assert!(err.starts_with("1 appliquée(s), échec"), "{err}");
+    assert!(err.contains("la liste a changé"), "{err}");
+    // The list changed since it was read: element #1 is no longer "y".
+    // [first, a, y, last, z]: an LPUSH elsewhere shifts it to #2.
+    apply(
+        l.clone(),
+        vec![KeyEdit::ListPush {
+            left: true,
+            value: b("other"),
+        }],
+    )
+    .await
+    .unwrap();
+    for stale in [
+        KeyEdit::ListSet {
+            index: 2,
+            old: b("y"),
+            value: b("Y"),
+        },
+        KeyEdit::ListRemove {
+            index: 2,
+            old: b("y"),
+        },
+    ] {
+        let err = apply(l.clone(), vec![stale]).await.unwrap_err().to_string();
+        assert!(
+            err.contains("la liste a changé (élément #2), rechargez"),
+            "{err}"
+        );
+    }
+    assert_eq!(
+        value(&c, &l).await,
+        RedisValue::List(vec![
+            b("other"),
+            b("first"),
+            b("a"),
+            b("y"),
+            b("last"),
+            b("z")
+        ]),
+        "nothing written"
+    );
+    // Binary elements are compared exactly.
+    let bin = k(p, "binlist");
+    create_key(
+        &c,
+        DB,
+        &bin,
+        &RedisValue::List(vec![vec![0xff, 0], b("x")]),
+        None,
+    )
+    .await
+    .unwrap();
+    let n = apply(
+        bin.clone(),
+        vec![KeyEdit::ListRemove {
+            index: 0,
+            old: vec![0xff, 0],
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(value(&c, &bin).await, RedisValue::List(vec![b("x")]));
     // Set, zset, hash, stream.
     let st = k(p, "set");
     create_key(&c, DB, &st, &RedisValue::Set(vec![b("a")]), None)

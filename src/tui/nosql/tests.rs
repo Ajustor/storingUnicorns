@@ -689,12 +689,16 @@ fn row_edits_of_each_redis_type() {
         edit(RedisType::List, &l, 1, set_cell(&l, 1, 1, "Y")).unwrap(),
         [KeyEdit::ListSet {
             index: 1,
+            old: b("y"),
             value: b("Y")
         }]
     );
     assert_eq!(
         edit(RedisType::List, &l, 2, None).unwrap(),
-        [KeyEdit::ListRemove { index: 2 }]
+        [KeyEdit::ListRemove {
+            index: 2,
+            old: b("z")
+        }]
     );
     assert_eq!(
         key_edits(b"k", &RedisType::List, &l, None, Some(&strings(&["", "w"]))).unwrap(),
@@ -854,12 +858,15 @@ async fn debug_mode_never_writes() {
 fn edit_previews_show_every_command() {
     let text = edit_preview(b"k", &KeyEdit::HDel(b"f".to_vec()));
     assert_eq!(text, "HDEL k f");
-    // A list removal takes two commands.
-    let text = edit_preview(b"k", &KeyEdit::ListRemove { index: 3 });
-    let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 2, "{text}");
-    assert!(lines[0].starts_with("LSET k 3 "), "{text}");
-    assert!(lines[1].starts_with("LREM k "), "{text}");
+    // A list removal: one script checking the element before removing it.
+    let remove = KeyEdit::ListRemove {
+        index: 3,
+        old: b"o".to_vec(),
+    };
+    let text = edit_preview(b"k", &remove);
+    assert!(text.starts_with("EVAL "), "{text}");
+    assert!(text.contains("LINDEX") && text.contains("LREM"), "{text}");
+    assert!(text.contains(" 1 k 3 o "), "{text}");
     let coll = CollectionRef {
         db: "shop".into(),
         coll: "users".into(),

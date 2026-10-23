@@ -693,6 +693,9 @@ impl RedisValue {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValuePage {
     pub value: RedisValue,
+    /// Offset of the first element (list, zset, stream; 0 otherwise), as
+    /// read: not derived from `total`, which may be stale.
+    pub from: u64,
     /// Elements in the whole value.
     pub total: u64,
     /// Where the next page starts: an offset (list, zset, stream) or a
@@ -730,6 +733,7 @@ pub async fn read_value(
             ValuePage {
                 total: b.len() as u64,
                 value: RedisValue::String(b),
+                from: 0,
                 next: None,
             }
         }
@@ -746,6 +750,7 @@ pub async fn read_value(
                 next: by_offset(items.len(), total),
                 total,
                 value: RedisValue::List(items),
+                from,
             }
         }
         RedisType::ZSet => {
@@ -769,6 +774,7 @@ pub async fn read_value(
                 next: by_offset(items.len(), total),
                 total,
                 value: RedisValue::ZSet(items),
+                from,
             }
         }
         RedisType::Set | RedisType::Hash => {
@@ -789,6 +795,7 @@ pub async fn read_value(
             ValuePage {
                 value,
                 total: info.size.unwrap_or_default(),
+                from: 0,
                 next: (cursor != 0).then_some(cursor),
             }
         }
@@ -816,6 +823,7 @@ pub async fn read_value(
                 next: by_offset(entries.len(), total),
                 total,
                 value: RedisValue::Stream(entries),
+                from,
             }
         }
         RedisType::Other(name) => {
@@ -964,13 +972,10 @@ pub fn value_result(v: &RedisValue) -> QueryResult {
     value_grid(v, 0)
 }
 
-/// Offset of a list / zset / stream page's first element.
+/// Offset of a list / zset / stream page's first element (`from`).
 pub fn page_offset(page: &ValuePage) -> u64 {
-    let len = page.value.len() as u64;
     match page.value {
-        RedisValue::List(_) | RedisValue::ZSet(_) | RedisValue::Stream(_) => {
-            page.next.unwrap_or(page.total).saturating_sub(len)
-        }
+        RedisValue::List(_) | RedisValue::ZSet(_) | RedisValue::Stream(_) => page.from,
         _ => 0,
     }
 }
@@ -985,16 +990,21 @@ pub fn page_result(page: &ValuePage) -> QueryResult {
 #[derive(Clone, Debug, PartialEq)]
 pub enum KeyEdit {
     SetString(Vec<u8>),
+    /// `LSET` of element `index`, if it still holds `old` (else the list
+    /// changed since it was read: refused).
     ListSet {
         index: i64,
+        old: Vec<u8>,
         value: Vec<u8>,
     },
     ListPush {
         left: bool,
         value: Vec<u8>,
     },
+    /// Removal of element `index`, if it still holds `old`.
     ListRemove {
         index: i64,
+        old: Vec<u8>,
     },
     SetAdd(Vec<u8>),
     SetRemove(Vec<u8>),
@@ -1034,40 +1044,54 @@ fn removal_sentinel() -> Vec<u8> {
     .into_bytes()
 }
 
-/// The command (argv) of an edit. `ListRemove` takes two commands (see
-/// `edit_to_commands`): this is its first, the `LSET` to a sentinel.
+/// `LSET` of element ARGV[1] to ARGV[3] if it still is ARGV[2]; 0 when the
+/// list changed (an index alone could hit another element).
+const LIST_SET_SCRIPT: &str =
+    "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end \
+redis.call('LSET', KEYS[1], ARGV[1], ARGV[3]) return 1";
+
+/// Removal of element ARGV[1] if it still is ARGV[2]: set to the sentinel
+/// ARGV[3], then `LREM` it; 0 when the list changed.
+const LIST_REMOVE_SCRIPT: &str =
+    "if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end \
+redis.call('LSET', KEYS[1], ARGV[1], ARGV[3]) return redis.call('LREM', KEYS[1], 1, ARGV[3])";
+
+/// The command (argv) of an edit (its first, when there are several).
 pub fn edit_to_command(key: &[u8], e: &KeyEdit) -> Vec<Vec<u8>> {
     edit_to_commands(key, e).swap_remove(0)
 }
 
-/// The commands of an edit, run in order (`ListRemove`: `LSET` the element
-/// to a sentinel, then `LREM` it, in one MULTI).
+/// The commands of an edit, run in order (in one MULTI when several).
+/// `ListSet` / `ListRemove` are `EVAL` scripts checking the element first.
 pub fn edit_to_commands(key: &[u8], e: &KeyEdit) -> Vec<Vec<Vec<u8>>> {
     let k = key.to_vec();
     let b = |s: &str| s.as_bytes().to_vec();
     let one = |v: Vec<Vec<u8>>| vec![v];
     match e {
         KeyEdit::SetString(v) => one(vec![b("SET"), k, v.clone(), b("KEEPTTL")]),
-        KeyEdit::ListSet { index, value } => {
-            one(vec![b("LSET"), k, b(&index.to_string()), value.clone()])
-        }
+        KeyEdit::ListSet { index, old, value } => one(vec![
+            b("EVAL"),
+            b(LIST_SET_SCRIPT),
+            b("1"),
+            k,
+            b(&index.to_string()),
+            old.clone(),
+            value.clone(),
+        ]),
         KeyEdit::ListPush { left, value } => one(vec![
             b(if *left { "LPUSH" } else { "RPUSH" }),
             k,
             value.clone(),
         ]),
-        KeyEdit::ListRemove { index } => {
-            let sentinel = removal_sentinel();
-            vec![
-                vec![
-                    b("LSET"),
-                    k.clone(),
-                    b(&index.to_string()),
-                    sentinel.clone(),
-                ],
-                vec![b("LREM"), k, b("1"), sentinel],
-            ]
-        }
+        KeyEdit::ListRemove { index, old } => one(vec![
+            b("EVAL"),
+            b(LIST_REMOVE_SCRIPT),
+            b("1"),
+            k,
+            b(&index.to_string()),
+            old.clone(),
+            removal_sentinel(),
+        ]),
         KeyEdit::SetAdd(m) => one(vec![b("SADD"), k, m.clone()]),
         KeyEdit::SetRemove(m) => one(vec![b("SREM"), k, m.clone()]),
         KeyEdit::ZAdd { member, score } => one(vec![
@@ -1173,6 +1197,7 @@ pub fn console_page(kind: &RedisType, result: &QueryResult) -> Result<ValuePage,
     Ok(ValuePage {
         value,
         total: end,
+        from: offset,
         next: Some(end),
     })
 }
@@ -1232,6 +1257,7 @@ pub fn grid_edits(
                 if old.get(1) != new.get(1) {
                     edits.push(KeyEdit::ListSet {
                         index,
+                        old: cell_bytes(old.get(1), "valeur")?,
                         value: cell_bytes(new.get(1), "valeur")?,
                     });
                 }
@@ -1239,14 +1265,15 @@ pub fn grid_edits(
             let mut indexes = changes
                 .deletes
                 .iter()
-                .map(|row| list_index(page, row))
-                .collect::<Result<Vec<_>, _>>()?;
-            indexes.sort_unstable_by(|a, b| b.cmp(a));
-            indexes.dedup();
+                .map(|row| Ok((list_index(page, row)?, cell_bytes(row.get(1), "valeur")?)))
+                .collect::<Result<Vec<_>, String>>()?;
+            // From the last: a removal doesn't move the ones before it.
+            indexes.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            indexes.dedup_by_key(|(i, _)| *i);
             removals.extend(
                 indexes
                     .into_iter()
-                    .map(|index| KeyEdit::ListRemove { index }),
+                    .map(|(index, old)| KeyEdit::ListRemove { index, old }),
             );
             for row in &changes.inserts {
                 inserts.push(KeyEdit::ListPush {
@@ -1397,8 +1424,8 @@ pub async fn apply_edits(c: &RedisClient, db: u8, key: &[u8], edits: &[KeyEdit])
                 KeyEdit::Expire(Some(_)) if zero => {
                     bail!("la clé {} n'existe pas", display_bytes(&key))
                 }
-                KeyEdit::ListRemove { index } if zero => {
-                    bail!("élément #{index} introuvable")
+                KeyEdit::ListSet { index, .. } | KeyEdit::ListRemove { index, .. } if zero => {
+                    bail!("la liste a changé (élément #{index}), rechargez")
                 }
                 KeyEdit::XDel(id) if zero => bail!("entrée {id} introuvable"),
                 _ => Ok(()),
@@ -1878,13 +1905,6 @@ mod tests {
         let cases: Vec<(KeyEdit, &str)> = vec![
             (KeyEdit::SetString(b"v".to_vec()), "SET k v KEEPTTL"),
             (
-                KeyEdit::ListSet {
-                    index: 2,
-                    value: b"v".to_vec(),
-                },
-                "LSET k 2 v",
-            ),
-            (
                 KeyEdit::ListPush {
                     left: true,
                     value: b"v".to_vec(),
@@ -1947,15 +1967,28 @@ mod tests {
             assert_eq!(strs(edit_to_command(k, &edit)).join(" "), expected);
             assert_eq!(edit_to_commands(k, &edit).len(), 1);
         }
-        let remove = edit_to_commands(k, &KeyEdit::ListRemove { index: 3 });
-        assert_eq!(remove.len(), 2);
-        assert_eq!(strs(remove[0][..3].to_vec()), ["LSET", "k", "3"]);
-        assert_eq!(strs(remove[1][..3].to_vec()), ["LREM", "k", "1"]);
-        assert_eq!(remove[0][3], remove[1][3], "same sentinel");
-        assert_eq!(
-            edit_to_command(k, &KeyEdit::ListRemove { index: 3 })[0],
-            b"LSET"
-        );
+        // List edits by index check the element first (one EVAL each).
+        let set = KeyEdit::ListSet {
+            index: 2,
+            old: b"o".to_vec(),
+            value: b"v".to_vec(),
+        };
+        let set = edit_to_commands(k, &set);
+        assert_eq!(set.len(), 1);
+        let argv = strs(set[0].clone());
+        assert_eq!(argv[0], "EVAL");
+        assert!(argv[1].contains("LINDEX") && argv[1].contains("LSET"));
+        assert_eq!(argv[2..], ["1", "k", "2", "o", "v"]);
+        let remove = KeyEdit::ListRemove {
+            index: 3,
+            old: b"o".to_vec(),
+        };
+        let remove = edit_to_commands(k, &remove);
+        assert_eq!(remove.len(), 1);
+        let argv = strs(remove[0].clone());
+        assert!(argv[1].contains("LINDEX") && argv[1].contains("LREM"));
+        assert_eq!(argv[2..6], ["1", "k", "3", "o"]);
+        assert!(argv[6].contains("storingUnicorns:removed"), "sentinel");
     }
 
     fn info(kind: RedisType) -> KeyInfo {
@@ -1967,8 +2000,15 @@ mod tests {
         }
     }
 
+    /// A page ending at `next` (or `total`).
     fn page(value: RedisValue, total: u64, next: Option<u64>) -> ValuePage {
-        ValuePage { value, total, next }
+        let from = next.unwrap_or(total).saturating_sub(value.len() as u64);
+        ValuePage {
+            value,
+            total,
+            from,
+            next,
+        }
     }
 
     fn row(cells: &[&str]) -> Vec<String> {
@@ -2019,6 +2059,16 @@ mod tests {
         assert_eq!(page_result(&p).rows[0][0], "4");
         let last = page(RedisValue::List(vec![b"z".to_vec()]), 10, None);
         assert_eq!(page_offset(&last), 9);
+        // The offset read, not one derived from a stale length (the list
+        // shrank to 3 elements after LLEN said 10).
+        let stale = ValuePage {
+            value: RedisValue::List(vec![b"h".to_vec(), b"i".to_vec()]),
+            total: 3,
+            from: 7,
+            next: None,
+        };
+        assert_eq!(page_offset(&stale), 7);
+        assert_eq!(page_result(&stale).rows[0][0], "7");
     }
 
     #[test]
@@ -2061,9 +2111,13 @@ mod tests {
             [
                 KeyEdit::ListSet {
                     index: 6,
+                    old: b"g".to_vec(),
                     value: b"G".to_vec()
                 },
-                KeyEdit::ListRemove { index: 5 },
+                KeyEdit::ListRemove {
+                    index: 5,
+                    old: b"f".to_vec()
+                },
             ]
         );
         // The row of a string deleted: the key.
@@ -2106,10 +2160,17 @@ mod tests {
             [
                 KeyEdit::ListSet {
                     index: 3,
+                    old: b"d".to_vec(),
                     value: b"D".to_vec()
                 },
-                KeyEdit::ListRemove { index: 4 },
-                KeyEdit::ListRemove { index: 2 },
+                KeyEdit::ListRemove {
+                    index: 4,
+                    old: b"e".to_vec()
+                },
+                KeyEdit::ListRemove {
+                    index: 2,
+                    old: b"c".to_vec()
+                },
                 KeyEdit::ListPush {
                     left: false,
                     value: b"z".to_vec()
@@ -2125,6 +2186,7 @@ mod tests {
             grid_edits(&info(RedisType::List), &p, &relative).unwrap(),
             [KeyEdit::ListSet {
                 index: 3,
+                old: b"d".to_vec(),
                 value: b"D".to_vec()
             }]
         );

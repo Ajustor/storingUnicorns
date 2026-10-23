@@ -4,6 +4,7 @@
 use egui::KeyboardShortcut;
 
 use crate::engine::db::utils::display_qualified;
+use crate::engine::ops::query::StatementOutcome;
 use crate::engine::services::history::HistoryEntry;
 use crate::gui::dialogs;
 use crate::gui::history_popup;
@@ -268,12 +269,11 @@ impl App {
             return;
         }
         let at = history_popup::now_secs();
-        // The result sets of one SQL Server batch share its SQL: log it once.
-        let mut logged: Option<&str> = None;
-        for o in outcomes.iter().filter(|o| !o.sql.trim().is_empty()) {
-            if logged.replace(&o.sql) == Some(&o.sql) {
-                continue;
-            }
+        let tsql = self
+            .sessions
+            .get(&tab.connection)
+            .is_some_and(|s| s.config.db_type.runs_tsql_batches());
+        for o in history_outcomes(&outcomes, tsql) {
             self.history.push(HistoryEntry {
                 sql: o.sql.clone(),
                 connection: tab.connection.clone(),
@@ -328,5 +328,49 @@ impl App {
                 None => {}
             }
         }
+    }
+}
+
+/// The outcomes of a console run that go to the history: those with SQL.
+/// On SQL Server (`tsql`), the result sets of one batch share its SQL when
+/// they could not be matched with their SELECTs: it is logged once.
+fn history_outcomes(
+    outcomes: &[StatementOutcome],
+    tsql: bool,
+) -> impl Iterator<Item = &StatementOutcome> {
+    let mut previous: Option<&str> = None;
+    outcomes
+        .iter()
+        .filter(|o| !o.sql.trim().is_empty())
+        .filter(move |o| !(tsql && previous.replace(&o.sql) == Some(o.sql.as_str())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(sql: &str) -> StatementOutcome {
+        StatementOutcome {
+            sql: sql.into(),
+            result: Err(String::new()),
+            elapsed_ms: 0,
+        }
+    }
+
+    #[test]
+    fn history_logs_a_batch_once_only_on_sql_server() {
+        let outcomes = [
+            outcome("SELECT 1"),
+            outcome("SELECT 1"),
+            outcome(" "),
+            outcome("SELECT 2"),
+        ];
+        let sqls = |tsql| {
+            history_outcomes(&outcomes, tsql)
+                .map(|o| o.sql.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sqls(false), ["SELECT 1", "SELECT 1", "SELECT 2"]);
+        assert_eq!(sqls(true), ["SELECT 1", "SELECT 2"]);
     }
 }

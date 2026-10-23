@@ -198,10 +198,7 @@ impl DatabaseConnection {
     /// Whether scripts run on this connection as T-SQL batches (split on
     /// `GO`, see `ops::query::run_script`): SQL Server and Azure.
     pub fn runs_tsql_batches(&self) -> bool {
-        matches!(
-            self,
-            DatabaseConnection::SQLServer(_) | DatabaseConnection::Azure(_)
-        )
+        self.db_type().runs_tsql_batches()
     }
 
     /// SQL Server / Azure: run one script batch in a single round trip

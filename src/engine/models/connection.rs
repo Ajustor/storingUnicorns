@@ -38,6 +38,14 @@ pub enum DatabaseType {
     Azure,
 }
 
+impl DatabaseType {
+    /// Whether scripts run as T-SQL batches split on `GO`
+    /// (`ops::query::run_script`): SQL Server and Azure.
+    pub fn runs_tsql_batches(&self) -> bool {
+        matches!(self, DatabaseType::SQLServer | DatabaseType::Azure)
+    }
+}
+
 impl std::fmt::Display for DatabaseType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

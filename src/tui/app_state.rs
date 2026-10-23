@@ -377,6 +377,8 @@ impl NewConnectionState {
             flavor: self.flavor.filter(|f| f.driver() == self.db_type),
             // The default method is left out, as in older files.
             db_auth: self.gcp_iam().then_some(DbAuthMethod::GcpIam),
+            // TODO(folders): carried over from the edited connection by the TUI task.
+            ..Default::default()
         }
     }
 

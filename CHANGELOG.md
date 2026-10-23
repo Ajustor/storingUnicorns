@@ -18,9 +18,12 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
   `COMMIT` (« Must declare the scalar variable » ne survient plus). Chaque jeu
   de résultats ouvre son propre onglet, un `SELECT` vide garde ses colonnes, et
   une erreur indique la ligne du script (`… (ligne 37 du script)`). Un lot
-  ouvrant une transaction s'exécute avec `XACT_ABORT ON` et est annulé en cas
-  d'erreur ; une transaction laissée ouverte à la fin du script est annulée et
-  signalée. Le mode transaction manuelle suit les mêmes lots.
+  ouvrant une transaction sans régler `XACT_ABORT` lui-même s'exécute avec
+  `XACT_ABORT ON` (le réglage de la session est rétabli ensuite) et est annulé
+  en cas d'erreur ; une transaction laissée ouverte à la fin du script est
+  annulée et signalée. Le mode transaction manuelle suit les mêmes lots. Quand
+  le script contient des branchements (`IF`, `TRY … CATCH`…), ses jeux de
+  résultats s'affichent sous le texte du lot, en lecture seule.
 - **Nombre de lignes affectées** : sous `SET NOCOUNT ON` (ou quand le serveur
   ne donne pas de compte), la console affiche « Exécuté » au lieu d'un
   trompeur « 0 lignes affectées ».

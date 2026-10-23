@@ -860,6 +860,9 @@ async fn run_mysql_suite(dsn: &str) {
     assert_eq!(scalar(&c, "SELECT 1").await, "1");
 }
 
+/// 1 when the session has `XACT_ABORT` on, else 0.
+const XACT_ABORT: &str = "SELECT CAST(@@OPTIONS & 16384 AS int) / 16384";
+
 /// `host=...;port=...;user=...;password=...;database=...`
 fn mssql_config(spec: &str) -> ConnectionConfig {
     let mut config = ConnectionConfig {
@@ -1675,12 +1678,12 @@ async fn integration_mssql_script_batches() {
     assert_eq!(out.len(), 1, "one result set");
     let r = out[0].result.as_ref().unwrap();
     assert_eq!(r.rows, [["2"]]);
-    assert!(
-        out[0].sql.starts_with("SELECT (SELECT COUNT(*)"),
-        "{}",
-        out[0].sql
-    );
+    // Its IFs make the producing SELECT unknown: shown under the batch.
+    assert_eq!(out[0].sql, script.trim_end());
     assert_eq!(scalar(&conn, "SELECT @@TRANCOUNT").await, "0");
+    // The script's own `SET XACT_ABORT ON` stays, as in SSMS.
+    assert_eq!(scalar(&conn, XACT_ABORT).await, "1");
+    exec(&conn, "SET XACT_ABORT OFF").await;
 
     // Several SELECTs: one outcome each, titled and enriched by its SELECT;
     // an empty result set keeps its columns.
@@ -1780,6 +1783,68 @@ async fn integration_mssql_script_batches() {
     let e = out[0].result.as_ref().unwrap_err();
     assert!(e.ends_with("(ligne 3 du script)"), "{e}");
     assert_eq!(scalar(&conn, &count("NgapActeId = 8")).await, "0");
+    // The forced XACT_ABORT ON is undone, on errors and successes alike,
+    // even when the batch ends early with RETURN.
+    assert_eq!(scalar(&conn, XACT_ABORT).await, "0");
+    let out = run_script(
+        &conn,
+        "BEGIN TRAN;\nUPDATE su_it_b.link SET Spec = Spec;\nCOMMIT;\nRETURN;\nSELECT 1;",
+        None,
+    )
+    .await;
+    assert_eq!(errors(&out), Vec::<String>::new());
+    assert_eq!(scalar(&conn, XACT_ABORT).await, "0");
+    // The user's own XACT_ABORT ON, set in an earlier batch, is kept.
+    let out = run_script(
+        &conn,
+        "SET XACT_ABORT ON\nGO\nBEGIN TRAN;\nUPDATE su_it_b.link SET Spec = Spec;\nCOMMIT;",
+        None,
+    )
+    .await;
+    assert_eq!(errors(&out), Vec::<String>::new());
+    assert_eq!(scalar(&conn, XACT_ABORT).await, "1");
+    let block = ["BEGIN TRAN".to_string(), "COMMIT".to_string()];
+    conn.execute_transaction(&block).await.unwrap();
+    assert_eq!(
+        scalar(&conn, XACT_ABORT).await,
+        "1",
+        "run at the cursor too"
+    );
+    let bad = [
+        "BEGIN TRAN".to_string(),
+        "SELECT 1 / 0".to_string(),
+        "COMMIT".to_string(),
+    ];
+    assert!(conn.execute_transaction(&bad).await.is_err());
+    assert_eq!(scalar(&conn, XACT_ABORT).await, "1");
+    exec(&conn, "SET XACT_ABORT OFF").await;
+
+    // Control flow: which SELECT ran is unknown, the result sets are shown
+    // under the batch, not enriched, so not editable.
+    let branches = "IF EXISTS (SELECT 1 FROM su_it_b.link WHERE 1 = 0)\n\
+                    BEGIN DELETE FROM su_it_b.link WHERE 1 = 0; SELECT * FROM su_it_b.link; END\n\
+                    ELSE SELECT * FROM su_it_b.acte;";
+    let out = run_script(&conn, branches, None).await;
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].sql, branches);
+    let r = out[0].result.as_ref().unwrap();
+    assert!(r.primary_key.is_empty());
+    assert_eq!(
+        crate::engine::ops::query::editable_table(&out[0].sql, r),
+        None
+    );
+    // An assignment after TOP returns nothing: the procedure's result set
+    // is not taken for the SELECT's.
+    exec(
+        &conn,
+        "CREATE OR ALTER PROCEDURE su_it_b.links AS SELECT * FROM su_it_b.link",
+    )
+    .await;
+    let assign = "DECLARE @id INT;\nSELECT TOP 1 @id = Id FROM su_it_b.acte;\nEXEC su_it_b.links;";
+    let out = run_script(&conn, assign, None).await;
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].sql, assign);
+    assert!(out[0].result.as_ref().unwrap().primary_key.is_empty());
     // A transaction left open at the end of the script is rolled back.
     let out = run_script(
         &conn,
@@ -1867,6 +1932,25 @@ async fn integration_mssql_manual_tx_batches() {
         .run_script(
             "DECLARE @n INT = 2;\nBEGIN TRAN;\nINSERT INTO su_it_mb.t VALUES (@n);\n\
              COMMIT;\nSELECT @n AS n;",
+            None,
+        )
+        .await;
+    assert!(out.iter().all(|o| o.result.is_ok()), "{out:?}");
+    assert!(!tx.status().open);
+    assert_eq!(
+        scalar(&shared, "SELECT COUNT(*) FROM su_it_mb.t").await,
+        "2"
+    );
+    // A batch ending in ROLLBACK inside the open transaction: no counting
+    // through sp_executesql (error 266), the whole transaction undone.
+    let out = tx
+        .run_script("DELETE FROM su_it_mb.t WHERE id = 1", None)
+        .await;
+    assert_eq!(out[0].result.as_ref().unwrap().rows_affected, 1);
+    assert!(tx.status().open);
+    let out = tx
+        .run_script(
+            "BEGIN TRAN;\nUPDATE su_it_mb.t SET id = id;\nROLLBACK;",
             None,
         )
         .await;

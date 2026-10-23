@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Result};
 
-use crate::engine::db::{batch_error_line, is_result_select, DatabaseConnection};
+use crate::engine::db::{batch_error_line, has_control_flow, is_result_select, DatabaseConnection};
 use crate::engine::models::{QueryResult, SchemaInfo};
 use crate::engine::sql::statements::{
     get_execution_unit_at_cursor, is_transaction_end, is_transaction_start, single_table_source,
@@ -289,10 +289,15 @@ fn batch_error(e: &anyhow::Error, start_line: usize) -> String {
 
 /// The statements of `batch` that produced its `sets` result sets, when
 /// each can be matched with one: every result set then comes from a
-/// `SELECT` that always returns one (`is_result_select`), in order. `None`
-/// when they don't add up (procedure calls, `IF … SELECT`, statements not
-/// separated by `;`…).
+/// `SELECT` that always returns one (`is_result_select`), in order, and the
+/// batch has no control flow (`has_control_flow`: with `IF … ELSE`, `TRY …
+/// CATCH`… which `SELECT` ran is unknown). `None` otherwise, or when they
+/// don't add up (procedure calls, statements not separated by `;`…): the
+/// result sets are then shown under the whole batch, not editable.
 pub(crate) fn result_statements(batch: &str, sets: usize) -> Option<Vec<String>> {
+    if has_control_flow(batch) {
+        return None;
+    }
     let selects: Vec<String> = split_statements(batch)
         .into_iter()
         .map(|(_, _, stmt)| stmt)
@@ -685,52 +690,50 @@ mod tests {
 
     #[test]
     fn result_sets_are_matched_with_their_selects() {
-        let batch = "DECLARE @n INT = 1;
-SELECT @n = 2;
-SELECT * FROM t;
-                     INSERT INTO u SELECT 1;
-SELECT @n AS n";
+        let batch = "DECLARE @n INT = 1;\nSELECT @n = 2;\nSELECT * FROM t;\n\
+                     INSERT INTO u SELECT 1;\nSELECT @n AS n";
         assert_eq!(
             result_statements(batch, 2).unwrap(),
             ["SELECT * FROM t", "SELECT @n AS n"]
         );
-        // Not adding up (an `IF … SELECT`, a procedure…): unknown.
+        // Not adding up (a procedure…): unknown.
         assert_eq!(result_statements(batch, 3), None);
         assert_eq!(result_statements(batch, 1), None);
         assert_eq!(result_statements("UPDATE t SET a = 1", 0), None);
         // Statements not separated by `;`: one statement, two result sets.
-        assert_eq!(
-            result_statements(
-                "SELECT 1
-SELECT 2",
-                2
-            ),
-            None
-        );
-        assert_eq!(
-            result_statements(
-                "SELECT 1
-SELECT 2",
-                1
-            )
-            .unwrap(),
-            ["SELECT 1
-SELECT 2"]
-        );
+        let unseparated = "SELECT 1\nSELECT 2";
+        assert_eq!(result_statements(unseparated, 2), None);
+        assert_eq!(result_statements(unseparated, 1).unwrap(), [unseparated]);
+        // A transaction is not control flow.
+        let tx = "BEGIN TRAN;\nUPDATE t SET a = 1;\nCOMMIT;\nSELECT * FROM t";
+        assert_eq!(result_statements(tx, 1).unwrap(), ["SELECT * FROM t"]);
+    }
+
+    #[test]
+    fn result_sets_of_control_flow_are_not_matched() {
+        // Whichever branch ran, two SELECTs for one result set would add up:
+        // c's rows must not be shown (and edited) as b's.
+        for batch in [
+            "IF EXISTS (SELECT 1 FROM a) BEGIN DELETE FROM a; SELECT * FROM b; END \
+             ELSE SELECT * FROM c;",
+            "BEGIN TRY\n  SELECT * FROM b;\nEND TRY\nBEGIN CATCH\n  SELECT * FROM c;\nEND CATCH",
+            "WHILE 1 = 0 SELECT * FROM b;\nSELECT * FROM c",
+            "SELECT * FROM b;\nIF @@ROWCOUNT = 0 RETURN;\nSELECT * FROM c",
+        ] {
+            assert_eq!(result_statements(batch, 1), None, "{batch}");
+            assert_eq!(result_statements(batch, 2), None, "{batch}");
+        }
+        // An assignment after TOP is not a result set: EXEC's one is
+        // not b's.
+        let batch = "SELECT TOP 1 @id = id FROM b;\nEXEC p @id;";
+        assert_eq!(result_statements(batch, 1), None);
     }
 
     #[tokio::test]
     async fn run_script_on_other_engines_ignores_go() {
         // `GO` means nothing outside SQL Server: SQLite reports the error.
         let conn = sqlite_mem(SETUP).await;
-        let out = run_script(
-            &conn,
-            "SELECT 1;
-GO
-SELECT 2",
-            None,
-        )
-        .await;
+        let out = run_script(&conn, "SELECT 1;\nGO\nSELECT 2", None).await;
         assert_eq!(out.len(), 2);
         assert!(out[1].result.is_err());
     }

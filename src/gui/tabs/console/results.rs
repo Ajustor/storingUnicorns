@@ -3,6 +3,7 @@
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icon;
 
+use crate::engine::nosql::Source;
 use crate::engine::ops::query::editable_table;
 use crate::engine::sql::statements::extract_table_from_query;
 use crate::gui::grid::{self, GridAction, GridOptions};
@@ -152,13 +153,34 @@ fn result_view(
     lock: Option<&str>,
 ) -> Option<ConsoleAction> {
     if let Some(e) = &r.error {
-        ui.colored_label(
-            ERROR,
+        let text = if r.source.is_some() {
+            format!("{} Submit interrompu : {e}", icon::WARNING)
+        } else {
             format!(
                 "{} Submit annulé (transaction annulée) : {e}",
                 icon::WARNING
-            ),
-        );
+            )
+        };
+        ui.colored_label(ERROR, text);
+    }
+    if let Some(Source::Key { db, key, .. }) = &r.source {
+        let mut open = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{} Valeur en lecture seule ici", icon::LOCK)).weak());
+            if ui
+                .button(format!("{} Modifier dans l'onglet Clés", icon::KEY))
+                .clicked()
+            {
+                open = Some(ConsoleAction::OpenKey {
+                    connection: r.connection.clone(),
+                    db: *db,
+                    key: key.clone(),
+                });
+            }
+        });
+        if open.is_some() {
+            return open;
+        }
     }
     if let Some(hint) = read_only_hint(&r.sql, &r.result) {
         ui.label(RichText::new(format!("{} {hint}", icon::LOCK)).weak());
@@ -188,6 +210,13 @@ fn result_view(
     }
     if action != GridAction::Submit || r.grid.edits.is_empty() {
         return None;
+    }
+    if r.source.is_some() {
+        // MongoDB documents: written by `mongo::doc_changes`, never as SQL.
+        return Some(ConsoleAction::NoSqlSubmit {
+            result_index: index,
+            changes: r.grid.edits.to_row_changes(&r.result.rows),
+        });
     }
     let table = editable_table(&r.sql, &r.result)?;
     let columns = r.result.columns.clone();

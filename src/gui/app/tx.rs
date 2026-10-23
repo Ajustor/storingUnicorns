@@ -16,6 +16,11 @@ impl App {
             self.not_connected(connection);
             return;
         };
+        if session.is_nosql() {
+            let db = session.config.db_type.clone();
+            self.error(format!("Mode transaction manuel indisponible pour {db}"));
+            return;
+        }
         match (action, &mut session.tx) {
             (TxAction::SetManual(true), tx @ TxMode::Auto) => {
                 *tx = TxMode::Opening;

@@ -9,7 +9,8 @@ use egui::{Color32, RichText, Sense, Stroke, StrokeKind};
 use egui_extras::{Column as TableColumn, TableBuilder};
 use egui_phosphor::regular as icon;
 
-use crate::engine::models::{display_cell, is_null, Column, QueryResult, NULL_CELL};
+use crate::engine::models::{is_null, Column, QueryResult, NULL_CELL};
+use crate::engine::nosql::is_absent;
 use crate::engine::ops::rows::detect_system_columns;
 use crate::gui::fk::{self, CellLink, ColumnLink};
 use crate::gui::shortcuts::{hint_here, is_mac, label_here};
@@ -148,11 +149,24 @@ pub fn first_input_column(columns: &[Column]) -> usize {
         .unwrap_or(0)
 }
 
-/// Text shown for a cell and whether it is NULL (drawn weak and italic):
-/// the text "NULL" is an ordinary value.
+/// Text shown for a cell and whether it is NULL or a missing field of a
+/// document (drawn weak and italic): the text "NULL" is an ordinary value.
 pub fn cell_display(value: &str) -> (&str, bool) {
-    (display_cell(value), is_null(value))
+    (display_cell(value), is_null(value) || is_absent(value))
 }
+
+/// Text shown for a cell: NULL as "NULL", a document's missing field
+/// (`ABSENT_CELL`) as "—".
+pub fn display_cell(value: &str) -> &str {
+    if is_absent(value) {
+        ABSENT_TEXT
+    } else {
+        crate::engine::models::display_cell(value)
+    }
+}
+
+/// How a document's missing field is shown.
+pub const ABSENT_TEXT: &str = "—";
 
 fn cell_text(value: &str, deleted: bool) -> RichText {
     let text = if let (shown, true) = cell_display(value) {
@@ -852,6 +866,15 @@ mod tests {
             to_tsv(&["a".into(), "b\tc".into(), "d\ne".into()]),
             "a\tb c\td e"
         );
+    }
+
+    #[test]
+    fn missing_fields_are_shown_greyed_apart_from_null() {
+        use crate::engine::nosql::ABSENT_CELL;
+        assert_eq!(cell_display(ABSENT_CELL), (ABSENT_TEXT, true));
+        assert_eq!(display_cell(ABSENT_CELL), "—");
+        assert_eq!(display_cell(NULL_CELL), "NULL");
+        assert_eq!(cell_display("—"), ("—", false));
     }
 
     #[test]

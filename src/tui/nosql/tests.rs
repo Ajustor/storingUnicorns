@@ -1428,3 +1428,16 @@ fn redis_completion_replaces_the_whole_key() {
     assert_eq!(complete_first(&mut state, "GET user:"), "GET user:1");
     assert_eq!(complete_first(&mut state, "hgetal"), "HGETALL");
 }
+
+#[test]
+fn transfer_hints_name_every_format_offered() {
+    let mongo = tables_help(&DatabaseType::MongoDB);
+    assert!(
+        mongo.contains(&("E/I", "Exp/Imp JSON/JSONL/CSV")),
+        "{mongo:?}"
+    );
+    let redis = tables_help(&DatabaseType::Redis);
+    assert!(redis.contains(&("E/I", "Exp/Imp JSON/CSV")), "{redis:?}");
+    assert!(help_text(&DatabaseType::MongoDB).contains("JSON, JSON Lines, CSV"));
+    assert!(help_text(&DatabaseType::Redis).contains("JSON/CSV"));
+}

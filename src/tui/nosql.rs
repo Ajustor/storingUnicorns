@@ -1911,7 +1911,7 @@ pub fn tables_help(db: &DatabaseType) -> Vec<(&'static str, &'static str)> {
             ("s", "Index"),
             ("t", "Vider"),
             ("h/H", "Masquer/Voir"),
-            ("E/I", "Exp/Imp JSON/CSV"),
+            ("E/I", "Exp/Imp JSON/JSONL/CSV"),
         ],
         _ => vec![
             ("Enter", "Ouvrir/Déplier"),
@@ -1953,7 +1953,7 @@ pub fn help_text(db: &DatabaseType) -> &'static str {
         DatabaseType::MongoDB => {
             "Aide MongoDB : Entrée=documents d'une collection, s=index, t=vider la collection, \
              F5=tout exécuter, Ctrl+Entrée=commande au curseur, v=document JSON, \
-             Entrée/a/d=modifier/ajouter/supprimer, E/I=export/import JSON/CSV, q=quitter"
+             Entrée/a/d=modifier/ajouter/supprimer, E/I=export/import JSON, JSON Lines, CSV,              q=quitter"
         }
         _ => {
             "Aide Redis : Entrée=lire la clé / déplier, /=motif SCAN, n=nouvelle clé, \

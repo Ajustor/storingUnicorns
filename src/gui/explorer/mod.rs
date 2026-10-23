@@ -1306,7 +1306,7 @@ fn collection_row(ui: &mut egui::Ui, t: &TableRef, open: bool, actions: &mut Vec
         ui.separator();
         menu_item(
             ui,
-            format!("{} Exporter (JSON)…", icon::EXPORT),
+            format!("{} Exporter…", icon::EXPORT),
             Action::CollectionTransfer {
                 connection: connection.clone(),
                 coll: coll.clone(),
@@ -1316,7 +1316,7 @@ fn collection_row(ui: &mut egui::Ui, t: &TableRef, open: bool, actions: &mut Vec
         );
         menu_item(
             ui,
-            format!("{} Importer (JSON)…", icon::DOWNLOAD_SIMPLE),
+            format!("{} Importer…", icon::DOWNLOAD_SIMPLE),
             Action::CollectionTransfer {
                 connection: connection.clone(),
                 coll: coll.clone(),

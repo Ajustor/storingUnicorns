@@ -151,8 +151,8 @@ pub enum ConsoleAction {
         result_index: usize,
         changes: RowChanges,
     },
-    /// Open a Redis key read by a console in its « Clés » tab (its value
-    /// is edited there).
+    /// Open a Redis key read by a console in its « Clés » tab (TTL,
+    /// rename, value pages).
     OpenKey {
         connection: String,
         db: u8,

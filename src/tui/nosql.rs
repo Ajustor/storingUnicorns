@@ -942,35 +942,8 @@ pub fn row_changes(old: Option<&[String]>, new: Option<&[String]>) -> RowChanges
     changes
 }
 
-/// The value a console grid of `kind` shows (`redis::value_result` shape),
-/// as the `ValuePage` `redis::grid_edits` checks rows against: list
-/// elements from the `valeur` column (`#` counted from 0, as `LRANGE k 0
-/// 99` reads them); the other types only need their kind.
-pub fn grid_page(kind: &RedisType, result: &QueryResult) -> Result<redis::ValuePage, String> {
-    let value = match kind {
-        RedisType::String => RedisValue::String(Vec::new()),
-        RedisType::List => RedisValue::List(
-            result
-                .rows
-                .iter()
-                .map(|r| redis::parse_display(r.get(1).map_or("", String::as_str)))
-                .collect::<Result<_, _>>()?,
-        ),
-        RedisType::Set => RedisValue::Set(Vec::new()),
-        RedisType::ZSet => RedisValue::ZSet(Vec::new()),
-        RedisType::Hash => RedisValue::Hash(Vec::new()),
-        RedisType::Stream => RedisValue::Stream(Vec::new()),
-        RedisType::Other(t) => return Err(format!("Type {t} en lecture seule")),
-    };
-    Ok(redis::ValuePage {
-        total: value.len() as u64,
-        value,
-        next: None,
-    })
-}
-
 /// The edits of one row of a Redis value shown by the console (see
-/// `row_changes`), by `redis::grid_edits`; deleting the row of a string
+/// `row_changes`), by `redis::console_edits`; deleting the row of a string
 /// deletes the key.
 pub fn key_edits(
     key: &[u8],
@@ -979,17 +952,7 @@ pub fn key_edits(
     old: Option<&[String]>,
     new: Option<&[String]>,
 ) -> Result<Vec<KeyEdit>, String> {
-    if *kind == RedisType::String && new.is_none() && old.is_some() {
-        return Ok(vec![KeyEdit::Delete]);
-    }
-    let page = grid_page(kind, result)?;
-    let info = KeyInfo {
-        key: key.to_vec(),
-        kind: kind.clone(),
-        ttl: None,
-        size: None,
-    };
-    redis::grid_edits(&info, &page, &row_changes(old, new))
+    redis::console_edits(key, kind, result, &row_changes(old, new))
 }
 
 /// The text of an edit in debug mode: its commands, one per line.

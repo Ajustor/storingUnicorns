@@ -81,10 +81,38 @@ impl ResultTab {
         ))
     }
 
+    /// The key writes of `changes` (edits of this result's grid) when its
+    /// rows are the value of a Redis key: the database, the key and the
+    /// edits (`redis::console_edits`, on the grid shown).
+    pub fn key_writes(
+        &self,
+        changes: &crate::engine::ops::rows::RowChanges,
+    ) -> Option<(
+        u8,
+        Vec<u8>,
+        Result<Vec<crate::engine::nosql::redis::KeyEdit>, String>,
+    )> {
+        let Some(Source::Key { db, key, kind }) = &self.source else {
+            return None;
+        };
+        Some((
+            *db,
+            key.clone(),
+            crate::engine::nosql::redis::console_edits(key, kind, &self.result, changes),
+        ))
+    }
+
     /// The rows are NoSQL rows from `source`: editable when they are the
-    /// documents of a collection (never through the SQL path).
+    /// documents of a collection or the value of a Redis key of a known
+    /// type (never through the SQL path).
     pub fn set_source(&mut self, source: Option<Source>) {
-        self.editable = matches!(source, Some(Source::Collection { .. }));
+        self.editable = match &source {
+            Some(Source::Collection { .. }) => true,
+            Some(Source::Key { kind, .. }) => {
+                !matches!(kind, crate::engine::nosql::redis::RedisType::Other(_))
+            }
+            None => false,
+        };
         let name = match &source {
             Some(Source::Collection { coll, .. }) => Some(coll.coll.clone()),
             Some(Source::Key { key, .. }) => Some(crate::engine::nosql::redis::display_bytes(key)),
@@ -493,9 +521,64 @@ mod tests {
             .collect();
         assert_eq!(
             tabs,
-            [("users", true), ("Résultat 2", false), ("user:1", false)]
+            [("users", true), ("Résultat 2", false), ("user:1", true)]
         );
         assert!(matches!(c.results[2].source, Some(Source::Key { .. })));
+    }
+
+    #[test]
+    fn a_redis_value_read_by_the_console_is_edited_in_place() {
+        use crate::engine::nosql::redis::{KeyEdit, RedisType};
+        let mut c = ConsoleTab::new(String::new(), 0);
+        // `LRANGE l 1 2`: #1 and #2, as the engine shows them.
+        let grid = QueryResult {
+            rows: vec![vec!["1".into(), "b".into()], vec!["2".into(), "c".into()]],
+            ..result(&["#", "valeur"], 0)
+        };
+        let key = Source::Key {
+            db: 3,
+            key: b"l".to_vec(),
+            kind: RedisType::List,
+        };
+        apply_nosql_outcomes(
+            &mut c,
+            "redis",
+            vec![nosql("LRANGE l 1 2", Ok(grid), Some(key))],
+            Local::now(),
+        );
+        let r = &c.results[0];
+        assert!(r.editable);
+        let changes = crate::engine::ops::rows::RowChanges {
+            updates: vec![(vec!["2".into(), "c".into()], vec!["2".into(), "C".into()])],
+            ..Default::default()
+        };
+        let (db, k, edits) = r.key_writes(&changes).unwrap();
+        assert_eq!((db, k.as_slice()), (3, b"l".as_slice()));
+        assert_eq!(
+            edits.unwrap(),
+            [KeyEdit::ListSet {
+                index: 2,
+                value: b"C".to_vec()
+            }]
+        );
+        assert!(r.doc_writes(&changes).is_none());
+        // A module type stays read-only.
+        let mut other = ConsoleTab::new(String::new(), 0);
+        apply_nosql_outcomes(
+            &mut other,
+            "redis",
+            vec![nosql(
+                "JSON.GET j",
+                Ok(result(&["valeur"], 1)),
+                Some(Source::Key {
+                    db: 0,
+                    key: b"j".to_vec(),
+                    kind: RedisType::Other("ReJSON-RL".into()),
+                }),
+            )],
+            Local::now(),
+        );
+        assert!(!other.results[0].editable);
     }
 
     #[test]

@@ -246,7 +246,11 @@ impl App {
                             Some(crate::engine::nosql::Source::Collection { coll, .. }) => {
                                 Some(coll.db.clone())
                             }
-                            _ => None,
+                            // Redis: the database the key was read in.
+                            Some(crate::engine::nosql::Source::Key { db, .. }) => {
+                                Some(db.to_string())
+                            }
+                            None => None,
                         });
                         let scope = match database {
                             Some(database) => crate::engine::nosql::NoSqlScope { database },

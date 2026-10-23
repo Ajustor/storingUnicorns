@@ -163,12 +163,22 @@ fn result_view(
         };
         ui.colored_label(ERROR, text);
     }
-    if let Some(Source::Key { db, key, .. }) = &r.source {
+    if let Some(Source::Key { db, key, kind }) = &r.source {
         let mut open = None;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{} Valeur en lecture seule ici", icon::LOCK)).weak());
+            if matches!(kind, crate::engine::nosql::redis::RedisType::Other(_)) {
+                ui.label(
+                    RichText::new(format!(
+                        "{} Type {} en lecture seule",
+                        icon::LOCK,
+                        kind.name()
+                    ))
+                    .weak(),
+                );
+            }
             if ui
-                .button(format!("{} Modifier dans l'onglet Clés", icon::KEY))
+                .button(format!("{} Ouvrir dans l'onglet Clés", icon::KEY))
+                .on_hover_text("TTL, renommage et pagination de la valeur")
                 .clicked()
             {
                 open = Some(ConsoleAction::OpenKey {
@@ -212,7 +222,8 @@ fn result_view(
         return None;
     }
     if r.source.is_some() {
-        // MongoDB documents: written by `mongo::doc_changes`, never as SQL.
+        // MongoDB documents / a Redis value: written by `mongo::doc_changes`
+        // / `redis::console_edits`, never as SQL.
         return Some(ConsoleAction::NoSqlSubmit {
             result_index: index,
             changes: r.grid.edits.to_row_changes(&r.result.rows),

@@ -1140,6 +1140,67 @@ fn list_index(page: &ValuePage, row: &[String]) -> Result<i64, String> {
     i64::try_from(index).map_err(|e| e.to_string())
 }
 
+/// The value a console grid of `kind` shows (a single-key read, see
+/// `Source::Key`), as the `ValuePage` [`grid_edits`] checks rows against:
+/// list elements from the `valeur` column, offset by the first row's `#`
+/// (`LRANGE k 5 9` shows #5..#9); the other types only need their kind.
+pub fn console_page(kind: &RedisType, result: &QueryResult) -> Result<ValuePage, String> {
+    let mut offset = 0;
+    let value = match kind {
+        RedisType::String => RedisValue::String(Vec::new()),
+        RedisType::List => {
+            if let Some(first) = result.rows.first() {
+                offset = first
+                    .first()
+                    .and_then(|c| c.parse().ok())
+                    .ok_or("# invalide")?;
+            }
+            RedisValue::List(
+                result
+                    .rows
+                    .iter()
+                    .map(|r| parse_display(r.get(1).map_or("", String::as_str)))
+                    .collect::<Result<_, _>>()?,
+            )
+        }
+        RedisType::Set => RedisValue::Set(Vec::new()),
+        RedisType::ZSet => RedisValue::ZSet(Vec::new()),
+        RedisType::Hash => RedisValue::Hash(Vec::new()),
+        RedisType::Stream => RedisValue::Stream(Vec::new()),
+        RedisType::Other(t) => return Err(format!("Type {t} en lecture seule")),
+    };
+    let end = offset + value.len() as u64;
+    Ok(ValuePage {
+        value,
+        total: end,
+        next: Some(end),
+    })
+}
+
+/// The edits of a console grid's pending changes (see [`console_page`]);
+/// deleting the row of a string deletes the key.
+pub fn console_edits(
+    key: &[u8],
+    kind: &RedisType,
+    result: &QueryResult,
+    changes: &RowChanges,
+) -> Result<Vec<KeyEdit>, String> {
+    if *kind == RedisType::String
+        && !changes.deletes.is_empty()
+        && changes.inserts.is_empty()
+        && changes.updates.is_empty()
+    {
+        return Ok(vec![KeyEdit::Delete]);
+    }
+    let info = KeyInfo {
+        key: key.to_vec(),
+        kind: kind.clone(),
+        ttl: None,
+        size: None,
+    };
+    grid_edits(&info, &console_page(kind, result)?, changes)
+}
+
 /// The edits of a value grid's pending changes (rows of `value_result` /
 /// `page_result`). Order: updates, removals (list: from the last index),
 /// insertions.
@@ -1962,6 +2023,53 @@ mod tests {
             ..Default::default()
         };
         assert!(grid_edits(&info(RedisType::String), &p, &null).is_err());
+    }
+
+    #[test]
+    fn console_edits_follow_the_grid_shown() {
+        // `LRANGE k 5 6` shows #5 and #6.
+        let grid = value_grid(&RedisValue::List(vec![b"f".to_vec(), b"g".to_vec()]), 5);
+        assert_eq!(grid.rows[0][0], "5");
+        let page = console_page(&RedisType::List, &grid).unwrap();
+        assert_eq!(page_offset(&page), 5);
+        let changes = RowChanges {
+            updates: vec![(row(&["6", "g"]), row(&["6", "G"]))],
+            deletes: vec![row(&["5", "f"])],
+            ..Default::default()
+        };
+        assert_eq!(
+            console_edits(b"k", &RedisType::List, &grid, &changes).unwrap(),
+            [
+                KeyEdit::ListSet {
+                    index: 6,
+                    value: b"G".to_vec()
+                },
+                KeyEdit::ListRemove { index: 5 },
+            ]
+        );
+        // The row of a string deleted: the key.
+        let get = value_grid(&RedisValue::String(b"v".to_vec()), 0);
+        let delete = RowChanges {
+            deletes: vec![row(&["v"])],
+            ..Default::default()
+        };
+        assert_eq!(
+            console_edits(b"k", &RedisType::String, &get, &delete).unwrap(),
+            [KeyEdit::Delete]
+        );
+        let hash = value_grid(&RedisValue::Hash(vec![(b"f".to_vec(), b"1".to_vec())]), 0);
+        let set = RowChanges {
+            updates: vec![(row(&["f", "1"]), row(&["f", "2"]))],
+            ..Default::default()
+        };
+        assert_eq!(
+            console_edits(b"k", &RedisType::Hash, &hash, &set).unwrap(),
+            [KeyEdit::HSet {
+                field: b"f".to_vec(),
+                value: b"2".to_vec()
+            }]
+        );
+        assert!(console_page(&RedisType::Other("ReJSON-RL".into()), &hash).is_err());
     }
 
     #[test]

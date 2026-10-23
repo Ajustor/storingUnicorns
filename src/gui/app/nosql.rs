@@ -599,8 +599,11 @@ impl App {
         let Some(r) = c.results.get_mut(result_index) else {
             return;
         };
-        let Some((coll, writes)) = r.doc_writes(&changes) else {
-            return;
+        // Documents of a collection, or the value of a Redis key.
+        let writes = match (r.doc_writes(&changes), r.key_writes(&changes)) {
+            (Some((coll, writes)), _) => writes.map(|w| ConsoleWrites::Docs(coll, w)),
+            (None, Some((db, key, edits))) => edits.map(|e| ConsoleWrites::Key(db, key, e)),
+            (None, None) => return,
         };
         let writes = match writes {
             Ok(w) => w,
@@ -620,7 +623,10 @@ impl App {
         };
         r.error = None;
         c.submitting = Some(r.id);
-        tab.runs.submit = Some(self.worker.apply_doc_changes(tab.id, conn, coll, writes));
+        tab.runs.submit = Some(match writes {
+            ConsoleWrites::Docs(coll, w) => self.worker.apply_doc_changes(tab.id, conn, coll, w),
+            ConsoleWrites::Key(db, key, e) => self.worker.apply_key_edits(tab.id, conn, db, key, e),
+        });
         tab.summary = Some("Submit…".into());
     }
 
@@ -764,6 +770,15 @@ impl App {
             self.documents_action(id, DocAction::Load { count: true });
         }
     }
+}
+
+/// The writes of a NoSQL console result's Submit.
+enum ConsoleWrites {
+    Docs(
+        crate::engine::nosql::mongo::CollectionRef,
+        Vec<crate::engine::nosql::mongo::DocChange>,
+    ),
+    Key(u8, Vec<u8>, Vec<crate::engine::nosql::redis::KeyEdit>),
 }
 
 #[cfg(test)]

@@ -9,10 +9,11 @@ use chrono::Local;
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText};
 use egui_phosphor::regular as icon;
 
-use crate::engine::models::{Column, QueryResult};
+use crate::engine::models::{Column, DatabaseType, QueryResult, SchemaInfo};
+use crate::engine::nosql::{self, NoSqlScope};
 use crate::engine::ops::rows::RowChanges;
 use crate::engine::sql::format::format_sql;
-use crate::gui::editor::completion::{Completion, CompletionSource};
+use crate::gui::editor::completion::{self, Completion, CompletionSource};
 use crate::gui::editor::{self, EditorContext};
 use crate::gui::shortcuts;
 use crate::gui::theme::{self, ACCENT, ERROR};
@@ -24,8 +25,8 @@ mod outcomes;
 mod results;
 
 pub use outcomes::{
-    apply_outcomes, apply_refresh, apply_submitted, read_only_hint, result_connection, LogLine,
-    ResultTab, MAX_LOG_LINES,
+    apply_nosql_outcomes, apply_nosql_refresh, apply_outcomes, apply_refresh, apply_submitted,
+    read_only_hint, result_connection, LogLine, ResultTab, MAX_LOG_LINES,
 };
 
 /// Row cap of console results.
@@ -106,6 +107,9 @@ pub struct ConsoleTab {
     /// The text changed since the app last looked (it saves consoles a
     /// moment after their last edit).
     pub edited: bool,
+    /// MongoDB / Redis console: its current database (`use`, `SELECT`, the
+    /// « Base » selector); `None` for an SQL console.
+    pub scope: Option<NoSqlScope>,
 }
 
 /// How to run the console's SQL.
@@ -141,6 +145,41 @@ pub enum ConsoleAction {
         columns: Vec<Column>,
         changes: RowChanges,
     },
+    /// Apply the pending edits of NoSQL result tab `result_index` (its
+    /// `Source` says to which documents).
+    NoSqlSubmit {
+        result_index: usize,
+        changes: RowChanges,
+    },
+    /// Open a Redis key read by a console in its « Clés » tab (its value
+    /// is edited there).
+    OpenKey {
+        connection: String,
+        db: u8,
+        key: Vec<u8>,
+    },
+}
+
+/// What a MongoDB / Redis console needs besides the SQL console's context.
+#[derive(Clone, Copy)]
+pub struct ConsoleNoSql<'a> {
+    pub db: &'a DatabaseType,
+    /// Databases → collections (MongoDB), `db0`… (Redis).
+    pub schemas: &'a [SchemaInfo],
+    /// Redis: the keys listed by the explorer (completion).
+    pub keys: &'a [String],
+}
+
+/// The databases the « Base » selector offers: MongoDB's by name, Redis'
+/// by index (`db3` → "3").
+pub fn scope_choices(db: &DatabaseType, schemas: &[SchemaInfo]) -> Vec<String> {
+    schemas
+        .iter()
+        .map(|s| match db {
+            DatabaseType::Redis => s.name.strip_prefix("db").unwrap_or(&s.name).to_string(),
+            _ => s.name.clone(),
+        })
+        .collect()
 }
 
 /// What the console needs from the app to draw itself.
@@ -159,6 +198,9 @@ pub struct ConsoleContext<'a> {
     pub source: &'a dyn CompletionSource,
     /// Transaction mode of the connection.
     pub tx: TxView,
+    /// The connection is MongoDB / Redis: NoSQL console (no transaction,
+    /// « Base » selector, engine completion and formatting).
+    pub nosql: Option<ConsoleNoSql<'a>>,
 }
 
 /// Whether Escape cancels the running query: only from the editor or with
@@ -201,6 +243,7 @@ impl ConsoleTab {
             submitting: None,
             refreshing: None,
             edited: false,
+            scope: None,
         }
     }
 
@@ -265,6 +308,17 @@ impl ConsoleTab {
         self.known_columns = cols;
     }
 
+    /// A NoSQL run left the console in `scope` (`use`, `SELECT`): the
+    /// « Base » selector follows. Whether it changed (the console is saved).
+    pub fn apply_scope(&mut self, scope: NoSqlScope) -> bool {
+        if self.scope.as_ref() == Some(&scope) {
+            return false;
+        }
+        self.scope = Some(scope);
+        self.edited = true;
+        true
+    }
+
     /// Log a cancelled run.
     pub fn cancelled(&mut self) {
         self.running_since = None;
@@ -290,11 +344,16 @@ impl ConsoleTab {
         ctx.memory_mut(|m| m.request_focus(id));
     }
 
-    /// Ctrl+Alt+L: format the selection, else the whole text.
-    fn format(&mut self, ctx: &egui::Context, tab: TabId) {
+    /// Ctrl+Alt+L: format the selection, else the whole text (MongoDB:
+    /// the engine's shell formatter; nothing for Redis or a text that does
+    /// not parse).
+    fn format(&mut self, ctx: &egui::Context, tab: TabId, db: Option<&DatabaseType>) {
         let (start, end) = self.selection.unwrap_or((0, self.query.len()));
         let (start, end) = (start.min(self.query.len()), end.min(self.query.len()));
-        let formatted = format_sql(&self.query[start..end]);
+        let formatted = match db {
+            Some(db) => nosql::format(db, &self.query[start..end]).unwrap_or_default(),
+            None => format_sql(&self.query[start..end]),
+        };
         if formatted.is_empty() {
             return;
         }
@@ -350,6 +409,16 @@ impl ConsoleTab {
         let max_editor = (ui.available_height() - 120.0).max(60.0);
         self.editor_height = self.editor_height.clamp(60.0, max_editor);
         let source = cx.source;
+        let scope = self.scope.clone().unwrap_or(NoSqlScope {
+            database: String::new(),
+        });
+        let nosql = cx.nosql.map(|n| completion::NoSqlScope {
+            db: n.db,
+            scope: &scope,
+            schemas: n.schemas,
+            keys: n.keys,
+            prefix: "",
+        });
         let out = egui::ScrollArea::vertical()
             .id_salt(id.with("scroll"))
             .max_height(self.editor_height)
@@ -365,6 +434,7 @@ impl ConsoleTab {
                     EditorContext {
                         known_columns: &self.known_columns,
                         source,
+                        nosql,
                     },
                 )
             })
@@ -405,7 +475,7 @@ impl ConsoleTab {
             action = Some(ConsoleAction::History(String::new()));
         }
         if editor_keys && cmd_alt(&FORMAT) {
-            self.format(&ctx, cx.tab);
+            self.format(&ctx, cx.tab, cx.nosql.map(|n| n.db));
         }
         // Consumed while running too: a run at a time per console.
         let (run, run_all) = ctx.input_mut(|i| run_keys(i, editor_keys));
@@ -473,15 +543,18 @@ impl ConsoleTab {
                 }
             }
             ui.separator();
-            if ui
-                .button(format!("{} Formater", icon::MAGIC_WAND))
-                .on_hover_text(format!(
-                    "Formater la sélection ou tout ({})",
-                    shortcuts::label_here(&FORMAT)
-                ))
-                .clicked()
+            // Redis commands have no formatter.
+            let can_format = cx.nosql.is_none_or(|n| *n.db == DatabaseType::MongoDB);
+            if can_format
+                && ui
+                    .button(format!("{} Formater", icon::MAGIC_WAND))
+                    .on_hover_text(format!(
+                        "Formater la sélection ou tout ({})",
+                        shortcuts::label_here(&FORMAT)
+                    ))
+                    .clicked()
             {
-                self.format(ui.ctx(), cx.tab);
+                self.format(ui.ctx(), cx.tab, cx.nosql.map(|n| n.db));
             }
             if ui
                 .button(format!("{} Historique", icon::CLOCK_COUNTER_CLOCKWISE))
@@ -497,8 +570,18 @@ impl ConsoleTab {
             if let Some(name) = connection_selector(ui, cx) {
                 action = Some(ConsoleAction::Rebind(name));
             }
-            if let Some(a) = tx::controls(ui, cx.tab, cx.tx) {
-                action = Some(ConsoleAction::Tx(a));
+            match cx.nosql {
+                // No manual transaction mode for MongoDB / Redis.
+                Some(n) => {
+                    if scope_selector(ui, cx.tab, n, &mut self.scope) {
+                        self.edited = true;
+                    }
+                }
+                None => {
+                    if let Some(a) = tx::controls(ui, cx.tab, cx.tx) {
+                        action = Some(ConsoleAction::Tx(a));
+                    }
+                }
             }
         });
         action
@@ -518,6 +601,47 @@ impl ConsoleTab {
             ui.visuals().widgets.noninteractive.bg_stroke
         };
         ui.painter().hline(rect.x_range(), rect.center().y, stroke);
+    }
+}
+
+/// « Base : » of a NoSQL console (its scope, also changed by `use` /
+/// `SELECT`); whether the user chose another one.
+fn scope_selector(
+    ui: &mut egui::Ui,
+    tab: TabId,
+    n: ConsoleNoSql,
+    scope: &mut Option<NoSqlScope>,
+) -> bool {
+    let current = scope
+        .as_ref()
+        .map(|s| s.database.clone())
+        .unwrap_or_default();
+    let mut chosen = None;
+    ui.label("Base :");
+    let shown = if current.is_empty() {
+        "—".to_string()
+    } else {
+        current.clone()
+    };
+    let choices = scope_choices(n.db, n.schemas);
+    egui::ComboBox::from_id_salt(("console_scope", tab))
+        .width(crate::gui::popup::combo_width(ui, choices.iter()).min(crate::gui::popup::COMBO_MAX))
+        .selected_text(shown)
+        .show_ui(ui, |ui| {
+            for name in &choices {
+                if ui.selectable_label(*name == current, name).clicked() && *name != current {
+                    chosen = Some(name.clone());
+                }
+            }
+        })
+        .response
+        .on_hover_text("Base courante (aussi changée par use / SELECT)");
+    match chosen {
+        Some(database) => {
+            *scope = Some(NoSqlScope { database });
+            true
+        }
+        None => false,
     }
 }
 
@@ -618,6 +742,113 @@ mod tests {
         assert_eq!(c.log[0].sql, "SELECT 5\nFROM t");
         assert_eq!(c.log[0].preview, "SELECT 5…");
         assert_eq!(c.log.back().map(|l| l.time.len()), Some(8));
+    }
+
+    #[test]
+    fn the_base_selector_follows_use_and_select() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        let shop = NoSqlScope {
+            database: "shop".into(),
+        };
+        assert!(c.apply_scope(shop.clone()));
+        assert!(c.edited, "saved with the console");
+        c.edited = false;
+        assert!(!c.apply_scope(shop.clone()), "unchanged");
+        assert!(!c.edited);
+        assert_eq!(c.scope, Some(shop));
+    }
+
+    /// Labels of the widgets the console draws with `nosql`.
+    fn toolbar_labels(nosql: Option<ConsoleNoSql>) -> Vec<String> {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut c = ConsoleTab::new("x".into(), 0);
+        c.scope = nosql.map(|_| NoSqlScope {
+            database: "shop".into(),
+        });
+        let color_of = |_: &str| Color32::GRAY;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                c.show(
+                    ui,
+                    ConsoleContext {
+                        tab: 1,
+                        connection: "c",
+                        connections: &[],
+                        color_of: &color_of,
+                        connected: true,
+                        running: false,
+                        shortcuts: false,
+                        source: &crate::gui::editor::completion::NoSource,
+                        tx: TxView::Auto,
+                        nosql,
+                    },
+                );
+            });
+        });
+        out.platform_output
+            .accesskit_update
+            .map(|u| {
+                u.nodes
+                    .iter()
+                    .flat_map(|(_, n)| [n.label(), n.value()])
+                    .flatten()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn nosql_consoles_have_a_base_selector_and_their_own_formatter() {
+        let has = |labels: &[String], text: &str| labels.iter().any(|l| l.contains(text));
+        let sql = toolbar_labels(None);
+        assert!(has(&sql, "Formater"), "{sql:?}");
+        assert!(!has(&sql, "Base :"));
+        let schemas = [SchemaInfo {
+            name: "shop".into(),
+            tables: vec![],
+            expanded: false,
+        }];
+        let nosql = |db| ConsoleNoSql {
+            db,
+            schemas: &schemas,
+            keys: &[],
+        };
+        let mongo = toolbar_labels(Some(nosql(&DatabaseType::MongoDB)));
+        assert!(has(&mongo, "Base :"), "{mongo:?}");
+        assert!(has(&mongo, "Formater"), "MongoDB has a formatter");
+        let redis = toolbar_labels(Some(nosql(&DatabaseType::Redis)));
+        assert!(has(&redis, "Base :"));
+        assert!(!has(&redis, "Formater"), "Redis has none");
+    }
+
+    #[test]
+    fn redis_scopes_are_database_indexes() {
+        let schemas = vec![
+            SchemaInfo {
+                name: "db0".into(),
+                tables: vec![],
+                expanded: false,
+            },
+            SchemaInfo {
+                name: "db12".into(),
+                tables: vec![],
+                expanded: false,
+            },
+        ];
+        assert_eq!(scope_choices(&DatabaseType::Redis, &schemas), ["0", "12"]);
+        assert_eq!(
+            scope_choices(&DatabaseType::MongoDB, &schemas),
+            ["db0", "db12"]
+        );
     }
 
     #[test]

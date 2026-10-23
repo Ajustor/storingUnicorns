@@ -30,6 +30,7 @@ use super::worker::Worker;
 mod actions;
 mod events;
 pub mod links;
+pub mod nosql;
 mod tabbar;
 mod tx;
 
@@ -38,6 +39,31 @@ pub const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND
 pub const SAVE_CONSOLES: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
 pub const REFRESH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::R);
 pub const TABLE_SEARCH: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
+
+/// Where opening the data of a table leads, by engine.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DataRoute {
+    /// The SQL data tab.
+    Sql,
+    /// A MongoDB collection's « Documents » tab (never the SQL one).
+    Documents(crate::engine::nosql::mongo::CollectionRef),
+    /// Redis: no tables.
+    NoTables,
+    /// A MongoDB name that is not `"db"."collection"`.
+    Unknown,
+}
+
+/// See [`DataRoute`]; `db` is `None` while disconnected (the SQL tab then
+/// waits for its connection, as before).
+pub fn data_route(db: Option<&crate::engine::models::DatabaseType>, table: &str) -> DataRoute {
+    use crate::engine::models::DatabaseType;
+    match db {
+        Some(DatabaseType::MongoDB) => crate::engine::nosql::mongo::CollectionRef::parse(table)
+            .map_or(DataRoute::Unknown, DataRoute::Documents),
+        Some(DatabaseType::Redis) => DataRoute::NoTables,
+        _ => DataRoute::Sql,
+    }
+}
 
 pub struct App {
     pub config: AppConfig,
@@ -355,6 +381,10 @@ impl App {
         };
         session.details.clear();
         session.loading.clear();
+        // Redis: the databases are listed again; their keys when opened.
+        session.redis_keys.clear();
+        session.keys_loading.clear();
+        session.key_names.clear();
         let conn = session.conn.clone();
         self.worker.forget(name);
         self.worker.refresh_schemas(name.to_string(), conn);
@@ -380,15 +410,50 @@ impl App {
         self.consoles_changed();
         let title = format!("Console {}", self.tabs.console_count() + 1);
         let cursor = query.len();
-        self.tabs.add(
-            connection.to_string(),
-            title,
-            TabKind::Console(ConsoleTab::new(query, cursor)),
-        )
+        let mut console = ConsoleTab::new(query, cursor);
+        console.scope = self.nosql_scope_of(connection, None);
+        self.tabs
+            .add(connection.to_string(), title, TabKind::Console(console))
+    }
+
+    /// The scope a console of `connection` starts in: `saved` (a restored
+    /// console's), else the connection's default database; `None` for an
+    /// SQL connection.
+    pub fn nosql_scope_of(
+        &self,
+        connection: &str,
+        saved: Option<String>,
+    ) -> Option<crate::engine::nosql::NoSqlScope> {
+        let session = self.sessions.get(connection).filter(|s| s.is_nosql())?;
+        Some(match saved {
+            Some(database) => crate::engine::nosql::NoSqlScope { database },
+            None => crate::engine::nosql::NoSqlScope::initial(&session.config),
+        })
     }
 
     /// Activate the data tab of `table` (qualified), opening it if needed.
+    /// A MongoDB collection opens its « Documents » tab (never the SQL data
+    /// tab); Redis has no tables.
     pub fn open_data(&mut self, connection: &str, table: &str, title: &str) {
+        let db_type = self
+            .sessions
+            .get(connection)
+            .map(|s| s.config.db_type.clone());
+        match data_route(db_type.as_ref(), table) {
+            DataRoute::Sql => {}
+            DataRoute::Documents(coll) => {
+                self.open_documents(connection, coll, super::tabs::documents::DocMode::Find);
+                return;
+            }
+            DataRoute::NoTables => {
+                self.error("Redis : pas de tables (ouvrez une base dans l'explorateur)");
+                return;
+            }
+            DataRoute::Unknown => {
+                self.error(format!("Collection « {title} » introuvable"));
+                return;
+            }
+        }
         match self.tabs.find_data(connection, table) {
             Some(i) => self.tabs.active = i,
             None => {
@@ -410,6 +475,9 @@ impl App {
     /// given) after their rows or columns changed elsewhere. Tabs with
     /// pending edits are left alone.
     pub fn reload_data_tabs(&mut self, connection: &str, table: Option<&str>) {
+        if table.is_none() {
+            self.reload_nosql_tabs(connection);
+        }
         let ids: Vec<TabId> = self
             .tabs
             .list
@@ -426,11 +494,40 @@ impl App {
         }
     }
 
+    /// The NoSQL tabs of `connection` after an import: documents tabs
+    /// without pending edits reload, keys tabs scan again.
+    fn reload_nosql_tabs(&mut self, connection: &str) {
+        use super::tabs::documents::DocAction;
+        use super::tabs::keys::KeyAction;
+        let tabs: Vec<(TabId, bool)> = self
+            .tabs
+            .list
+            .iter()
+            .filter(|t| t.connection == connection)
+            .filter_map(|t| match &t.kind {
+                TabKind::Documents(d) if d.grid.edits.is_empty() => Some((t.id, true)),
+                TabKind::Keys(_) => Some((t.id, false)),
+                _ => None,
+            })
+            .collect();
+        for (id, documents) in tabs {
+            if documents {
+                self.documents_action(id, DocAction::Load { count: true });
+            } else {
+                self.keys_action(id, KeyAction::Scan { more: false });
+            }
+        }
+    }
+
     /// Open a DDL tab for `table` (qualified) and request its `CREATE TABLE`.
     pub fn open_ddl(&mut self, connection: &str, table: &str, title: &str) {
         let Some(session) = self.sessions.get(connection) else {
             return;
         };
+        if session.is_nosql() {
+            self.error(format!("DDL indisponible pour {}", session.config.db_type));
+            return;
+        }
         let (conn, db_type) = (session.conn.clone(), session.config.db_type.clone());
         let id = self.tabs.add(
             connection.to_string(),
@@ -502,9 +599,22 @@ impl App {
         let Some(tab) = self.tabs.find(id) else {
             return;
         };
-        if let TabKind::Data(d) = &mut tab.kind {
-            d.close_after_submit = true;
-            self.data_action(id, DataAction::Submit);
+        match &mut tab.kind {
+            TabKind::Data(d) => {
+                d.close_after_submit = true;
+                self.data_action(id, DataAction::Submit);
+            }
+            TabKind::Documents(d) => {
+                d.close_after_submit = true;
+                self.documents_action(id, super::tabs::documents::DocAction::Submit);
+            }
+            TabKind::Keys(k) => {
+                if let Some(action) = k.submit_pending() {
+                    k.close_after_submit = true;
+                    self.keys_action(id, action);
+                }
+            }
+            _ => {}
         }
     }
 

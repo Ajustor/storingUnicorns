@@ -2,6 +2,9 @@
 
 pub mod connection;
 pub mod folder;
+pub mod indexes;
+pub mod json_editor;
+pub mod nosql;
 pub mod structure;
 pub mod transfer;
 pub mod update;
@@ -14,11 +17,14 @@ use super::tabs::console::RunKind;
 use super::tabs::{CloseRisk, TabId, TabKind};
 use super::worker::Event;
 use crate::engine::db::entra_interactive;
+use crate::engine::nosql::Warning;
 use crate::engine::ops::transfer::qualified;
 use connection::{ConnectionForm, FormAction};
 use folder::FolderPrompt;
+use indexes::{IndexAnswer, IndexDialog};
+use json_editor::JsonEditor;
 use structure::{StructureAction, StructureDialog};
-use transfer::{BatchDialog, BatchStart};
+use transfer::{BatchDialog, BatchStart, NoSqlBatch, NoSqlStart};
 use update::UpdateAction;
 
 pub enum Dialog {
@@ -64,6 +70,25 @@ pub enum Dialog {
     Folder(FolderPrompt),
     /// « Mise à jour »: follows the updater's state.
     Update,
+    /// Run console `id` although `nosql::warnings` found destructive
+    /// commands in what it runs.
+    ConfirmNoSqlRun {
+        id: TabId,
+        kind: RunKind,
+        warnings: Vec<Warning>,
+    },
+    /// A destructive MongoDB / Redis task (drop, flush, delete…).
+    ConfirmTask(nosql::ConfirmTask),
+    /// New collection, key rename, key expiration.
+    Prompt(nosql::Prompt),
+    /// « Nouvelle clé… » of a Redis database.
+    NewKey(nosql::NewKey),
+    /// A whole MongoDB document in shell syntax.
+    JsonEditor(Box<JsonEditor>),
+    /// « Index… » of a MongoDB collection.
+    Indexes(Box<IndexDialog>),
+    /// MongoDB / Redis export or import (JSON, JSON Lines, CSV).
+    NoSqlBatch(Box<NoSqlBatch>),
 }
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
@@ -100,7 +125,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
 }
 
 /// Buttons of the standard confirmations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Answer {
     /// The (destructive or not) confirmed action.
     Confirm,
@@ -122,6 +147,11 @@ enum Answer {
     Folder,
     /// A button of the update modal.
     Update(UpdateAction),
+    /// The primary button of a NoSQL form (prompt, new key, JSON editor,
+    /// export / import).
+    FormOk,
+    /// What the index dialog asked for.
+    Index(IndexAnswer),
 }
 
 /// The answer a standard dialog got this frame: `Some(None)` to cancel it
@@ -272,6 +302,15 @@ fn dialog_ui(app: &mut App, ui: &mut egui::Ui, dialog: &mut Dialog) -> ModalResp
         Dialog::Folder(prompt) => prompt.ui(ui).map(|()| Answer::Folder),
         Dialog::Update => update::ui(ui, &app.updater.state, crate::updater::current_version())
             .map(Answer::Update),
+        Dialog::ConfirmNoSqlRun { warnings, .. } => {
+            nosql::warnings_ui(ui, warnings).map(|()| Answer::Confirm)
+        }
+        Dialog::ConfirmTask(c) => c.ui(ui).map(|()| Answer::Confirm),
+        Dialog::Prompt(p) => p.ui(ui).map(|()| Answer::FormOk),
+        Dialog::NewKey(k) => k.ui(ui).map(|()| Answer::FormOk),
+        Dialog::JsonEditor(e) => e.ui(ui).map(|()| Answer::FormOk),
+        Dialog::Indexes(d) => d.ui(ui).map(Answer::Index),
+        Dialog::NoSqlBatch(b) => b.ui(ui).map(|()| Answer::FormOk),
     }
 }
 
@@ -328,6 +367,19 @@ enum Effect {
     Folder,
     /// The update modal's button, `None` when it was closed.
     Update(Option<UpdateAction>),
+    /// Run console `id` (dangerous NoSQL commands confirmed).
+    RunNoSql(TabId, RunKind),
+    /// Run a confirmed NoSQL task.
+    Task {
+        connection: String,
+        task: crate::gui::worker::nosql::NoSqlTask,
+    },
+    /// The primary button of a NoSQL form (the form is the dialog).
+    Form,
+    /// A request of the index dialog (the dialog is its own).
+    Index(IndexAnswer),
+    /// Start a NoSQL export / import.
+    NoSqlBatch(NoSqlStart),
 }
 
 /// The effect of `answer` (`None`: cancelled) to `dialog`.
@@ -373,6 +425,20 @@ fn effect(dialog: &Dialog, answer: Option<Answer>) -> Effect {
         (Dialog::Folder(_), Some(Answer::Folder)) => Effect::Folder,
         (Dialog::Update, Some(Answer::Update(a))) => Effect::Update(Some(a)),
         (Dialog::Update, None) => Effect::Update(None),
+        (Dialog::ConfirmNoSqlRun { id, kind, .. }, Some(Confirm)) => {
+            Effect::RunNoSql(*id, kind.clone())
+        }
+        (Dialog::ConfirmTask(c), Some(Confirm)) => Effect::Task {
+            connection: c.connection.clone(),
+            task: c.task.clone(),
+        },
+        (Dialog::NoSqlBatch(b), Some(FormOk)) => {
+            b.start().map_or(Effect::Nothing, Effect::NoSqlBatch)
+        }
+        (Dialog::Prompt(_) | Dialog::NewKey(_) | Dialog::JsonEditor(_), Some(FormOk)) => {
+            Effect::Form
+        }
+        (Dialog::Indexes(_), Some(Index(a))) => Effect::Index(a),
         _ => Effect::Nothing,
     }
 }
@@ -397,6 +463,15 @@ fn apply(app: &mut App, ctx: &egui::Context, dialog: &mut Dialog, effect: Effect
             }
         }
         Effect::Update(action) => return update::act(app, ctx, action),
+        Effect::Form => return super::app::nosql::submit_form(app, dialog),
+        Effect::Index(answer) => {
+            if let Dialog::Indexes(d) = dialog {
+                return super::app::nosql::index_answer(app, d, answer);
+            }
+        }
+        Effect::RunNoSql(id, kind) => app.run_console_confirmed(id, kind),
+        Effect::Task { connection, task } => app.nosql_task(&connection, task),
+        Effect::NoSqlBatch(start) => transfer::start_nosql(app, start),
         Effect::Nothing => {}
         Effect::DeleteConnection(name) => app.delete_connection(&name),
         Effect::AnswerDiscard(id, answer) => answer_discard(app, id, answer),
@@ -443,6 +518,35 @@ enum Discard {
 }
 
 fn answer_discard(app: &mut App, id: TabId, answer: Discard) {
+    // The NoSQL tabs ask the same question.
+    let nosql = app.tabs.find(id).and_then(|t| match &mut t.kind {
+        TabKind::Documents(d) => Some(super::tabs::TabAction::Documents(match answer {
+            Discard::Submit => d.submit_and_continue(),
+            Discard::Drop => d.discard_and_continue()?,
+            Discard::Cancel => {
+                d.confirm = None;
+                return None;
+            }
+        })),
+        TabKind::Keys(k) => match answer {
+            // Value edits are submitted by their own buttons: « Submit »
+            // keeps the key open and applies them.
+            Discard::Submit => {
+                k.confirm = None;
+                k.submit_pending().map(super::tabs::TabAction::Keys)
+            }
+            Discard::Drop => k.discard_and_continue().map(super::tabs::TabAction::Keys),
+            Discard::Cancel => {
+                k.confirm = None;
+                None
+            }
+        },
+        _ => None,
+    });
+    if let Some(action) = nosql {
+        app.tab_action(id, action);
+        return;
+    }
     let action = app.tabs.find(id).and_then(|t| match &mut t.kind {
         TabKind::Data(d) => match answer {
             Discard::Submit => Some(d.submit_and_continue()),
@@ -604,6 +708,65 @@ mod tests {
             error: None,
             goto: None,
         })
+    }
+
+    #[test]
+    fn nosql_confirmations_run_only_when_confirmed() {
+        let kind = RunKind::Script("db.users.drop()".into());
+        let run = Dialog::ConfirmNoSqlRun {
+            id: 4,
+            kind: kind.clone(),
+            warnings: vec![Warning {
+                unit: "db.users.drop()".into(),
+                reason: "Supprime la collection shop.users".into(),
+            }],
+        };
+        assert_eq!(effect(&run, None), Effect::Nothing);
+        assert_eq!(
+            effect(&run, Some(Answer::Confirm)),
+            Effect::RunNoSql(4, kind)
+        );
+        let task = crate::gui::worker::nosql::NoSqlTask::FlushDb(3);
+        let confirm = Dialog::ConfirmTask(nosql::ConfirmTask {
+            connection: "r".into(),
+            title: "Vider la base".into(),
+            text: "Toutes les clés de db3 seront supprimées.".into(),
+            button: "Vider".into(),
+            task: task.clone(),
+        });
+        assert_eq!(effect(&confirm, None), Effect::Nothing);
+        assert_eq!(
+            effect(&confirm, Some(Answer::Confirm)),
+            Effect::Task {
+                connection: "r".into(),
+                task
+            }
+        );
+        let prompt = Dialog::Prompt(nosql::Prompt::new(
+            "m",
+            nosql::PromptKind::NewCollection { db: "shop".into() },
+            String::new(),
+        ));
+        assert_eq!(effect(&prompt, Some(Answer::FormOk)), Effect::Form);
+        assert_eq!(effect(&prompt, None), Effect::Nothing);
+        let indexes = Dialog::Indexes(Box::new(IndexDialog::new(
+            "m",
+            crate::engine::nosql::mongo::CollectionRef {
+                db: "shop".into(),
+                coll: "users".into(),
+            },
+        )));
+        assert_eq!(
+            effect(&indexes, Some(Answer::Index(IndexAnswer::Create))),
+            Effect::Index(IndexAnswer::Create)
+        );
+        // An export not ready starts nothing.
+        let batch = Dialog::NoSqlBatch(Box::new(NoSqlBatch::redis(
+            "r",
+            transfer::BatchKind::Export,
+            0,
+        )));
+        assert_eq!(effect(&batch, Some(Answer::FormOk)), Effect::Nothing);
     }
 
     #[test]

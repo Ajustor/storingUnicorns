@@ -83,6 +83,11 @@ pub fn open(app: &mut App, connection: &str, table: &str, title: &str) {
     let Some(session) = app.sessions.get_mut(connection) else {
         return;
     };
+    if session.is_nosql() {
+        let db = session.config.db_type.clone();
+        app.error(format!("Structure indisponible pour {db}"));
+        return;
+    }
     if !session.details.contains_key(table) && !session.loading.contains_key(table) {
         session.load_details(&mut app.worker, connection, table);
     }

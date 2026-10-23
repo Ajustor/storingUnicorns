@@ -134,8 +134,10 @@ impl GridState {
             return;
         }
         let value = self.edits.value(rows, r, c);
-        self.editing_blank = is_null(value) || self.edits.is_default(r, c);
-        let text = if is_null(value) { "" } else { value };
+        // NULL and a document's missing field are edited from an empty text.
+        let blank = is_null(value) || crate::engine::nosql::is_absent(value);
+        self.editing_blank = blank || self.edits.is_default(r, c);
+        let text = if blank { "" } else { value };
         self.editing = Some((r, c, text.to_string()));
         self.select(r, c);
         self.select_all = true;

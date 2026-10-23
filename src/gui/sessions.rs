@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::engine::models::{ConnectionConfig, SchemaInfo, TableDetails};
+use crate::engine::nosql::redis::KeyInfo;
 use crate::engine::ops::transfer::qualified;
 use crate::engine::ops::tx::ManualTx;
 use crate::engine::sql::completion::{ColumnInfo, TableRef};
@@ -42,6 +43,26 @@ pub struct Session {
     /// the request awaited: an answer to another one is stale.
     pub loading: HashMap<String, RunId>,
     pub tx: TxMode,
+    /// Redis: the keys the explorer lists, per database, filled when the
+    /// database is opened.
+    pub redis_keys: HashMap<u8, Result<KeySet, String>>,
+    /// Redis databases whose keys are being listed, with the request awaited.
+    pub keys_loading: HashMap<u8, RunId>,
+    /// The names of the keys listed (Redis completion), kept with them.
+    pub key_names: Vec<String>,
+}
+
+/// The keys of a Redis database listed by the explorer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeySet {
+    pub keys: Vec<KeyInfo>,
+    /// The listing stopped at the explorer's limit: there are more.
+    pub more: bool,
+}
+
+/// The index of a Redis database from its schema name (`db3` → 3).
+pub fn redis_db(schema: &str) -> Option<u8> {
+    schema.strip_prefix("db")?.parse().ok()
 }
 
 impl Session {
@@ -54,7 +75,36 @@ impl Session {
             details: HashMap::new(),
             loading: HashMap::new(),
             tx: TxMode::Auto,
+            redis_keys: HashMap::new(),
+            keys_loading: HashMap::new(),
+            key_names: Vec::new(),
         }
+    }
+
+    /// A MongoDB or Redis session (no SQL path may be used for it).
+    pub fn is_nosql(&self) -> bool {
+        !self.config.db_type.is_sql()
+    }
+
+    /// Request the keys of Redis database `db` for the explorer,
+    /// superseding a listing still running for it.
+    pub fn load_keys(&mut self, worker: &mut Worker, name: &str, db: u8) {
+        let run = worker.explorer_keys(name.to_string(), self.conn.clone(), db);
+        self.keys_loading.insert(db, run);
+    }
+
+    /// Compute `key_names` again (the listed keys changed).
+    pub fn refresh_key_names(&mut self) {
+        let mut names: Vec<String> = self
+            .redis_keys
+            .values()
+            .filter_map(|k| k.as_ref().ok())
+            .flat_map(|k| &k.keys)
+            .map(|k| crate::engine::nosql::redis::display_bytes(&k.key))
+            .collect();
+        names.sort();
+        names.dedup();
+        self.key_names = names;
     }
 
     /// Where the consoles and grids of this session run their SQL.
@@ -124,6 +174,23 @@ impl Session {
             self.load_details(worker, name, &key);
         }
     }
+}
+
+/// Store the keys of Redis database `db` answered by request `run`, unless
+/// it is no longer awaited (see [`accept_details`]).
+pub fn accept_keys(
+    keys: &mut HashMap<u8, Result<KeySet, String>>,
+    loading: &mut HashMap<u8, RunId>,
+    db: u8,
+    run: RunId,
+    outcome: Result<KeySet, String>,
+) -> bool {
+    if loading.get(&db) != Some(&run) {
+        return false;
+    }
+    loading.remove(&db);
+    keys.insert(db, outcome);
+    true
 }
 
 /// See [`Session::details_key`].
@@ -295,6 +362,11 @@ impl Sessions {
         } else {
             ""
         }
+    }
+
+    /// Whether connection `name` is an open MongoDB / Redis session.
+    pub fn is_nosql(&self, name: &str) -> bool {
+        self.open.get(name).is_some_and(Session::is_nosql)
     }
 
     /// Whether connection `name` is in manual transaction mode.
@@ -567,6 +639,36 @@ mod tests {
             Some(vec![]),
             "unknown: nothing to load"
         );
+    }
+
+    #[test]
+    fn redis_databases_by_schema_name() {
+        assert_eq!(redis_db("db0"), Some(0));
+        assert_eq!(redis_db("db15"), Some(15));
+        assert_eq!(redis_db("main"), None);
+        assert_eq!(redis_db("dbx"), None);
+    }
+
+    #[test]
+    fn stale_key_listings_are_dropped() {
+        let (mut keys, mut loading) = (HashMap::new(), HashMap::new());
+        loading.insert(3u8, 7);
+        assert!(!accept_keys(
+            &mut keys,
+            &mut loading,
+            3,
+            6,
+            Ok(KeySet::default())
+        ));
+        assert!(keys.is_empty());
+        assert!(accept_keys(
+            &mut keys,
+            &mut loading,
+            3,
+            7,
+            Ok(KeySet::default())
+        ));
+        assert!(keys.contains_key(&3) && loading.is_empty());
     }
 
     #[test]

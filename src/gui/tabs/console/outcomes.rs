@@ -5,6 +5,7 @@ use chrono::{DateTime, Local};
 
 use crate::engine::db::utils::display_table_name;
 use crate::engine::models::QueryResult;
+use crate::engine::nosql::{NoSqlOutcome, Source};
 use crate::engine::ops::query::{editable_table, StatementOutcome};
 use crate::engine::ops::rows::NO_PRIMARY_KEY;
 use crate::engine::sql::statements::{extract_table_from_query, single_table_source};
@@ -29,6 +30,9 @@ pub struct ResultTab {
     pub editable: bool,
     /// Last failed Submit (the transaction was rolled back).
     pub error: Option<String>,
+    /// MongoDB / Redis: where the rows come from (documents of a
+    /// collection: editable; a Redis key: opened in its « Clés » tab).
+    pub source: Option<Source>,
 }
 
 impl ResultTab {
@@ -50,7 +54,50 @@ impl ResultTab {
             grid: GridState::default(),
             editable,
             error: None,
+            source: None,
         }
+    }
+
+    /// The document writes of `changes` (edits of this result's grid) when
+    /// its rows are documents of a collection: the collection and the
+    /// writes (`mongo::doc_changes`).
+    pub fn doc_writes(
+        &self,
+        changes: &crate::engine::ops::rows::RowChanges,
+    ) -> Option<(
+        crate::engine::nosql::mongo::CollectionRef,
+        Result<Vec<crate::engine::nosql::mongo::DocChange>, String>,
+    )> {
+        let Some(Source::Collection { coll, docs }) = &self.source else {
+            return None;
+        };
+        let page = crate::engine::nosql::mongo::DocPage {
+            result: self.result.clone(),
+            docs: docs.clone(),
+        };
+        Some((
+            coll.clone(),
+            crate::engine::nosql::mongo::doc_changes(&page, changes),
+        ))
+    }
+
+    /// The rows are NoSQL rows from `source`: editable when they are the
+    /// documents of a collection (never through the SQL path).
+    pub fn set_source(&mut self, source: Option<Source>) {
+        self.editable = matches!(source, Some(Source::Collection { .. }));
+        let name = match &source {
+            Some(Source::Collection { coll, .. }) => Some(coll.coll.clone()),
+            Some(Source::Key { key, .. }) => Some(crate::engine::nosql::redis::display_bytes(key)),
+            None => None,
+        };
+        if let Some(name) = name {
+            self.title = if self.result.truncated {
+                format!("{name} ({MAX_ROWS}+)")
+            } else {
+                name
+            };
+        }
+        self.source = source;
     }
 }
 
@@ -211,6 +258,59 @@ pub fn apply_outcomes(
     }
 }
 
+/// [`apply_outcomes`] for a MongoDB / Redis run: the result tabs also get
+/// the `Source` of their rows (`set_source`).
+pub fn apply_nosql_outcomes(
+    console: &mut ConsoleTab,
+    connection: &str,
+    outcomes: Vec<NoSqlOutcome>,
+    now: DateTime<Local>,
+) -> String {
+    let (plain, sources) = split_nosql(outcomes);
+    let summary = apply_outcomes(console, connection, plain, now);
+    let start = console.results.len() - sources.len();
+    for (r, source) in console.results[start..].iter_mut().zip(sources) {
+        r.set_source(source);
+    }
+    console.refresh_known_columns();
+    summary
+}
+
+/// [`apply_refresh`] for a MongoDB / Redis re-run: the refreshed tab also
+/// gets its new `Source`.
+pub fn apply_nosql_refresh(
+    console: &mut ConsoleTab,
+    id: u64,
+    outcomes: Vec<NoSqlOutcome>,
+    now: DateTime<Local>,
+) -> String {
+    let (plain, sources) = split_nosql(outcomes);
+    let summary = apply_refresh(console, id, plain, now);
+    if let (Some(source), Some(tab)) = (
+        sources.into_iter().last(),
+        console.results.iter_mut().find(|r| r.id == id),
+    ) {
+        tab.set_source(source);
+    }
+    summary
+}
+
+/// The outcomes, and the sources of those that make a result tab (rows
+/// returned), in order.
+fn split_nosql(outcomes: Vec<NoSqlOutcome>) -> (Vec<StatementOutcome>, Vec<Option<Source>>) {
+    let mut sources = Vec::new();
+    let plain = outcomes
+        .into_iter()
+        .map(|o| {
+            if matches!(&o.outcome.result, Ok(r) if !r.columns.is_empty()) {
+                sources.push(o.source);
+            }
+            o.outcome
+        })
+        .collect();
+    (plain, sources)
+}
+
 /// What to do once a console Submit finished.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SubmitReport {
@@ -331,6 +431,100 @@ mod tests {
             result: Ok(r),
             elapsed_ms: 5,
         }
+    }
+
+    fn nosql(sql: &str, r: Result<QueryResult, String>, source: Option<Source>) -> NoSqlOutcome {
+        NoSqlOutcome {
+            outcome: StatementOutcome {
+                sql: sql.into(),
+                result: r,
+                elapsed_ms: 2,
+            },
+            source,
+        }
+    }
+
+    fn documents() -> Source {
+        Source::Collection {
+            coll: crate::engine::nosql::mongo::CollectionRef {
+                db: "shop".into(),
+                coll: "users".into(),
+            },
+            docs: vec![],
+        }
+    }
+
+    #[test]
+    fn nosql_results_are_editable_through_their_source_only() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        let mut affected = QueryResult {
+            rows_affected: 1,
+            ..Default::default()
+        };
+        affected.columns.clear();
+        let key = Source::Key {
+            db: 0,
+            key: b"user:1".to_vec(),
+            kind: crate::engine::nosql::redis::RedisType::Hash,
+        };
+        apply_nosql_outcomes(
+            &mut c,
+            "mongo",
+            vec![
+                nosql("db.users.insertOne({})", Ok(affected), None),
+                nosql(
+                    "db.users.find()",
+                    Ok(result(&["_id", "a"], 2)),
+                    Some(documents()),
+                ),
+                nosql("db.users.distinct(\"a\")", Ok(result(&["valeur"], 1)), None),
+                nosql(
+                    "HGETALL user:1",
+                    Ok(result(&["champ", "valeur"], 1)),
+                    Some(key),
+                ),
+            ],
+            Local::now(),
+        );
+        let tabs: Vec<_> = c
+            .results
+            .iter()
+            .map(|r| (r.title.as_str(), r.editable))
+            .collect();
+        assert_eq!(
+            tabs,
+            [("users", true), ("Résultat 2", false), ("user:1", false)]
+        );
+        assert!(matches!(c.results[2].source, Some(Source::Key { .. })));
+    }
+
+    #[test]
+    fn a_nosql_refresh_keeps_the_source() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        apply_nosql_outcomes(
+            &mut c,
+            "mongo",
+            vec![nosql(
+                "db.users.find()",
+                Ok(result(&["_id"], 1)),
+                Some(documents()),
+            )],
+            Local::now(),
+        );
+        let id = c.results[0].id;
+        apply_nosql_refresh(
+            &mut c,
+            id,
+            vec![nosql(
+                "db.users.find()",
+                Ok(result(&["_id"], 3)),
+                Some(documents()),
+            )],
+            Local::now(),
+        );
+        assert_eq!(c.results[0].result.rows.len(), 3);
+        assert!(c.results[0].editable);
+        assert!(c.results[0].source.is_some());
     }
 
     #[test]

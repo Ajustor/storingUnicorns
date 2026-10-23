@@ -7,6 +7,33 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Améliorations
+
+- **Raccourcis sur macOS** : les infobulles, menus et indications affichent
+  les touches de la plateforme : `⌘↩`, `⌥⌘L`, `⇧⌘↩`, `⌘+clic` sur macOS,
+  `Ctrl+Entrée`, `Ctrl+Alt+L`, `Ctrl+Maj+Entrée`, `Ctrl+clic` ailleurs.
+- **Tout exécuter sans touche de fonction** : `Ctrl+Maj+Entrée` (`⇧⌘↩` sur
+  macOS) exécute tout le script comme `F5`, qui demande `fn` sur un clavier
+  Mac ; l'instruction au curseur ne s'exécute pas en plus.
+- **Grille** : `Ctrl+I` (`⌘I` sur macOS) ajoute une ligne, comme
+  `Alt+Inser`, absent des claviers Mac ; sur macOS, `⌘⌫` supprime la ligne
+  (`⌘⌦` reste possible).
+- **Interface terminal** : des touches de secours fonctionnent dans les
+  terminaux macOS par défaut : `Ctrl+E` (instruction au curseur, comme
+  `Ctrl+Entrée`), `Ctrl+K` (complétion, comme `Ctrl+Espace`), `Ctrl+G`
+  (`F5`), `Ctrl+O` / `Ctrl+L` (`F6` / `F7`), `E` / `I` dans le panneau des
+  tables (`Maj+F6` / `Maj+F7`), `+` / `-` hors de l'éditeur (`Alt+=` /
+  `Alt+-`). Les indications en bas de l'écran les mentionnent.
+
+### Corrections
+
+- **Complétion sur macOS** : elle s'ouvre avec `⌃Espace`, `⌘Espace` étant
+  Spotlight.
+- **Formater / Historique sur macOS** : `⌥⌘L` et `⌥⌘E` n'insèrent plus dans
+  la console le caractère produit par Option (`¬`, `´`).
+
 ## [0.18.3] - 2026-10-23
 
 ### Améliorations

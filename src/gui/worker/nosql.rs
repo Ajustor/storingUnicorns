@@ -773,6 +773,8 @@ mod tests {
                 name: "it".into(),
                 db_type: crate::engine::models::DatabaseType::MongoDB,
                 uri: Some(uri),
+                // Not the default "postgres": the URI carries the user.
+                username: None,
                 password,
                 database: "su_it_gui".into(),
                 ..Default::default()

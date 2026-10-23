@@ -480,9 +480,30 @@ impl Tree {
     /// Folder `from` (and the folders under it, among `folders`) became
     /// `to`: they keep the states the user gave them.
     pub(super) fn folder_moved(&mut self, folders: &[String], from: &str, to: &str) {
+        self.remap_folders(folders, |p| moved_under(p, from, to));
+    }
+
+    /// Folder `deleted` was deleted: the folders under it (among `folders`)
+    /// moved up one level and keep the states the user gave them.
+    pub(super) fn folder_deleted(&mut self, folders: &[String], deleted: &str) {
+        self.remap_folders(folders, |p| lifted_out(p, deleted));
+    }
+
+    /// Connection `old` was renamed `new`: its « Afficher les schémas
+    /// masqués » follows it.
+    pub fn connection_renamed(&mut self, old: &str, new: &str) {
+        if let Some(show) = self.open.remove(&show_hidden_id(old)) {
+            self.open.insert(show_hidden_id(new), show);
+        }
+        self.generation += 1;
+    }
+
+    /// Move the states of `folders` to the paths `map` gives them (`None`:
+    /// unchanged).
+    fn remap_folders(&mut self, folders: &[String], map: impl Fn(&str) -> Option<String>) {
         let moved: Vec<(Id, Id)> = folders
             .iter()
-            .filter_map(|p| Some((folder_id(p), folder_id(&moved_under(p, from, to)?))))
+            .filter_map(|p| Some((folder_id(p), folder_id(&map(p)?))))
             .collect();
         let states: Vec<(Id, bool)> = moved
             .iter()
@@ -528,6 +549,13 @@ pub(super) fn inputs_key(filter: &str, config: &AppConfig, sessions: &Sessions, 
 /// `path` once folder `from` became `to`, if it is `from` or under it.
 pub fn moved_under(path: &str, from: &str, to: &str) -> Option<String> {
     (!from.is_empty() && is_within(path, from)).then(|| format!("{to}{}", &path[from.len()..]))
+}
+
+/// `path` once folder `deleted` is deleted, if it lies under it: its
+/// content moves up one level.
+pub fn lifted_out(path: &str, deleted: &str) -> Option<String> {
+    let rest = path.strip_prefix(deleted)?.strip_prefix(SEP)?;
+    (!deleted.is_empty()).then(|| join_folder(folders::parent(deleted), rest))
 }
 
 /// `name` in folder `parent` (`""`: the root).
@@ -785,6 +813,33 @@ mod tests {
         assert_eq!(t.is_open(folder_id("Z/C")), Some(false));
         assert_eq!(t.is_open(folder_id("A/B")), None);
         assert_eq!(t.is_open(folder_id("A")), Some(false));
+    }
+
+    #[test]
+    fn deleted_folders_leave_their_states_to_the_lifted_subfolders() {
+        assert_eq!(lifted_out("A/B/C", "A/B"), Some("A/C".into()));
+        assert_eq!(lifted_out("A/B/C/D", "A/B"), Some("A/C/D".into()));
+        assert_eq!(lifted_out("A/C", "A"), Some("C".into()));
+        assert_eq!(lifted_out("A/B", "A/B"), None, "the deleted one");
+        assert_eq!(lifted_out("A/BC", "A/B"), None);
+        let mut t = Tree::default();
+        t.set_open(folder_id("A"), true);
+        t.set_open(folder_id("A/B"), false);
+        t.set_open(folder_id("A/B/C"), false);
+        let all = ["A".to_string(), "A/B".into(), "A/B/C".into()];
+        t.folder_deleted(&all, "A/B");
+        assert_eq!(t.is_open(folder_id("A/C")), Some(false));
+        assert_eq!(t.is_open(folder_id("A")), Some(true), "the parent's own");
+        assert_eq!(t.is_open(folder_id("A/B/C")), None);
+    }
+
+    #[test]
+    fn the_show_hidden_toggle_follows_a_renamed_connection() {
+        let mut t = Tree::default();
+        t.set_open(show_hidden_id("old"), true);
+        t.connection_renamed("old", "new");
+        assert_eq!(t.is_open(show_hidden_id("new")), Some(true));
+        assert_eq!(t.is_open(show_hidden_id("old")), None);
     }
 
     #[test]

@@ -261,6 +261,7 @@ impl App {
             self.sign_ins.dismiss(&old);
         }
         if old != new {
+            self.explorer_tree.connection_renamed(&old, &new);
             for tab in &mut self.tabs.list {
                 if tab.connection == old {
                     tab.connection = new.clone();

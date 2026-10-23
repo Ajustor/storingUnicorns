@@ -393,7 +393,16 @@ fn apply(app: &mut App, ctx: &egui::Context, action: Action) {
             let goal = FolderGoal::Rename { from };
             app.dialog = Some(Dialog::Folder(FolderPrompt::new(goal)));
         }
-        Action::DeleteFolder(path) => change_config(app, |c| c.delete_folder(&path)),
+        Action::DeleteFolder(path) => {
+            let before = folder_paths(&app.config);
+            match app.config.delete_folder(&path) {
+                Ok(()) => {
+                    app.explorer_tree.folder_deleted(&before, &path);
+                    app.save_config();
+                }
+                Err(e) => app.error(e),
+            }
+        }
         Action::MoveConnection { name, folder } => {
             change_config(app, |c| c.move_connection(&name, Some(&folder)))
         }

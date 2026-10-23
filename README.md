@@ -239,7 +239,12 @@ Limites : un **Submit n'est pas atomique** (les écritures sont envoyées une à
 une, sans transaction : en cas d'erreur, le message indique combien ont été
 appliquées) ; pas d'authentification X.509 / AWS / Kerberos ; pas de BSON
 binaire (`mongodump` / `mongorestore`) ; pas de mode transaction manuel, de DDL
-ni de clés étrangères.
+ni de clés étrangères. Des documents lus avec une **projection** (barre
+« Projection », `find(filtre, projection)`) sont en **lecture seule** : les
+réécrire effacerait les champs masqués. Un champ dont le nom contient `.` ou
+commence par `$` se modifie dans l'éditeur JSON, pas dans la grille. Une
+agrégation avec `$out` / `$merge` ne s'exécute que dans la console, après
+confirmation.
 
 ### Redis
 
@@ -275,7 +280,11 @@ URL `redis://` / `rediss://` remplit le formulaire.
 
 Limites : pas de Redis Cluster ni Sentinel ; parcours limité à 5 000 clés par
 base dans l'explorateur ; les types de modules (`ReJSON-RL`…) sont en lecture
-seule.
+seule. Modifier ou supprimer un élément de liste passe par un script `EVAL`
+qui vérifie d'abord l'élément (si la liste a changé entre-temps, rien n'est
+écrit : « la liste a changé, rechargez ») : un serveur qui refuse `EVAL`
+(ACL, service managé) ne permet que l'ajout. `HSCAN … NOVALUES` / `ZSCAN …
+NOSCORES` donnent un résultat en lecture seule.
 
 ### Raccourcis (GUI)
 

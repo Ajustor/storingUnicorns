@@ -44,6 +44,11 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
 - CSV MongoDB : `null` et champ absent s'exportent tous deux vides ; à
   l'import, une cellule vide donne un champ absent (une chaîne vide, écrite
   `""`, est conservée).
+- MongoDB : des documents lus avec une projection sont en lecture seule ; un
+  champ nommé avec `.` ou commençant par `$` se modifie dans l'éditeur JSON ;
+  `$out` / `$merge` ne s'exécutent que dans la console, après confirmation.
+- Redis : modifier ou supprimer un élément de liste demande `EVAL` (script qui
+  vérifie l'élément avant d'écrire).
 
 ## [0.18.4] - 2026-10-23
 

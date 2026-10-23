@@ -896,6 +896,13 @@ impl NoSqlBatch {
             };
             ui.checkbox(&mut self.opts.upsert, upsert);
         }
+        if self.has_csv() && matches!(self.target, NoSqlTarget::Mongo { .. }) {
+            ui.label(
+                egui::RichText::new(crate::engine::nosql::CSV_NULL_HINT)
+                    .weak()
+                    .small(),
+            );
+        }
         if self.has_csv() && self.kind == BatchKind::Import {
             ui.checkbox(&mut self.opts.keep_strings, "Tout garder en texte");
             ui.add_enabled(

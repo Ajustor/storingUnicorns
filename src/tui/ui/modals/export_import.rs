@@ -8,8 +8,8 @@ use ratatui::{
 
 use super::centered_rect;
 use crate::engine::services::export_import::PathCompletion;
-use crate::tui::{AppState, DialogMode};
 use crate::tui::ui::widgets::draw_cursor;
+use crate::tui::{AppState, DialogMode};
 
 /// Render a path completion dropdown at the given position.
 /// `x` and `y` are the top-left of where the dropdown should appear (below the field).
@@ -1170,6 +1170,17 @@ pub fn render_nosql_transfer_dialog(frame: &mut Frame, state: &AppState) {
             )));
         }
     }
+    if t.format == crate::engine::nosql::TransferFormat::Csv
+        && t.engine == crate::engine::models::DatabaseType::MongoDB
+    {
+        // Two lines: the modal is narrow.
+        for part in crate::engine::nosql::CSV_NULL_HINT.split_inclusive("; ") {
+            lines.push(Line::from(Span::styled(
+                part.trim_end(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
     lines.push(Line::from(""));
     if let Some((done, total, ref current)) = t.progress {
         lines.push(Line::from(Span::styled(
@@ -1273,6 +1284,8 @@ mod nosql_tests {
             "Reconnaître les dates ISO: [ ]",
             "[ ] shop.users",
             "[ ] shop.orders",
+            "null et champ absent s'exportent tous deux vides",
+            "valeur nulle",
         ] {
             assert!(all.contains(label), "{label} missing:\n{all}");
         }

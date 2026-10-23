@@ -210,6 +210,10 @@ impl TransferFormat {
     }
 }
 
+/// What a MongoDB CSV round trip loses, shown by both interfaces' export /
+/// import dialogs (`flatten_paths` / `csv_row_to_doc`).
+pub const CSV_NULL_HINT: &str = "CSV : null et champ absent s'exportent tous deux vides ; à l'import, vide = champ absent, null = valeur nulle.";
+
 /// Options of a NoSQL import.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImportOptions {

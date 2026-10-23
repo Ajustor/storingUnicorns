@@ -11,6 +11,17 @@ numéros de version suivent le [versionnage sémantique](https://semver.org/lang
 
 ### Nouveautés
 
+- **Dossiers de connexions** : les connexions se rangent dans des dossiers
+  imbriqués (`Clients/ACME/Prod`) : bouton **Nouveau dossier**, menu du dossier
+  (**Nouvelle connexion ici**, **Nouveau sous-dossier…**, **Renommer…**,
+  **Supprimer**, le contenu remontant d'un niveau), **Déplacer vers…**,
+  glisser-déposer sur un dossier ou sur l'en-tête de l'explorateur (racine) et
+  champ **Dossier** du formulaire. Dans l'interface terminal : `f`, `m`, `r` /
+  `e`, `d`, `Entrée` / `Espace` et `←` / `→`.
+- **Masquer des schémas** : **Masquer le schéma**, **Afficher les schémas
+  masqués** et **Schémas affichés** dans le formulaire ; les schémas masqués
+  sont exclus de `Ctrl+N` et de la complétion des tables (une table saisie à la
+  main fonctionne toujours). Interface terminal : `h` et `H`.
 - **Navigation par clés étrangères** : les colonnes FK (avec `→ table.colonne`)
   et les clés primaires sont marquées dans la grille, l'explorateur, la
   structure et la complétion. Dans la grille, cliquer sur le lien d'une cellule

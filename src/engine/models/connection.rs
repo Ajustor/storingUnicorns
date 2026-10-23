@@ -186,15 +186,23 @@ pub struct ConnectionConfig {
     /// PostgreSQL / MySQL only; `None` = `DbAuthMethod::Password`.
     #[serde(default)]
     pub db_auth: Option<DbAuthMethod>,
-    /// Folder holding the connection in the explorer, `"A/B"`; `None` = root.
+    /// Folder holding the connection in the explorer, a normalized
+    /// `/`-separated path such as `"Clients/ACME/Prod"`; `None` = root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
-    /// Schemas hidden from the explorer, the table search and completion.
+    /// Schemas hidden from the explorer, the table search and the
+    /// completion, by their exact listed name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_schemas: Vec<String>,
 }
 
 impl ConnectionConfig {
+    /// Whether `schema` is hidden on this connection (exact name match).
+    #[allow(dead_code)] // TODO(folders): used by the GUI/TUI tasks
+    pub fn is_schema_hidden(&self, schema: &str) -> bool {
+        self.hidden_schemas.iter().any(|s| s == schema)
+    }
+
     /// The SSL mode connections use: Google Cloud IAM sends its token as the
     /// password, so it never goes below `Require`.
     pub fn effective_ssl_mode(&self) -> SslMode {

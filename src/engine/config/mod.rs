@@ -18,7 +18,8 @@ pub struct AppConfig {
     /// GUI theme: "system" (default), "dark" or "light".
     #[serde(default)]
     pub theme: Option<String>,
-    /// Connection folders (even empty ones), paths `"A/B"`.
+    /// Folders created explicitly (kept even when empty), normalized
+    /// `/`-separated paths; see `folders`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<String>,
 }
@@ -187,6 +188,71 @@ mod tests {
     fn old_config_without_new_fields_still_parses() {
         let c: AppConfig = toml::from_str("connections = []").unwrap();
         assert!(c.skipped_version.is_none() && c.theme.is_none());
+    }
+
+    /// A config written before folders and hidden schemas existed.
+    const OLD_CONFIG: &str = r#"
+last_connection = "prod"
+theme = "dark"
+
+[[connections]]
+name = "prod"
+db_type = "Postgres"
+host = "db.example.com"
+port = 5432
+username = "app"
+database = "shop"
+color = [200, 30, 30]
+"#;
+
+    #[test]
+    fn old_config_loads_unchanged_and_writes_back_identically() {
+        let c: AppConfig = toml::from_str(OLD_CONFIG).unwrap();
+        assert!(c.folders.is_empty());
+        let prod = &c.connections[0];
+        assert_eq!(prod.folder, None);
+        assert!(prod.hidden_schemas.is_empty());
+        let written = toml::to_string_pretty(&c).unwrap();
+        assert!(!written.contains("folder"), "{written}");
+        assert!(!written.contains("hidden_schemas"), "{written}");
+        let again: AppConfig = toml::from_str(&written).unwrap();
+        assert_eq!(again.connections, c.connections);
+    }
+
+    #[test]
+    fn folders_and_hidden_schemas_round_trip_through_toml() {
+        let mut c: AppConfig = toml::from_str(OLD_CONFIG).unwrap();
+        c.create_folder(r"Clients/Équipe \ 2").unwrap();
+        c.move_connection("prod", Some("Clients/ACME/Prod"))
+            .unwrap();
+        c.set_schema_hidden("prod", "audit", true);
+        c.set_schema_hidden("prod", "pg_temp", true);
+        let written = toml::to_string_pretty(&c).unwrap();
+        assert!(
+            written.contains("folder = \"Clients/ACME/Prod\""),
+            "{written}"
+        );
+        let back: AppConfig = toml::from_str(&written).unwrap();
+        assert_eq!(back.folders, ["Clients", r"Clients/Équipe \ 2"]);
+        assert_eq!(back.connections, c.connections);
+        assert_eq!(back.connections[0].hidden_schemas, ["audit", "pg_temp"]);
+    }
+
+    #[test]
+    fn save_writes_folders_and_hidden_schemas() {
+        let mut c = AppConfig::default();
+        c.add_connection(ConnectionConfig {
+            name: "p".into(),
+            ..Default::default()
+        });
+        c.create_folder("F").unwrap();
+        c.move_connection("p", Some("F/G")).unwrap();
+        c.set_schema_hidden("p", "s", true);
+        c.save().unwrap();
+        let loaded = AppConfig::load().unwrap();
+        assert_eq!(loaded.folders, ["F"]);
+        assert_eq!(loaded.connections[0].folder.as_deref(), Some("F/G"));
+        assert!(loaded.connections[0].is_schema_hidden("s"));
     }
 
     #[test]

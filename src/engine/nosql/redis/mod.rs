@@ -24,7 +24,7 @@ use anyhow::{anyhow, bail, Result};
 use tokio::sync::Mutex;
 
 use self::cli::{classify, quote_arg, reply_to_result, tokenize, Safety};
-pub use self::complete::complete;
+pub use self::complete::{complete, replace_start};
 // Used by the GUI and the TUI (plan 13, Tasks 4 and 5).
 #[allow(unused_imports)]
 pub use self::keys::key_tree;

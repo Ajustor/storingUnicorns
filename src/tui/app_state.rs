@@ -1,19 +1,19 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
-use crate::engine::services::export_import::{
-    BatchExportState, BatchImportState, BatchTruncateState, ExportState, ImportState,
-};
-use crate::engine::services::query_tabs::QueryTabsState;
-use crate::engine::services::table_cache::{FetchQueue, TableCache};
 use crate::engine::config::AppConfig;
 use crate::engine::db::DatabaseConnection;
+use crate::engine::models::{display_cell, NULL_CELL};
 use crate::engine::models::{
     AzureAuthMethod, ConnectionConfig, DatabaseType, DbAuthMethod, Flavor, QueryResult, SchemaInfo,
     SslMode,
 };
 use crate::engine::presets;
-use crate::engine::models::{display_cell, NULL_CELL};
+use crate::engine::services::export_import::{
+    BatchExportState, BatchImportState, BatchTruncateState, ExportState, ImportState,
+};
+use crate::engine::services::query_tabs::QueryTabsState;
+use crate::engine::services::table_cache::{FetchQueue, TableCache};
 use crate::engine::sql::completion::{self, Suggestion, TableRef};
 use crate::engine::sql::statements::single_table_source;
 use crate::tui::columns::{self, ColumnStore};
@@ -1232,8 +1232,12 @@ impl AppState {
             .clone();
         let query = self.query_input().to_string();
         let cursor = self.cursor_position().min(query.len());
-        // Same token the engine completed (quotes in strings / comments ignored).
-        let token_start = crate::engine::sql::completion::token_start(&query, cursor);
+        // Same token the engine completed (quotes in strings / comments
+        // ignored; MongoDB / Redis: the NoSQL engine's span).
+        let token_start = match crate::tui::nosql::engine(self) {
+            Some(db) => crate::engine::nosql::completion_start(&db, &query, cursor),
+            None => crate::engine::sql::completion::token_start(&query, cursor),
+        };
 
         let new_query = format!("{}{}{}", &query[..token_start], insert, &query[cursor..]);
         let new_cursor = token_start + insert.len();

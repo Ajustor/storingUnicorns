@@ -1399,3 +1399,32 @@ async fn redis_databases_show_their_key_counts() {
     load_key_counts(&mut state).await;
     assert_eq!(state.nosql.key_counts, None);
 }
+
+/// Type `text`, ask for the completion, accept the first suggestion.
+fn complete_first(state: &mut AppState, text: &str) -> String {
+    state.set_query(text.into());
+    state.set_cursor_position(text.len());
+    state.update_completions();
+    assert!(state.show_completion, "no suggestion for {text:?}");
+    state.apply_completion();
+    state.query_input().to_string()
+}
+
+#[tokio::test]
+async fn mongo_completion_replaces_the_engine_span() {
+    let mut state = mongo_state().await;
+    state.query_tabs.current_tab_mut().nosql_scope = Some("shop".into());
+    assert_eq!(
+        complete_first(&mut state, "db.users.find({age: {$g"),
+        "db.users.find({age: {$gt"
+    );
+    assert_eq!(complete_first(&mut state, "db.or"), "db.orders");
+}
+
+#[test]
+fn redis_completion_replaces_the_whole_key() {
+    let mut state = redis_state();
+    load_tree(&mut state);
+    assert_eq!(complete_first(&mut state, "GET user:"), "GET user:1");
+    assert_eq!(complete_first(&mut state, "hgetal"), "HGETALL");
+}

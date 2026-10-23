@@ -3,9 +3,8 @@
 //! documents the sampled fields and the operators the position allows
 //! (query, update, aggregation stage).
 //!
-//! Like the SQL completion, a suggestion replaces the word (letters,
-//! digits, `_`) ending at the cursor: after a typed `$`, the inserted text
-//! of a `$` item leaves its `$` out.
+//! A suggestion replaces the word (letters, digits, `_`) ending at the
+//! cursor, with the `$` typed before it: [`replace_start`].
 
 use crate::engine::nosql::CompletionContext;
 use crate::engine::sql::completion::{Completions, Kind, Suggestion, TableRef};
@@ -442,12 +441,7 @@ impl Builder {
 
     fn operators(&mut self, items: &[&str], detail: &str) {
         for op in items {
-            let insert = if self.dollar {
-                op.trim_start_matches('$').to_string()
-            } else {
-                op.to_string()
-            };
-            self.push(op, detail, insert, Kind::Keyword);
+            self.push(op, detail, op.to_string(), Kind::Keyword);
         }
     }
 
@@ -518,6 +512,27 @@ impl Builder {
     }
 }
 
+/// Start (bytes) of the text a suggestion replaces: the word (letters,
+/// digits, `_`) ending at `cursor`, with the `$` right before it.
+pub fn replace_start(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let before = &text[..cursor];
+    let start = before
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| c.is_alphanumeric() || c == '_')
+        .last()
+        .map_or(cursor, |(i, _)| i);
+    if before[..start].ends_with('$') {
+        start - 1
+    } else {
+        start
+    }
+}
+
 /// Suggestions at `cursor` of a console script or a filter bar.
 pub fn complete(text: &str, cursor: usize, cx: &CompletionContext) -> Completions {
     let mut cursor = cursor.min(text.len());
@@ -525,15 +540,10 @@ pub fn complete(text: &str, cursor: usize, cx: &CompletionContext) -> Completion
         cursor -= 1;
     }
     let before = &text[..cursor];
-    let word_start = before
-        .char_indices()
-        .rev()
-        .take_while(|&(_, c)| c.is_alphanumeric() || c == '_')
-        .last()
-        .map_or(cursor, |(i, _)| i);
+    let prefix_end = replace_start(text, cursor);
+    let dollar = before[prefix_end..].starts_with('$');
+    let word_start = if dollar { prefix_end + 1 } else { prefix_end };
     let word = before[word_start..].to_string();
-    let dollar = before[..word_start].ends_with('$');
-    let prefix_end = if dollar { word_start - 1 } else { word_start };
     // The unit under the cursor.
     // The last unit goes on to the cursor unless a separator (`;`, a line
     // break at depth 0) comes between.
@@ -821,7 +831,7 @@ mod tests {
         let g = run("db.users.find({age: {$g|").items;
         assert_eq!(
             g.iter().map(|s| s.insert.as_str()).collect::<Vec<_>>(),
-            ["gt", "gte"]
+            ["$gt", "$gte"]
         );
         // In $or elements: fields again.
         assert!(has("db.users.find({$or: [{|", "name"));
@@ -838,7 +848,7 @@ mod tests {
         assert!(l.contains(&"$set".to_string()) && !l.contains(&"name".to_string()));
         assert!(has("db.users.updateMany({}, {$set: {|", "name"));
         let ins = run("db.users.updateOne({}, {$|").items;
-        assert!(ins.iter().any(|s| s.label == "$inc" && s.insert == "inc"));
+        assert!(ins.iter().any(|s| s.label == "$inc" && s.insert == "$inc"));
     }
 
     #[test]
@@ -871,5 +881,15 @@ mod tests {
             }]
         );
         assert!(out.items.iter().all(|s| s.label.starts_with('$')));
+    }
+
+    #[test]
+    fn replaced_text_is_the_word_with_its_dollar() {
+        assert_eq!(replace_start("db.users.find({age: {$g", 23), 21);
+        assert_eq!(replace_start("db.us", 5), 3);
+        assert_eq!(replace_start("db.users.find({na", 17), 15);
+        assert_eq!(replace_start("{a: ", 4), 4);
+        assert_eq!(replace_start("{$", 2), 1);
+        assert_eq!(replace_start("é", 1), 0);
     }
 }

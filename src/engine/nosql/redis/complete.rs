@@ -223,6 +223,21 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("ZUNIONSTORE", "destination nb_clés clé [clé …]", true),
 ];
 
+/// Start (bytes) of the text a suggestion replaces: the whole argument
+/// (non-blank run of the line) ending at `cursor`, quotes included.
+pub fn replace_start(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    text[..cursor]
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| !c.is_whitespace())
+        .last()
+        .map_or(cursor, |(i, _)| i)
+}
+
 /// Suggestions for the token ending at `cursor`: a command name as the first
 /// token of the line, a known key (`cx.keys`) as the first argument of a key
 /// command, a database index after `SELECT`.
@@ -359,5 +374,14 @@ mod tests {
             labels(&run("SELECT 1", &[])),
             ["1", "10", "11", "12", "13", "14", "15"]
         );
+    }
+
+    #[test]
+    fn replaced_text_is_the_whole_argument() {
+        assert_eq!(replace_start("GET user:4", 10), 4);
+        assert_eq!(replace_start("GET \"a", 6), 4);
+        assert_eq!(replace_start("HGET  ", 6), 6);
+        assert_eq!(replace_start("GET a\nhge", 9), 6);
+        assert_eq!(replace_start("hge", 3), 0);
     }
 }

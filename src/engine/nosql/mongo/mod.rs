@@ -1110,6 +1110,8 @@ pub fn complete(text: &str, cursor: usize, cx: &CompletionContext) -> Completion
     complete::complete(text, cursor, cx)
 }
 
+pub use complete::replace_start;
+
 /// The script reformatted (one command per unit, long arguments
 /// indented); `None` when it doesn't parse. Comments are not kept.
 pub fn format(text: &str) -> Option<String> {

@@ -96,7 +96,7 @@ pub enum TokenRule {
     /// SQL identifiers (`token_start`).
     #[default]
     Sql,
-    /// MongoDB shell: a name or an operator (`$gt`), cut at dots.
+    /// MongoDB shell: a name, or an operator with its `$` (`$gt`), cut at dots.
     Mongo,
     /// Redis: the whole argument (keys hold `:`, `-`…).
     Redis,
@@ -111,26 +111,14 @@ impl TokenRule {
         }
     }
 
-    /// Byte offset where the token ending at `cursor` starts.
+    /// Byte offset where the token ending at `cursor` starts (NoSQL: the
+    /// engine's own `nosql::completion_start`).
     pub fn start(self, text: &str, cursor: usize) -> usize {
-        let mut cursor = cursor.min(text.len());
-        while !text.is_char_boundary(cursor) {
-            cursor -= 1;
+        match self {
+            Self::Sql => token_start(text, cursor),
+            Self::Mongo => nosql::completion_start(&DatabaseType::MongoDB, text, cursor),
+            Self::Redis => nosql::completion_start(&DatabaseType::Redis, text, cursor),
         }
-        let part = |c: char| match self {
-            Self::Sql => false,
-            Self::Mongo => c.is_alphanumeric() || c == '_' || c == '$',
-            Self::Redis => !c.is_whitespace(),
-        };
-        if self == Self::Sql {
-            return token_start(text, cursor);
-        }
-        text[..cursor]
-            .char_indices()
-            .rev()
-            .take_while(|(_, c)| part(*c))
-            .last()
-            .map_or(cursor, |(i, _)| i)
     }
 }
 
@@ -699,6 +687,74 @@ mod tests {
         let (out, _) = apply_suggestion_with(TokenRule::Redis, redis, redis.len(), "user:42");
         assert_eq!(out, "GET user:42", "a key is one token");
         assert_eq!(TokenRule::Redis.start("HGET  ", 6), 6);
+    }
+
+    /// The engine's suggestions, accepted as the popup does, on the text
+    /// the engine completed.
+    fn accept_first(db: &DatabaseType, text: &str, keys: &[String]) -> String {
+        let scope = nosql::NoSqlScope {
+            database: "shop".into(),
+        };
+        let schemas = [SchemaInfo {
+            name: "shop".into(),
+            tables: vec!["users".into()],
+            expanded: false,
+        }];
+        let n = NoSqlScope {
+            db,
+            scope: &scope,
+            schemas: &schemas,
+            keys,
+            prefix: "",
+        };
+        let mut c = Completion::default();
+        c.refresh(text, text.len(), &FieldsSource, Scope::NoSql(n));
+        assert!(c.open, "no suggestion for {text:?}");
+        apply_suggestion_with(c.rule, text, text.len(), &c.items[0].insert).0
+    }
+
+    /// Fields `age` and `address.city` for every collection.
+    struct FieldsSource;
+    impl CompletionSource for FieldsSource {
+        fn tables(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn quotes(&self) -> (char, char) {
+            ('"', '"')
+        }
+        fn columns(&self, _: &TableRef) -> Option<Vec<ColumnInfo>> {
+            let col = |name: &str| ColumnInfo {
+                name: name.into(),
+                type_name: "int".into(),
+                primary_key: false,
+                foreign_key: None,
+            };
+            Some(vec![col("age"), col("address.city")])
+        }
+    }
+
+    #[test]
+    fn engine_suggestions_apply_on_the_engine_span() {
+        let mongo = DatabaseType::MongoDB;
+        assert_eq!(
+            accept_first(&mongo, "db.users.find({age: {$g", &[]),
+            "db.users.find({age: {$gt"
+        );
+        assert_eq!(accept_first(&mongo, "db.us", &[]), "db.users");
+        assert_eq!(
+            accept_first(&mongo, "db.users.find({addr", &[]),
+            "db.users.find({\"address.city\""
+        );
+        assert_eq!(
+            accept_first(&mongo, "db.users.updateOne({}, {$se", &[]),
+            "db.users.updateOne({}, {$set"
+        );
+        let redis = DatabaseType::Redis;
+        let keys = vec!["user:42".to_string(), "a b".to_string()];
+        assert_eq!(accept_first(&redis, "GET user:4", &keys), "GET user:42");
+        assert_eq!(accept_first(&redis, "DEL a", &keys), "DEL \"a b\"");
+        assert_eq!(accept_first(&redis, "DEL \"a", &keys), "DEL \"a b\"");
+        assert_eq!(accept_first(&redis, "hgetal", &keys), "HGETALL");
     }
 
     #[test]

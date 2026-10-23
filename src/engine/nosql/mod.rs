@@ -149,6 +149,17 @@ pub fn complete(
     }
 }
 
+/// Start (bytes) of the text a suggestion of [`complete`] replaces, up to
+/// `cursor`: MongoDB, the word with the `$` typed before it (`$g` → `$gt`);
+/// Redis, the whole argument (`user:4` → `user:42`, quotes included). Both
+/// interfaces replace `completion_start..cursor` with `Suggestion::insert`.
+pub fn completion_start(db: &DatabaseType, text: &str, cursor: usize) -> usize {
+    match db {
+        DatabaseType::Redis => redis::replace_start(text, cursor),
+        _ => mongo::replace_start(text, cursor),
+    }
+}
+
 /// The console text reformatted (MongoDB); `None` when the engine has no
 /// formatter (Redis) or the text doesn't parse.
 pub fn format(db: &DatabaseType, text: &str) -> Option<String> {

@@ -3,8 +3,8 @@
 use egui::{Key, Modifiers, Sense, Stroke, StrokeKind};
 use egui_phosphor::regular as icon;
 
-use crate::engine::db::azure::{self, AzureCloud};
 use crate::engine::config::folders;
+use crate::engine::db::azure::{self, AzureCloud};
 use crate::engine::db::{entra_interactive, gcp_iam};
 use crate::engine::models::{
     AzureAuthMethod, ConnectionConfig, DatabaseType, DbAuthMethod, Flavor, SslMode,
@@ -262,7 +262,11 @@ impl ConnectionForm {
 
     /// The existing folders to choose from, and the connection's schemas
     /// when it is open.
-    pub fn with_context(mut self, known_folders: Vec<String>, schemas: Option<Vec<String>>) -> Self {
+    pub fn with_context(
+        mut self,
+        known_folders: Vec<String>,
+        schemas: Option<Vec<String>>,
+    ) -> Self {
         self.known_folders = known_folders;
         self.schemas = schemas;
         self
@@ -572,10 +576,6 @@ impl ConnectionForm {
                 self.folder_row(ui);
                 ui.end_row();
 
-                ui.label("Schémas affichés");
-                self.schemas_row(ui);
-                ui.end_row();
-
                 ui.label("Coller une URL");
                 ui.horizontal(|ui| {
                     let field = ui.add(
@@ -657,6 +657,10 @@ impl ConnectionForm {
                     });
                     ui.end_row();
                 }
+
+                ui.label("Schémas affichés");
+                self.schemas_row(ui);
+                ui.end_row();
             });
         let forced = self.advanced_force();
         if !advanced_fields(&self.db_type, &self.azure_auth).is_empty() {
@@ -919,7 +923,10 @@ impl ConnectionForm {
             let mut chosen = None;
             ui.add_enabled_ui(!self.known_folders.is_empty(), |ui| {
                 ui.menu_button(icon::CARET_DOWN, |ui| {
-                    if ui.button(format!("{} Racine", icon::ARROW_LINE_UP)).clicked() {
+                    if ui
+                        .button(format!("{} Racine", icon::ARROW_LINE_UP))
+                        .clicked()
+                    {
                         chosen = Some(String::new());
                     }
                     for path in &self.known_folders {

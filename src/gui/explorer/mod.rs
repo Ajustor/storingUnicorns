@@ -111,6 +111,7 @@ enum Action {
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let mut actions = Vec::new();
+    let top = ui.cursor().top();
     ui.horizontal(|ui| {
         ui.strong("Explorateur");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -145,6 +146,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             .hint_text(format!("{} Filtrer les tables", icon::MAGNIFYING_GLASS))
             .desired_width(f32::INFINITY),
     );
+    let header = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+    if let Some(item) = DragAndDrop::payload::<DragItem>(ui.ctx()) {
+        dragging_ui(ui, header, &app.config.connections, &item, &mut actions);
+    }
     ui.separator();
     if app.config.connections.is_empty() {
         ui.label(RichText::new("Aucune connexion. Cliquez sur + pour en ajouter une.").weak());
@@ -207,9 +212,6 @@ fn tree_ui(
         all_folders: &flat.all_folders,
         show_hidden: &show_hidden,
     };
-    if let Some(item) = DragAndDrop::payload::<DragItem>(ui.ctx()) {
-        dragging_ui(ui, &cx, &item, actions);
-    }
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show_rows(ui, cx.row_height, flat.rows.len(), |ui, range| {
@@ -220,21 +222,56 @@ fn tree_ui(
 }
 
 /// While an item is dragged: what it is, by the pointer, and the root as a
-/// drop target above the tree.
-fn dragging_ui(ui: &mut egui::Ui, cx: &Cx, item: &DragItem, actions: &mut Vec<Action>) {
+/// drop target over the explorer's `header` (title and filter: covering
+/// them leaves the rows where they are).
+fn dragging_ui(
+    ui: &mut egui::Ui,
+    header: egui::Rect,
+    connections: &[ConnectionConfig],
+    item: &DragItem,
+    actions: &mut Vec<Action>,
+) {
     let text = match item {
         DragItem::Connection(name) => format!("{} {name}", icon::DATABASE),
         DragItem::Folder(path) => format!("{} {}", icon::FOLDER, folders::name(path)),
     };
     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), Id::new("explorer_drag"), |ui| {
-        ui.label(text)
+        ui.add(Label::new(text).extend())
     });
-    fixed_row(ui, cx.row_height, "explorer_root_drop", |ui, rect| {
-        ui.add_space(ui.spacing().indent);
-        ui.label(RichText::new(format!("{} Racine", icon::ARROW_LINE_UP)).weak());
-        drop_target(ui, rect, cx, "", actions);
-    });
+    if !can_drop(item, "", |name| folder_of(connections, name)) {
+        return;
+    }
+    let visuals = ui.visuals();
+    let painter = ui.painter();
+    painter.rect(
+        header,
+        4.0,
+        visuals.panel_fill,
+        visuals.widgets.noninteractive.bg_stroke,
+        StrokeKind::Inside,
+    );
+    painter.text(
+        header.center(),
+        egui::Align2::CENTER_CENTER,
+        format!(
+            "{} Déposer ici pour ranger à la racine",
+            icon::ARROW_LINE_UP
+        ),
+        egui::TextStyle::Body.resolve(ui.style()),
+        visuals.weak_text_color(),
+    );
+    drop_target(ui, header, connections, "", actions);
+}
+
+/// The folder of connection `name` (`""`: the root).
+fn folder_of(connections: &[ConnectionConfig], name: &str) -> String {
+    connections
+        .iter()
+        .find(|c| c.name == name)
+        .and_then(|c| c.folder.as_deref())
+        .and_then(|f| folders::normalize(f).ok())
+        .unwrap_or_default()
 }
 
 /// Highlight `rect` while the dragged item can be dropped into folder
@@ -243,7 +280,7 @@ fn dragging_ui(ui: &mut egui::Ui, cx: &Cx, item: &DragItem, actions: &mut Vec<Ac
 fn drop_target(
     ui: &mut egui::Ui,
     rect: egui::Rect,
-    cx: &Cx,
+    connections: &[ConnectionConfig],
     target: &str,
     actions: &mut Vec<Action>,
 ) {
@@ -254,7 +291,7 @@ fn drop_target(
     if !ui.rect_contains_pointer(rect) {
         return;
     }
-    if !can_drop(&item, target, |name| cx.folder_of(name)) {
+    if !can_drop(&item, target, |name| folder_of(connections, name)) {
         ctx.set_cursor_icon(egui::CursorIcon::NotAllowed);
         return;
     }
@@ -467,16 +504,6 @@ struct TableRef<'a> {
 }
 
 impl<'a> Cx<'a> {
-    /// The folder of connection `name` (`""`: the root).
-    fn folder_of(&self, name: &str) -> String {
-        self.connections
-            .iter()
-            .find(|c| c.name == name)
-            .and_then(|c| c.folder.as_deref())
-            .and_then(|f| folders::normalize(f).ok())
-            .unwrap_or_default()
-    }
-
     fn table(&self, at: TableAt) -> Option<TableRef<'a>> {
         let connection = &self.connections.get(at.conn)?.name;
         let session = self.sessions.get(connection)?;
@@ -534,7 +561,7 @@ fn row_contents(
         } => {
             if let Some(path) = cx.folders.get(folder) {
                 folder_row(ui, path, count, open, actions);
-                drop_target(ui, rect, cx, path, actions);
+                drop_target(ui, rect, cx.connections, path, actions);
             }
         }
         RowKind::Connection { conn, open } => {
@@ -764,7 +791,7 @@ fn schema_row(ui: &mut egui::Ui, row: &SchemaRow, actions: &mut Vec<Action>) {
 
 /// « Déplacer vers… »: the root, every folder, or a new one.
 fn move_menu(ui: &mut egui::Ui, cx: &Cx, name: &str, actions: &mut Vec<Action>) {
-    let current = cx.folder_of(name);
+    let current = folder_of(cx.connections, name);
     let mut target = None;
     if ui
         .add_enabled(

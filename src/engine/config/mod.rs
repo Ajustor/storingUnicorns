@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::models::ConnectionConfig;
 
+pub mod folders;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     pub connections: Vec<ConnectionConfig>,
@@ -16,6 +18,9 @@ pub struct AppConfig {
     /// GUI theme: "system" (default), "dark" or "light".
     #[serde(default)]
     pub theme: Option<String>,
+    /// Connection folders (even empty ones), as "A/B" paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<String>,
 }
 
 /// Environment variable overriding the directory holding every file the app

@@ -186,6 +186,12 @@ pub struct ConnectionConfig {
     /// PostgreSQL / MySQL only; `None` = `DbAuthMethod::Password`.
     #[serde(default)]
     pub db_auth: Option<DbAuthMethod>,
+    /// Folder path ("Clients/ACME/Prod"); `None` = root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    /// Schemas hidden from the explorer, table search and completion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_schemas: Vec<String>,
 }
 
 impl ConnectionConfig {
@@ -284,6 +290,8 @@ impl Default for ConnectionConfig {
             ssl_ca: None,
             flavor: None,
             db_auth: None,
+            folder: None,
+            hidden_schemas: Vec::new(),
         }
     }
 }

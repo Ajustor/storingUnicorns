@@ -454,6 +454,8 @@ impl ConnectionForm {
             flavor: self.flavor.filter(|f| f.driver() == self.db_type),
             // The default method is left out, as in older files.
             db_auth: iam.then_some(DbAuthMethod::GcpIam),
+            folder: None,
+            hidden_schemas: Vec::new(),
         })
     }
 

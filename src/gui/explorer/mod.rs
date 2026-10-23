@@ -218,7 +218,43 @@ fn tree_ui(
             for row in &flat.rows[range] {
                 row_ui(ui, &cx, row, actions);
             }
+            if DragAndDrop::has_payload_of_type::<DragItem>(ui.ctx()) {
+                drag_scroll(ui, cx.row_height);
+            }
         });
+}
+
+/// Scroll speed while dragging by an edge of the tree, in points / second.
+const DRAG_SCROLL_SPEED: f32 = 600.0;
+
+/// While dragging, scroll the tree when the pointer is within one row of
+/// its top or bottom edge (`ui`: the scroll area's content).
+fn drag_scroll(ui: &mut egui::Ui, edge: f32) {
+    let Some(pointer) = ui.ctx().pointer_latest_pos() else {
+        return;
+    };
+    let view = ui.clip_rect();
+    let direction = edge_direction(view.y_range(), pointer.y, edge);
+    if direction == 0.0 || !view.x_range().contains(pointer.x) {
+        return;
+    }
+    let dt = ui.input(|i| i.stable_dt).min(0.1);
+    ui.scroll_with_delta(egui::vec2(0.0, direction * DRAG_SCROLL_SPEED * dt));
+    ui.ctx().request_repaint();
+}
+
+/// `1.0` (scroll up) with `y` within `edge` of the top of `view`, `-1.0`
+/// (down) within `edge` of its bottom, else `0.0` (also outside it).
+fn edge_direction(view: egui::Rangef, y: f32, edge: f32) -> f32 {
+    if !view.contains(y) {
+        0.0
+    } else if y < view.min + edge {
+        1.0
+    } else if y > view.max - edge {
+        -1.0
+    } else {
+        0.0
+    }
 }
 
 /// While an item is dragged: what it is, by the pointer, and the root as a
@@ -578,6 +614,11 @@ fn row_contents(
             if let Some(config) = cx.connections.get(conn) {
                 let show_hidden = cx.show_hidden.get(conn).copied().unwrap_or(false);
                 connection_row(ui, cx, config, open, show_hidden, actions);
+                // In a folder, the row takes drops for that folder.
+                let parent = folder_of(cx.connections, &config.name);
+                if !parent.is_empty() {
+                    drop_target(ui, rect, cx.connections, &parent, actions);
+                }
             }
         }
         RowKind::Note(text) => {
@@ -1139,6 +1180,17 @@ fn item_row(ui: &mut egui::Ui, d: &TableDetails, group: Group, index: usize) {
 mod tests {
     use super::*;
     use crate::engine::models::SchemaInfo;
+
+    #[test]
+    fn dragging_by_an_edge_scrolls_towards_it() {
+        let view = egui::Rangef::new(100.0, 400.0);
+        assert_eq!(edge_direction(view, 105.0, 20.0), 1.0, "top: up");
+        assert_eq!(edge_direction(view, 395.0, 20.0), -1.0, "bottom: down");
+        assert_eq!(edge_direction(view, 250.0, 20.0), 0.0);
+        // Above the tree is the root's drop zone: no scrolling there.
+        assert_eq!(edge_direction(view, 90.0, 20.0), 0.0);
+        assert_eq!(edge_direction(view, 410.0, 20.0), 0.0);
+    }
 
     #[test]
     fn only_browser_sign_ins_can_be_forgotten() {

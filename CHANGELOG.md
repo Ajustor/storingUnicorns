@@ -7,6 +7,33 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Nouveautés
+
+- **Navigation par clés étrangères** : les colonnes FK (avec `→ table.colonne`)
+  et les clés primaires sont marquées dans la grille, l'explorateur, la
+  structure et la complétion. Dans la grille, cliquer sur le lien d'une cellule
+  FK (ou `Alt+Entrée`) affiche la ligne liée dans le panneau de valeur, avec
+  fil d'Ariane, **Retour**, ses propres clés étrangères et **Référencée par** ;
+  `Ctrl+clic` ou **Ouvrir dans un onglet** ouvre la table liée filtrée. Le menu
+  contextuel propose **Voir la ligne liée** et **Enregistrements liés**. La
+  structure affiche **Lien**, **Clés étrangères** et **Référencée par**, avec
+  des liens cliquables.
+
+### Corrections
+
+- MySQL : une valeur contenant un antislash (`\`) était mal écrite dans les
+  requêtes générées (modifications de la grille, suppression, navigation) : elle
+  pouvait faire échouer la requête ou, avec certaines valeurs, en modifier le
+  sens ; c'est corrigé.
+- SQL Server / Azure : les valeurs Unicode (accents hors page de code,
+  idéogrammes, emoji) sont comparées correctement.
+- PostgreSQL : une table partitionnée n'apparaît qu'une fois parmi les tables
+  qui en référencent une autre.
+- SQLite : les clés étrangères sans colonne cible explicite pointent vers la
+  clé primaire.
+
 ## [0.17.0] - 2026-10-22
 
 ### Modifications

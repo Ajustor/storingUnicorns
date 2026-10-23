@@ -316,12 +316,26 @@ pub struct ForeignKeyInfo {
     pub name: String,
     /// Referencing columns of this table, in key order.
     pub columns: Vec<String>,
+    /// Referenced table, always qualified like `get_tables` (`schema.table`).
     pub ref_table: String,
     /// Referenced columns of `ref_table`, matching `columns` one to one.
     pub ref_columns: Vec<String>,
 }
 
-/// Columns, indexes and foreign keys of a table.
+/// A foreign key of another table that points at this one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncomingForeignKey {
+    /// Constraint name (empty for SQLite, which does not expose it).
+    pub name: String,
+    /// Referencing table, qualified like `get_tables` (`schema.table`).
+    pub table: String,
+    /// Columns of the referencing table, in key order.
+    pub columns: Vec<String>,
+    /// Columns of this table, matching `columns` one to one.
+    pub ref_columns: Vec<String>,
+}
+
+/// Columns, indexes, foreign keys and incoming foreign keys of a table.
 #[derive(Debug, Clone, Default)]
 pub struct TableDetails {
     pub columns: Vec<Column>,
@@ -332,6 +346,10 @@ pub struct TableDetails {
     pub indexes_error: Option<String>,
     /// Same for `foreign_keys`.
     pub foreign_keys_error: Option<String>,
+    /// Foreign keys of other tables pointing at this one.
+    pub incoming: Vec<IncomingForeignKey>,
+    /// Same as `indexes_error` for `incoming`.
+    pub incoming_error: Option<String>,
 }
 
 /// The value of a NULL cell. Cells are text, so NULL needs a value of its

@@ -3,6 +3,7 @@ mod app;
 mod dialogs;
 mod editor;
 mod explorer;
+mod fk;
 mod history_popup;
 mod modal;
 mod persist;

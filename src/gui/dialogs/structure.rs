@@ -4,14 +4,17 @@
 use egui::RichText;
 use egui_phosphor::regular as icon;
 
-use crate::engine::db::utils::display_table_name;
-use crate::engine::models::{Column, DatabaseType};
+use crate::engine::db::utils::{display_qualified, display_table_name};
+use crate::engine::models::{
+    Column, DatabaseType, ForeignKeyInfo, IncomingForeignKey, TableDetails,
+};
 use crate::engine::services::{ColumnDefinition, SchemaModification};
 
 use super::super::app::App;
+use super::super::fk;
 use super::super::modal::{self, MessageKind, ModalButton, ModalResponse, ModalSize, ModalSpec};
 use super::super::status;
-use super::super::theme::{ACCENT, ERROR};
+use super::super::theme::ERROR;
 use super::Dialog;
 
 /// One pending change of the structure dialog.
@@ -69,6 +72,9 @@ pub struct StructureDialog {
     pub applying: bool,
     /// Last failed modification.
     pub error: Option<String>,
+    /// A linked table clicked (its name as the key gives it): its
+    /// structure replaces this one.
+    pub goto: Option<String>,
 }
 
 /// Open the structure of `table` (qualified) on `connection`, loading its
@@ -87,6 +93,7 @@ pub fn open(app: &mut App, connection: &str, table: &str, title: &str) {
         edit: None,
         applying: false,
         error: None,
+        goto: None,
     }));
 }
 
@@ -170,6 +177,8 @@ pub enum StructureAction {
     Apply,
     /// Drop the pending change.
     CloseEdit,
+    /// Open the structure of the linked table in `goto`.
+    Goto,
 }
 
 /// What the body lists.
@@ -177,7 +186,10 @@ enum Content<'a> {
     NotConnected,
     Loading,
     Error(&'a str),
-    Columns { columns: &'a [Column], sqlite: bool },
+    Columns {
+        details: &'a TableDetails,
+        sqlite: bool,
+    },
 }
 
 /// Draw the dialog in the standard modal; what the user asked for.
@@ -189,12 +201,37 @@ pub fn ui(app: &App, ui: &mut egui::Ui, d: &mut StructureDialog) -> ModalRespons
         None => Content::NotConnected,
         Some((None, _)) | Some((_, true)) => Content::Loading,
         Some((Some(Err(e)), _)) => Content::Error(e),
-        Some((Some(Ok(details)), _)) => Content::Columns {
-            columns: &details.columns,
-            sqlite,
-        },
+        Some((Some(Ok(details)), _)) => Content::Columns { details, sqlite },
     };
-    draw(ui, d, content)
+    let response = draw(ui, d, content);
+    with_goto(response, d)
+}
+
+/// Why the links to other tables are disabled: following one replaces
+/// the dialog, which would drop the pending column change.
+fn links_lock(d: &StructureDialog) -> Option<&'static str> {
+    if d.applying {
+        Some("Modification en cours…")
+    } else if d.edit.is_some() {
+        Some("Appliquez ou annulez la modification en cours d'abord")
+    } else {
+        None
+    }
+}
+
+/// A link clicked in the body (`goto`) answers like a button, unless the
+/// links are locked (`links_lock`).
+fn with_goto(
+    response: ModalResponse<StructureAction>,
+    d: &mut StructureDialog,
+) -> ModalResponse<StructureAction> {
+    if links_lock(d).is_some() {
+        d.goto = None;
+    }
+    match (&response, &d.goto) {
+        (ModalResponse::None, Some(_)) => ModalResponse::Button(StructureAction::Goto),
+        _ => response,
+    }
 }
 
 fn draw(
@@ -251,12 +288,22 @@ fn body(ui: &mut egui::Ui, d: &mut StructureDialog, content: Content) {
         Content::Error(e) => {
             ui.colored_label(ERROR, e);
         }
-        Content::Columns { columns, sqlite } => {
+        Content::Columns { details, sqlite } => {
             egui::ScrollArea::vertical()
                 .id_salt("structure_columns_scroll")
                 .max_height(320.0)
                 .show(ui, |ui| {
-                    columns_grid(ui, columns, sqlite, d.applying, &mut d.edit);
+                    let lock = links_lock(d);
+                    let mut grid = ColumnsGrid {
+                        details,
+                        sqlite,
+                        applying: d.applying,
+                        lock,
+                        edit: &mut d.edit,
+                        goto: &mut d.goto,
+                    };
+                    grid.show(ui);
+                    links_sections(ui, details, lock, &mut d.goto);
                 });
             if ui
                 .add_enabled(
@@ -303,6 +350,19 @@ fn body(ui: &mut egui::Ui, d: &mut StructureDialog, content: Content) {
 /// Do `action`; the dialog stays open.
 pub fn act(app: &mut App, d: &mut StructureDialog, action: StructureAction) -> bool {
     match action {
+        StructureAction::Goto => {
+            let Some(name) = d.goto.take() else {
+                return true;
+            };
+            let Some(session) = app.sessions.get(&d.connection) else {
+                return true;
+            };
+            let key = fk::target_key(&session.schemas, session.quotes, &d.table, &name);
+            let connection = d.connection.clone();
+            // Replaces this dialog.
+            open(app, &connection, &key, &display_qualified(&name));
+            return false;
+        }
         StructureAction::CloseEdit => {
             d.edit = None;
             d.error = None;
@@ -327,64 +387,168 @@ pub fn act(app: &mut App, d: &mut StructureDialog, action: StructureAction) -> b
     true
 }
 
-/// Column list with per-column actions (they set `edit`).
-fn columns_grid(
-    ui: &mut egui::Ui,
-    columns: &[Column],
+/// Column list with per-column actions (they set `edit`) and links (they
+/// set `goto`).
+struct ColumnsGrid<'a> {
+    details: &'a TableDetails,
     sqlite: bool,
     applying: bool,
-    edit: &mut Option<ColumnEdit>,
-) {
-    egui::Grid::new("structure_columns")
-        .striped(true)
-        .num_columns(5)
-        .spacing([18.0, 4.0])
-        .show(ui, |ui| {
-            for h in ["Colonne", "Type", "Nullable", "Clé", ""] {
-                ui.strong(h);
-            }
-            ui.end_row();
-            for c in columns {
-                ui.label(&c.name);
-                ui.label(&c.type_name);
-                ui.label(if c.nullable { "oui" } else { "non" });
-                if c.is_primary_key {
-                    ui.label(RichText::new(icon::KEY).color(ACCENT))
-                        .on_hover_text("Clé primaire");
-                } else {
-                    ui.label("");
+    /// Why the links are disabled, if they are.
+    lock: Option<&'static str>,
+    edit: &'a mut Option<ColumnEdit>,
+    goto: &'a mut Option<String>,
+}
+
+impl ColumnsGrid<'_> {
+    fn show(&mut self, ui: &mut egui::Ui) {
+        let color = fk::link_color(ui.visuals().dark_mode);
+        let details = self.details;
+        let fks = &details.foreign_keys;
+        egui::Grid::new("structure_columns")
+            .striped(true)
+            .num_columns(6)
+            .spacing([18.0, 4.0])
+            .show(ui, |ui| {
+                for h in ["Colonne", "Type", "Nullable", "Clé", "Lien", ""] {
+                    ui.strong(h);
                 }
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!applying, |ui| {
-                        let modify = ui
-                            .add_enabled(!sqlite, egui::Button::new(icon::PENCIL_SIMPLE).small())
-                            .on_hover_text("Modifier le type")
-                            .on_disabled_hover_text("SQLite ne permet pas de modifier une colonne");
-                        if modify.clicked() {
-                            *edit = Some(ColumnEdit::Modify(definition(c)));
+                ui.end_row();
+                for c in &details.columns {
+                    let link = fk::link_of(fks, &c.name);
+                    ui.label(&c.name);
+                    ui.label(&c.type_name);
+                    ui.label(if c.nullable { "oui" } else { "non" });
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if c.is_primary_key {
+                            fk::pk_badge(ui);
                         }
-                        if ui
-                            .small_button(icon::TEXT_AA)
-                            .on_hover_text("Renommer")
-                            .clicked()
-                        {
-                            *edit = Some(ColumnEdit::Rename {
-                                old: c.name.clone(),
-                                new: c.name.clone(),
-                            });
-                        }
-                        if ui
-                            .small_button(RichText::new(icon::TRASH).color(ERROR))
-                            .on_hover_text("Supprimer")
-                            .clicked()
-                        {
-                            *edit = Some(ColumnEdit::Drop(c.name.clone()));
+                        if let Some(l) = &link {
+                            fk::fk_badge(ui, &l.tooltip());
                         }
                     });
-                });
-                ui.end_row();
-            }
+                    match &link {
+                        Some(l) => {
+                            let text = format!("→ {}", l.target);
+                            let link = egui::Link::new(RichText::new(text).color(color));
+                            if ui
+                                .add_enabled(self.lock.is_none(), link)
+                                .on_hover_text(format!(
+                                    "{} · ouvrir la structure de {}",
+                                    l.tooltip(),
+                                    l.table
+                                ))
+                                .on_disabled_hover_text(self.lock.unwrap_or_default())
+                                .clicked()
+                            {
+                                *self.goto = Some(fks[l.fk].ref_table.clone());
+                            }
+                        }
+                        None => {
+                            ui.label("");
+                        }
+                    }
+                    self.actions(ui, c);
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn actions(&mut self, ui: &mut egui::Ui, c: &Column) {
+        let (sqlite, edit) = (self.sqlite, &mut *self.edit);
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!self.applying, |ui| {
+                let modify = ui
+                    .add_enabled(!sqlite, egui::Button::new(icon::PENCIL_SIMPLE).small())
+                    .on_hover_text("Modifier le type")
+                    .on_disabled_hover_text("SQLite ne permet pas de modifier une colonne");
+                if modify.clicked() {
+                    *edit = Some(ColumnEdit::Modify(definition(c)));
+                }
+                if ui
+                    .small_button(icon::TEXT_AA)
+                    .on_hover_text("Renommer")
+                    .clicked()
+                {
+                    *edit = Some(ColumnEdit::Rename {
+                        old: c.name.clone(),
+                        new: c.name.clone(),
+                    });
+                }
+                if ui
+                    .small_button(RichText::new(icon::TRASH).color(ERROR))
+                    .on_hover_text("Supprimer")
+                    .clicked()
+                {
+                    *edit = Some(ColumnEdit::Drop(c.name.clone()));
+                }
+            });
         });
+    }
+}
+
+/// `(a, b) → pairs (x, y)`: an outgoing key, its columns grouped.
+fn outgoing_line(fk: &ForeignKeyInfo) -> String {
+    let refs: Vec<&str> = fk
+        .ref_columns
+        .iter()
+        .map(String::as_str)
+        .filter(|c| !c.is_empty())
+        .collect();
+    let target = display_qualified(&fk.ref_table);
+    let target = if refs.is_empty() {
+        target
+    } else {
+        format!("{target} ({})", refs.join(", "))
+    };
+    format!("({}) → {target}", fk.columns.join(", "))
+}
+
+/// `orders (user_id) → id`: an incoming key.
+fn incoming_line(fk: &IncomingForeignKey) -> String {
+    format!("{} → {}", fk::incoming_label(fk), fk.ref_columns.join(", "))
+}
+
+/// The keys, each once: "Clés étrangères" (outgoing) and "Référencée par"
+/// (incoming). A click opens the linked table's structure.
+fn links_sections(
+    ui: &mut egui::Ui,
+    d: &TableDetails,
+    lock: Option<&'static str>,
+    goto: &mut Option<String>,
+) {
+    let color = fk::link_color(ui.visuals().dark_mode);
+    let mut link = |ui: &mut egui::Ui, text: String, table: &str| {
+        let link = egui::Link::new(RichText::new(format!("{} {text}", icon::LINK)).color(color));
+        if ui
+            .add_enabled(lock.is_none(), link)
+            .on_hover_text(format!(
+                "Ouvrir la structure de {}",
+                display_qualified(table)
+            ))
+            .on_disabled_hover_text(lock.unwrap_or_default())
+            .clicked()
+        {
+            *goto = Some(table.to_string());
+        }
+    };
+    if !d.foreign_keys.is_empty() {
+        ui.add_space(8.0);
+        ui.strong("Clés étrangères");
+        for fk in &d.foreign_keys {
+            link(ui, outgoing_line(fk), &fk.ref_table);
+        }
+    }
+    ui.add_space(8.0);
+    ui.strong("Référencée par");
+    if let Some(e) = &d.incoming_error {
+        ui.colored_label(ERROR, e);
+    } else if d.incoming.is_empty() {
+        ui.label(RichText::new("Aucune table").weak());
+    }
+    for fk in &d.incoming {
+        link(ui, incoming_line(fk), &fk.table);
+    }
 }
 
 #[cfg(test)]
@@ -451,6 +615,7 @@ mod tests {
             edit,
             applying: false,
             error: None,
+            goto: None,
         }
     }
 
@@ -511,12 +676,15 @@ mod tests {
 
     /// Draw `d` over columns, then press `k`: the response.
     fn press(d: &mut StructureDialog, k: egui::Key) -> ModalResponse<StructureAction> {
-        let columns = [Column {
-            name: "id".into(),
-            type_name: "INTEGER".into(),
-            nullable: false,
-            is_primary_key: true,
-        }];
+        let details = TableDetails {
+            columns: vec![Column {
+                name: "id".into(),
+                type_name: "INTEGER".into(),
+                nullable: false,
+                is_primary_key: true,
+            }],
+            ..Default::default()
+        };
         let ctx = egui::Context::default();
         let mut last = ModalResponse::None;
         for events in [vec![], vec![key(k)]] {
@@ -526,7 +694,7 @@ mod tests {
             };
             let _ = ctx.run(input, |ctx| {
                 let content = Content::Columns {
-                    columns: &columns,
+                    details: &details,
                     sqlite: false,
                 };
                 last = egui::Modal::new(egui::Id::new("dialog"))
@@ -535,6 +703,64 @@ mod tests {
             });
         }
         last
+    }
+
+    #[test]
+    fn keys_are_listed_once_with_their_columns_grouped() {
+        let out = ForeignKeyInfo {
+            name: "fk".into(),
+            columns: vec!["a".into(), "b".into()],
+            ref_table: "public.pairs".into(),
+            ref_columns: vec!["x".into(), "y".into()],
+        };
+        assert_eq!(outgoing_line(&out), "(a, b) → public.pairs (x, y)");
+        let implicit = ForeignKeyInfo {
+            ref_columns: vec![String::new()],
+            columns: vec!["owner".into()],
+            ..out
+        };
+        assert_eq!(outgoing_line(&implicit), "(owner) → public.pairs");
+        let incoming = IncomingForeignKey {
+            name: String::new(),
+            table: "main.orders".into(),
+            columns: vec!["user_id".into()],
+            ref_columns: vec!["id".into()],
+        };
+        assert_eq!(incoming_line(&incoming), "main.orders (user_id) → id");
+    }
+
+    #[test]
+    fn a_clicked_link_answers_like_a_button() {
+        let mut d = dialog(None);
+        assert_eq!(with_goto(ModalResponse::None, &mut d), ModalResponse::None);
+        d.goto = Some("users".into());
+        assert_eq!(
+            with_goto(ModalResponse::None, &mut d),
+            ModalResponse::Button(StructureAction::Goto)
+        );
+        // Closing the dialog in the same frame wins.
+        assert_eq!(
+            with_goto(ModalResponse::Cancel, &mut d),
+            ModalResponse::Cancel
+        );
+    }
+
+    #[test]
+    fn links_are_locked_while_a_column_change_is_pending() {
+        let mut d = dialog(None);
+        assert_eq!(links_lock(&d), None);
+        let mut editing = dialog(Some(filled()));
+        assert!(links_lock(&editing).is_some());
+        editing.goto = Some("users".into());
+        assert_eq!(
+            with_goto(ModalResponse::None, &mut editing),
+            ModalResponse::None,
+            "the pending change is kept"
+        );
+        assert_eq!(editing.goto, None);
+        assert!(editing.edit.is_some());
+        d.applying = true;
+        assert_eq!(links_lock(&d), Some("Modification en cours…"));
     }
 
     #[test]

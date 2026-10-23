@@ -94,6 +94,11 @@ impl App {
                     sessions::accept_details(&mut s.details, &mut s.loading, table, run, outcome);
                 }
             }
+            Event::LinkedRow { name, run, outcome } => {
+                if let Some(p) = self.fk_preview.as_mut().filter(|p| p.connection == name) {
+                    p.on_loaded(run, outcome);
+                }
+            }
             ev @ Event::Script { .. } => self.on_script(ev),
             ev @ Event::Submitted { .. } if self.is_console(&ev) => self.on_console_submitted(ev),
             ev @ (Event::Page { .. }

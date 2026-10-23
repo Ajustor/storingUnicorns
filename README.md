@@ -120,6 +120,28 @@ montre le SQL complet avec sa coloration. La recherche porte sur le SQL et sur
 le nom de la connexion. **Insérer** place la requête dans la console, **Copier**
 la met dans le presse-papiers.
 
+### Clés étrangères
+
+Les colonnes qui portent une clé étrangère sont marquées **FK** avec leur cible
+(`→ table.colonne`) dans les en-têtes de la grille, l'explorateur, la structure
+et la complétion ; les colonnes de clé primaire sont marquées d'une clé.
+
+- **Grille** : une cellule FK est un lien. Cliquer sur l'icône de lien (ou
+  `Alt+Entrée`) affiche la ligne liée dans le panneau de valeur : fil d'Ariane,
+  bouton **Retour**, ses propres clés étrangères cliquables pour continuer, et
+  la liste **Référencée par** (les lignes d'autres tables qui pointent vers
+  elle). `Ctrl+clic` sur le lien, ou **Ouvrir dans un onglet**, ouvre un nouvel
+  onglet « table (filtre) » filtré sur cette ligne.
+- Si la clé ne correspond à aucune ligne, l'aperçu indique que la clé est
+  orpheline.
+- **Menu contextuel d'une cellule** : **Voir la ligne liée** et
+  **Enregistrements liés** (les lignes des tables qui référencent la ligne
+  courante, dans un onglet filtré).
+- **Structure** : la colonne **Lien** donne la cible de chaque clé, et les
+  sections **Clés étrangères** et **Référencée par** listent les clés sortantes
+  et entrantes ; chaque lien est cliquable et ouvre la structure de l'autre
+  table.
+
 ### Raccourcis (GUI)
 
 | Touche                      | Action                                                   |
@@ -134,6 +156,7 @@ la met dans le presse-papiers.
 | `Ctrl+S`                    | Enregistrer les consoles                                 |
 | `Ctrl+Espace`               | Autocomplétion contextuelle (console, barres WHERE / ORDER BY) |
 | `F2` / double-clic          | Éditer la cellule                                        |
+| `Alt+Entrée`                | Cellule FK : voir la ligne liée dans le panneau de valeur |
 | `Alt+Insert` / `Ctrl+Suppr` | Ajouter / supprimer une ligne                            |
 | `Ctrl+R`                    | Rafraîchir (explorateur ou données)                      |
 

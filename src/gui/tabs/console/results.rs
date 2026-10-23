@@ -167,6 +167,8 @@ fn result_view(
             editable: r.editable && lock.is_none(),
             server_sort: false,
             sort_indicator: None,
+            links: &[],
+            incoming: &[],
         },
     );
     if action == GridAction::Export {

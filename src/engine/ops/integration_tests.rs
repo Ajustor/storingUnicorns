@@ -253,7 +253,8 @@ async fn exercise(conn: &DatabaseConnection, d: &Dialect) {
     assert_eq!(fks[0].name, "child_parent_fk");
     assert_eq!(fks[0].columns, ["cb", "ca"], "FK columns in key order");
     assert_eq!(fks[0].ref_columns, ["a", "b"]);
-    assert_eq!(fks[0].ref_table, "parent");
+    // Qualified even in the table's own schema.
+    assert_eq!(fks[0].ref_table, format!("{}.parent", d.schema));
 
     let details = table_details(conn, &TableCache::default(), &child)
         .await
@@ -1201,4 +1202,411 @@ async fn integration_gcp_iam_token_renewal() {
         .execute(&admin)
         .await
         .unwrap();
+}
+
+/// Incoming foreign keys and the row-matching conditions, on two schemas
+/// `s1` / `s2` (MySQL: databases) that `setup` (re)creates with:
+/// `s1.single (id)`, `s1.parent (a, b)` keyed on `(a, b)`, `s1.child` with
+/// `child_single_fk (pid) → single (id)` and `child_parent_fk (cb, ca) →
+/// parent (a, b)`, `s2.other` with `other_single_fk (sid) → s1.single (id)`;
+/// one row each: `single.id = 1`, `parent = (1, 2)`, `child = (pid 1, ca 2,
+/// cb 1)`, `other.sid = 1`.
+async fn check_incoming_fks(conn: &DatabaseConnection, db: DatabaseType, setup: &[&str]) {
+    use crate::engine::db::utils::split_qualified;
+    use crate::engine::sql::relations::{follow, referencing};
+
+    for sql in setup {
+        exec(conn, sql).await;
+    }
+    let quotes = quote_chars(&db);
+    let q = |name: &str| match split_qualified(name) {
+        (Some(schema), table) => qualified(&schema, &table, quotes),
+        (None, table) => qualified("su_it_fk1", &table, quotes),
+    };
+    let count = |table: String, condition: String| async move {
+        scalar(
+            conn,
+            &format!("SELECT COUNT(*) FROM {} WHERE {condition}", q(&table)),
+        )
+        .await
+    };
+
+    // Simple key, referenced from its own schema and from another one.
+    let single = conn
+        .get_incoming_foreign_keys(&q("su_it_fk1.single"))
+        .await
+        .unwrap();
+    let got: Vec<_> = single
+        .iter()
+        .map(|k| {
+            (
+                k.name.as_str(),
+                k.table.as_str(),
+                k.columns.clone(),
+                k.ref_columns.clone(),
+            )
+        })
+        .collect();
+    let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        got,
+        [
+            (
+                "child_single_fk",
+                "su_it_fk1.child",
+                v(&["pid"]),
+                v(&["id"])
+            ),
+            (
+                "other_single_fk",
+                "su_it_fk2.other",
+                v(&["sid"]),
+                v(&["id"])
+            ),
+        ]
+    );
+    for fk in &single {
+        let row = |c: &str| (c == "id").then(|| "1".to_string());
+        let (table, condition) = referencing(fk, &row, &db).unwrap();
+        assert_eq!(count(table, condition).await, "1", "{fk:?}");
+    }
+
+    // Composite key, in key order (not column order), through the details.
+    let details = table_details(conn, &TableCache::default(), &q("su_it_fk1.parent"))
+        .await
+        .unwrap();
+    assert_eq!(details.incoming_error, None);
+    assert_eq!(details.incoming.len(), 1, "{:?}", details.incoming);
+    let fk = &details.incoming[0];
+    assert_eq!(fk.name, "child_parent_fk");
+    assert_eq!(fk.table, "su_it_fk1.child");
+    assert_eq!(fk.columns, ["cb", "ca"]);
+    assert_eq!(fk.ref_columns, ["a", "b"]);
+    let parent_row = |c: &str| match c {
+        "a" => Some("1".to_string()),
+        "b" => Some("2".to_string()),
+        _ => None,
+    };
+    let (table, condition) = referencing(fk, &parent_row, &db).unwrap();
+    assert_eq!(count(table, condition).await, "1");
+
+    // Following the child's outgoing keys finds the referenced rows.
+    let child_row = |c: &str| match c {
+        "pid" | "cb" => Some("1".to_string()),
+        "ca" => Some("2".to_string()),
+        _ => None,
+    };
+    let outgoing = conn.get_foreign_keys(&q("su_it_fk1.child")).await.unwrap();
+    let mut targets: Vec<_> = outgoing.iter().map(|k| k.ref_table.as_str()).collect();
+    targets.sort();
+    assert_eq!(targets, ["su_it_fk1.parent", "su_it_fk1.single"]);
+    let other = conn.get_foreign_keys(&q("su_it_fk2.other")).await.unwrap();
+    assert_eq!(other[0].ref_table, "su_it_fk1.single");
+    for fk in &outgoing {
+        let (table, condition) = follow(fk, &child_row, &db).unwrap();
+        assert_eq!(count(table, condition).await, "1", "{fk:?}");
+    }
+
+    // Nothing points at the leaf tables.
+    assert!(conn
+        .get_incoming_foreign_keys(&q("su_it_fk2.other"))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_incoming_fks_postgres() {
+    let Some(dsn) = env("SU_IT_PG") else {
+        eprintln!("SU_IT_PG not set, skipping");
+        return;
+    };
+    let conn = DatabaseConnection::Postgres(sqlx::PgPool::connect(&dsn).await.unwrap());
+    check_incoming_fks(
+        &conn,
+        DatabaseType::Postgres,
+        &[
+            "DROP SCHEMA IF EXISTS su_it_fk2 CASCADE",
+            "DROP SCHEMA IF EXISTS su_it_fk1 CASCADE",
+            "CREATE SCHEMA su_it_fk1",
+            "CREATE SCHEMA su_it_fk2",
+            "CREATE TABLE su_it_fk1.single (id INT PRIMARY KEY)",
+            "CREATE TABLE su_it_fk1.parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b))",
+            "CREATE TABLE su_it_fk1.child (id INT PRIMARY KEY, ca INT, cb INT, pid INT, \
+             CONSTRAINT child_single_fk FOREIGN KEY (pid) REFERENCES su_it_fk1.single (id), \
+             CONSTRAINT child_parent_fk FOREIGN KEY (cb, ca) REFERENCES su_it_fk1.parent (a, b))",
+            "CREATE TABLE su_it_fk2.other (id INT PRIMARY KEY, sid INT, \
+             CONSTRAINT other_single_fk FOREIGN KEY (sid) REFERENCES su_it_fk1.single (id))",
+            "INSERT INTO su_it_fk1.single VALUES (1)",
+            "INSERT INTO su_it_fk1.parent VALUES (1, 2)",
+            "INSERT INTO su_it_fk1.child VALUES (1, 2, 1, 1)",
+            "INSERT INTO su_it_fk2.other VALUES (1, 1)",
+        ],
+    )
+    .await;
+    // A partitioned referencing table: its partitions hold cloned
+    // constraints (`conparentid` set), listed once through the parent.
+    for sql in [
+        "CREATE TABLE su_it_fk1.part (id INT, sid INT, \
+         CONSTRAINT part_single_fk FOREIGN KEY (sid) REFERENCES su_it_fk1.single (id)) \
+         PARTITION BY RANGE (id)",
+        "CREATE TABLE su_it_fk1.part_1 PARTITION OF su_it_fk1.part FOR VALUES FROM (0) TO (100)",
+        "CREATE TABLE su_it_fk1.part_2 PARTITION OF su_it_fk1.part FOR VALUES FROM (100) TO (200)",
+    ] {
+        exec(&conn, sql).await;
+    }
+    let tables: Vec<_> = conn
+        .get_incoming_foreign_keys("su_it_fk1.single")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|k| k.table)
+        .collect();
+    assert_eq!(
+        tables,
+        ["su_it_fk1.child", "su_it_fk1.part", "su_it_fk2.other"]
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_incoming_fks_mysql() {
+    let Some(dsn) = env("SU_IT_MYSQL") else {
+        eprintln!("SU_IT_MYSQL not set, skipping");
+        return;
+    };
+    let conn = DatabaseConnection::MySQL(sqlx::MySqlPool::connect(&dsn).await.unwrap());
+    check_incoming_fks(
+        &conn,
+        DatabaseType::MySQL,
+        &[
+            "DROP DATABASE IF EXISTS su_it_fk2",
+            "DROP DATABASE IF EXISTS su_it_fk1",
+            "CREATE DATABASE su_it_fk1",
+            "CREATE DATABASE su_it_fk2",
+            "CREATE TABLE su_it_fk1.single (id INT PRIMARY KEY)",
+            "CREATE TABLE su_it_fk1.parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b))",
+            "CREATE TABLE su_it_fk1.child (id INT PRIMARY KEY, ca INT, cb INT, pid INT, \
+             CONSTRAINT child_single_fk FOREIGN KEY (pid) REFERENCES su_it_fk1.single (id), \
+             CONSTRAINT child_parent_fk FOREIGN KEY (cb, ca) REFERENCES su_it_fk1.parent (a, b))",
+            "CREATE TABLE su_it_fk2.other (id INT PRIMARY KEY, sid INT, \
+             CONSTRAINT other_single_fk FOREIGN KEY (sid) REFERENCES su_it_fk1.single (id))",
+            "INSERT INTO su_it_fk1.single VALUES (1)",
+            "INSERT INTO su_it_fk1.parent VALUES (1, 2)",
+            "INSERT INTO su_it_fk1.child VALUES (1, 2, 1, 1)",
+            "INSERT INTO su_it_fk2.other VALUES (1, 1)",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_incoming_fks_mssql() {
+    let Some(spec) = env("SU_IT_MSSQL") else {
+        eprintln!("SU_IT_MSSQL not set, skipping");
+        return;
+    };
+    let conn = DatabaseConnection::connect(&mssql_config(&spec))
+        .await
+        .unwrap();
+    check_incoming_fks(
+        &conn,
+        DatabaseType::SQLServer,
+        &[
+            "DROP TABLE IF EXISTS su_it_fk2.other, su_it_fk1.child, su_it_fk1.parent, \
+             su_it_fk1.single",
+            "IF SCHEMA_ID('su_it_fk1') IS NULL EXEC('CREATE SCHEMA su_it_fk1')",
+            "IF SCHEMA_ID('su_it_fk2') IS NULL EXEC('CREATE SCHEMA su_it_fk2')",
+            "CREATE TABLE su_it_fk1.single (id INT PRIMARY KEY)",
+            "CREATE TABLE su_it_fk1.parent (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b))",
+            "CREATE TABLE su_it_fk1.child (id INT PRIMARY KEY, ca INT, cb INT, pid INT, \
+             CONSTRAINT child_single_fk FOREIGN KEY (pid) REFERENCES su_it_fk1.single (id), \
+             CONSTRAINT child_parent_fk FOREIGN KEY (cb, ca) REFERENCES su_it_fk1.parent (a, b))",
+            "CREATE TABLE su_it_fk2.other (id INT PRIMARY KEY, sid INT, \
+             CONSTRAINT other_single_fk FOREIGN KEY (sid) REFERENCES su_it_fk1.single (id))",
+            "INSERT INTO su_it_fk1.single VALUES (1)",
+            "INSERT INTO su_it_fk1.parent VALUES (1, 2)",
+            "INSERT INTO su_it_fk1.child VALUES (1, 2, 1, 1)",
+            "INSERT INTO su_it_fk2.other VALUES (1, 1)",
+        ],
+    )
+    .await;
+}
+
+/// Keys and values holding `\`, `'` and non-Latin text round-trip through
+/// `submit_changes` (insert / update / delete) and the conditions of
+/// `follow` / `referencing`. `setup` (re)creates, in `schema`, `lp (k text
+/// PRIMARY KEY, v text)` and `lc (id INT PRIMARY KEY, pk text REFERENCES
+/// lp (k))`, empty.
+async fn check_tricky_literals(
+    conn: &DatabaseConnection,
+    db: DatabaseType,
+    schema: &str,
+    setup: &[&str],
+) {
+    use crate::engine::db::utils::split_qualified;
+    use crate::engine::sql::relations::{follow, referencing};
+
+    for sql in setup {
+        exec(conn, sql).await;
+    }
+    let quotes = quote_chars(&db);
+    let q = |name: &str| match split_qualified(name) {
+        (Some(s), t) => qualified(&s, &t, quotes),
+        (None, t) => qualified(schema, &t, quotes),
+    };
+    let (lp, lc) = (q("lp"), q("lc"));
+    let p_cols = conn.get_table_column_details(&lp).await.unwrap();
+    let c_cols = conn.get_table_column_details(&lc).await.unwrap();
+    let db = &db;
+    let submit = |table: String, columns, changes: RowChanges| async move {
+        submit_changes(conn, db, &table, columns, &changes)
+            .await
+            .unwrap_or_else(|e| panic!("{table}: {e:#}"))
+    };
+    let keys = ["x\\' OR 1=1 -- ", "ends\\", "C:\\temp", "東京 🦄"];
+    let some = |v: &str| Some(v.to_string());
+
+    for key in keys {
+        let changes = RowChanges {
+            inserts: vec![vec![some(key), some(key)]],
+            ..Default::default()
+        };
+        submit(lp.clone(), &p_cols, changes).await;
+    }
+    let stored = exec(conn, &format!("SELECT k, v FROM {lp}")).await.rows;
+    for key in keys {
+        assert!(
+            stored.iter().any(|r| r[0] == key && r[1] == key),
+            "{key:?} in {stored:?}"
+        );
+    }
+
+    for (i, key) in keys.iter().enumerate() {
+        // Update identified by the tricky key, to another tricky value.
+        let new_value = format!("{key}'\\");
+        let changes = RowChanges {
+            updates: vec![(
+                vec![key.to_string(), key.to_string()],
+                vec![key.to_string(), new_value.clone()],
+            )],
+            ..Default::default()
+        };
+        assert_eq!(submit(lp.clone(), &p_cols, changes).await, 1);
+        let id = (i + 1).to_string();
+        let changes = RowChanges {
+            inserts: vec![vec![some(&id), some(key)]],
+            ..Default::default()
+        };
+        submit(lc.clone(), &c_cols, changes).await;
+
+        // Child → parent, then parent → children.
+        let fk = &conn.get_foreign_keys(&lc).await.unwrap()[0];
+        let child_row = |c: &str| (c == "pk").then(|| key.to_string());
+        let (table, condition) = follow(fk, &child_row, db).unwrap();
+        let r = exec(
+            conn,
+            &format!("SELECT v FROM {} WHERE {condition}", q(&table)),
+        )
+        .await;
+        assert_eq!(r.rows, vec![vec![new_value.clone()]], "{condition}");
+        let incoming = &conn.get_incoming_foreign_keys(&lp).await.unwrap()[0];
+        let parent_row = |c: &str| (c == "k").then(|| key.to_string());
+        let (table, condition) = referencing(incoming, &parent_row, db).unwrap();
+        let r = exec(
+            conn,
+            &format!("SELECT id FROM {} WHERE {condition}", q(&table)),
+        )
+        .await;
+        assert_eq!(r.rows, vec![vec![id.clone()]], "{condition}");
+
+        // Delete both through their keys.
+        let changes = RowChanges {
+            deletes: vec![vec![id.clone(), key.to_string()]],
+            ..Default::default()
+        };
+        assert_eq!(submit(lc.clone(), &c_cols, changes).await, 1);
+        let changes = RowChanges {
+            deletes: vec![vec![key.to_string(), new_value]],
+            ..Default::default()
+        };
+        assert_eq!(submit(lp.clone(), &p_cols, changes).await, 1);
+    }
+    assert_eq!(
+        scalar(conn, &format!("SELECT COUNT(*) FROM {lp}")).await,
+        "0"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_tricky_literals_mysql() {
+    let Some(dsn) = env("SU_IT_MYSQL") else {
+        eprintln!("SU_IT_MYSQL not set, skipping");
+        return;
+    };
+    let conn = DatabaseConnection::MySQL(sqlx::MySqlPool::connect(&dsn).await.unwrap());
+    check_tricky_literals(
+        &conn,
+        DatabaseType::MySQL,
+        "su_it_lit",
+        &[
+            "DROP DATABASE IF EXISTS su_it_lit",
+            "CREATE DATABASE su_it_lit CHARACTER SET utf8mb4",
+            "CREATE TABLE su_it_lit.lp (k VARCHAR(50) PRIMARY KEY, v VARCHAR(60))",
+            "CREATE TABLE su_it_lit.lc (id INT PRIMARY KEY, pk VARCHAR(50), \
+             FOREIGN KEY (pk) REFERENCES su_it_lit.lp (k))",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_tricky_literals_postgres() {
+    let Some(dsn) = env("SU_IT_PG") else {
+        eprintln!("SU_IT_PG not set, skipping");
+        return;
+    };
+    let conn = DatabaseConnection::Postgres(sqlx::PgPool::connect(&dsn).await.unwrap());
+    check_tricky_literals(
+        &conn,
+        DatabaseType::Postgres,
+        "su_it_lit",
+        &[
+            "DROP SCHEMA IF EXISTS su_it_lit CASCADE",
+            "CREATE SCHEMA su_it_lit",
+            "CREATE TABLE su_it_lit.lp (k VARCHAR(50) PRIMARY KEY, v VARCHAR(60))",
+            "CREATE TABLE su_it_lit.lc (id INT PRIMARY KEY, pk VARCHAR(50) \
+             REFERENCES su_it_lit.lp (k))",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn integration_tricky_literals_mssql() {
+    let Some(spec) = env("SU_IT_MSSQL") else {
+        eprintln!("SU_IT_MSSQL not set, skipping");
+        return;
+    };
+    let conn = DatabaseConnection::connect(&mssql_config(&spec))
+        .await
+        .unwrap();
+    check_tricky_literals(
+        &conn,
+        DatabaseType::SQLServer,
+        "su_it_lit",
+        &[
+            "DROP TABLE IF EXISTS su_it_lit.lc, su_it_lit.lp",
+            "IF SCHEMA_ID('su_it_lit') IS NULL EXEC('CREATE SCHEMA su_it_lit')",
+            "CREATE TABLE su_it_lit.lp (k NVARCHAR(50) PRIMARY KEY, v NVARCHAR(60))",
+            "CREATE TABLE su_it_lit.lc (id INT PRIMARY KEY, pk NVARCHAR(50) \
+             REFERENCES su_it_lit.lp (k))",
+        ],
+    )
+    .await;
 }

@@ -4,8 +4,8 @@ use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{postgres::PgRow, Column as SqlxColumn, PgPool, Postgres, Row, TypeInfo};
 
 use crate::engine::models::{
-    Column, ConnectionConfig, DbAuthMethod, ForeignKeyInfo, IndexInfo, QueryResult, SchemaInfo,
-    SslMode, NULL_CELL,
+    Column, ConnectionConfig, DbAuthMethod, ForeignKeyInfo, IncomingForeignKey, IndexInfo,
+    QueryResult, SchemaInfo, SslMode, NULL_CELL,
 };
 
 use super::utils::{fetch_rows_and_result, group_tables_by_schema, split_qualified, TxConnection};
@@ -368,7 +368,7 @@ pub async fn get_indexes(pool: &PgPool, table_name: &str) -> Result<Vec<IndexInf
 
 /// Get the foreign keys of a table from `pg_constraint` (`conkey`/`confkey`
 /// keep the column pairing of multi-column keys). The referenced table is
-/// qualified with its schema when it lives in another schema.
+/// always qualified with its schema (`schema.table`).
 pub async fn get_foreign_keys(pool: &PgPool, table_name: &str) -> Result<Vec<ForeignKeyInfo>> {
     let (schema, table) = split_table(table_name);
 
@@ -380,8 +380,7 @@ pub async fn get_foreign_keys(pool: &PgPool, table_name: &str) -> Result<Vec<For
                     JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
                     ORDER BY k.ord
                 ),
-                CASE WHEN rn.nspname = n.nspname THEN rt.relname::text
-                     ELSE rn.nspname::text || '.' || rt.relname::text END,
+                rn.nspname::text || '.' || rt.relname::text,
                 ARRAY(
                     SELECT a.attname::text
                     FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
@@ -408,6 +407,58 @@ pub async fn get_foreign_keys(pool: &PgPool, table_name: &str) -> Result<Vec<For
             name,
             columns,
             ref_table,
+            ref_columns,
+        })
+        .collect())
+}
+
+/// Get the foreign keys of other tables pointing at a table, from
+/// `pg_constraint` (`confrelid` = the table). Constraints cloned onto the
+/// partitions of a partitioned table (`conparentid` set, PostgreSQL 11+;
+/// older servers fail and the list degrades) are left out: the key is
+/// listed once, on the partitioned table. The referencing table is always
+/// qualified with its schema (`schema.table`).
+pub async fn get_incoming_foreign_keys(
+    pool: &PgPool,
+    table_name: &str,
+) -> Result<Vec<IncomingForeignKey>> {
+    let (schema, table) = split_table(table_name);
+
+    let rows: Vec<(String, String, Vec<String>, Vec<String>)> = sqlx::query_as(
+        "SELECT c.conname::text,
+                n.nspname::text || '.' || t.relname::text,
+                ARRAY(
+                    SELECT a.attname::text
+                    FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+                    ORDER BY k.ord
+                ),
+                ARRAY(
+                    SELECT a.attname::text
+                    FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+                    JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum
+                    ORDER BY k.ord
+                )
+         FROM pg_constraint c
+         JOIN pg_class t ON t.oid = c.conrelid
+         JOIN pg_namespace n ON n.oid = t.relnamespace
+         JOIN pg_class rt ON rt.oid = c.confrelid
+         JOIN pg_namespace rn ON rn.oid = rt.relnamespace
+         WHERE c.contype = 'f' AND c.conparentid = 0
+           AND rn.nspname = COALESCE($1, current_schema()) AND rt.relname = $2
+         ORDER BY n.nspname, t.relname, c.conname",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(name, table, columns, ref_columns)| IncomingForeignKey {
+            name,
+            table,
+            columns,
             ref_columns,
         })
         .collect())

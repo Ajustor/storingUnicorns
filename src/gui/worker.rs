@@ -102,6 +102,13 @@ pub enum Event {
         run: RunId,
         outcome: Result<u64, String>,
     },
+    /// The rows a foreign key leads to (linked-row preview of connection
+    /// `name`, request `run`).
+    LinkedRow {
+        name: String,
+        run: RunId,
+        outcome: Result<QueryResult, String>,
+    },
     /// Number of statements applied by a Submit.
     Submitted {
         tab: TabId,
@@ -491,6 +498,26 @@ impl Worker {
                 .await
                 .map_err(err);
             Event::Page { tab, run, outcome }
+        });
+        run
+    }
+
+    /// Load the rows a foreign key leads to (`sql` selects at most a few)
+    /// for the linked-row preview of connection `name`.
+    pub fn linked_row(
+        &mut self,
+        name: String,
+        runner: Runner,
+        table: String,
+        sql: String,
+    ) -> RunId {
+        let run = self.next_run();
+        let (conn, meta) = (runner.data(), runner.meta());
+        self.spawn(async move {
+            let outcome = ops::query::run_table_page(&conn, &meta, &sql, &table)
+                .await
+                .map_err(err);
+            Event::LinkedRow { name, run, outcome }
         });
         run
     }

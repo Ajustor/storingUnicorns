@@ -415,21 +415,21 @@ mod tests {
     #[test]
     fn chip_next_to_the_version() {
         assert_eq!(
-            update_chip(&UpdateState::Available(release("0.18.2"))),
+            update_chip(&UpdateState::Available(release("99.0.2"))),
             Some(UpdateChip::Button {
-                label: format!("{} 0.18.2 disponible", icon::ARROW_CIRCLE_UP),
-                hover: "La version 0.18.2 est disponible : cliquer pour la voir".into(),
+                label: format!("{} 99.0.2 disponible", icon::ARROW_CIRCLE_UP),
+                hover: "La version 99.0.2 est disponible : cliquer pour la voir".into(),
             })
         );
         assert_eq!(
-            update_chip(&UpdateState::Ready(release("0.18.2"))),
+            update_chip(&UpdateState::Ready(release("99.0.2"))),
             Some(UpdateChip::Button {
-                label: format!("{} Redémarrer pour 0.18.2", icon::ARROW_CLOCKWISE),
-                hover: "La version 0.18.2 est installée : cliquer pour redémarrer".into(),
+                label: format!("{} Redémarrer pour 99.0.2", icon::ARROW_CLOCKWISE),
+                hover: "La version 99.0.2 est installée : cliquer pour redémarrer".into(),
             })
         );
         assert!(matches!(
-            update_chip(&UpdateState::Downloading(release("0.18.2"))),
+            update_chip(&UpdateState::Downloading(release("99.0.2"))),
             Some(UpdateChip::Busy { label, .. }) if label == "Téléchargement…"
         ));
         for state in [
@@ -478,15 +478,15 @@ mod tests {
         use crate::gui::ui_test::{click, Driver};
         let mut d = Driver::new();
         let idle = UpdateState::Idle;
-        d.panel(vec![], |ui| version_row(ui, &idle, "0.18.1"));
-        let link = d.widget("v0.18.1").expect("version link");
-        assert!(d.panel(click(link), |ui| version_row(ui, &idle, "0.18.1")));
-        assert!(!d.panel(vec![], |ui| version_row(ui, &idle, "0.18.1")));
+        d.panel(vec![], |ui| version_row(ui, &idle, "99.0.1"));
+        let link = d.widget("v99.0.1").expect("version link");
+        assert!(d.panel(click(link), |ui| version_row(ui, &idle, "99.0.1")));
+        assert!(!d.panel(vec![], |ui| version_row(ui, &idle, "99.0.1")));
 
-        let ready = UpdateState::Ready(release("0.18.2"));
-        d.panel(vec![], |ui| version_row(ui, &ready, "0.18.1"));
-        let chip = d.button("Redémarrer pour 0.18.2").expect("chip");
-        assert!(d.panel(click(chip.center), |ui| version_row(ui, &ready, "0.18.1")));
+        let ready = UpdateState::Ready(release("99.0.2"));
+        d.panel(vec![], |ui| version_row(ui, &ready, "99.0.1"));
+        let chip = d.button("Redémarrer pour 99.0.2").expect("chip");
+        assert!(d.panel(click(chip.center), |ui| version_row(ui, &ready, "99.0.1")));
     }
 
     #[test]

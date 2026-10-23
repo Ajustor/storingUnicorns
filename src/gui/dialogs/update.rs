@@ -394,7 +394,7 @@ mod tests {
 
     fn info(notes: &str) -> ReleaseInfo {
         let json = serde_json::json!({
-            "version": "0.18.2",
+            "version": "99.0.2",
             "notes": notes,
             "page_url": "https://p/",
             "assets": [{"name": "storingUnicorns-setup.msi", "url": "u", "sha256": "00"}],
@@ -412,25 +412,25 @@ mod tests {
     #[test]
     fn checking_and_up_to_date() {
         for state in [UpdateState::Idle, UpdateState::Checking] {
-            let v = view(&state, "0.18.1");
+            let v = view(&state, "99.0.1");
             assert!(v.busy);
             assert_eq!(v.text, "Recherche d'une mise à jour…");
             assert_eq!(v.cancel, "Fermer");
             assert!(v.buttons.is_empty());
         }
-        let v = view(&UpdateState::UpToDate, "0.18.1");
+        let v = view(&UpdateState::UpToDate, "99.0.1");
         assert!(!v.busy);
-        assert_eq!(v.text, "Vous utilisez la dernière version (0.18.1).");
+        assert_eq!(v.text, "Vous utilisez la dernière version (99.0.1).");
         assert_eq!(v.cancel, "Fermer");
         assert!(v.buttons.is_empty());
     }
 
     #[test]
     fn available_shows_notes_page_and_choices() {
-        let v = view(&UpdateState::Available(info("### Corrections")), "0.18.1");
+        let v = view(&UpdateState::Available(info("### Corrections")), "99.0.1");
         assert_eq!(
             v.text,
-            "La version 0.18.2 est disponible (vous avez 0.18.1)."
+            "La version 99.0.2 est disponible (vous avez 99.0.1)."
         );
         assert_eq!(v.notes.as_deref(), Some("### Corrections"));
         assert_eq!(v.page_url.as_deref(), Some("https://p/"));
@@ -443,24 +443,24 @@ mod tests {
 
     #[test]
     fn downloading_ready_and_failed() {
-        let v = view(&UpdateState::Downloading(info("")), "0.18.1");
+        let v = view(&UpdateState::Downloading(info("")), "99.0.1");
         assert!(v.busy);
-        assert_eq!(v.text, "Téléchargement de la version 0.18.2…");
+        assert_eq!(v.text, "Téléchargement de la version 99.0.2…");
         assert_eq!(v.cancel, "Continuer en arrière-plan");
         assert!(v.buttons.is_empty());
         assert!(v.notes.is_none());
 
-        let v = view(&UpdateState::Ready(info("")), "0.18.1");
+        let v = view(&UpdateState::Ready(info("")), "99.0.1");
         assert_eq!(
             v.text,
-            "La version 0.18.2 est installée. Redémarrez pour l'utiliser."
+            "La version 99.0.2 est installée. Redémarrez pour l'utiliser."
         );
         assert_eq!(labels(&v), ["Redémarrer maintenant"]);
         assert_eq!(v.buttons[0].kind, modal::ButtonKind::Primary);
         assert_eq!(v.buttons[0].action, UpdateAction::Restart);
         assert_eq!(v.cancel, "Plus tard");
 
-        let v = view(&UpdateState::Failed("réseau".into()), "0.18.1");
+        let v = view(&UpdateState::Failed("réseau".into()), "99.0.1");
         assert_eq!(v.error.as_deref(), Some("réseau"));
         assert_eq!(labels(&v), ["Réessayer"]);
         assert_eq!(v.buttons[0].action, UpdateAction::Retry);
@@ -590,6 +590,6 @@ mod tests {
     }
 
     fn ui_for(ui: &mut egui::Ui, state: &UpdateState) -> ModalResponse<UpdateAction> {
-        super::ui(ui, state, "0.18.1")
+        super::ui(ui, state, "99.0.1")
     }
 }

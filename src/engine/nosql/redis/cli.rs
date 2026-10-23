@@ -376,7 +376,19 @@ pub fn reply_to_result(argv: &[Vec<u8>], reply: &Value) -> QueryResult {
             }
         }) {
             let next = format!("(curseur suivant : {})", nested(cursor, false));
+            // `HSCAN … NOVALUES` / `ZSCAN … NOSCORES`: names only.
+            let names_only = argv.iter().skip(2).any(|a| {
+                a.eq_ignore_ascii_case(b"NOVALUES") || a.eq_ignore_ascii_case(b"NOSCORES")
+            });
             let mut result = match name.as_str() {
+                "HSCAN" | "ZSCAN" if names_only => grid(
+                    &[if name == "HSCAN" { "champ" } else { "membre" }],
+                    items(elements)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|v| vec![cell(v)])
+                        .collect(),
+                ),
                 "HSCAN" | "ZSCAN" => {
                     let names = if name == "HSCAN" {
                         ["champ", "valeur"]
@@ -741,6 +753,14 @@ mod tests {
         assert_eq!(r.rows, [["f", "v"]]);
         let r = reply_to_result(&argv("ZSCAN z 0"), &reply);
         assert_eq!(r.columns[1].name, "score");
+        // Names only: one column, one row per element.
+        let r = reply_to_result(&argv("HSCAN h 0 NOVALUES"), &reply);
+        assert_eq!(r.columns.len(), 1);
+        assert_eq!(r.columns[0].name, "champ (curseur suivant : 0)");
+        assert_eq!(r.rows, [["f"], ["v"]]);
+        let r = reply_to_result(&argv("ZSCAN z 0 COUNT 10 noscores"), &reply);
+        assert_eq!(r.columns.len(), 1);
+        assert_eq!(r.rows.len(), 2);
     }
 
     #[test]

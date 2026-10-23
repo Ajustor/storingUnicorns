@@ -31,8 +31,10 @@ pub struct ResultTab {
     /// Last failed Submit (the transaction was rolled back).
     pub error: Option<String>,
     /// MongoDB / Redis: where the rows come from (documents of a
-    /// collection: editable; a Redis key: opened in its « Clés » tab).
+    /// collection or the value of a key: editable).
     pub source: Option<Source>,
+    /// MongoDB / Redis: why these rows are read-only (a projection…).
+    pub read_only: Option<String>,
 }
 
 impl ResultTab {
@@ -55,6 +57,7 @@ impl ResultTab {
             editable,
             error: None,
             source: None,
+            read_only: None,
         }
     }
 
@@ -298,8 +301,9 @@ pub fn apply_nosql_outcomes(
     let (plain, sources) = split_nosql(outcomes);
     let summary = apply_outcomes(console, connection, plain, now);
     let start = console.results.len() - sources.len();
-    for (r, source) in console.results[start..].iter_mut().zip(sources) {
+    for (r, (source, read_only)) in console.results[start..].iter_mut().zip(sources) {
         r.set_source(source);
+        r.read_only = read_only;
     }
     console.refresh_known_columns();
     summary
@@ -315,24 +319,28 @@ pub fn apply_nosql_refresh(
 ) -> String {
     let (plain, sources) = split_nosql(outcomes);
     let summary = apply_refresh(console, id, plain, now);
-    if let (Some(source), Some(tab)) = (
+    if let (Some((source, read_only)), Some(tab)) = (
         sources.into_iter().last(),
         console.results.iter_mut().find(|r| r.id == id),
     ) {
         tab.set_source(source);
+        tab.read_only = read_only;
     }
     summary
 }
 
-/// The outcomes, and the sources of those that make a result tab (rows
-/// returned), in order.
-fn split_nosql(outcomes: Vec<NoSqlOutcome>) -> (Vec<StatementOutcome>, Vec<Option<Source>>) {
+/// The sources (and read-only reasons) of the outcomes that make a result
+/// tab (rows returned), in order.
+type Sources = Vec<(Option<Source>, Option<String>)>;
+
+/// The outcomes, and the sources of those that make a result tab.
+fn split_nosql(outcomes: Vec<NoSqlOutcome>) -> (Vec<StatementOutcome>, Sources) {
     let mut sources = Vec::new();
     let plain = outcomes
         .into_iter()
         .map(|o| {
             if matches!(&o.outcome.result, Ok(r) if !r.columns.is_empty()) {
-                sources.push(o.source);
+                sources.push((o.source, o.read_only));
             }
             o.outcome
         })
@@ -470,6 +478,7 @@ mod tests {
                 elapsed_ms: 2,
             },
             source,
+            read_only: None,
         }
     }
 

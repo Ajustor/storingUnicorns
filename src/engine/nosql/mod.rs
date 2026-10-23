@@ -62,7 +62,14 @@ pub enum Source {
 pub struct NoSqlOutcome {
     pub outcome: StatementOutcome,
     pub source: Option<Source>,
+    /// Why rows that look like documents / a value can't be edited (a
+    /// projection, `HSCAN … NOVALUES`…), shown by the interfaces.
+    pub read_only: Option<String>,
 }
+
+/// Why the rows of a MongoDB find with a projection are read-only.
+pub const PROJECTION_READ_ONLY: &str =
+    "Lecture seule : la projection masque des champs (modifier ces lignes les effacerait)";
 
 /// A destructive command to confirm before it is sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +128,7 @@ pub async fn run_script(
                 elapsed_ms: 0,
             },
             source: None,
+            read_only: None,
         }],
     }
 }

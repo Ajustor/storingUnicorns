@@ -382,6 +382,9 @@ impl App {
                 let max = crate::gui::tabs::documents::MAX_AGGREGATE_ROWS;
                 tab.runs.agg = Some(self.worker.aggregate(id, conn, coll, pipeline, max));
             }
+            DocAction::Edit(Some(_)) | DocAction::Duplicate(_) if d.projected() => {
+                self.error(crate::engine::nosql::PROJECTION_READ_ONLY.to_string());
+            }
             DocAction::Edit(row) => {
                 let coll = d.coll.clone();
                 let editor = match row {

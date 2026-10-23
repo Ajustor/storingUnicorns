@@ -1620,6 +1620,7 @@ pub async fn run_script(
         };
         let failed = result.is_err();
         out.push(NoSqlOutcome {
+            read_only: (!failed).then(|| names_only_note(unit)).flatten(),
             outcome: StatementOutcome {
                 sql: unit.to_string(),
                 result,
@@ -1632,6 +1633,22 @@ pub async fn run_script(
         }
     }
     out
+}
+
+/// Why `HSCAN … NOVALUES` / `ZSCAN … NOSCORES` rows can't be edited.
+fn names_only_note(unit: &str) -> Option<String> {
+    let argv = tokenize(unit).ok()?;
+    let name = String::from_utf8_lossy(argv.first()?).to_ascii_uppercase();
+    let flag = argv
+        .iter()
+        .skip(2)
+        .find(|a| a.eq_ignore_ascii_case(b"NOVALUES") || a.eq_ignore_ascii_case(b"NOSCORES"))?;
+    matches!(name.as_str(), "HSCAN" | "ZSCAN").then(|| {
+        format!(
+            "Lecture seule : {} ne renvoie que les noms",
+            String::from_utf8_lossy(flag).to_ascii_uppercase()
+        )
+    })
 }
 
 async fn run_unit(
@@ -1726,6 +1743,8 @@ fn key_read(argv: &[Vec<u8>], reply: &Value) -> Option<(RedisValue, u64, Option<
             Some((RedisValue::ZSet(scored(byte_pairs(reply)?)?), 0, None))
         }
         "XRANGE" | "XREVRANGE" => Some((RedisValue::Stream(stream_entries(reply)?), 0, None)),
+        // Names only (`NOVALUES` / `NOSCORES`): not the value's shape.
+        "HSCAN" | "ZSCAN" if has(b"NOVALUES") || has(b"NOSCORES") => None,
         "SSCAN" | "HSCAN" | "ZSCAN" => {
             let (cursor, elements) = scan_reply(reply)?;
             let value = match name.as_str() {
@@ -2340,6 +2359,17 @@ mod tests {
             ))
         );
         assert_eq!(key_read(&a("MGET a b"), &Value::Array(vec![])), None);
+        // Names only: read-only (no value shape).
+        let names = Value::Array(vec![
+            bulk("0"),
+            Value::Array(vec![bulk("f1"), bulk("f2"), bulk("f3")]),
+        ]);
+        assert_eq!(key_read(&a("HSCAN k 0 NOVALUES"), &names), None);
+        assert_eq!(key_read(&a("ZSCAN k 0 NOSCORES"), &names), None);
+        assert!(
+            key_read(&a("HSCAN k 0"), &names).is_none(),
+            "odd: not pairs"
+        );
     }
 
     #[test]

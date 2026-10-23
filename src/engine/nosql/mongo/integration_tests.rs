@@ -120,7 +120,9 @@ db.users.deleteOne({_id: 5})
 db.users.countDocuments({age: {$gt: 30}})
 db.users.distinct("address.city")
 db.users.find({}, {_id: 0, name: 1}).limit(2)
-show collections"#,
+show collections
+db.users.find({_id: 1}, {"address.city": 1})
+db.users.find({_id: 1}, {})"#,
     )
     .await;
     assert_eq!(result(&out[1]).rows_affected, 4);
@@ -147,6 +149,15 @@ show collections"#,
     assert!(out[10].source.is_none(), "_id excluded: read-only");
     assert_eq!(result(&out[10]).rows.len(), 2);
     assert_eq!(result(&out[11]).rows, [["users"]]);
+    // A projection keeping `_id` is read-only too (hidden fields), with
+    // its reason; `{}` projects nothing.
+    assert!(out[12].source.is_none(), "projected: read-only");
+    assert_eq!(
+        out[12].read_only.as_deref(),
+        Some(nosql::PROJECTION_READ_ONLY)
+    );
+    assert!(out[10].read_only.is_some());
+    assert!(out[13].source.is_some() && out[13].read_only.is_none());
     let docs = all_docs(c, "users").await;
     assert_eq!(docs[1], doc! { "_id": 2, "name": "Bob", "age": 27 });
     assert_eq!(docs[3], doc! { "_id": 4, "name": "Dee", "age": 50 });

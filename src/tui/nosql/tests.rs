@@ -456,6 +456,7 @@ async fn a_run_shows_its_last_result_and_keeps_its_source() {
         docs: vec![bson::doc! { "_id": 1, "name": "Ann" }],
     };
     let outcome = |r: Result<QueryResult, String>, source| NoSqlOutcome {
+        read_only: None,
         outcome: StatementOutcome {
             sql: "x".into(),
             result: r,

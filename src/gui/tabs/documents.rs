@@ -320,13 +320,22 @@ impl DocumentsTab {
         ))
     }
 
-    /// Rows can be edited: a page is loaded and it shows `_id` (the key
-    /// the writes find documents by).
+    /// The page was read with a projection (not `{}`): its documents lack
+    /// fields, so writing them back would lose those (`$set` of a projected
+    /// sub-document, `$slice`d arrays, a Replace from the JSON editor).
+    pub fn projected(&self) -> bool {
+        let p = self.query.projection.trim();
+        !p.is_empty() && shell::parse_document(p).map_or(true, |d| !d.is_empty())
+    }
+
+    /// Rows can be edited: a page is loaded without a projection and it
+    /// shows `_id` (the key the writes find documents by).
     pub fn editable(&self) -> bool {
-        self.page.as_ref().is_some_and(|p| {
-            p.result.primary_key.iter().any(|k| k == "_id")
-                || p.result.columns.iter().any(|c| c.name == "_id")
-        })
+        !self.projected()
+            && self.page.as_ref().is_some_and(|p| {
+                p.result.primary_key.iter().any(|k| k == "_id")
+                    || p.result.columns.iter().any(|c| c.name == "_id")
+            })
     }
 
     /// The document of saved row `r` of the grid shown.
@@ -594,8 +603,10 @@ impl DocumentsTab {
             {
                 action = Some(DocAction::Edit(None));
             }
-            let with_doc =
-                can_write && selected.is_some_and(|i| self.doc(RowRef::Base(i)).is_some());
+            // A projected document is partial: no editor, copy or delete.
+            let with_doc = can_write
+                && !self.projected()
+                && selected.is_some_and(|i| self.doc(RowRef::Base(i)).is_some());
             if ui
                 .add_enabled(
                     with_doc,
@@ -738,6 +749,16 @@ impl DocumentsTab {
 
     fn find_grid(&mut self, ui: &mut egui::Ui, cx: &DocumentsContext) -> Option<DocAction> {
         let busy = busy_hint(cx.submitting, cx.loading);
+        if self.projected() && self.page.is_some() {
+            ui.label(
+                RichText::new(format!(
+                    "{} {} — videz « Projection » pour modifier",
+                    icon::LOCK,
+                    crate::engine::nosql::PROJECTION_READ_ONLY
+                ))
+                .weak(),
+            );
+        }
         if let (Some(hint), true) = (busy, self.editable()) {
             ui.label(RichText::new(format!("{} {hint}", icon::HOURGLASS)).weak());
         }
@@ -1024,6 +1045,17 @@ mod tests {
                 assert_eq!(t.query.filter, "");
             }
         }
+    }
+
+    #[test]
+    fn a_projection_makes_the_page_read_only() {
+        let mut t = loaded();
+        assert!(!t.projected() && t.editable());
+        t.query.projection = "{name: 1}".into();
+        assert!(t.projected());
+        assert!(!t.editable(), "hidden fields would be lost");
+        t.query.projection = " { } ".into();
+        assert!(!t.projected() && t.editable(), "{{}} projects nothing");
     }
 
     #[test]

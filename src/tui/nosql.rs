@@ -42,6 +42,8 @@ pub struct NoSqlUi {
     pub key_counts: Option<std::collections::BTreeMap<u8, u64>>,
     /// Where the rows of the shown result come from: editable when set.
     pub source: Option<Source>,
+    /// Why the shown result is read-only (a projection…), when known.
+    pub read_only: Option<String>,
     /// A question waiting for its `(o/N)` answer.
     pub confirm: Option<Confirm>,
     pub json: Option<JsonView>,
@@ -678,7 +680,7 @@ pub fn apply_outcomes(state: &mut AppState, outcomes: Vec<NoSqlOutcome>) {
     let mut error = None;
     for (i, o) in outcomes.into_iter().enumerate() {
         match o.outcome.result {
-            Ok(result) => shown = Some((result, o.source, o.outcome.elapsed_ms)),
+            Ok(result) => shown = Some((result, (o.source, o.read_only), o.outcome.elapsed_ms)),
             Err(e) => {
                 error = Some((i, e));
                 break;
@@ -701,9 +703,10 @@ pub fn apply_outcomes(state: &mut AppState, outcomes: Vec<NoSqlOutcome>) {
         }
         None => String::new(),
     };
-    if let Some((result, source, _)) = shown {
+    if let Some((result, (source, read_only), _)) = shown {
         super::show_result(state, result, None);
         state.nosql.source = source;
+        state.nosql.read_only = read_only;
     }
     if let Some((i, e)) = error {
         status = if total > 1 {
@@ -975,9 +978,11 @@ fn editable(state: &mut AppState) -> Option<(Source, QueryResult)> {
     match state.nosql.source.clone() {
         Some(source) => Some((source, result)),
         None => {
-            state.set_status(
-                "Résultat en lecture seule : ouvrir une collection ou une clé (Entrée dans le panneau)",
-            );
+            let why = state.nosql.read_only.clone().unwrap_or_else(|| {
+                "Résultat en lecture seule : ouvrir une collection ou une clé (Entrée dans le panneau)"
+                    .into()
+            });
+            state.set_status(why);
             None
         }
     }

@@ -1642,6 +1642,7 @@ fn show_result(
     state.result_sql = sql;
     // A NoSQL run sets the source of its rows after this.
     state.nosql.source = None;
+    state.nosql.read_only = None;
     state.update_known_columns(); // Update columns for autocompletion
     state.compute_col_widths(); // Cache column widths once
     state.selected_row = 0;

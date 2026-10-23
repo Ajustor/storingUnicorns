@@ -765,16 +765,6 @@ fn write_result(text: String, affected: u64) -> QueryResult {
     }
 }
 
-/// Whether a projection keeps `_id` (rows found back by it).
-fn keeps_id(projection: &Option<Document>) -> bool {
-    match projection.as_ref().and_then(|p| p.get("_id")) {
-        Some(Bson::Boolean(false)) => false,
-        Some(Bson::Int32(0)) | Some(Bson::Int64(0)) => false,
-        Some(Bson::Double(f)) if *f == 0.0 => false,
-        _ => true,
-    }
-}
-
 /// Run one command in the scope's database.
 async fn execute(
     c: &MongoClient,
@@ -853,7 +843,10 @@ async fn execute(
             let (docs, truncated) = collect_capped(cursor, cap).await?;
             let mut result = flatten(&docs);
             result.truncated = truncated && !one;
-            let source = keeps_id(&projection).then(|| Source::Collection {
+            // A projection hides fields: writing its rows back would lose
+            // them (`$set` of a projected sub-document, Replace…).
+            let projected = projection.as_ref().is_some_and(|p| !p.is_empty());
+            let source = (!projected).then(|| Source::Collection {
                 coll: coll_ref(&coll),
                 docs,
             });
@@ -1079,16 +1072,19 @@ pub async fn run_script(
     for span in units(text).into_iter().filter(|s| selected(s, &range)) {
         let unit = &text[span.clone()];
         let start = Instant::now();
+        let mut read_only = None;
         let (result, source) = match shell::parse_command(unit, span.start) {
             Err(e) => (Err(e.to_string()), None),
-            Ok(cmd) => match execute(c, cmd, scope, max_rows).await {
-                Ok((mut r, source)) => {
-                    let elapsed = start.elapsed().as_millis();
-                    r.execution_time_ms = elapsed;
-                    (Ok(r), source)
+            Ok(cmd) => {
+                read_only = read_only_note(&cmd).map(str::to_string);
+                match execute(c, cmd, scope, max_rows).await {
+                    Ok((mut r, source)) => {
+                        r.execution_time_ms = start.elapsed().as_millis();
+                        (Ok(r), source)
+                    }
+                    Err(e) => (Err(e.to_string()), None),
                 }
-                Err(e) => (Err(e.to_string()), None),
-            },
+            }
         };
         let failed = result.is_err();
         out.push(NoSqlOutcome {
@@ -1097,6 +1093,7 @@ pub async fn run_script(
                 result,
                 elapsed_ms: start.elapsed().as_millis(),
             },
+            read_only: if failed { None } else { read_only },
             source,
         });
         if failed {
@@ -1104,6 +1101,17 @@ pub async fn run_script(
         }
     }
     out
+}
+
+/// Why the result of `cmd` can't be edited although it shows documents.
+fn read_only_note(cmd: &MongoCommand) -> Option<&'static str> {
+    match cmd {
+        MongoCommand::Find {
+            projection: Some(p),
+            ..
+        } if !p.is_empty() => Some(super::PROJECTION_READ_ONLY),
+        _ => None,
+    }
 }
 
 pub fn complete(text: &str, cursor: usize, cx: &CompletionContext) -> Completions {

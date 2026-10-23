@@ -525,6 +525,24 @@ async fn integration_redis_console() {
             ..
         })
     ));
+    // Names only (`HSCAN … NOVALUES`, Redis ≥ 7.4): read-only, one column,
+    // a row per name. (`ZSCAN … NOSCORES`, Valkey 8, is handled alike.)
+    let out = run_script(
+        &c,
+        &format!("HSET {p}h f1 1 f2 2 f3 3\nHSCAN {p}h 0 NOVALUES"),
+        None,
+        &mut scope,
+        1000,
+    )
+    .await;
+    let r = out[1].outcome.result.as_ref().unwrap();
+    assert_eq!(r.columns.len(), 1, "{r:?}");
+    assert_eq!(r.rows.len(), 3);
+    assert!(out[1].source.is_none());
+    assert_eq!(
+        out[1].read_only.as_deref(),
+        Some("Lecture seule : NOVALUES ne renvoie que les noms")
+    );
     // KEYS truncated at max_rows.
     let out = run_script(&c, &format!("KEYS {p}*"), None, &mut scope, 1).await;
     let r = out[0].outcome.result.as_ref().unwrap();

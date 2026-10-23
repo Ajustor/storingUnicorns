@@ -192,6 +192,9 @@ fn result_view(
             return open;
         }
     }
+    if let Some(note) = &r.read_only {
+        ui.label(RichText::new(format!("{} {note}", icon::LOCK)).weak());
+    }
     if let Some(hint) = read_only_hint(&r.sql, &r.result) {
         ui.label(RichText::new(format!("{} {hint}", icon::LOCK)).weak());
     }

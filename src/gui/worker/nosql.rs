@@ -106,11 +106,14 @@ impl NoSqlTask {
     }
 }
 
-/// The console command emptying `coll` (its name as a JSON string, so that
-/// any character survives).
+/// The console command emptying `coll` (`shell::command_to_shell`, which
+/// quotes any name so that it parses back).
 pub fn delete_all_command(coll: &CollectionRef) -> String {
-    let name = serde_json::to_string(&coll.coll).unwrap_or_else(|_| "\"\"".into());
-    format!("db.getCollection({name}).deleteMany({{}})")
+    mongo::shell::command_to_shell(&mongo::shell::MongoCommand::Delete {
+        coll: coll.coll.clone(),
+        filter: bson::Document::new(),
+        many: true,
+    })
 }
 
 async fn run_task(conn: &Conn, task: NoSqlTask) -> Result<String, String> {
@@ -657,13 +660,21 @@ mod tests {
     #[test]
     fn emptying_a_collection_quotes_its_name() {
         assert_eq!(
-            delete_all_command(&coll("shop", "fs.chunks")),
-            r#"db.getCollection("fs.chunks").deleteMany({})"#
+            delete_all_command(&coll("shop", "users")),
+            "db.users.deleteMany({})"
         );
-        assert_eq!(
-            delete_all_command(&coll("shop", "a\"b")),
-            r#"db.getCollection("a\"b").deleteMany({})"#
-        );
+        // Each name parses back to itself.
+        for name in ["fs.chunks", "a\"b", "my-coll", "getName", "é x", r"a\b"] {
+            let command = delete_all_command(&coll("shop", name));
+            let parsed = mongo::shell::parse_script(&command);
+            match parsed.as_slice() {
+                [Ok(p)] => assert!(
+                    matches!(&p.command, mongo::shell::MongoCommand::Delete { coll, many: true, .. } if coll == name),
+                    "{command}"
+                ),
+                other => panic!("{command}: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -901,12 +912,98 @@ mod tests {
             _ => None,
         });
         assert_eq!(applied, Ok(1));
-        w.read_key(1, conn, 15, b"su_it:gui:l".to_vec(), 0, 500);
+        w.read_key(1, conn.clone(), 15, b"su_it:gui:l".to_vec(), 0, 500);
         let (info, page) = wait_for(&mut w, |ev| match ev {
             Event::KeyValue { outcome, .. } => Some(outcome.expect("read").expect("exists")),
             _ => None,
         });
         assert_eq!(info.kind, RedisType::List);
         assert_eq!(page.total, 3);
+
+        // Key names as the dialogs take them: binary (quoted, `\xHH`) and
+        // with a space, created then renamed.
+        use crate::gui::dialogs::nosql::{NewKey, Prompt, PromptKind};
+        let task = |w: &mut Worker, task: NoSqlTask| {
+            w.nosql_task("it".into(), conn.clone(), task);
+            wait_for(w, |ev| match ev {
+                Event::NoSqlDone { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+        };
+        script(
+            &mut w,
+            &conn,
+            r#"DEL "su_it:gui:\xff\x00" "su_it:gui:a b""#,
+            "15",
+        );
+        let new_key = NewKey {
+            name: r#""su_it:gui:\xff\x00""#.into(),
+            value: "v".into(),
+            ..NewKey::new("it", 15)
+        };
+        assert!(task(&mut w, new_key.task().unwrap()).is_ok());
+        let binary = b"su_it:gui:\xff\x00".to_vec();
+        // The explorer / « Clés » tab shows the name as typed.
+        assert_eq!(redis::display_bytes(&binary), new_key.name);
+        let rename = Prompt::new(
+            "it",
+            PromptKind::RenameKey {
+                db: 15,
+                key: binary.clone(),
+            },
+            "su_it:gui:a b".into(),
+        );
+        assert!(task(&mut w, rename.task().unwrap()).is_ok());
+        let out = script(&mut w, &conn, r#"EXISTS "su_it:gui:a b""#, "15");
+        assert_eq!(out, [(Ok(1), false)]);
+        // A second creation of the same name is refused.
+        let again = NewKey {
+            name: "su_it:gui:a b".into(),
+            value: "w".into(),
+            ..NewKey::new("it", 15)
+        };
+        assert!(task(&mut w, again.task().unwrap()).is_err());
+
+        // A console read edited in place (as the console's Submit does).
+        w.nosql_script(
+            9,
+            conn.clone(),
+            "LRANGE su_it:gui:l 1 2".into(),
+            None,
+            NoSqlScope {
+                database: "15".into(),
+            },
+            100,
+        );
+        let read = wait_for(&mut w, |ev| match ev {
+            Event::NoSqlScript { mut outcomes, .. } => outcomes.pop(),
+            _ => None,
+        });
+        let (Ok(result), Some(crate::engine::nosql::Source::Key { db, key, kind })) =
+            (read.outcome.result, read.source)
+        else {
+            panic!("LRANGE should be editable")
+        };
+        assert_eq!(result.rows[0][0], "1");
+        let changes = crate::engine::ops::rows::RowChanges {
+            updates: vec![(result.rows[1].clone(), vec!["2".into(), "C".into()])],
+            ..Default::default()
+        };
+        let edits = redis::console_edits(&key, &kind, &result, &changes).unwrap();
+        w.apply_key_edits(1, conn.clone(), db, key, edits);
+        let applied = wait_for(&mut w, |ev| match ev {
+            Event::Submitted { outcome, .. } => Some(outcome),
+            _ => None,
+        });
+        assert_eq!(applied, Ok(1));
+        w.read_key(1, conn, 15, b"su_it:gui:l".to_vec(), 0, 500);
+        let (_, page) = wait_for(&mut w, |ev| match ev {
+            Event::KeyValue { outcome, .. } => Some(outcome.expect("read").expect("exists")),
+            _ => None,
+        });
+        assert_eq!(
+            page.value,
+            redis::RedisValue::List(vec![b"a".to_vec(), b"b".to_vec(), b"C".to_vec()])
+        );
     }
 }

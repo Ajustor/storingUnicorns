@@ -178,8 +178,11 @@ pub fn completion_tables(
     quotes: (char, char),
     hidden: &[String],
 ) -> Vec<String> {
+    // Bare or qualified after the full list: with several schemas the
+    // server needs the prefix, whichever of them are hidden.
+    let qualify = schemas.len() > 1;
     let schemas: Vec<&SchemaInfo> = visible(schemas, hidden).collect();
-    if schemas.len() <= 1 {
+    if !qualify {
         return tables_of(schemas);
     }
     let part = |p: &str| {
@@ -503,14 +506,17 @@ mod tests {
             completion_tables(&schemas, q, &hidden),
             vec!["public.users", "pg_toast.t1"]
         );
-        // One schema left visible: bare names, as with a single schema.
+        // One schema left visible: still qualified, as the server needs it
+        // (only a lone schema gets bare names).
         let hidden = vec!["audit".to_string(), "pg_toast".to_string()];
-        assert_eq!(completion_tables(&schemas, q, &hidden), vec!["users"]);
-        let all = all_tables([("prod", schemas.as_slice(), hidden.as_slice())]);
         assert_eq!(
-            all,
-            vec![("prod".into(), "public".into(), "users".into())]
+            completion_tables(&schemas, q, &hidden),
+            vec!["public.users"]
         );
+        let lone = vec![schema("main", &["t"])];
+        assert!(completion_tables(&lone, q, &["main".to_string()]).is_empty());
+        let all = all_tables([("prod", schemas.as_slice(), hidden.as_slice())]);
+        assert_eq!(all, vec![("prod".into(), "public".into(), "users".into())]);
         // A table of a hidden schema still gets its columns when typed.
         let t = TableRef {
             schema: Some("audit".into()),

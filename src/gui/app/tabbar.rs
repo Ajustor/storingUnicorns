@@ -4,6 +4,7 @@ use egui::RichText;
 use egui_phosphor::regular as icon;
 
 use crate::gui::sessions::SessionSource;
+use crate::gui::shortcuts;
 use crate::gui::tabs::console::ConsoleContext;
 use crate::gui::tabs::data::DataContext;
 use crate::gui::tabs::ddl::DdlAction;
@@ -38,7 +39,10 @@ impl App {
                         }
                         let close = ui
                             .small_button(icon::X)
-                            .on_hover_text("Fermer (Ctrl+W)")
+                            .on_hover_text(format!(
+                                "Fermer ({})",
+                                shortcuts::label_here(&super::CLOSE_TAB)
+                            ))
                             .clicked();
                         if close || r.middle_clicked() {
                             action = Some(Action::Close(i));
@@ -48,7 +52,10 @@ impl App {
                     }
                     if ui
                         .small_button(icon::PLUS)
-                        .on_hover_text("Nouvelle console (Ctrl+T)")
+                        .on_hover_text(format!(
+                            "Nouvelle console ({})",
+                            shortcuts::label_here(&super::NEW_CONSOLE)
+                        ))
                         .clicked()
                     {
                         action = Some(Action::NewConsole);

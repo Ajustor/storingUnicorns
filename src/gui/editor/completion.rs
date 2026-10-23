@@ -5,7 +5,7 @@
 //! Columns not loaded yet are requested from the app (`take_requests`); the
 //! popup is computed again when they arrive, while the cursor stays put.
 
-use egui::{Key, Modifiers};
+use egui::{Key, KeyboardShortcut, Modifiers};
 
 use crate::engine::sql::completion::{
     complete, complete_for_table, token_start, BarMode, ColumnInfo, Completions, Context,
@@ -21,6 +21,17 @@ const MIN_WIDTH: f32 = 220.0;
 const MAX_WIDTH_SHARE: f32 = 0.6;
 /// Space between a label and its detail.
 const DETAIL_GAP: f32 = 16.0;
+
+/// The key opening the popup: ⌃Space on macOS, where ⌘Space is
+/// Spotlight; Ctrl+Space elsewhere.
+pub fn trigger(mac: bool) -> KeyboardShortcut {
+    let modifiers = if mac {
+        Modifiers::CTRL
+    } else {
+        Modifiers::COMMAND
+    };
+    KeyboardShortcut::new(modifiers, Key::Space)
+}
 
 /// What completion reads from the connection.
 pub trait CompletionSource {
@@ -168,14 +179,15 @@ impl Completion {
     }
 
     /// Called before the TextEdit: navigation keys go to the popup while it
-    /// is open. Returns whether Ctrl+Space was pressed.
+    /// is open. Returns whether [`trigger`] was pressed.
     pub fn intercept_keys(&mut self, ui: &mut egui::Ui, text: &mut String, id: egui::Id) -> bool {
         let focused = ui.memory(|m| m.has_focus(id));
         if !focused {
             self.close();
             return false;
         }
-        let trigger = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Space));
+        let trigger =
+            ui.input_mut(|i| i.consume_shortcut(&trigger(crate::gui::shortcuts::is_mac())));
         if !self.open {
             return trigger;
         }
@@ -358,6 +370,29 @@ mod tests {
     use crate::engine::sql::completion::Kind;
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    #[test]
+    fn the_trigger_avoids_spotlight_on_mac() {
+        use crate::gui::shortcuts::{label, test_support::*};
+        let cmd_space = KeyboardShortcut::new(Modifiers::COMMAND, Key::Space);
+        let ctrl_space = KeyboardShortcut::new(Modifiers::CTRL, Key::Space);
+        let fires = |pressed: &KeyboardShortcut, mac| {
+            frame(vec![press(pressed, mac)], |i| {
+                i.consume_shortcut(&trigger(mac))
+            })
+        };
+        // macOS: ⌃Space opens the popup, ⌘Space (Spotlight) does not.
+        assert!(fires(&ctrl_space, true));
+        assert!(!fires(&cmd_space, true));
+        // Elsewhere: Ctrl+Space.
+        assert!(fires(&ctrl_space, false));
+        assert!(!fires(
+            &KeyboardShortcut::new(Modifiers::NONE, Key::Space),
+            false
+        ));
+        assert_eq!(label(&trigger(true), true), "⌃Espace");
+        assert_eq!(label(&trigger(false), false), "Ctrl+Espace");
+    }
 
     #[test]
     fn apply_replaces_current_word() {

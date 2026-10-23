@@ -496,7 +496,10 @@ impl DataTab {
             let can = cx.connected && !cx.submitting;
             if ui
                 .add_enabled(can, egui::Button::new(icon::ARROW_CLOCKWISE))
-                .on_hover_text("Rafraîchir (Ctrl+R)")
+                .on_hover_text(format!(
+                    "Rafraîchir ({})",
+                    crate::gui::shortcuts::label_here(&crate::gui::app::REFRESH)
+                ))
                 .clicked()
             {
                 nav = Some(Nav::Refresh);
@@ -1020,6 +1023,12 @@ mod tests {
         );
     }
 
+    /// The completion key as this platform sends it.
+    fn completion_key() -> egui::Event {
+        use crate::gui::shortcuts::{is_mac, test_support::press};
+        press(&crate::gui::editor::completion::trigger(is_mac()), is_mac())
+    }
+
     #[test]
     fn ctrl_space_in_the_order_bar_offers_columns_and_directions() {
         let ctx = egui::Context::default();
@@ -1027,12 +1036,7 @@ mod tests {
         bar_frame(&ctx, &mut t, &Unloaded, vec![]);
         ctx.memory_mut(|m| m.request_focus(egui::Id::new(("data_order", 1u64))));
         bar_frame(&ctx, &mut t, &Unloaded, vec![]);
-        bar_frame(
-            &ctx,
-            &mut t,
-            &Unloaded,
-            vec![key(Key::Space, egui::Modifiers::COMMAND)],
-        );
+        bar_frame(&ctx, &mut t, &Unloaded, vec![completion_key()]);
         let labels: Vec<_> = t.completions[1]
             .items
             .iter()
@@ -1060,12 +1064,7 @@ mod tests {
         bar_frame(&ctx, &mut t, &Unloaded, vec![]);
         ctx.memory_mut(|m| m.request_focus(egui::Id::new(("data_where", 1u64))));
         bar_frame(&ctx, &mut t, &Unloaded, vec![]);
-        bar_frame(
-            &ctx,
-            &mut t,
-            &Unloaded,
-            vec![key(Key::Space, egui::Modifiers::COMMAND)],
-        );
+        bar_frame(&ctx, &mut t, &Unloaded, vec![completion_key()]);
         let req = t.take_completion_requests();
         assert_eq!(
             req,

@@ -11,6 +11,7 @@ mod popup;
 mod rows;
 mod grid;
 mod sessions;
+mod shortcuts;
 mod sign_in;
 mod status;
 mod table_search;

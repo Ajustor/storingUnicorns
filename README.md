@@ -40,7 +40,8 @@ desktop GUI (egui) and a terminal UI (ratatui) sharing the same engine.
   - value panel (indented JSON, editable), read-only DDL tab, structure dialog
     (add / modify / rename / drop column), quick table search
   - dark and light themes (follows the system by default)
-  - in-app updates
+  - in-app updates: click the version at the bottom left to check, read the
+    release notes, install and restart from one window
 - **TUI** (`storingUnicorns tui`): the original terminal client
 - Persistent configuration, consoles and history
 

@@ -71,8 +71,7 @@ struct ManifestAsset {
 #[derive(Debug, Clone)]
 pub struct ReleaseInfo {
     pub version: semver::Version,
-    // Used by the GUI (plan 3b).
-    #[allow(dead_code)]
+    /// Release notes: the version's CHANGELOG section (Markdown).
     pub notes: String,
     pub page_url: String,
     asset: ManifestAsset,

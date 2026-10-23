@@ -7,6 +7,22 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Améliorations
+
+- **Fenêtre « Mise à jour »** : un clic sur le numéro de version, en bas à
+  gauche, ouvre une fenêtre où se déroule toute la mise à jour : recherche,
+  « Vous utilisez la dernière version », ou la version disponible avec ses
+  notes de version, **Installer**, **Ignorer cette version** et **Plus tard** ;
+  puis le téléchargement (qui peut **Continuer en arrière-plan**) et
+  **Redémarrer maintenant**. En cas d'échec, **Réessayer**. Quand une mise à
+  jour est disponible ou installée, un bouton bien visible à côté de la version
+  (« 0.18.2 disponible », « Redémarrer pour 0.18.2 ») rouvre cette fenêtre ;
+  pendant le téléchargement, une roue de progression s'y affiche. Le bandeau
+  du haut, affiché quand une mise à jour est trouvée au démarrage, propose
+  **Voir la mise à jour** et ne double plus la fenêtre quand elle est ouverte.
+
 ## [0.18.1] - 2026-10-23
 
 ### Corrections

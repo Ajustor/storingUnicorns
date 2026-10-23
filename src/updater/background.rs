@@ -36,7 +36,8 @@ enum Msg {
 
 pub struct Updater {
     pub state: UpdateState,
-    /// The "update available" banner was dismissed for this session.
+    /// The banner of the available / ready update was put off ("Plus
+    /// tard"); it shows again when the next state comes in.
     pub dismissed: bool,
     pub exit_action: Option<ExitAction>,
     manual: bool,
@@ -140,19 +141,30 @@ impl Updater {
         }
     }
 
-    /// "Later" on a ready update: hide its banner; it applies on quit.
+    /// "Plus tard" on an available or ready update: hide its banner; a
+    /// ready one applies on quit.
     pub fn later(&mut self) {
-        if matches!(self.state, UpdateState::Ready(_)) {
-            self.dismissed = true;
-            self.schedule_on_quit();
+        match self.state {
+            UpdateState::Available(_) => self.dismissed = true,
+            UpdateState::Ready(_) => {
+                self.dismissed = true;
+                self.schedule_on_quit();
+            }
+            _ => {}
         }
     }
 
-    /// Show the banner of a ready update again (after `later`).
-    pub fn show_ready(&mut self) {
-        if matches!(self.state, UpdateState::Ready(_)) {
-            self.dismissed = false;
-        }
+    /// "Ignorer cette version" on an available update: forget it (back to
+    /// Idle, so that nothing advertises it any more); its version, to save
+    /// as `skipped_version`.
+    pub fn skip(&mut self) -> Option<String> {
+        let UpdateState::Available(info) = &self.state else {
+            return None;
+        };
+        let version = info.version.to_string();
+        self.state = UpdateState::Idle;
+        self.dismissed = false;
+        Some(version)
     }
 
     /// The close that `schedule_restart` was for got cancelled: keep
@@ -191,6 +203,8 @@ impl Updater {
                     Ok(staged) => {
                         self.staged_msi = staged;
                         self.state = UpdateState::Ready(info);
+                        // Downloaded in the background: announce it.
+                        self.dismissed = false;
                         Some(UpdateEvent::Ready)
                     }
                     Err(e) => {
@@ -305,25 +319,52 @@ mod tests {
         assert!(u.dismissed);
         assert!(u.exit_action.is_none());
 
-        // Only a ready update can be put off.
+        // An available one is only hidden.
         let mut u = Updater::new(|| {});
         u.state = UpdateState::Available(info("99.0.0"));
+        u.later();
+        assert!(u.dismissed);
+        assert!(u.exit_action.is_none());
+
+        // Nothing to put off otherwise.
+        let mut u = Updater::new(|| {});
         u.later();
         assert!(!u.dismissed);
     }
 
     #[test]
-    fn show_ready_shows_the_banner_again() {
-        let mut u = ready(Some("x.msi"));
-        u.later();
-        u.show_ready();
-        assert!(!u.dismissed);
-
+    fn skip_forgets_the_available_update() {
         let mut u = Updater::new(|| {});
         u.state = UpdateState::Available(info("99.0.0"));
         u.dismissed = true;
-        u.show_ready();
-        assert!(u.dismissed, "only a ready update is shown again");
+        assert_eq!(u.skip().as_deref(), Some("99.0.0"));
+        assert!(matches!(u.state, UpdateState::Idle));
+        assert!(!u.dismissed);
+        assert_eq!(u.skip(), None, "nothing to skip any more");
+
+        let mut u = ready(None);
+        assert_eq!(u.skip(), None, "a ready update can't be skipped");
+        assert!(matches!(u.state, UpdateState::Ready(_)));
+    }
+
+    #[test]
+    fn a_manual_check_tells_up_to_date_apart_from_idle() {
+        let mut u = Updater::new(|| {});
+        assert!(matches!(u.state, UpdateState::Idle));
+        u.check_with(true, None, || Ok(None));
+        assert!(matches!(u.state, UpdateState::Checking));
+        assert!(matches!(wait(&mut u), Some(UpdateEvent::UpToDate)));
+        assert!(matches!(u.state, UpdateState::UpToDate));
+    }
+
+    #[test]
+    fn a_download_finished_in_the_background_is_announced_again() {
+        let mut u = Updater::new(|| {});
+        u.state = UpdateState::Available(info("99.0.0"));
+        u.later();
+        u.install_with(|_| Ok(None));
+        assert!(matches!(wait(&mut u), Some(UpdateEvent::Ready)));
+        assert!(!u.dismissed);
     }
 
     #[test]

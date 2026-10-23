@@ -6,6 +6,7 @@ use egui_phosphor::regular as icon;
 use crate::updater::{UpdateEvent, UpdateState, Updater};
 
 use super::app::App;
+use super::dialogs::{update, Dialog};
 use super::theme::{self, ERROR, SUCCESS};
 use super::worker::OpId;
 
@@ -79,32 +80,54 @@ impl Default for Status {
     }
 }
 
+/// Whether the update modal is open.
+fn update_modal_open(app: &App) -> bool {
+    matches!(app.dialog, Some(Dialog::Update))
+}
+
 pub fn poll_updater(app: &mut App) {
+    let modal = update_modal_open(app);
     while let Some(ev) = app.updater.poll() {
-        match ev {
-            UpdateEvent::UpToDate => app.info("storingUnicorns est à jour"),
-            UpdateEvent::Available(v) => app.info(format!("Version {v} disponible")),
-            UpdateEvent::Ready => {
-                app.success("Mise à jour installée : redémarrez pour l'appliquer")
-            }
-            UpdateEvent::Error(e) => app.error(format!("Mise à jour : {e}")),
+        match update_message(&ev, modal) {
+            Some((StatusKind::Info, text)) => app.info(text),
+            Some((StatusKind::Success, text)) => app.success(text),
+            Some((StatusKind::Error, text)) => app.error(text),
+            None => {}
         }
     }
 }
 
-/// The banner shows an available (not dismissed), downloading or ready (not
-/// put off) update.
-fn banner_shown(updater: &Updater) -> bool {
+/// The status message of an update event; none while the update modal is
+/// open: it shows the outcome itself.
+fn update_message(ev: &UpdateEvent, modal_open: bool) -> Option<(StatusKind, String)> {
+    if modal_open {
+        return None;
+    }
+    Some(match ev {
+        UpdateEvent::UpToDate => (StatusKind::Info, "storingUnicorns est à jour".into()),
+        UpdateEvent::Available(v) => (StatusKind::Info, format!("Version {v} disponible")),
+        UpdateEvent::Ready => (
+            StatusKind::Success,
+            "Mise à jour installée : redémarrez pour l'appliquer".into(),
+        ),
+        UpdateEvent::Error(e) => (StatusKind::Error, format!("Mise à jour : {e}")),
+    })
+}
+
+/// The banner shows an available or ready update not put off ("Plus
+/// tard"), unless the update modal (which shows it) is open.
+fn banner_shown(updater: &Updater, modal_open: bool) -> bool {
     match &updater.state {
-        UpdateState::Available(_) | UpdateState::Ready(_) => !updater.dismissed,
-        UpdateState::Downloading(_) => true,
+        UpdateState::Available(_) | UpdateState::Ready(_) => !updater.dismissed && !modal_open,
         _ => false,
     }
 }
 
-/// Thin banner above everything while an update is available / downloading / ready.
+/// Thin banner above everything when an update was found (at startup) or
+/// got installed in the background; « Voir la mise à jour » opens the
+/// update modal.
 pub fn update_banner(app: &mut App, ctx: &egui::Context) {
-    if !banner_shown(&app.updater) {
+    if !banner_shown(&app.updater, update_modal_open(app)) {
         return;
     }
     let state = app.updater.state.clone();
@@ -113,26 +136,19 @@ pub fn update_banner(app: &mut App, ctx: &egui::Context) {
             UpdateState::Available(info) => {
                 ui.label(RichText::new(icon::ARROW_CIRCLE_UP).color(theme::ACCENT));
                 ui.label(format!("La version {} est disponible.", info.version));
-                if ui.button("Installer").clicked() {
-                    app.updater.install();
+                if ui.button("Voir la mise à jour").clicked() {
+                    update::open(app);
                 }
-                ui.hyperlink_to("Nouveautés", &info.page_url);
                 if ui.button("Plus tard").clicked() {
-                    app.updater.dismissed = true;
+                    app.updater.later();
                 }
-                if ui.button("Ignorer cette version").clicked() {
-                    app.config.skipped_version = Some(info.version.to_string());
-                    app.updater.dismissed = true;
-                    app.save_config();
-                }
-            }
-            UpdateState::Downloading(info) => {
-                ui.spinner();
-                ui.label(format!("Téléchargement de la version {}…", info.version));
             }
             UpdateState::Ready(info) => {
                 ui.label(RichText::new(icon::CHECK_CIRCLE).color(SUCCESS));
-                ui.label(format!("Version {} prête.", info.version));
+                ui.label(format!(
+                    "La version {} est installée. Redémarrez pour l'utiliser.",
+                    info.version
+                ));
                 // Goes through the normal close: cancelling its confirmation
                 // drops the relaunch (`cancel_restart`).
                 if ui.button("Redémarrer maintenant").clicked() {
@@ -212,41 +228,87 @@ fn message(app: &App, ui: &mut egui::Ui) {
     }
 }
 
-/// Text and hover of the version link for `current`: "v0.13.0 → 0.14.0"
-/// once an update is ready.
-fn version_label(state: &UpdateState, current: &str) -> (String, String) {
+/// Hover of the version link for `current`.
+fn version_hover(state: &UpdateState, current: &str) -> String {
     match state {
-        UpdateState::Ready(info) => (
-            format!("v{current} → {}", info.version),
-            "Mise à jour prête : cliquer pour redémarrer".into(),
-        ),
-        UpdateState::Failed(e) => (
-            format!("v{current}"),
-            format!("storingUnicorns {current} — dernière vérification en échec : {e}"),
-        ),
-        _ => (
-            format!("v{current}"),
-            format!("storingUnicorns {current} — vérifier les mises à jour"),
-        ),
+        UpdateState::Checking => {
+            format!("storingUnicorns {current} — recherche d'une mise à jour…")
+        }
+        UpdateState::Failed(e) => {
+            format!("storingUnicorns {current} — dernière vérification en échec : {e}")
+        }
+        UpdateState::Available(_) | UpdateState::Downloading(_) | UpdateState::Ready(_) => {
+            format!("storingUnicorns {current} — voir la mise à jour")
+        }
+        _ => format!("storingUnicorns {current} — vérifier les mises à jour"),
     }
 }
 
-/// The running version, at the far left; a click checks for updates, or
-/// shows the banner of a ready update again.
-fn version(app: &mut App, ui: &mut egui::Ui) {
-    let ready = matches!(app.updater.state, UpdateState::Ready(_));
-    let (text, hover) = version_label(&app.updater.state, crate::updater::current_version());
-    let text = if ready {
-        RichText::new(text).color(theme::ACCENT)
-    } else {
-        RichText::new(text).weak()
-    };
-    if ui.link(text).on_hover_text(hover).clicked() {
-        if ready {
-            app.updater.show_ready();
-        } else {
-            app.updater.check(true, None);
+/// What the status bar shows next to the version while an update is under
+/// way.
+#[derive(Debug, PartialEq)]
+enum UpdateChip {
+    /// An accent button (available, ready).
+    Button { label: String, hover: String },
+    /// A spinner and a link (downloading).
+    Busy { label: String, hover: String },
+}
+
+fn update_chip(state: &UpdateState) -> Option<UpdateChip> {
+    match state {
+        UpdateState::Available(info) => Some(UpdateChip::Button {
+            label: format!("{} {} disponible", icon::ARROW_CIRCLE_UP, info.version),
+            hover: format!(
+                "La version {} est disponible : cliquer pour la voir",
+                info.version
+            ),
+        }),
+        UpdateState::Downloading(info) => Some(UpdateChip::Busy {
+            label: "Téléchargement…".into(),
+            hover: format!(
+                "Téléchargement de la version {} : cliquer pour suivre",
+                info.version
+            ),
+        }),
+        UpdateState::Ready(info) => Some(UpdateChip::Button {
+            label: format!("{} Redémarrer pour {}", icon::ARROW_CLOCKWISE, info.version),
+            hover: format!(
+                "La version {} est installée : cliquer pour redémarrer",
+                info.version
+            ),
+        }),
+        _ => None,
+    }
+}
+
+/// The running version (a link) and, while an update is under way, its
+/// chip; whether one of them was clicked.
+fn version_row(ui: &mut egui::Ui, state: &UpdateState, current: &str) -> bool {
+    let mut clicked = ui
+        .link(RichText::new(format!("v{current}")).weak())
+        .on_hover_text(version_hover(state, current))
+        .clicked();
+    match update_chip(state) {
+        Some(UpdateChip::Button { label, hover }) => {
+            let chip = egui::Button::new(RichText::new(label).color(egui::Color32::WHITE))
+                .fill(theme::ACCENT)
+                .small();
+            clicked |= ui.add(chip).on_hover_text(hover).clicked();
         }
+        Some(UpdateChip::Busy { label, hover }) => {
+            ui.spinner();
+            clicked |= ui.link(label).on_hover_text(hover).clicked();
+        }
+        None => {}
+    }
+    clicked
+}
+
+/// The running version, at the far left, and the update chip: a click
+/// opens the update modal (checking first when nothing was found yet).
+fn version(app: &mut App, ui: &mut egui::Ui) {
+    if version_row(ui, &app.updater.state, crate::updater::current_version()) {
+        update::open(app);
     }
 }
 
@@ -312,41 +374,119 @@ mod tests {
         assert_eq!(p.current(), None);
     }
 
-    fn ready_updater() -> Updater {
-        let json = r#"{"version":"99.0.0","notes":"","page_url":"p","assets":[{"name":"storingUnicorns-setup.msi","url":"u","sha256":"00"}]}"#;
-        let info = crate::updater::release_from_manifest_for_tests(json)
+    fn release(version: &str) -> crate::updater::ReleaseInfo {
+        let json = format!(
+            r#"{{"version":"{version}","notes":"","page_url":"p","assets":[{{"name":"storingUnicorns-setup.msi","url":"u","sha256":"00"}}]}}"#
+        );
+        crate::updater::release_from_manifest_for_tests(&json)
             .unwrap()
-            .unwrap();
+            .unwrap()
+    }
+
+    fn updater(state: UpdateState) -> Updater {
         let mut u = Updater::new(|| {});
-        u.state = UpdateState::Ready(info);
+        u.state = state;
         u
     }
 
     #[test]
-    fn later_hides_the_ready_banner_and_the_version_shows_it_again() {
-        let mut u = ready_updater();
-        assert!(banner_shown(&u));
-        u.later();
-        assert!(!banner_shown(&u));
-        let (text, hover) = version_label(&u.state, "0.13.0");
-        assert_eq!(text, "v0.13.0 → 99.0.0");
-        assert_eq!(hover, "Mise à jour prête : cliquer pour redémarrer");
-        u.show_ready();
-        assert!(banner_shown(&u));
+    fn banner_shows_found_updates_unless_put_off_or_the_modal_is_open() {
+        for state in [
+            UpdateState::Available(release("99.0.0")),
+            UpdateState::Ready(release("99.0.0")),
+        ] {
+            let mut u = updater(state);
+            assert!(banner_shown(&u, false));
+            assert!(!banner_shown(&u, true), "the modal shows it");
+            u.later();
+            assert!(!banner_shown(&u, false));
+        }
+        for state in [
+            UpdateState::Idle,
+            UpdateState::Checking,
+            UpdateState::UpToDate,
+            UpdateState::Downloading(release("99.0.0")),
+            UpdateState::Failed("boom".into()),
+        ] {
+            assert!(!banner_shown(&updater(state), false));
+        }
     }
 
     #[test]
-    fn version_label_without_ready_update() {
-        let u = Updater::new(|| {});
-        assert!(!banner_shown(&u));
-        let (text, hover) = version_label(&u.state, "0.13.0");
-        assert_eq!(text, "v0.13.0");
-        assert_eq!(hover, "storingUnicorns 0.13.0 — vérifier les mises à jour");
-        let (_, hover) = version_label(&UpdateState::Failed("boom".into()), "0.13.0");
+    fn chip_next_to_the_version() {
         assert_eq!(
-            hover,
+            update_chip(&UpdateState::Available(release("0.18.2"))),
+            Some(UpdateChip::Button {
+                label: format!("{} 0.18.2 disponible", icon::ARROW_CIRCLE_UP),
+                hover: "La version 0.18.2 est disponible : cliquer pour la voir".into(),
+            })
+        );
+        assert_eq!(
+            update_chip(&UpdateState::Ready(release("0.18.2"))),
+            Some(UpdateChip::Button {
+                label: format!("{} Redémarrer pour 0.18.2", icon::ARROW_CLOCKWISE),
+                hover: "La version 0.18.2 est installée : cliquer pour redémarrer".into(),
+            })
+        );
+        assert!(matches!(
+            update_chip(&UpdateState::Downloading(release("0.18.2"))),
+            Some(UpdateChip::Busy { label, .. }) if label == "Téléchargement…"
+        ));
+        for state in [
+            UpdateState::Idle,
+            UpdateState::Checking,
+            UpdateState::UpToDate,
+            UpdateState::Failed("boom".into()),
+        ] {
+            assert_eq!(update_chip(&state), None);
+        }
+    }
+
+    #[test]
+    fn version_hover_follows_the_state() {
+        assert_eq!(
+            version_hover(&UpdateState::Idle, "0.13.0"),
+            "storingUnicorns 0.13.0 — vérifier les mises à jour"
+        );
+        assert_eq!(
+            version_hover(&UpdateState::Failed("boom".into()), "0.13.0"),
             "storingUnicorns 0.13.0 — dernière vérification en échec : boom"
         );
+        assert_eq!(
+            version_hover(&UpdateState::Ready(release("99.0.0")), "0.13.0"),
+            "storingUnicorns 0.13.0 — voir la mise à jour"
+        );
+    }
+
+    #[test]
+    fn no_status_message_while_the_modal_shows_the_outcome() {
+        let ev = UpdateEvent::Error("boom".into());
+        assert_eq!(
+            update_message(&ev, false),
+            Some((StatusKind::Error, "Mise à jour : boom".into()))
+        );
+        assert_eq!(update_message(&ev, true), None);
+        assert_eq!(update_message(&UpdateEvent::UpToDate, true), None);
+        assert_eq!(
+            update_message(&UpdateEvent::Ready, false).map(|m| m.0),
+            Some(StatusKind::Success)
+        );
+    }
+
+    #[test]
+    fn clicking_the_version_or_its_chip_opens_the_modal() {
+        use crate::gui::ui_test::{click, Driver};
+        let mut d = Driver::new();
+        let idle = UpdateState::Idle;
+        d.panel(vec![], |ui| version_row(ui, &idle, "0.18.1"));
+        let link = d.widget("v0.18.1").expect("version link");
+        assert!(d.panel(click(link), |ui| version_row(ui, &idle, "0.18.1")));
+        assert!(!d.panel(vec![], |ui| version_row(ui, &idle, "0.18.1")));
+
+        let ready = UpdateState::Ready(release("0.18.2"));
+        d.panel(vec![], |ui| version_row(ui, &ready, "0.18.1"));
+        let chip = d.button("Redémarrer pour 0.18.2").expect("chip");
+        assert!(d.panel(click(chip.center), |ui| version_row(ui, &ready, "0.18.1")));
     }
 
     #[test]

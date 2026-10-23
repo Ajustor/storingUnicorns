@@ -4,6 +4,7 @@ pub mod connection;
 pub mod folder;
 pub mod structure;
 pub mod transfer;
+pub mod update;
 
 use super::app::App;
 use super::history_popup::HistoryPopup;
@@ -18,6 +19,7 @@ use connection::{ConnectionForm, FormAction};
 use folder::FolderPrompt;
 use structure::{StructureAction, StructureDialog};
 use transfer::{BatchDialog, BatchStart};
+use update::UpdateAction;
 
 pub enum Dialog {
     Connection(Box<ConnectionForm>),
@@ -60,6 +62,8 @@ pub enum Dialog {
     Batch(BatchDialog),
     /// Name a new or renamed folder of the explorer.
     Folder(FolderPrompt),
+    /// « Mise à jour »: follows the updater's state.
+    Update,
 }
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
@@ -116,6 +120,8 @@ enum Answer {
     StartBatch,
     /// Create / rename the folder of the prompt.
     Folder,
+    /// A button of the update modal.
+    Update(UpdateAction),
 }
 
 /// The answer a standard dialog got this frame: `Some(None)` to cancel it
@@ -264,6 +270,8 @@ fn dialog_ui(app: &mut App, ui: &mut egui::Ui, dialog: &mut Dialog) -> ModalResp
         }
         Dialog::Structure(d) => structure::ui(app, ui, d).map(Answer::Structure),
         Dialog::Folder(prompt) => prompt.ui(ui).map(|()| Answer::Folder),
+        Dialog::Update => update::ui(ui, &app.updater.state, crate::updater::current_version())
+            .map(Answer::Update),
     }
 }
 
@@ -318,6 +326,8 @@ enum Effect {
     Batch(BatchStart),
     /// The folder prompt's button (the prompt is the dialog).
     Folder,
+    /// The update modal's button, `None` when it was closed.
+    Update(Option<UpdateAction>),
 }
 
 /// The effect of `answer` (`None`: cancelled) to `dialog`.
@@ -361,6 +371,8 @@ fn effect(dialog: &Dialog, answer: Option<Answer>) -> Effect {
         },
         (Dialog::Batch(b), Some(StartBatch)) => b.start().map_or(Effect::Nothing, Effect::Batch),
         (Dialog::Folder(_), Some(Answer::Folder)) => Effect::Folder,
+        (Dialog::Update, Some(Answer::Update(a))) => Effect::Update(Some(a)),
+        (Dialog::Update, None) => Effect::Update(None),
         _ => Effect::Nothing,
     }
 }
@@ -384,6 +396,7 @@ fn apply(app: &mut App, ctx: &egui::Context, dialog: &mut Dialog, effect: Effect
                 return super::explorer::apply_folder_prompt(app, prompt);
             }
         }
+        Effect::Update(action) => return update::act(app, ctx, action),
         Effect::Nothing => {}
         Effect::DeleteConnection(name) => app.delete_connection(&name),
         Effect::AnswerDiscard(id, answer) => answer_discard(app, id, answer),
@@ -591,6 +604,16 @@ mod tests {
             error: None,
             goto: None,
         })
+    }
+
+    #[test]
+    fn update_modal_buttons_and_closing() {
+        assert_eq!(
+            effect(&Dialog::Update, Some(Answer::Update(UpdateAction::Install))),
+            Effect::Update(Some(UpdateAction::Install))
+        );
+        // Plus tard / Fermer / ×: the updater puts the update off.
+        assert_eq!(effect(&Dialog::Update, None), Effect::Update(None));
     }
 
     #[test]

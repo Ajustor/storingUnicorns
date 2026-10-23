@@ -233,13 +233,28 @@ pub fn cell_to_bson(original: Option<&Bson>, text: &str) -> Result<Option<Bson>,
     }
 }
 
-/// The document of a grid row, found by its `_id` cell.
+/// The document of a grid row: the page's row equal to `row` (all its
+/// cells), the document at that position. Not by the `_id` text alone:
+/// `"1"`, `1` and `NumberLong(1)` show alike. Two equal rows: refused.
 fn row_doc<'a>(page: &'a DocPage, id_col: usize, row: &[String]) -> Result<&'a Document, String> {
-    let cell = row.get(id_col).ok_or("ligne incomplète")?;
-    page.docs
+    let id = row.get(id_col).ok_or("ligne incomplète")?;
+    let mut found = page
+        .result
+        .rows
         .iter()
-        .find(|d| d.get("_id").is_some_and(|id| cell_text(id) == *cell))
-        .ok_or_else(|| format!("document introuvable (_id {cell})"))
+        .enumerate()
+        .filter(|(_, r)| r.as_slice() == row)
+        .map(|(i, _)| i);
+    match (found.next(), found.next()) {
+        (Some(i), None) => page
+            .docs
+            .get(i)
+            .ok_or_else(|| format!("document introuvable (_id {id})")),
+        (Some(_), Some(_)) => Err(format!(
+            "plusieurs documents s'affichent à l'identique (_id {id}) :              modifier par la console ou l'éditeur JSON"
+        )),
+        (None, _) => Err(format!("document introuvable (_id {id})")),
+    }
 }
 
 /// The writes of the grid's pending edits (rows found by `_id`): changed
@@ -578,6 +593,51 @@ mod tests {
                 DocChange::Delete { id: Bson::Int32(2) },
             ]
         );
+    }
+
+    #[test]
+    fn rows_are_found_by_position_not_by_the_id_text() {
+        // `"1"`, `1` and `NumberLong(1)` all show as 1.
+        let docs = vec![
+            doc! { "_id": "1", "a": 1 },
+            doc! { "_id": 1, "a": 2 },
+            doc! { "_id": 1_i64, "a": 1 },
+        ];
+        let p = DocPage {
+            result: flatten(&docs),
+            docs,
+        };
+        assert_eq!(p.result.rows[0], p.result.rows[2]);
+        let row1 = p.result.rows[1].clone();
+        let mut edited = row1.clone();
+        edited[1] = "3".into();
+        let out = doc_changes(
+            &p,
+            &RowChanges {
+                updates: vec![(row1, edited)],
+                deletes: vec![],
+                inserts: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            [DocChange::Set {
+                id: Bson::Int32(1),
+                field: "a".into(),
+                value: Bson::Int32(3)
+            }]
+        );
+        // Rows 0 and 2 can't be told apart: refused, nothing guessed.
+        let e = doc_changes(
+            &p,
+            &RowChanges {
+                deletes: vec![p.result.rows[0].clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(e.contains("plusieurs documents"), "{e}");
     }
 
     #[test]

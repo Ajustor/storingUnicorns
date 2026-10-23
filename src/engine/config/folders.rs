@@ -16,25 +16,130 @@ use crate::engine::models::ConnectionConfig;
 /// Separator between the segments of a folder path.
 pub const SEP: char = '/';
 
-/// Normalize a folder path: segments trimmed, empty ones dropped
-/// (`"  a / b//c "` -> `"a/b/c"`). Refuses an empty path, `.` / `..`
-/// segments and control characters.
-pub fn normalize(path: &str) -> Result<String, String> {
+/// Most segments a folder path may have.
+pub const MAX_DEPTH: usize = 32;
+/// Most characters (not bytes) a folder name may have.
+pub const MAX_NAME_CHARS: usize = 128;
+
+/// Unicode format (Cf), line (Zl) and paragraph (Zp) separator characters:
+/// invisible, and the bidi controls among them can disguise a name.
+fn is_format_or_separator(c: char) -> bool {
+    matches!(
+        c,
+        '\u{AD}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61C}'
+            | '\u{6DD}'
+            | '\u{70F}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Whether `c` shows something: not whitespace, nor one of the characters
+/// rendered as blank (Hangul fillers, blank Braille pattern, combining
+/// grapheme joiner).
+fn is_visible(c: char) -> bool {
+    !c.is_whitespace()
+        && !matches!(
+            c,
+            '\u{34F}' | '\u{115F}' | '\u{1160}' | '\u{2800}' | '\u{3164}' | '\u{FFA0}'
+        )
+}
+
+/// The checked segments of `path` (NFC, trimmed, empty ones dropped); an
+/// empty list is the root.
+fn segments(path: &str) -> Result<Vec<String>, String> {
+    use unicode_normalization::UnicodeNormalization;
     if path.chars().any(char::is_control) {
         return Err("Le nom du dossier contient un caractère de contrôle".into());
     }
-    let segments: Vec<&str> = path
+    if path.chars().any(is_format_or_separator) {
+        return Err("Le nom du dossier contient un caractère invisible".into());
+    }
+    let nfc: String = path.nfc().collect();
+    let segments: Vec<String> = nfc
         .split(SEP)
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .map(String::from)
         .collect();
+    if segments.len() > MAX_DEPTH {
+        return Err(format!(
+            "Un dossier ne peut pas être imbriqué sur plus de {MAX_DEPTH} niveaux"
+        ));
+    }
+    for s in &segments {
+        if s == "." || s == ".." {
+            return Err("« . » et « .. » ne sont pas des noms de dossier valides".into());
+        }
+        if !s.chars().any(is_visible) {
+            return Err("Le nom du dossier doit contenir un caractère visible".into());
+        }
+        if s.chars().count() > MAX_NAME_CHARS {
+            return Err(format!(
+                "Un nom de dossier ne peut pas dépasser {MAX_NAME_CHARS} caractères"
+            ));
+        }
+    }
+    Ok(segments)
+}
+
+/// Normalize a folder path: NFC, segments trimmed, empty ones dropped
+/// (`"  a / b//c "` -> `"a/b/c"`). Refuses an empty path (see `is_root`),
+/// `.` / `..` segments, control, format and separator characters, a segment
+/// without a visible character, more than `MAX_DEPTH` segments and a
+/// segment longer than `MAX_NAME_CHARS` characters.
+pub fn normalize(path: &str) -> Result<String, String> {
+    let segments = segments(path)?;
     if segments.is_empty() {
         return Err("Le nom du dossier est vide".into());
     }
-    if segments.iter().any(|s| *s == "." || *s == "..") {
-        return Err("« . » et « .. » ne sont pas des noms de dossier valides".into());
-    }
     Ok(segments.join(&SEP.to_string()))
+}
+
+/// Whether `path` designates the root, i.e. normalizes to nothing (`""`,
+/// `"/"`, `" // "`). The root is not a folder.
+pub fn is_root(path: &str) -> bool {
+    segments(path).is_ok_and(|s| s.is_empty())
+}
+
+/// Refuse `path` when it, or one of its ancestors spelled differently,
+/// matches an existing folder case-insensitively (`except` aside, so a
+/// case-only rename works). Ancestors spelled exactly alike are fine.
+fn check_collision(
+    existing: &BTreeSet<String>,
+    path: &str,
+    except: Option<&str>,
+) -> Result<(), String> {
+    let mut prefix = path;
+    while !prefix.is_empty() {
+        let lower = prefix.to_lowercase();
+        let clash = existing.iter().find(|e| {
+            Some(e.as_str()) != except
+                && e.to_lowercase() == lower
+                && (prefix == path || e.as_str() != prefix)
+        });
+        if let Some(e) = clash {
+            return Err(format!("Le dossier « {e} » existe déjà"));
+        }
+        prefix = parent(prefix);
+    }
+    Ok(())
 }
 
 /// The parent of a normalized path, `""` for a top-level folder.
@@ -148,7 +253,8 @@ fn build(
 }
 
 impl AppConfig {
-    /// Whether the folder exists, explicitly or implicitly.
+    /// Whether the folder exists, explicitly or implicitly. False for the
+    /// root (`""`, `"/"`), which is not a folder.
     pub fn folder_exists(&self, path: &str) -> bool {
         normalize(path).is_ok_and(|p| all_paths(self).contains(&p))
     }
@@ -157,9 +263,7 @@ impl AppConfig {
     /// content too). Returns the normalized path; refuses an existing one.
     pub fn create_folder(&mut self, path: &str) -> Result<String, String> {
         let path = normalize(path)?;
-        if all_paths(self).contains(&path) {
-            return Err(format!("Le dossier « {path} » existe déjà"));
-        }
+        check_collision(&all_paths(self), &path, None)?;
         let explicit: BTreeSet<String> = self
             .folders
             .iter()
@@ -176,8 +280,10 @@ impl AppConfig {
     }
 
     /// Rename / move a folder with all its content (connections and
-    /// subfolders). Refuses moving it into itself or a descendant, and a
-    /// destination that already exists (no merge).
+    /// subfolders). Refuses moving it into itself or a descendant, a
+    /// destination colliding case-insensitively with another folder (no
+    /// merge; a case-only rename is fine) and nesting deeper than
+    /// `MAX_DEPTH`.
     pub fn rename_folder(&mut self, from: &str, to: &str) -> Result<(), String> {
         let from = normalize(from)?;
         let to = normalize(to)?;
@@ -191,8 +297,18 @@ impl AppConfig {
         if is_within(&to, &from) {
             return Err("Un dossier ne peut pas être déplacé dans lui-même".into());
         }
-        if paths.contains(&to) {
-            return Err(format!("Le dossier « {to} » existe déjà"));
+        check_collision(&paths, &to, Some(&from))?;
+        let depth = |p: &str| p.split(SEP).count();
+        let deepest = paths
+            .iter()
+            .filter(|p| is_within(p, &from))
+            .map(|p| depth(p) - depth(&from) + depth(&to))
+            .max()
+            .unwrap_or(0);
+        if deepest > MAX_DEPTH {
+            return Err(format!(
+                "Un dossier ne peut pas être imbriqué sur plus de {MAX_DEPTH} niveaux"
+            ));
         }
         self.rewrite_folders(|p| is_within(p, &from).then(|| format!("{to}{}", &p[from.len()..])));
         Ok(())
@@ -219,11 +335,11 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Move a connection into `folder` (`None`, or a blank string, = root),
-    /// which needn't exist yet.
+    /// Move a connection into `folder` (`None`, or anything normalizing to
+    /// nothing such as `""` or `"/"`, = root), which needn't exist yet.
     pub fn move_connection(&mut self, name: &str, folder: Option<&str>) -> Result<(), String> {
         let folder = match folder {
-            Some(f) if !f.trim().is_empty() => Some(normalize(f)?),
+            Some(f) if !is_root(f) => Some(normalize(f)?),
             _ => None,
         };
         let conn = self
@@ -591,5 +707,117 @@ mod tests {
         c.connections[0].name = "new".into();
         assert_eq!(folder_of(&c, "new"), Some("F"));
         assert!(c.get_connection("new").unwrap().is_schema_hidden("s"));
+    }
+
+    #[test]
+    fn normalize_refuses_invisible_format_and_separator_characters() {
+        for bad in [
+            "a\u{200B}b",
+            "\u{FEFF}a",
+            "a/\u{202E}gpj.exe",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{00AD}b",
+            "a\u{2066}b\u{2069}",
+            "\u{E0041}a",
+        ] {
+            assert!(normalize(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_requires_a_visible_character_per_segment() {
+        for bad in ["\u{3164}", "a/\u{3164}\u{115F}/b", "\u{2800}", "\u{034F}"] {
+            assert!(normalize(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(normalize("a\u{3164}").unwrap(), "a\u{3164}");
+    }
+
+    #[test]
+    fn normalize_composes_to_nfc() {
+        assert_eq!(normalize("E\u{301}quipe").unwrap(), "\u{C9}quipe");
+    }
+
+    #[test]
+    fn normalize_limits_depth_and_segment_length() {
+        let deep = vec!["d"; 32].join("/");
+        assert_eq!(normalize(&deep).unwrap(), deep);
+        let err = normalize(&format!("{deep}/e")).unwrap_err();
+        assert!(err.contains("32"), "{err}");
+        let long = "é".repeat(128);
+        assert_eq!(normalize(&long).unwrap(), long, "characters, not bytes");
+        let err = normalize(&format!("a/{long}x")).unwrap_err();
+        assert!(err.contains("128"), "{err}");
+    }
+
+    #[test]
+    fn rename_folder_refuses_nesting_too_deep() {
+        let deep = vec!["d"; 30].join("/");
+        let mut c = config(&[&deep, "M/N"], &[]);
+        assert!(
+            c.rename_folder("M", &format!("{deep}/d/x")).is_err(),
+            "M/N would land 33 levels deep"
+        );
+        c.rename_folder("M", &format!("{}/x", vec!["d"; 29].join("/")))
+            .unwrap();
+    }
+
+    #[test]
+    fn is_root_and_folder_exists_on_the_root() {
+        for root in ["", " ", "/", " // / "] {
+            assert!(is_root(root), "{root:?}");
+        }
+        for not_root in ["a", "a/../b", "\u{200B}"] {
+            assert!(!is_root(not_root), "{not_root:?}");
+        }
+        let c = config(&["A"], &[("p", None)]);
+        assert!(!c.folder_exists(""), "the root is not a folder");
+        assert!(!c.folder_exists("/"));
+    }
+
+    #[test]
+    fn create_folder_collisions_are_case_insensitive() {
+        let mut c = config(&["Clients"], &[("p", Some("Live/Prod"))]);
+        assert!(c.create_folder("clients").is_err());
+        assert!(c.create_folder("LIVE").is_err(), "implicit too");
+        assert!(c.create_folder("live/prod").is_err());
+        assert!(
+            c.create_folder("clients/X").is_err(),
+            "ancestor in another case"
+        );
+        assert_eq!(c.create_folder("Clients/X").unwrap(), "Clients/X");
+        assert!(c.create_folder("Clients/x").is_err());
+        assert_eq!(c.folders, ["Clients", "Clients/X"]);
+    }
+
+    #[test]
+    fn rename_folder_collisions_are_case_insensitive() {
+        let mut c = config(&["Alpha", "Beta", "Beta/Sub"], &[]);
+        assert!(c.rename_folder("Alpha", "beta").is_err());
+        assert!(c.rename_folder("Alpha", "BETA/sub").is_err());
+        assert!(
+            c.rename_folder("Alpha", "beta/New").is_err(),
+            "ancestor in another case"
+        );
+        c.rename_folder("Alpha", "Beta/New").unwrap();
+        c.rename_folder("Beta/Sub", "Beta/SUB").unwrap();
+        assert_eq!(
+            c.folders,
+            ["Beta/New", "Beta", "Beta/SUB"],
+            "case-only rename"
+        );
+        c.rename_folder("Beta", "BETA").unwrap();
+        assert_eq!(c.folders, ["BETA/New", "BETA", "BETA/SUB"]);
+    }
+
+    #[test]
+    fn move_connection_to_a_path_normalizing_to_empty_means_root() {
+        let mut c = config(&[], &[("p", Some("A"))]);
+        for root in ["/", " // ", ""] {
+            c.move_connection("p", Some("A")).unwrap();
+            c.move_connection("p", Some(root)).unwrap();
+            assert_eq!(folder_of(&c, "p"), None, "{root:?}");
+        }
+        assert!(c.move_connection("p", Some("/\u{200B}/")).is_err());
     }
 }

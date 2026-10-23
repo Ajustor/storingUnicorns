@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::tui::{ActivePanel, AppState, DialogMode};
+use crate::tui::{nosql, ActivePanel, AppState, DialogMode};
 
 /// Returns the help entries for the Connections panel.
 fn connections_help(state: &AppState) -> Vec<(&'static str, &'static str)> {
@@ -122,6 +122,33 @@ fn dialog_help(mode: DialogMode) -> Vec<(&'static str, &'static str)> {
             ("Esc", "Cancel"),
         ],
         DialogMode::FolderPrompt => vec![("Enter", "Confirm"), ("Esc", "Cancel")],
+        DialogMode::NoSqlConfirm => vec![("o", "Oui"), ("N/Entrée/Échap", "Non")],
+        DialogMode::JsonView => vec![
+            ("↑/↓", "Défiler"),
+            ("PgUp/PgDn", "Page"),
+            ("Échap", "Fermer"),
+        ],
+        DialogMode::Indexes => vec![
+            ("↑/↓", "Choisir"),
+            ("n", "Nouvel index"),
+            ("d", "Supprimer"),
+            ("r", "Recharger"),
+            ("Échap", "Fermer"),
+        ],
+        DialogMode::NoSqlForm => vec![
+            ("Tab", "Champ suivant"),
+            ("←/→", "Choix"),
+            ("Entrée", "Valider"),
+            ("Échap", "Annuler"),
+        ],
+        DialogMode::NoSqlTransfer => vec![
+            ("Tab", "Champ"),
+            ("←/→", "Format/Base"),
+            ("Espace", "Cocher"),
+            ("a/n", "Tout/Rien"),
+            ("Entrée", "Lancer"),
+            ("Échap", "Annuler"),
+        ],
         DialogMode::DeleteRowConfirm | DialogMode::TruncateConfirm => {
             vec![("y/Enter", "Confirm"), ("n/Esc", "Cancel")]
         }
@@ -152,12 +179,21 @@ pub fn get_help_entries(state: &AppState) -> Vec<(&'static str, &'static str)> {
     } else if state.tables_filter_active || state.results_filter_active {
         filter_help()
     } else {
-        let mut entries = match state.active_panel {
-            ActivePanel::Connections => connections_help(state),
-            ActivePanel::Tables => tables_help(),
-            ActivePanel::QueryEditor => query_editor_help(state),
-            ActivePanel::Results => results_help(),
+        let engine = nosql::engine(state);
+        let mut entries = match (state.active_panel, &engine) {
+            (ActivePanel::Connections, _) => connections_help(state),
+            (ActivePanel::Tables, Some(db)) => nosql::tables_help(db),
+            (ActivePanel::Tables, None) => tables_help(),
+            (ActivePanel::QueryEditor, Some(_))
+                if !state.show_completion && !state.has_selection() =>
+            {
+                nosql::editor_help()
+            }
+            (ActivePanel::QueryEditor, _) => query_editor_help(state),
+            (ActivePanel::Results, Some(_)) => nosql::results_help(),
+            (ActivePanel::Results, None) => results_help(),
         };
+
         if state.pending_connect.is_some() {
             entries.insert(0, ("Esc", "Annuler la connexion"));
         }

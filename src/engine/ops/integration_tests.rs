@@ -152,14 +152,19 @@ async fn exercise(conn: &DatabaseConnection, d: &Dialect) {
          SELECT name FROM {parent} WHERE a = 4"
     );
     let out = run_script(conn, &script, Some(100)).await;
-    assert_eq!(out.len(), 3);
     for o in &out {
         assert!(o.result.is_ok(), "{}: {:?}", o.sql, o.result);
     }
-    assert_eq!(out[0].result.as_ref().unwrap().rows_affected, 1);
-    assert_eq!(out[1].result.as_ref().unwrap().rows_affected, 1);
+    // SQL Server runs the script as one T-SQL batch: an outcome per result
+    // set (see `integration_mssql_script_batches`).
+    let tsql = matches!(d.db, DatabaseType::SQLServer | DatabaseType::Azure);
+    if !tsql {
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].result.as_ref().unwrap().rows_affected, 1);
+        assert_eq!(out[1].result.as_ref().unwrap().rows_affected, 1);
+    }
     assert_eq!(
-        out[2].result.as_ref().unwrap().rows,
+        out.last().unwrap().result.as_ref().unwrap().rows,
         vec![vec!["y".to_string()]]
     );
     let out = run_script(
@@ -168,8 +173,13 @@ async fn exercise(conn: &DatabaseConnection, d: &Dialect) {
         None,
     )
     .await;
-    assert_eq!(out.len(), 2, "run_script stops after the first error");
-    assert!(out[1].result.is_err());
+    let failing = if tsql { 0 } else { 1 };
+    assert_eq!(
+        out.len(),
+        failing + 1,
+        "run_script stops after the first error"
+    );
+    assert!(out[failing].result.is_err());
 
     // --- Transaction blocks ---
     let (begin, commit) = transaction_bounds(&d.db);
@@ -849,6 +859,9 @@ async fn run_mysql_suite(dsn: &str) {
     let c = DatabaseConnection::connect(&special).await.unwrap();
     assert_eq!(scalar(&c, "SELECT 1").await, "1");
 }
+
+/// 1 when the session has `XACT_ABORT` on, else 0.
+const XACT_ABORT: &str = "SELECT CAST(@@OPTIONS & 16384 AS int) / 16384";
 
 /// `host=...;port=...;user=...;password=...;database=...`
 fn mssql_config(spec: &str) -> ConnectionConfig {
@@ -1609,4 +1622,342 @@ async fn integration_tricky_literals_mssql() {
         ],
     )
     .await;
+}
+
+/// Scripts on SQL Server run as T-SQL batches split on `GO`, as in SSMS:
+/// the user's script shape (variables declared before a transaction, used
+/// by a SELECT after its COMMIT), one outcome per result set, script line
+/// numbers in errors, THROW rolling back and leaving the client usable.
+#[tokio::test]
+#[ignore]
+async fn integration_mssql_script_batches() {
+    use crate::engine::ops::query::{run_all, StatementOutcome, TSQL_UNTERMINATED};
+    let Some(spec) = env("SU_IT_MSSQL") else {
+        eprintln!("SU_IT_MSSQL not set, skipping");
+        return;
+    };
+    let conn = DatabaseConnection::connect(&mssql_config(&spec))
+        .await
+        .unwrap();
+    for sql in [
+        "DROP TABLE IF EXISTS su_it_b.link, su_it_b.acte",
+        "IF SCHEMA_ID('su_it_b') IS NULL EXEC('CREATE SCHEMA su_it_b')",
+        "CREATE TABLE su_it_b.acte (Id INT IDENTITY(1,1) PRIMARY KEY, \
+         CodeActe NVARCHAR(10) NOT NULL, CreatedBy NVARCHAR(36))",
+        "CREATE TABLE su_it_b.link (Id INT IDENTITY(1,1) PRIMARY KEY, \
+         NgapActeId INT NOT NULL, Spec NVARCHAR(10))",
+    ] {
+        exec(&conn, sql).await;
+    }
+    let errors = |outcomes: &[StatementOutcome]| {
+        outcomes
+            .iter()
+            .filter_map(|o| o.result.as_ref().err().cloned())
+            .collect::<Vec<_>>()
+    };
+    let count = |filter: &str| format!("SELECT COUNT(*) FROM su_it_b.link WHERE {filter}");
+
+    // The user's script: a variable declared before the transaction is
+    // used by the SELECT after its COMMIT.
+    let script = "-- reprise CEP\n\
+        SET XACT_ABORT ON;\n\
+        SET NOCOUNT ON;\n\
+        BEGIN TRANSACTION;\n\
+        DECLARE @UserId NVARCHAR(36) = 'u-1';\n\
+        IF NOT EXISTS (SELECT 1 FROM su_it_b.acte WHERE CodeActe = N'CEP')\n\
+            INSERT INTO su_it_b.acte (CodeActe, CreatedBy) VALUES (N'CEP', @UserId);\n\
+        DECLARE @ActeCepId INT = (SELECT [Id] FROM su_it_b.acte WHERE [CodeActe] = N'CEP');\n\
+        DECLARE @Specialites TABLE (Code NVARCHAR(10));\n\
+        INSERT INTO @Specialites VALUES (N'S1'), (N'S2');\n\
+        IF EXISTS (SELECT 1 FROM su_it_b.link WHERE NgapActeId = -1) THROW 50001, N'impossible', 1;\n\
+        INSERT INTO su_it_b.link (NgapActeId, Spec) SELECT @ActeCepId, Code FROM @Specialites;\n\
+        COMMIT;\n\
+        SELECT (SELECT COUNT(*) FROM su_it_b.link WHERE [NgapActeId] = @ActeCepId) AS Liens;\n";
+    let out = run_script(&conn, script, Some(1000)).await;
+    assert!(errors(&out).is_empty(), "{:?}", errors(&out));
+    assert_eq!(out.len(), 1, "one result set");
+    let r = out[0].result.as_ref().unwrap();
+    assert_eq!(r.rows, [["2"]]);
+    // Its IFs make the producing SELECT unknown: shown under the batch.
+    assert_eq!(out[0].sql, script.trim_end());
+    assert_eq!(scalar(&conn, "SELECT @@TRANCOUNT").await, "0");
+    // The script's own `SET XACT_ABORT ON` stays, as in SSMS.
+    assert_eq!(scalar(&conn, XACT_ABORT).await, "1");
+    exec(&conn, "SET XACT_ABORT OFF").await;
+
+    // Several SELECTs: one outcome each, titled and enriched by its SELECT;
+    // an empty result set keeps its columns.
+    let out = run_script(
+        &conn,
+        "DECLARE @n INT = 1;\nSELECT * FROM su_it_b.acte;\nSELECT @n + 1 AS deux;\n\
+         SELECT Id FROM su_it_b.link WHERE 1 = 0;",
+        None,
+    )
+    .await;
+    assert!(errors(&out).is_empty(), "{:?}", errors(&out));
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0].sql, "SELECT * FROM su_it_b.acte");
+    let acte = out[0].result.as_ref().unwrap();
+    assert_eq!(acte.primary_key, ["Id"]);
+    let code = acte.columns.iter().find(|c| c.name == "CodeActe").unwrap();
+    assert!(!code.nullable);
+    assert_eq!(out[1].result.as_ref().unwrap().rows, [["2"]]);
+    let empty = out[2].result.as_ref().unwrap();
+    assert!(empty.rows.is_empty());
+    assert_eq!(empty.columns.len(), 1);
+
+    // A batch without result sets: the count when the server reports it,
+    // « executed » under NOCOUNT. Session settings stay, as in SSMS: the
+    // script above left NOCOUNT on.
+    let out = run_script(&conn, "UPDATE su_it_b.link SET Spec = Spec", None).await;
+    assert!(out[0].result.as_ref().unwrap().count_unknown, "{out:?}");
+    exec(&conn, "SET NOCOUNT OFF").await;
+    let out = run_script(&conn, "UPDATE su_it_b.link SET Spec = Spec", None).await;
+    let r = out[0].result.as_ref().unwrap();
+    assert_eq!((r.rows_affected, r.count_unknown), (2, false));
+    let out = run_script(
+        &conn,
+        "SET NOCOUNT ON;\nUPDATE su_it_b.link SET Spec = Spec;\nSET NOCOUNT OFF;",
+        None,
+    )
+    .await;
+    assert!(out[0].result.as_ref().unwrap().count_unknown, "{out:?}");
+    let out = run_script(
+        &conn,
+        "SET NOCOUNT ON\nGO\nUPDATE su_it_b.link SET Spec = Spec\nGO\nSET NOCOUNT OFF",
+        None,
+    )
+    .await;
+    assert_eq!(out.len(), 3);
+    assert!(out[1].result.as_ref().unwrap().count_unknown, "{out:?}");
+
+    // GO separates batches: the second one does not see the first one's
+    // variables, and its error names the script line.
+    let out = run_script(
+        &conn,
+        "DECLARE @x INT = 1;\nSELECT @x AS x;\nGO\n\n-- plus loin\nSELECT @x AS x;",
+        None,
+    )
+    .await;
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].result.as_ref().unwrap().rows, [["1"]]);
+    let e = out[1].result.as_ref().unwrap_err();
+    assert!(
+        e.contains("@x") && e.ends_with("(ligne 6 du script)"),
+        "{e}"
+    );
+    // `GO 3` repeats its batch.
+    let out = run_script(
+        &conn,
+        "INSERT INTO su_it_b.link VALUES (0, 'r')\nGO 3",
+        None,
+    )
+    .await;
+    assert_eq!(out.len(), 3);
+    assert_eq!(scalar(&conn, &count("NgapActeId = 0")).await, "3");
+
+    // THROW inside a transaction: error with its line, all rolled back,
+    // nothing left open, the client still usable (its temp tables kept).
+    exec(&conn, "CREATE TABLE #su_keep (x INT)").await;
+    let out = run_script(
+        &conn,
+        "SELECT 1 AS avant;\nGO\nBEGIN TRAN;\nINSERT INTO su_it_b.link VALUES (9, 'x');\n\
+         THROW 50001, N'refusé', 1;\nCOMMIT;\nGO\nSELECT 2 AS apres;",
+        None,
+    )
+    .await;
+    assert_eq!(out.len(), 2, "stops at the failing batch: {out:?}");
+    let e = out[1].result.as_ref().unwrap_err();
+    assert_eq!(e, "refusé (ligne 5 du script)");
+    assert_eq!(scalar(&conn, "SELECT @@TRANCOUNT").await, "0");
+    assert_eq!(scalar(&conn, &count("NgapActeId = 9")).await, "0");
+    assert_eq!(scalar(&conn, "SELECT COUNT(*) FROM #su_keep").await, "0");
+    // A constraint error in a transaction is not committed by its COMMIT.
+    let out = run_script(
+        &conn,
+        "BEGIN TRAN;\nINSERT INTO su_it_b.link VALUES (8, 'x');\n\
+         INSERT INTO su_it_b.link VALUES (NULL, 'x');\nCOMMIT;",
+        None,
+    )
+    .await;
+    let e = out[0].result.as_ref().unwrap_err();
+    assert!(e.ends_with("(ligne 3 du script)"), "{e}");
+    assert_eq!(scalar(&conn, &count("NgapActeId = 8")).await, "0");
+    // The forced XACT_ABORT ON is undone, on errors and successes alike,
+    // even when the batch ends early with RETURN.
+    assert_eq!(scalar(&conn, XACT_ABORT).await, "0");
+    let out = run_script(
+        &conn,
+        "BEGIN TRAN;\nUPDATE su_it_b.link SET Spec = Spec;\nCOMMIT;\nRETURN;\nSELECT 1;",
+        None,
+    )
+    .await;
+    assert_eq!(errors(&out), Vec::<String>::new());
+    assert_eq!(scalar(&conn, XACT_ABORT).await, "0");
+    // The user's own XACT_ABORT ON, set in an earlier batch, is kept.
+    let out = run_script(
+        &conn,
+        "SET XACT_ABORT ON\nGO\nBEGIN TRAN;\nUPDATE su_it_b.link SET Spec = Spec;\nCOMMIT;",
+        None,
+    )
+    .await;
+    assert_eq!(errors(&out), Vec::<String>::new());
+    assert_eq!(scalar(&conn, XACT_ABORT).await, "1");
+    let block = ["BEGIN TRAN".to_string(), "COMMIT".to_string()];
+    conn.execute_transaction(&block).await.unwrap();
+    assert_eq!(
+        scalar(&conn, XACT_ABORT).await,
+        "1",
+        "run at the cursor too"
+    );
+    let bad = [
+        "BEGIN TRAN".to_string(),
+        "SELECT 1 / 0".to_string(),
+        "COMMIT".to_string(),
+    ];
+    assert!(conn.execute_transaction(&bad).await.is_err());
+    assert_eq!(scalar(&conn, XACT_ABORT).await, "1");
+    exec(&conn, "SET XACT_ABORT OFF").await;
+
+    // Control flow: which SELECT ran is unknown, the result sets are shown
+    // under the batch, not enriched, so not editable.
+    let branches = "IF EXISTS (SELECT 1 FROM su_it_b.link WHERE 1 = 0)\n\
+                    BEGIN DELETE FROM su_it_b.link WHERE 1 = 0; SELECT * FROM su_it_b.link; END\n\
+                    ELSE SELECT * FROM su_it_b.acte;";
+    let out = run_script(&conn, branches, None).await;
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].sql, branches);
+    let r = out[0].result.as_ref().unwrap();
+    assert!(r.primary_key.is_empty());
+    assert_eq!(
+        crate::engine::ops::query::editable_table(&out[0].sql, r),
+        None
+    );
+    // An assignment after TOP returns nothing: the procedure's result set
+    // is not taken for the SELECT's.
+    exec(
+        &conn,
+        "CREATE OR ALTER PROCEDURE su_it_b.links AS SELECT * FROM su_it_b.link",
+    )
+    .await;
+    let assign = "DECLARE @id INT;\nSELECT TOP 1 @id = Id FROM su_it_b.acte;\nEXEC su_it_b.links;";
+    let out = run_script(&conn, assign, None).await;
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].sql, assign);
+    assert!(out[0].result.as_ref().unwrap().primary_key.is_empty());
+    // A transaction left open at the end of the script is rolled back.
+    let out = run_script(
+        &conn,
+        "BEGIN TRAN;\nINSERT INTO su_it_b.link VALUES (7, 'x');",
+        None,
+    )
+    .await;
+    let e = out.last().unwrap().result.as_ref().unwrap_err();
+    assert_eq!(e, TSQL_UNTERMINATED);
+    assert_eq!(scalar(&conn, "SELECT @@TRANCOUNT").await, "0");
+    assert_eq!(scalar(&conn, &count("NgapActeId = 7")).await, "0");
+    // A transaction spanning batches is committed by its last one.
+    let out = run_script(
+        &conn,
+        "BEGIN TRAN
+GO
+INSERT INTO su_it_b.link VALUES (6, 'x')
+GO
+COMMIT",
+        None,
+    )
+    .await;
+    assert_eq!(errors(&out), Vec::<String>::new());
+    assert_eq!(out[1].result.as_ref().unwrap().rows_affected, 1);
+    assert_eq!(scalar(&conn, &count("NgapActeId = 6")).await, "1");
+
+    // The TUI's F5 (run_all) runs batches too: the last result set.
+    let r = run_all(&conn, "DECLARE @v INT = 4\nGO\nSELECT 5 AS v")
+        .await
+        .unwrap();
+    assert_eq!(r.rows, [["5"]]);
+}
+
+/// Manual transaction mode on SQL Server: scripts run as batches on the
+/// dedicated session, inside the transaction left open for the user.
+#[tokio::test]
+#[ignore]
+async fn integration_mssql_manual_tx_batches() {
+    use crate::engine::ops::tx::ManualTx;
+    use std::sync::Arc;
+    let Some(spec) = env("SU_IT_MSSQL") else {
+        eprintln!("SU_IT_MSSQL not set, skipping");
+        return;
+    };
+    let config = mssql_config(&spec);
+    let shared = Arc::new(DatabaseConnection::connect(&config).await.unwrap());
+    for sql in [
+        "DROP TABLE IF EXISTS su_it_mb.t",
+        "IF SCHEMA_ID('su_it_mb') IS NULL EXEC('CREATE SCHEMA su_it_mb')",
+        "CREATE TABLE su_it_mb.t (id INT PRIMARY KEY)",
+    ] {
+        exec(&shared, sql).await;
+    }
+    let tx = ManualTx::open(&config, shared.clone()).await.unwrap();
+    let out = tx
+        .run_script(
+            "DECLARE @n INT = 1;\nINSERT INTO su_it_mb.t VALUES (@n);\n\
+             SELECT id FROM su_it_mb.t WHERE id = @n;",
+            None,
+        )
+        .await;
+    assert!(out.iter().all(|o| o.result.is_ok()), "{out:?}");
+    assert_eq!(out.last().unwrap().result.as_ref().unwrap().rows, [["1"]]);
+    let status = tx.status();
+    assert!(status.open);
+    assert_eq!(status.statements, 3);
+    // Not visible from the shared session before the commit.
+    let visible = "SELECT COUNT(*) FROM su_it_mb.t WITH (READPAST)";
+    assert_eq!(scalar(&shared, visible).await, "0");
+    // GO: the second batch fails with its script line, the transaction is
+    // kept (XACT_ABORT off) and can still be committed.
+    let out = tx.run_script("SELECT 1 AS un\nGO\nSELECT @n", None).await;
+    assert_eq!(out.len(), 2);
+    let e = out[1].result.as_ref().unwrap_err();
+    assert!(e.ends_with("(ligne 3 du script)"), "{e}");
+    assert!(tx.status().open);
+    assert_eq!(tx.commit().await.unwrap(), 4);
+    assert_eq!(
+        scalar(&shared, "SELECT COUNT(*) FROM su_it_mb.t").await,
+        "1"
+    );
+    // A script with its own BEGIN … COMMIT, run while none is open,
+    // commits by itself.
+    let out = tx
+        .run_script(
+            "DECLARE @n INT = 2;\nBEGIN TRAN;\nINSERT INTO su_it_mb.t VALUES (@n);\n\
+             COMMIT;\nSELECT @n AS n;",
+            None,
+        )
+        .await;
+    assert!(out.iter().all(|o| o.result.is_ok()), "{out:?}");
+    assert!(!tx.status().open);
+    assert_eq!(
+        scalar(&shared, "SELECT COUNT(*) FROM su_it_mb.t").await,
+        "2"
+    );
+    // A batch ending in ROLLBACK inside the open transaction: no counting
+    // through sp_executesql (error 266), the whole transaction undone.
+    let out = tx
+        .run_script("DELETE FROM su_it_mb.t WHERE id = 1", None)
+        .await;
+    assert_eq!(out[0].result.as_ref().unwrap().rows_affected, 1);
+    assert!(tx.status().open);
+    let out = tx
+        .run_script(
+            "BEGIN TRAN;\nUPDATE su_it_mb.t SET id = id;\nROLLBACK;",
+            None,
+        )
+        .await;
+    assert!(out.iter().all(|o| o.result.is_ok()), "{out:?}");
+    assert!(!tx.status().open);
+    assert_eq!(
+        scalar(&shared, "SELECT COUNT(*) FROM su_it_mb.t").await,
+        "2"
+    );
 }

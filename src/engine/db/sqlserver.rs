@@ -160,22 +160,23 @@ pub async fn connect(config: &ConnectionConfig) -> Result<SqlServerClient> {
     Ok(SqlServerClient::new(config.clone(), open(config).await?))
 }
 
+/// A result column as the app describes it.
+fn column_of(c: &tiberius::Column) -> Column {
+    Column {
+        name: c.name().to_string(),
+        type_name: format!("{:?}", c.column_type()),
+        nullable: true,
+        is_primary_key: false,
+    }
+}
+
 /// Convert fetched rows into a `QueryResult`.
 fn rows_to_result(rows: &[tiberius::Row]) -> QueryResult {
     if rows.is_empty() {
         return QueryResult::default();
     }
 
-    let columns: Vec<Column> = rows[0]
-        .columns()
-        .iter()
-        .map(|c| Column {
-            name: c.name().to_string(),
-            type_name: format!("{:?}", c.column_type()),
-            nullable: true,
-            is_primary_key: false,
-        })
-        .collect();
+    let columns: Vec<Column> = rows[0].columns().iter().map(column_of).collect();
 
     let data: Vec<Vec<String>> = rows
         .iter()
@@ -194,7 +195,23 @@ fn rows_to_result(rows: &[tiberius::Row]) -> QueryResult {
 /// identifiers and comments. `INSERT/UPDATE/DELETE/MERGE ... OUTPUT` returns
 /// rows, so it must keep the row-fetching path.
 fn has_output_clause(stmt: &str) -> bool {
+    has_word(stmt, "OUTPUT")
+}
+
+/// Whether `stmt` contains `word` (any case) outside string literals, quoted
+/// identifiers and comments.
+fn has_word(stmt: &str, word: &str) -> bool {
+    code_tokens(stmt)
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(word))
+}
+
+/// The tokens of `stmt`, comments left out: words (`@var`, `#temp`
+/// included), each string literal or quoted identifier whole, and every
+/// other non-blank character on its own.
+fn code_tokens(stmt: &str) -> Vec<&str> {
     let is_word_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$');
+    let mut tokens = Vec::new();
     let mut rest = stmt;
     while let Some(c) = rest.chars().next() {
         let quote_end = match c {
@@ -203,23 +220,25 @@ fn has_output_clause(stmt: &str) -> bool {
             '[' => Some(']'),
             _ => None,
         };
-        if let Some(end) = quote_end {
-            rest = rest[1..].split_once(end).map_or("", |(_, tail)| tail);
+        let len = if let Some(end) = quote_end {
+            rest[1..].find(end).map_or(rest.len(), |at| at + 2)
         } else if let Some(after) = rest.strip_prefix("--") {
             rest = after.split_once('\n').map_or("", |(_, tail)| tail);
+            continue;
         } else if let Some(after) = rest.strip_prefix("/*") {
             rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+            continue;
         } else if is_word_char(c) {
-            let end = rest.find(|ch| !is_word_char(ch)).unwrap_or(rest.len());
-            if rest[..end].eq_ignore_ascii_case("OUTPUT") {
-                return true;
-            }
-            rest = &rest[end..];
+            rest.find(|ch| !is_word_char(ch)).unwrap_or(rest.len())
         } else {
-            rest = &rest[c.len_utf8()..];
+            c.len_utf8()
+        };
+        if !c.is_whitespace() {
+            tokens.push(&rest[..len]);
         }
+        rest = &rest[len..];
     }
-    false
+    tokens
 }
 
 /// Transaction control or variable handling: statements that return no rows.
@@ -257,45 +276,34 @@ fn counts_only<S: AsRef<str>>(statements: &[S]) -> bool {
 /// Run `batch` with `Client::execute` and sum the affected-row counts. It goes
 /// through `sp_executesql`: the whole text is still one batch, so variables
 /// declared in it stay visible across its statements.
+///
+/// Under `SET NOCOUNT ON` the server reports no counts (tiberius then sees
+/// zeros): a zero total is checked against the session's `NOCOUNT` and the
+/// count is then flagged unknown rather than shown as "0 rows".
 async fn execute_counting(client: &mut TdsClient, batch: &str) -> Result<QueryResult> {
     let affected = client.execute(batch, &[]).await?.total();
+    let count_unknown = affected == 0 && {
+        let rows = run_batch(client, "SELECT CAST(@@OPTIONS & 512 AS int)").await?;
+        let nocount: Option<i32> = rows
+            .first()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get(0));
+        nocount.is_some_and(|bit| bit != 0)
+    };
     Ok(QueryResult {
         rows_affected: affected,
+        count_unknown,
         ..QueryResult::default()
     })
 }
 
-/// Collect the rows of the first result set of `stream`, keeping at most
-/// `max_rows` of them. Returns the rows and whether more were available.
-///
-/// The stream is always read to the end, extra rows being discarded right
-/// away (only the kept rows use memory). Dropping a partially read
-/// `QueryStream` would leave the rest of the response on the wire: tiberius
-/// then flushes it packet by packet at the start of the next query on this
-/// shared client, logging a warning for every packet, and a later error in the
-/// batch would surface on that unrelated query. Draining here keeps the client
-/// clean and reports errors where they belong.
-async fn first_result_capped(
-    mut stream: QueryStream<'_>,
-    max_rows: Option<usize>,
-) -> Result<(Vec<tiberius::Row>, bool)> {
-    let mut rows = Vec::new();
-    let mut truncated = false;
-    let mut result_sets = 0usize;
-    while let Some(item) = stream.try_next().await? {
-        match item {
-            QueryItem::Metadata(_) => result_sets += 1,
-            QueryItem::Row(row) if result_sets <= 1 => {
-                if max_rows.is_some_and(|max| rows.len() >= max) {
-                    truncated = true;
-                } else {
-                    rows.push(row);
-                }
-            }
-            QueryItem::Row(_) => {}
-        }
+/// The result of a batch that returned no result set and whose affected-row
+/// counts tiberius' `QueryStream` does not report.
+fn executed() -> QueryResult {
+    QueryResult {
+        count_unknown: true,
+        ..QueryResult::default()
     }
-    Ok((rows, truncated))
 }
 
 /// Execute a query on SQL Server, keeping at most `max_rows` rows of the first
@@ -316,11 +324,11 @@ pub async fn execute_query_limited(
             return execute_counting(&mut client, query).await;
         }
         let stream = client.simple_query(query).await?;
-        let (rows, truncated) = first_result_capped(stream, max_rows).await?;
-        Ok(QueryResult {
-            truncated,
-            ..rows_to_result(&rows)
-        })
+        let first = result_sets(stream, max_rows, true)
+            .await?
+            .into_iter()
+            .next();
+        Ok(first.unwrap_or_else(executed))
     }
     .await;
     client.settle(&outcome);
@@ -332,15 +340,18 @@ pub async fn execute_query_limited(
 /// visible across all statements — running them as separate batches would drop
 /// the variables between statements.
 ///
-/// The batch runs with `XACT_ABORT ON`: otherwise most errors (constraint
-/// violations…) only end their statement, the batch goes on and its `COMMIT`
-/// commits the statements that succeeded. The session setting is restored at
-/// the end of the batch (and by the error path of `execute_transaction`).
+/// Unless the block sets `XACT_ABORT` itself, it runs with `XACT_ABORT ON`
+/// (`with_xact_abort`): otherwise most errors (constraint violations…) only
+/// end their statement, the batch goes on and its `COMMIT` commits the
+/// statements that succeeded. `execute_transaction` then restores the
+/// session's own setting.
 fn build_tsql_batch(statements: &[String]) -> String {
-    format!(
-        "SET XACT_ABORT ON;\n{};\nSET XACT_ABORT OFF",
-        statements.join(";\n")
-    )
+    let block = statements.join(";\n");
+    if sets_xact_abort(statements) {
+        block
+    } else {
+        with_xact_abort(&block)
+    }
 }
 
 /// Execute a transaction block as one T-SQL batch. The single tiberius client
@@ -353,43 +364,302 @@ pub async fn execute_transaction(
 ) -> Result<QueryResult> {
     let batch = build_tsql_batch(statements);
     let mut client = client.lock().await?;
+    let original = if sets_xact_abort(statements) {
+        None
+    } else {
+        match xact_abort_on(&mut client).await {
+            Ok(on) => Some(on),
+            Err(e) => {
+                let failed = Err(e);
+                client.settle(&failed);
+                return failed;
+            }
+        }
+    };
 
     let outcome = async {
-        if counts_only(statements) {
+        if counts_only(statements) && counts_safely(statements) {
             return execute_counting(&mut client, &batch).await;
         }
         let stream = client.simple_query(&batch).await?;
         let results = stream.into_results().await?;
         // Return the last result set that produced rows (typically the final
         // SELECT); otherwise an empty result.
-        let rows = results
-            .into_iter()
-            .rev()
-            .find(|r| !r.is_empty())
-            .unwrap_or_default();
-        Ok(rows_to_result(&rows))
+        let rows = results.into_iter().rev().find(|r| !r.is_empty());
+        Ok(rows.map_or_else(executed, |rows| rows_to_result(&rows)))
     }
     .await;
+    finish(client, outcome, true, original).await
+}
 
-    if outcome.is_err() && is_server_error(outcome.as_ref().unwrap_err()) {
-        // The failed batch may have left a transaction open on the shared
-        // client; roll it back so later queries aren't poisoned. If that
-        // fails too, the client is left dirty and replaced on next use.
-        let cleanup = async {
-            client
-                .simple_query("IF @@TRANCOUNT > 0 ROLLBACK; SET XACT_ABORT OFF")
-                .await?
-                .into_results()
-                .await?;
-            Ok(())
-        }
-        .await;
-        client.settle(&cleanup);
-    } else {
-        // Other errors may leave the response unread: reconnect.
+/// Whether `stmt` opens a transaction (`BEGIN TRAN[SACTION]`,
+/// `BEGIN DISTRIBUTED …`), as opposed to a `BEGIN … END` block or
+/// `BEGIN TRY`.
+pub(crate) fn is_tsql_transaction_start(stmt: &str) -> bool {
+    leading_keyword(stmt) == "BEGIN" && is_rowless_control(stmt)
+}
+
+/// Whether `statements` set `XACT_ABORT` themselves: the user's setting is
+/// then left alone.
+fn sets_xact_abort(statements: &[String]) -> bool {
+    statements.iter().any(|s| {
+        let tokens = code_tokens(s);
+        tokens
+            .windows(2)
+            .any(|w| w[0].eq_ignore_ascii_case("SET") && w[1].eq_ignore_ascii_case("XACT_ABORT"))
+    })
+}
+
+/// Whether a script batch run in auto-commit mode must run with
+/// `XACT_ABORT ON` (`with_xact_abort`): it opens a transaction (otherwise
+/// most errors only end their statement and the batch's `COMMIT` would
+/// commit the statements that succeeded) and does not set `XACT_ABORT`
+/// itself. A batch starting with `CREATE`/`ALTER` (a procedure, a view…
+/// must come first in its batch) is left alone.
+fn needs_xact_abort(statements: &[String]) -> bool {
+    let first = statements.first().map(|s| leading_keyword(s));
+    statements.iter().any(|s| is_tsql_transaction_start(s))
+        && !sets_xact_abort(statements)
+        && !matches!(first.as_deref(), Some("CREATE" | "ALTER"))
+}
+
+/// `batch` with `XACT_ABORT ON` set on its first line, so the line numbers
+/// the server reports are unchanged. Nothing is appended: an early `RETURN`
+/// would skip it. The caller restores the session's setting afterwards, in
+/// a separate request (`finish`).
+fn with_xact_abort(batch: &str) -> String {
+    format!("SET XACT_ABORT ON; {batch}")
+}
+
+/// Whether the session has `XACT_ABORT` on.
+async fn xact_abort_on(client: &mut TdsClient) -> Result<bool> {
+    let rows = run_batch(client, "SELECT CAST(@@OPTIONS & 16384 AS int)").await?;
+    let bit: Option<i32> = rows
+        .first()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get(0));
+    Ok(bit.is_some_and(|bit| bit != 0))
+}
+
+/// What to send after a batch run on the shared client: on a server error
+/// with `rollback`, roll back the transaction it may have left open (so
+/// later queries aren't poisoned); when it ran with `XACT_ABORT ON` forced
+/// over a session that had it off (`original` `Some(false)`), turn it off
+/// again. Other errors may leave the response unread: the client is then
+/// replaced (the server rolls back), nothing is sent. If the cleanup fails
+/// too, the client is left dirty and replaced on next use.
+async fn finish<T>(
+    mut client: ClientGuard<'_>,
+    outcome: Result<T>,
+    rollback: bool,
+    original: Option<bool>,
+) -> Result<T> {
+    let server_error = outcome.as_ref().err().is_some_and(is_server_error);
+    if outcome.is_err() && !server_error {
         client.settle(&outcome);
+        return outcome;
+    }
+    let mut cleanup = String::new();
+    if server_error && rollback {
+        cleanup.push_str("IF @@TRANCOUNT > 0 ROLLBACK;");
+    }
+    if original == Some(false) {
+        cleanup.push_str("SET XACT_ABORT OFF;");
+    }
+    if cleanup.is_empty() {
+        client.settle(&outcome);
+    } else {
+        let done = run_batch(&mut client, &cleanup).await.map(drop);
+        client.settle(&done);
     }
     outcome
+}
+
+/// Whether `statements` can go through `execute_counting`
+/// (`sp_executesql`), which fails (error 266) when it returns with another
+/// transaction count than it started with: the batch must end as many
+/// transactions as it opens, and not `ROLLBACK`, which ends all of them,
+/// the caller's too. Then the count is unchanged whatever it was on entry
+/// (a manual transaction, a `BEGIN TRAN` in an earlier batch).
+fn counts_safely(statements: &[String]) -> bool {
+    let mut balance = 0i32;
+    for stmt in statements {
+        let tokens = code_tokens(stmt);
+        if tokens.iter().any(|t| t.eq_ignore_ascii_case("ROLLBACK")) {
+            return false;
+        }
+        match leading_keyword(stmt).as_str() {
+            "BEGIN" if is_tsql_transaction_start(stmt) => balance += 1,
+            "COMMIT" => balance -= 1,
+            _ => {}
+        }
+    }
+    balance == 0
+}
+
+/// Read the result sets of `stream` (only the first one when `first_only`),
+/// keeping at most `max_rows` rows of each (`truncated` set when more were
+/// available). An empty result set keeps its columns.
+///
+/// The stream is always read to the end, extra rows being discarded right
+/// away (only the kept rows use memory). Dropping a partially read
+/// `QueryStream` would leave the rest of the response on the wire: tiberius
+/// then flushes it packet by packet at the start of the next query on this
+/// shared client, logging a warning for every packet, and a later error in the
+/// batch would surface on that unrelated query. Draining here keeps the client
+/// clean and reports errors where they belong.
+async fn result_sets(
+    mut stream: QueryStream<'_>,
+    max_rows: Option<usize>,
+    first_only: bool,
+) -> Result<Vec<QueryResult>> {
+    let mut sets: Vec<QueryResult> = Vec::new();
+    let mut skipping = false;
+    while let Some(item) = stream.try_next().await? {
+        match item {
+            QueryItem::Metadata(_) if first_only && !sets.is_empty() => skipping = true,
+            QueryItem::Metadata(meta) => sets.push(QueryResult {
+                columns: meta.columns().iter().map(column_of).collect(),
+                ..QueryResult::default()
+            }),
+            QueryItem::Row(_) if skipping => {}
+            QueryItem::Row(row) => {
+                let Some(set) = sets.last_mut() else {
+                    continue;
+                };
+                if max_rows.is_some_and(|max| set.rows.len() >= max) {
+                    set.truncated = true;
+                } else {
+                    let values = (0..set.columns.len()).map(|i| get_value(&row, i));
+                    set.rows.push(values.collect());
+                }
+            }
+        }
+    }
+    for set in &mut sets {
+        set.rows_affected = set.rows.len() as u64;
+    }
+    Ok(sets)
+}
+
+/// Run one batch of a script in a single round trip, as SSMS does: its
+/// variables are visible to all its statements. Returns one result per
+/// result set (each capped at `max_rows`), or, when it returns none, one
+/// result with the affected-row count (counted only for DML-only batches,
+/// see `counts_only` and `counts_safely`; flagged unknown otherwise).
+///
+/// `auto`: auto-commit mode, on the connection's shared client. A batch
+/// opening a transaction then runs with `XACT_ABORT ON`
+/// (`needs_xact_abort`), the session's setting restored afterwards, and,
+/// when it fails, a transaction it left open is rolled back (`finish`). In
+/// manual transaction mode (`auto` false) the batch is sent as is and the
+/// open transaction is the user's: it is left as the server left it.
+pub async fn execute_batch(
+    client: &SqlServerClient,
+    batch: &str,
+    max_rows: Option<usize>,
+    auto: bool,
+) -> Result<Vec<QueryResult>> {
+    let statements: Vec<String> = split_statements(batch)
+        .into_iter()
+        .map(|(_, _, stmt)| stmt)
+        .collect();
+    let guard = auto && needs_xact_abort(&statements);
+    let guarded = guard.then(|| with_xact_abort(batch));
+    let text = guarded.as_deref().unwrap_or(batch);
+    let mut client = client.lock().await?;
+    let original = if guard {
+        match xact_abort_on(&mut client).await {
+            Ok(on) => Some(on),
+            Err(e) => {
+                let failed = Err(e);
+                client.settle(&failed);
+                return failed;
+            }
+        }
+    } else {
+        None
+    };
+    let outcome = async {
+        if counts_only(&statements) && counts_safely(&statements) {
+            return Ok(vec![execute_counting(&mut client, text).await?]);
+        }
+        let stream = client.simple_query(text).await?;
+        let mut sets = result_sets(stream, max_rows, false).await?;
+        if sets.is_empty() {
+            sets.push(executed());
+        }
+        Ok(sets)
+    }
+    .await;
+    finish(client, outcome, auto, original).await
+}
+
+/// Roll back the transaction a script left open on the shared client.
+/// Returns whether there was one.
+pub async fn rollback_open_transaction(client: &SqlServerClient) -> Result<bool> {
+    let mut client = client.lock().await?;
+    let outcome = run_batch(
+        &mut client,
+        "IF @@TRANCOUNT > 0 BEGIN ROLLBACK; SELECT 1 END ELSE SELECT 0",
+    )
+    .await;
+    client.settle(&outcome);
+    let open: Option<i32> = outcome?
+        .first()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get(0));
+    Ok(open == Some(1))
+}
+
+/// The message and line of the server error `e` raised by the batch text
+/// itself (not by a procedure it called): the line counts from the batch's
+/// first line.
+pub fn batch_error_line(e: &anyhow::Error) -> Option<(String, u32)> {
+    match e.downcast_ref::<tiberius::error::Error>() {
+        Some(tiberius::error::Error::Server(t)) if t.procedure().is_empty() && t.line() > 0 => {
+            Some((t.message().to_string(), t.line()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a batch statement always returns one result set: a `SELECT`
+/// that neither assigns variables (`SELECT TOP 1 @x = …`, `@y += …`
+/// anywhere: a comparison `@v = 1` is taken for one too, which only loses
+/// the match) nor fills a table (`SELECT … INTO`).
+pub(crate) fn is_result_select(stmt: &str) -> bool {
+    if leading_keyword(stmt) != "SELECT" {
+        return false;
+    }
+    let tokens = code_tokens(stmt);
+    let assigns = tokens.windows(3).any(|w| {
+        let variable = w[0].starts_with('@') && !w[0].starts_with("@@");
+        let compound = w[1].len() == 1 && "+-*/%&|^".contains(w[1]) && w[2] == "=";
+        variable && (w[1] == "=" || compound)
+    });
+    !assigns && !tokens.iter().any(|t| t.eq_ignore_ascii_case("INTO"))
+}
+
+/// Whether `batch` holds control flow (`IF`, `ELSE`, `WHILE`, `BEGIN … END`
+/// blocks, `TRY` / `CATCH`, `GOTO`, `RETURN`…): which of its statements
+/// run, and so which `SELECT` produced which result set, is then unknown.
+/// `BEGIN TRAN` is not control flow.
+pub(crate) fn has_control_flow(batch: &str) -> bool {
+    let tokens = code_tokens(batch);
+    tokens.iter().enumerate().any(|(i, t)| {
+        let word = t.to_ascii_uppercase();
+        match word.as_str() {
+            "IF" | "ELSE" | "WHILE" | "TRY" | "CATCH" | "GOTO" | "RETURN" | "BREAK"
+            | "CONTINUE" => true,
+            "BEGIN" => !tokens.get(i + 1).is_some_and(|next| {
+                ["TRAN", "TRANSACTION", "DISTRIBUTED"]
+                    .iter()
+                    .any(|kw| next.eq_ignore_ascii_case(kw))
+            }),
+            _ => false,
+        }
+    })
 }
 
 /// Run `sql` as one batch and read its whole response.
@@ -800,7 +1070,118 @@ fn get_value(row: &tiberius::Row, index: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_tsql_batch, counts_only, has_output_clause, is_rowless_control};
+    use super::{
+        build_tsql_batch, code_tokens, counts_only, counts_safely, has_control_flow,
+        has_output_clause, is_result_select, is_rowless_control, is_tsql_transaction_start,
+        needs_xact_abort, with_xact_abort,
+    };
+
+    fn stmts(sql: &str) -> Vec<String> {
+        crate::engine::sql::statements::split_statements(sql)
+            .into_iter()
+            .map(|s| s.2)
+            .collect()
+    }
+
+    #[test]
+    fn tokens_skip_comments_and_keep_literals_whole() {
+        assert_eq!(
+            code_tokens("SELECT [a b], 'it''s' -- c\n/* d */ FROM t WHERE @x>=1"),
+            ["SELECT", "[a b]", ",", "'it'", "'s'", "FROM", "t", "WHERE", "@x", ">", "=", "1"]
+        );
+    }
+
+    #[test]
+    fn transaction_start_is_begin_tran_only() {
+        assert!(is_tsql_transaction_start("BEGIN TRANSACTION"));
+        assert!(is_tsql_transaction_start("-- x\nbegin tran t1"));
+        assert!(is_tsql_transaction_start("BEGIN DISTRIBUTED TRANSACTION"));
+        assert!(!is_tsql_transaction_start("BEGIN TRY"));
+        assert!(!is_tsql_transaction_start("BEGIN\nSELECT 1"));
+        assert!(!is_tsql_transaction_start("COMMIT"));
+    }
+
+    #[test]
+    fn batches_opening_a_transaction_abort_on_error() {
+        let batch = "-- note\nBEGIN TRAN;\nINSERT INTO t VALUES (1);\nCOMMIT;";
+        assert!(needs_xact_abort(&stmts(batch)));
+        // Same line numbers: the setting is on the first line, nothing is
+        // appended (an early RETURN would skip it).
+        let guarded = with_xact_abort(batch);
+        assert_eq!(guarded, format!("SET XACT_ABORT ON; {batch}"));
+        assert_eq!(guarded.lines().count(), batch.lines().count());
+        assert!(!needs_xact_abort(&stmts("SELECT 1")));
+        assert!(!needs_xact_abort(&stmts("BEGIN TRY SELECT 1")));
+        let proc = "CREATE PROCEDURE p AS BEGIN TRAN; COMMIT;";
+        assert!(!needs_xact_abort(&stmts(proc)));
+        // The user's own setting is left alone.
+        let own = "SET XACT_ABORT OFF;\nBEGIN TRAN;\nCOMMIT;";
+        assert!(!needs_xact_abort(&stmts(own)));
+    }
+
+    #[test]
+    fn counted_batches_keep_the_transaction_count() {
+        assert!(counts_safely(&stmts("INSERT INTO t VALUES (1)")));
+        assert!(counts_safely(&stmts(
+            "BEGIN TRAN; INSERT INTO t VALUES (1); COMMIT"
+        )));
+        assert!(!counts_safely(&stmts(
+            "BEGIN TRAN; INSERT INTO t VALUES (1)"
+        )));
+        assert!(!counts_safely(&stmts("INSERT INTO t VALUES (1); COMMIT")));
+        // ROLLBACK ends every open transaction, the caller's too.
+        assert!(!counts_safely(&stmts(
+            "BEGIN TRAN; UPDATE t SET a = 1; ROLLBACK"
+        )));
+        assert!(!counts_safely(&stmts(
+            "SAVE TRAN s; UPDATE t SET a = 1; ROLLBACK TRAN s"
+        )));
+        assert!(counts_safely(&stmts("UPDATE t SET a = 'ROLLBACK'")));
+    }
+
+    #[test]
+    fn result_selects() {
+        assert!(is_result_select("SELECT * FROM t"));
+        assert!(is_result_select("-- c\nselect @x AS x"));
+        assert!(is_result_select("SELECT @a, @b"));
+        assert!(is_result_select("SELECT 'INTO' AS w"));
+        assert!(is_result_select("SELECT [into] FROM t"));
+        assert!(is_result_select("SELECT a FROM t WHERE @x >= 1"));
+        assert!(!is_result_select("SELECT @x = 1"));
+        assert!(!is_result_select("SELECT TOP 1 @id = id FROM a"));
+        assert!(!is_result_select("SELECT DISTINCT @a = x, @b = y FROM t"));
+        assert!(!is_result_select("SELECT @x += n FROM t"));
+        assert!(!is_result_select("SELECT * INTO #t FROM t"));
+        assert!(!is_result_select("INSERT INTO t SELECT 1"));
+        assert!(!is_result_select("IF 1 = 1 SELECT 1"));
+        assert!(!is_result_select(
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM c"
+        ));
+    }
+
+    #[test]
+    fn control_flow() {
+        for batch in [
+            "IF 1 = 1 SELECT 1",
+            "SELECT 1; END ELSE SELECT 2",
+            "WHILE @i < 3 SET @i += 1",
+            "BEGIN TRY SELECT 1 END TRY BEGIN CATCH SELECT 2 END CATCH",
+            "BEGIN\nSELECT 1\nEND",
+            "GOTO done",
+            "RETURN",
+        ] {
+            assert!(has_control_flow(batch), "{batch}");
+        }
+        for batch in [
+            "BEGIN TRAN; UPDATE t SET a = 1; COMMIT; SELECT * FROM t",
+            "begin transaction x; commit",
+            "BEGIN DISTRIBUTED TRANSACTION",
+            "SELECT 'IF', [else], CASE WHEN a = 1 THEN 2 END FROM t -- IF\n",
+            "SELECT TRY_CAST(a AS int) FROM t",
+        ] {
+            assert!(!has_control_flow(batch), "{batch}");
+        }
+    }
 
     #[test]
     fn detects_output_clause() {
@@ -864,8 +1245,10 @@ mod tests {
         // one statement stays in scope for the SELECT that uses it.
         assert_eq!(
             build_tsql_batch(&stmts),
-            "SET XACT_ABORT ON;\nBEGIN TRAN;\nDECLARE @x INT = 5;\nSELECT @x;\nCOMMIT;\n\
-             SET XACT_ABORT OFF"
+            "SET XACT_ABORT ON; BEGIN TRAN;\nDECLARE @x INT = 5;\nSELECT @x;\nCOMMIT"
         );
+        // A block setting XACT_ABORT itself is sent as is.
+        let own = ["SET XACT_ABORT OFF".to_string(), "BEGIN TRAN".to_string()];
+        assert_eq!(build_tsql_batch(&own), "SET XACT_ABORT OFF;\nBEGIN TRAN");
     }
 }

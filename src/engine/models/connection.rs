@@ -38,6 +38,14 @@ pub enum DatabaseType {
     Azure,
 }
 
+impl DatabaseType {
+    /// Whether scripts run as T-SQL batches split on `GO`
+    /// (`ops::query::run_script`): SQL Server and Azure.
+    pub fn runs_tsql_batches(&self) -> bool {
+        matches!(self, DatabaseType::SQLServer | DatabaseType::Azure)
+    }
+}
+
 impl std::fmt::Display for DatabaseType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -394,6 +402,10 @@ pub struct QueryResult {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<String>>,
     pub rows_affected: u64,
+    /// The statement returned no rows and the server reported no
+    /// affected-row count (SQL Server under `SET NOCOUNT ON`, or a batch
+    /// mixing statements): `rows_affected` means nothing, show "executed".
+    pub count_unknown: bool,
     pub execution_time_ms: u128,
     /// True when fetching stopped at a row cap (more rows were available).
     pub truncated: bool,

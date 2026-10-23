@@ -108,6 +108,149 @@ fn dollar_tag(text: &str) -> Option<&str> {
     valid.then(|| &text[..len + 2])
 }
 
+/// Most times a batch followed by `GO n` is repeated.
+pub const MAX_GO_REPEAT: u32 = 1000;
+
+/// One T-SQL batch of a script (see `split_tsql_batches`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Batch {
+    /// Script line (1-based) of the first line of `sql`: line `n` reported
+    /// by the server for this batch is script line `start_line + n - 1`.
+    pub start_line: usize,
+    /// The batch text, from its first non-blank line, without trailing
+    /// whitespace.
+    pub sql: String,
+}
+
+/// What the scan of a script is inside of, carried from line to line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TsqlState {
+    Code,
+    /// `/* … */`, nested comments counted.
+    Comment(usize),
+    /// `'…'` or `"…"`.
+    Quoted(char),
+    /// `[…]`.
+    Bracketed,
+}
+
+/// The repeat count of a `GO` separator line (`GO`, `go 3`, `GO -- note`),
+/// `None` for any other line.
+fn go_line(line: &str) -> Option<u32> {
+    let line = line.trim();
+    let rest = line
+        .get(..2)
+        .filter(|w| w.eq_ignore_ascii_case("GO"))
+        .map(|_| &line[2..])?;
+    let rest = rest.split_once("--").map_or(rest, |(code, _)| code);
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None; // `GOTO`, `GO;`…
+    }
+    let count = rest.trim();
+    if count.is_empty() {
+        return Some(1);
+    }
+    let n: u32 = count.parse().ok()?;
+    Some(n.clamp(1, MAX_GO_REPEAT))
+}
+
+/// Scan `line` from `state`: the state at its end, and whether it holds
+/// code (anything but blanks and comments).
+fn scan_tsql_line(line: &str, mut state: TsqlState) -> (TsqlState, bool) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut code = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match state {
+            TsqlState::Code => match c {
+                '-' if next == Some('-') => break,
+                '/' if next == Some('*') => {
+                    state = TsqlState::Comment(1);
+                    i += 1;
+                }
+                '\'' | '"' => {
+                    state = TsqlState::Quoted(c);
+                    code = true;
+                }
+                '[' => {
+                    state = TsqlState::Bracketed;
+                    code = true;
+                }
+                c if !c.is_whitespace() => code = true,
+                _ => {}
+            },
+            TsqlState::Comment(depth) => match (c, next) {
+                ('/', Some('*')) => {
+                    state = TsqlState::Comment(depth + 1);
+                    i += 1;
+                }
+                ('*', Some('/')) => {
+                    state = match depth {
+                        1 => TsqlState::Code,
+                        _ => TsqlState::Comment(depth - 1),
+                    };
+                    i += 1;
+                }
+                _ => {}
+            },
+            // A doubled quote is an escaped one: leave and re-enter.
+            TsqlState::Quoted(q) if c == q => state = TsqlState::Code,
+            // `]]` is an escaped `]`.
+            TsqlState::Bracketed if c == ']' && next == Some(']') => i += 1,
+            TsqlState::Bracketed if c == ']' => state = TsqlState::Code,
+            TsqlState::Quoted(_) | TsqlState::Bracketed => {}
+        }
+        i += 1;
+    }
+    (state, code)
+}
+
+/// Split a T-SQL script into batches the way SSMS and sqlcmd do: on lines
+/// holding only `GO` (any case, with an optional repeat count and trailing
+/// `--` comment), never inside a string, a `[name]` or a block comment. A
+/// batch followed by `GO n` appears `n` times (at most `MAX_GO_REPEAT`).
+/// Batches holding no code (blanks and comments only) are left out.
+pub fn split_tsql_batches(text: &str) -> Vec<Batch> {
+    let mut batches = Vec::new();
+    let mut state = TsqlState::Code;
+    // First line of the current batch (byte offset, line number), once a
+    // non-blank line was seen, and whether it holds code.
+    let mut start: Option<(usize, usize)> = None;
+    let mut code = false;
+    let mut flush = |start: Option<(usize, usize)>, end: usize, code: bool, times: u32| {
+        if let (Some((at, line)), true) = (start, code) {
+            let sql = text[at..end].trim_end().to_string();
+            for _ in 0..times {
+                batches.push(Batch {
+                    start_line: line,
+                    sql: sql.clone(),
+                });
+            }
+        }
+    };
+    let mut offset = 0;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let line_no = index + 1;
+        let go = (state == TsqlState::Code).then(|| go_line(line)).flatten();
+        if let Some(times) = go {
+            flush(start.take(), offset, code, times);
+            code = false;
+        } else {
+            let (after, has_code) = scan_tsql_line(line, state);
+            state = after;
+            code |= has_code;
+            if start.is_none() && !line.trim().is_empty() {
+                start = Some((offset, line_no));
+            }
+        }
+        offset += line.len();
+    }
+    flush(start, text.len(), code, 1);
+    batches
+}
+
 /// Classify a statement as a transaction start, returning true for
 /// `BEGIN`, `BEGIN TRANSACTION`, `BEGIN TRAN`, `START TRANSACTION`.
 pub fn is_transaction_start(stmt: &str) -> bool {
@@ -490,10 +633,111 @@ pub fn quote_chars(db_type: &DatabaseType) -> (char, char) {
 
 #[cfg(test)]
 mod execution_unit_tests {
-    use super::{get_execution_unit_at_cursor, ExecutionUnit};
+    use super::{get_execution_unit_at_cursor, split_tsql_batches, ExecutionUnit, MAX_GO_REPEAT};
 
     fn tx(stmts: &[&str]) -> ExecutionUnit {
         ExecutionUnit::Transaction(stmts.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn batches(text: &str) -> Vec<(usize, &str)> {
+        // Each batch is a slice of `text`: borrow it from there.
+        split_tsql_batches(text)
+            .into_iter()
+            .map(|b| {
+                let at = text
+                    .find(b.sql.as_str())
+                    .expect("batch text from the script");
+                (b.start_line, &text[at..at + b.sql.len()])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tsql_script_without_go_is_one_batch() {
+        let sql = "DECLARE @x INT = 1;\nBEGIN TRAN;\nCOMMIT;\nSELECT @x;";
+        assert_eq!(batches(sql), [(1, sql)]);
+    }
+
+    #[test]
+    fn tsql_batches_split_on_go_lines_with_their_start_lines() {
+        let sql = "SELECT 1\nGO\n\nSELECT 2;\nSELECT 3\n  go  \nSELECT 4\nGO";
+        assert_eq!(
+            batches(sql),
+            [(1, "SELECT 1"), (4, "SELECT 2;\nSELECT 3"), (7, "SELECT 4")]
+        );
+    }
+
+    #[test]
+    fn tsql_go_accepts_a_repeat_count_and_a_comment() {
+        let sql = "INSERT INTO t DEFAULT VALUES\nGO 3 -- three rows\nSELECT 1\nGo -- done";
+        assert_eq!(
+            batches(sql),
+            [
+                (1, "INSERT INTO t DEFAULT VALUES"),
+                (1, "INSERT INTO t DEFAULT VALUES"),
+                (1, "INSERT INTO t DEFAULT VALUES"),
+                (3, "SELECT 1"),
+            ]
+        );
+        assert_eq!(
+            split_tsql_batches("SELECT 1\nGO 99999").len(),
+            MAX_GO_REPEAT as usize
+        );
+        assert_eq!(split_tsql_batches("SELECT 1\nGO 0").len(), 1);
+    }
+
+    #[test]
+    fn tsql_go_must_be_alone_on_its_line() {
+        for sql in [
+            "GOTO done\nSELECT 1",
+            "SELECT 1 GO",
+            "SELECT 1\nGO;\nSELECT 2",
+            "SELECT 1\nGO 2 3\nSELECT 2",
+            "SELECT 1\nGO x\nSELECT 2",
+        ] {
+            assert_eq!(split_tsql_batches(sql).len(), 1, "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn tsql_go_inside_strings_identifiers_and_comments_is_not_a_separator() {
+        for sql in [
+            "SELECT 'a\nGO\nb'",
+            "SELECT 'it''s\nGO\n'",
+            "SELECT \"a\nGO\n\" FROM t",
+            "SELECT [weird\nGO\nname] FROM t",
+            "SELECT [a]]\nGO\n] FROM t",
+            "SELECT 1 /* note\nGO\n*/",
+            "SELECT 1 /* outer /* inner */\nGO\n*/",
+        ] {
+            assert_eq!(batches(sql), [(1, sql)], "{sql:?}");
+        }
+        // A `--` comment ends with its line: the next GO splits.
+        assert_eq!(
+            batches("SELECT 1 -- it's /* [\nGO\nSELECT 2"),
+            [(1, "SELECT 1 -- it's /* ["), (3, "SELECT 2")]
+        );
+        // A closed string or comment does not swallow the GO.
+        assert_eq!(
+            batches("SELECT 'x' /* c */\nGO\nSELECT 2"),
+            [(1, "SELECT 'x' /* c */"), (3, "SELECT 2")]
+        );
+    }
+
+    #[test]
+    fn tsql_batches_handle_crlf() {
+        let sql = "SELECT 1\r\nGO\r\nSELECT 2\r\nSELECT 3\r\n";
+        assert_eq!(batches(sql), [(1, "SELECT 1"), (3, "SELECT 2\r\nSELECT 3")]);
+    }
+
+    #[test]
+    fn tsql_empty_and_comment_only_batches_are_skipped() {
+        assert!(split_tsql_batches("").is_empty());
+        assert!(split_tsql_batches("  \n\nGO\nGO\n").is_empty());
+        assert_eq!(
+            batches("-- header\nGO\n\n/* x */\nSELECT 1\nGO\nGO\n  \n"),
+            [(4, "/* x */\nSELECT 1")]
+        );
     }
 
     #[test]

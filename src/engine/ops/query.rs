@@ -2,11 +2,11 @@ use std::time::Instant;
 
 use anyhow::{bail, Result};
 
-use crate::engine::db::DatabaseConnection;
+use crate::engine::db::{batch_error_line, is_result_select, DatabaseConnection};
 use crate::engine::models::{QueryResult, SchemaInfo};
 use crate::engine::sql::statements::{
     get_execution_unit_at_cursor, is_transaction_end, is_transaction_start, single_table_source,
-    split_statements, ExecutionUnit,
+    split_statements, split_tsql_batches, Batch, ExecutionUnit,
 };
 
 /// Outcome of executing the SQL at the cursor.
@@ -216,11 +216,24 @@ async fn unit_outcome(
 /// Execution stops after the first failing unit (its error is the last outcome).
 /// Row-returning results are capped at `max_rows` and enriched with
 /// PK/nullability like `run_query` when they read a single table.
+///
+/// SQL Server and Azure run the script as T-SQL batches instead
+/// (`run_tsql_batches`), as SSMS does; a transaction it leaves open is
+/// rolled back and reported (`rollback_unterminated`).
 pub async fn run_script(
     conn: &DatabaseConnection,
     text: &str,
     max_rows: Option<usize>,
 ) -> Vec<StatementOutcome> {
+    if conn.runs_tsql_batches() {
+        let mut outcomes = run_tsql_batches(conn, text, max_rows).await;
+        if outcomes.last().is_some_and(|o| o.result.is_ok()) {
+            if let Some(unterminated) = rollback_unterminated(conn).await {
+                outcomes.push(unterminated);
+            }
+        }
+        return outcomes;
+    }
     let statements: Vec<String> = split_statements(text)
         .into_iter()
         .map(|(_, _, stmt)| stmt)
@@ -256,6 +269,130 @@ pub async fn run_script(
     outcomes
 }
 
+/// Script line (1-based) of line `server_line` of a batch whose first line
+/// is script line `start_line`.
+fn script_line(start_line: usize, server_line: u32) -> usize {
+    start_line + (server_line as usize).saturating_sub(1)
+}
+
+/// Message of a failed batch: a server error raised by the batch text keeps
+/// the server's message and names the script line.
+fn batch_error(e: &anyhow::Error, start_line: usize) -> String {
+    match batch_error_line(e) {
+        Some((message, line)) => format!(
+            "{message} (ligne {} du script)",
+            script_line(start_line, line)
+        ),
+        None => e.to_string(),
+    }
+}
+
+/// The statements of `batch` that produced its `sets` result sets, when
+/// each can be matched with one: every result set then comes from a
+/// `SELECT` that always returns one (`is_result_select`), in order. `None`
+/// when they don't add up (procedure calls, `IF … SELECT`, statements not
+/// separated by `;`…).
+pub(crate) fn result_statements(batch: &str, sets: usize) -> Option<Vec<String>> {
+    let selects: Vec<String> = split_statements(batch)
+        .into_iter()
+        .map(|(_, _, stmt)| stmt)
+        .filter(|stmt| is_result_select(stmt))
+        .collect();
+    (sets > 0 && selects.len() == sets).then_some(selects)
+}
+
+/// Run the T-SQL script `text` (SQL Server, Azure) in auto-commit mode,
+/// batch by batch (`split_tsql_batches`, `run_tsql_batch`), stopping at the
+/// first failing batch.
+async fn run_tsql_batches(
+    conn: &DatabaseConnection,
+    text: &str,
+    max_rows: Option<usize>,
+) -> Vec<StatementOutcome> {
+    let mut outcomes = Vec::new();
+    for batch in split_tsql_batches(text) {
+        outcomes.extend(run_tsql_batch(conn, conn, batch, max_rows, true).await);
+        if outcomes.last().is_some_and(|o| o.result.is_err()) {
+            break;
+        }
+    }
+    outcomes
+}
+
+/// Run one T-SQL batch in one round trip, so its variables are visible to
+/// all its statements. Each result set gives an outcome (a result tab),
+/// titled and enriched (metadata read on `meta`) with the `SELECT` that
+/// produced it when known (`result_statements`), else with the whole batch;
+/// a batch without result sets gives one outcome with its affected-row
+/// count. The batch's time goes to its first outcome. On failure, the only
+/// outcome is the error, naming the script line. `auto`: see
+/// `sqlserver::execute_batch`.
+pub(crate) async fn run_tsql_batch(
+    conn: &DatabaseConnection,
+    meta: &DatabaseConnection,
+    batch: Batch,
+    max_rows: Option<usize>,
+    auto: bool,
+) -> Vec<StatementOutcome> {
+    let start = Instant::now();
+    let executed = conn.execute_tsql_batch(&batch.sql, max_rows, auto).await;
+    let elapsed_ms = start.elapsed().as_millis();
+    let results = match executed {
+        Ok(results) => results,
+        Err(e) => {
+            return vec![StatementOutcome {
+                result: Err(batch_error(&e, batch.start_line)),
+                sql: batch.sql,
+                elapsed_ms,
+            }]
+        }
+    };
+    let sets = results.iter().filter(|r| !r.columns.is_empty()).count();
+    let mut statements = result_statements(&batch.sql, sets).map(Vec::into_iter);
+    let mut outcomes = Vec::new();
+    for (i, mut result) in results.into_iter().enumerate() {
+        let statement = match &mut statements {
+            Some(statements) if !result.columns.is_empty() => statements.next(),
+            _ => None,
+        };
+        let sql = match statement {
+            Some(sql) => {
+                enrich(meta, &sql, &mut result).await;
+                sql
+            }
+            None => batch.sql.clone(),
+        };
+        let elapsed_ms = if i == 0 { elapsed_ms } else { 0 };
+        result.execution_time_ms = elapsed_ms;
+        outcomes.push(StatementOutcome {
+            sql,
+            result: Ok(result),
+            elapsed_ms,
+        });
+    }
+    outcomes
+}
+
+/// After a script run in auto-commit mode: a transaction it left open (a
+/// `BEGIN TRAN` without `COMMIT`) would hold its locks on the shared
+/// session; it is rolled back and reported.
+async fn rollback_unterminated(conn: &DatabaseConnection) -> Option<StatementOutcome> {
+    let message = match conn.rollback_open_transaction().await {
+        Ok(false) => return None,
+        Ok(true) => TSQL_UNTERMINATED.to_string(),
+        Err(e) => format!("Fin du script : {e}"),
+    };
+    Some(StatementOutcome {
+        sql: String::new(),
+        result: Err(message),
+        elapsed_ms: 0,
+    })
+}
+
+/// A script left a transaction open in auto-commit mode.
+pub const TSQL_UNTERMINATED: &str =
+    "Transaction non terminée à la fin du script : elle a été annulée (ajoutez COMMIT ou ROLLBACK)";
+
 /// Execute the statement or transaction block under the cursor (Ctrl+Enter
 /// without selection), with the same outcome shape as `run_script`.
 pub async fn run_at_cursor_outcomes(
@@ -270,11 +407,27 @@ pub async fn run_at_cursor_outcomes(
 }
 
 /// Execute the whole editor content as one query (F5).
+///
+/// SQL Server and Azure run it as T-SQL batches (`run_script`): the result
+/// is the last result set, or the last outcome when none returned rows.
 pub async fn run_all(conn: &DatabaseConnection, text: &str) -> Result<QueryResult> {
     if text.trim().is_empty() {
         bail!("Query is empty");
     }
-    run_query(conn, text).await
+    if !conn.runs_tsql_batches() {
+        return run_query(conn, text).await;
+    }
+    let mut outcomes = run_script(conn, text, None).await;
+    if let Some(i) = outcomes.iter().position(|o| o.result.is_err()) {
+        bail!("{}", outcomes.swap_remove(i).result.unwrap_err());
+    }
+    let last_set = outcomes
+        .iter()
+        .rposition(|o| o.result.as_ref().is_ok_and(|r| !r.columns.is_empty()));
+    match last_set.or(outcomes.len().checked_sub(1)) {
+        Some(i) => Ok(outcomes.swap_remove(i).result.unwrap_or_default()),
+        None => bail!("Query is empty"),
+    }
 }
 
 pub async fn refresh_schemas(conn: &DatabaseConnection) -> Result<Vec<SchemaInfo>> {
@@ -520,6 +673,66 @@ mod tests {
         let r = out[0].result.as_ref().unwrap();
         assert_eq!(r.rows.len(), 1);
         assert!(r.truncated);
+    }
+
+    #[test]
+    fn script_lines_of_batch_lines() {
+        assert_eq!(script_line(1, 3), 3);
+        assert_eq!(script_line(37, 1), 37);
+        assert_eq!(script_line(10, 4), 13);
+        assert_eq!(script_line(5, 0), 5);
+    }
+
+    #[test]
+    fn result_sets_are_matched_with_their_selects() {
+        let batch = "DECLARE @n INT = 1;
+SELECT @n = 2;
+SELECT * FROM t;
+                     INSERT INTO u SELECT 1;
+SELECT @n AS n";
+        assert_eq!(
+            result_statements(batch, 2).unwrap(),
+            ["SELECT * FROM t", "SELECT @n AS n"]
+        );
+        // Not adding up (an `IF … SELECT`, a procedure…): unknown.
+        assert_eq!(result_statements(batch, 3), None);
+        assert_eq!(result_statements(batch, 1), None);
+        assert_eq!(result_statements("UPDATE t SET a = 1", 0), None);
+        // Statements not separated by `;`: one statement, two result sets.
+        assert_eq!(
+            result_statements(
+                "SELECT 1
+SELECT 2",
+                2
+            ),
+            None
+        );
+        assert_eq!(
+            result_statements(
+                "SELECT 1
+SELECT 2",
+                1
+            )
+            .unwrap(),
+            ["SELECT 1
+SELECT 2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_script_on_other_engines_ignores_go() {
+        // `GO` means nothing outside SQL Server: SQLite reports the error.
+        let conn = sqlite_mem(SETUP).await;
+        let out = run_script(
+            &conn,
+            "SELECT 1;
+GO
+SELECT 2",
+            None,
+        )
+        .await;
+        assert_eq!(out.len(), 2);
+        assert!(out[1].result.is_err());
     }
 
     #[tokio::test]

@@ -122,20 +122,27 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// Log message of a successful outcome.
 fn ok_message(result: &QueryResult, elapsed_ms: u128) -> String {
     if result.columns.is_empty() {
-        format!(
-            "{} en {elapsed_ms} ms",
-            plural(
-                result.rows_affected as usize,
-                "ligne affectée",
-                "lignes affectées"
-            )
-        )
+        format!("{} en {elapsed_ms} ms", affected(result))
     } else if result.truncated {
         format!("{MAX_ROWS}+ lignes (limité) en {elapsed_ms} ms")
     } else {
         format!(
             "{} en {elapsed_ms} ms",
             plural(result.rows.len(), "ligne", "lignes")
+        )
+    }
+}
+
+/// What a statement returning no rows did: its affected-row count, or
+/// « Exécuté » when the server reported none (SQL Server `SET NOCOUNT ON`…).
+fn affected(result: &QueryResult) -> String {
+    if result.count_unknown {
+        "Exécuté".into()
+    } else {
+        plural(
+            result.rows_affected as usize,
+            "ligne affectée",
+            "lignes affectées",
         )
     }
 }
@@ -167,11 +174,7 @@ pub fn apply_outcomes(
                     true,
                 ));
                 last_rows = Some(if result.columns.is_empty() {
-                    plural(
-                        result.rows_affected as usize,
-                        "ligne affectée",
-                        "lignes affectées",
-                    )
+                    affected(&result)
                 } else if result.truncated {
                     format!("{MAX_ROWS}+ lignes")
                 } else {
@@ -383,6 +386,24 @@ mod tests {
         assert!(c.running_since.is_none());
         assert_eq!(summary, "1 ligne · 15 ms");
         assert_eq!(c.known_columns, ["?column?", "a", "id", "name"]);
+    }
+
+    #[test]
+    fn unknown_row_count_is_shown_as_executed() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        let executed = QueryResult {
+            count_unknown: true,
+            ..Default::default()
+        };
+        let summary = apply_outcomes(
+            &mut c,
+            "c",
+            vec![ok("SET NOCOUNT ON; INSERT INTO t VALUES (1)", executed)],
+            Local::now(),
+        );
+        assert_eq!(c.log[0].message, "Exécuté en 5 ms");
+        assert_eq!(summary, "Exécuté · 5 ms");
+        assert!(c.results.is_empty());
     }
 
     #[test]

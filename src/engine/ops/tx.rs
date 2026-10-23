@@ -18,14 +18,14 @@ use anyhow::{anyhow, bail, Result};
 use tokio::sync::Mutex;
 
 use crate::engine::db::utils::{row_count_error, transaction_bounds};
-use crate::engine::db::DatabaseConnection;
+use crate::engine::db::{is_tsql_transaction_start, DatabaseConnection};
 use crate::engine::models::{Column, ConnectionConfig, DatabaseType, QueryResult};
 use crate::engine::sql::statements::{
     get_execution_unit_at_cursor, is_transaction_end, is_transaction_start, split_statements,
-    ExecutionUnit,
+    split_tsql_batches, Batch, ExecutionUnit,
 };
 
-use super::query::{enrich, StatementOutcome};
+use super::query::{enrich, run_tsql_batch, StatementOutcome};
 use super::rows::{submit_statements, RowChanges};
 
 pub const SESSION_LOST: &str =
@@ -331,10 +331,108 @@ impl ManualTx {
         outcomes
     }
 
-    /// Every statement of `text` (F5, selection).
+    /// Every statement of `text` (F5, selection). SQL Server and Azure run
+    /// it as T-SQL batches (`run_tsql_batch`).
     pub async fn run_script(&self, text: &str, max_rows: Option<usize>) -> Vec<StatementOutcome> {
+        if self.conn.runs_tsql_batches() {
+            return self.run_tsql_script(text, max_rows).await;
+        }
         let statements = split_statements(text).into_iter().map(|s| s.2).collect();
         self.run_statements(statements, max_rows).await
+    }
+
+    /// `run_script` on SQL Server: the batches of `text` (split on `GO`)
+    /// run one by one on the session, stopping after the first failure.
+    async fn run_tsql_script(&self, text: &str, max_rows: Option<usize>) -> Vec<StatementOutcome> {
+        let mut st = self.state.lock().await;
+        let mut outcomes = Vec::new();
+        for batch in split_tsql_batches(text) {
+            outcomes.extend(self.tsql_batch(&mut st, batch, max_rows).await);
+            if outcomes.last().is_some_and(|o| o.result.is_err()) {
+                break;
+            }
+        }
+        self.publish(&st);
+        outcomes
+    }
+
+    /// One T-SQL batch in the transaction. A batch that opens its own
+    /// (`BEGIN TRAN`) while none is open runs as is, its `COMMIT` /
+    /// `ROLLBACK` honoured; otherwise the transaction is opened first (a
+    /// `BEGIN TRAN … COMMIT` in the batch then only nests in it, as on SQL
+    /// Server). Afterwards the state follows `@@TRANCOUNT`: the batch may
+    /// have committed, rolled back (`XACT_ABORT`, `ROLLBACK`) or opened a
+    /// transaction.
+    async fn tsql_batch(
+        &self,
+        st: &mut State,
+        batch: Batch,
+        max_rows: Option<usize>,
+    ) -> Vec<StatementOutcome> {
+        let statements: Vec<String> = split_statements(&batch.sql)
+            .into_iter()
+            .map(|s| s.2)
+            .collect();
+        let opens = statements.iter().any(|s| is_tsql_transaction_start(s));
+        let prepared = if opens && st.began_on.is_none() {
+            Ok(())
+        } else {
+            self.ensure_open(st).await
+        };
+        if let Err(e) = prepared {
+            return vec![StatementOutcome {
+                sql: batch.sql,
+                result: Err(e.to_string()),
+                elapsed_ms: 0,
+            }];
+        }
+        let was_open = st.began_on.is_some();
+        let sql = batch.sql.clone();
+        let mut outcomes = run_tsql_batch(&self.conn, &self.meta, batch, max_rows, false).await;
+        if st.began_on.is_some_and(|b| b != self.sessions()) {
+            *st = State::default();
+            return vec![StatementOutcome {
+                sql,
+                result: Err(format!(
+                    "{SESSION_LOST} (ce lot a peut-être été exécuté hors transaction)"
+                )),
+                elapsed_ms: 0,
+            }];
+        }
+        let failed = outcomes.last().is_some_and(|o| o.result.is_err());
+        let open = match self.conn.execute_query("SELECT @@TRANCOUNT").await {
+            Ok(r) => r
+                .rows
+                .first()
+                .and_then(|r| r.first())
+                .is_some_and(|c| c != "0"),
+            Err(_) => was_open, // checked again before the next statement
+        };
+        match (was_open, open) {
+            (false, true) => {
+                *st = State {
+                    began_on: Some(self.sessions()),
+                    ..State::default()
+                }
+            }
+            (true, false) => {
+                *st = State::default();
+                if failed {
+                    if let Some(Err(e)) = outcomes.last_mut().map(|o| &mut o.result) {
+                        e.push('\n');
+                        e.push_str(ENDED_BY_SERVER);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if open && !failed {
+            st.statements += statements
+                .iter()
+                .filter(|s| !is_transaction_start(s) && !is_transaction_end(s))
+                .count();
+        }
+        outcomes
     }
 
     /// The statement under `cursor` (`statements_at_cursor`).

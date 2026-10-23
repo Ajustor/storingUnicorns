@@ -195,6 +195,42 @@ impl DatabaseConnection {
         })
     }
 
+    /// Whether scripts run on this connection as T-SQL batches (split on
+    /// `GO`, see `ops::query::run_script`): SQL Server and Azure.
+    pub fn runs_tsql_batches(&self) -> bool {
+        matches!(
+            self,
+            DatabaseConnection::SQLServer(_) | DatabaseConnection::Azure(_)
+        )
+    }
+
+    /// SQL Server / Azure: run one script batch in a single round trip
+    /// (`sqlserver::execute_batch`); one result per result set.
+    pub async fn execute_tsql_batch(
+        &self,
+        batch: &str,
+        max_rows: Option<usize>,
+        auto: bool,
+    ) -> Result<Vec<QueryResult>> {
+        match self {
+            DatabaseConnection::SQLServer(client) | DatabaseConnection::Azure(client) => {
+                sqlserver::execute_batch(client, batch, max_rows, auto).await
+            }
+            _ => anyhow::bail!("T-SQL batches need SQL Server"),
+        }
+    }
+
+    /// SQL Server / Azure: roll back a transaction left open on the
+    /// session; returns whether there was one (always false elsewhere).
+    pub async fn rollback_open_transaction(&self) -> Result<bool> {
+        match self {
+            DatabaseConnection::SQLServer(client) | DatabaseConnection::Azure(client) => {
+                sqlserver::rollback_open_transaction(client).await
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// The database type of this connection.
     pub fn db_type(&self) -> DatabaseType {
         match self {

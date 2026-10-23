@@ -12,3 +12,4 @@ pub mod utils;
 pub mod connector;
 
 pub use connector::*;
+pub(crate) use sqlserver::{batch_error_line, is_result_select, is_tsql_transaction_start};

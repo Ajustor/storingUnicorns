@@ -268,7 +268,12 @@ impl App {
             return;
         }
         let at = history_popup::now_secs();
+        // The result sets of one SQL Server batch share its SQL: log it once.
+        let mut logged: Option<&str> = None;
         for o in outcomes.iter().filter(|o| !o.sql.trim().is_empty()) {
+            if logged.replace(&o.sql) == Some(&o.sql) {
+                continue;
+            }
             self.history.push(HistoryEntry {
                 sql: o.sql.clone(),
                 connection: tab.connection.clone(),

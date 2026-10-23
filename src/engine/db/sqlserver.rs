@@ -160,22 +160,23 @@ pub async fn connect(config: &ConnectionConfig) -> Result<SqlServerClient> {
     Ok(SqlServerClient::new(config.clone(), open(config).await?))
 }
 
+/// A result column as the app describes it.
+fn column_of(c: &tiberius::Column) -> Column {
+    Column {
+        name: c.name().to_string(),
+        type_name: format!("{:?}", c.column_type()),
+        nullable: true,
+        is_primary_key: false,
+    }
+}
+
 /// Convert fetched rows into a `QueryResult`.
 fn rows_to_result(rows: &[tiberius::Row]) -> QueryResult {
     if rows.is_empty() {
         return QueryResult::default();
     }
 
-    let columns: Vec<Column> = rows[0]
-        .columns()
-        .iter()
-        .map(|c| Column {
-            name: c.name().to_string(),
-            type_name: format!("{:?}", c.column_type()),
-            nullable: true,
-            is_primary_key: false,
-        })
-        .collect();
+    let columns: Vec<Column> = rows[0].columns().iter().map(column_of).collect();
 
     let data: Vec<Vec<String>> = rows
         .iter()
@@ -194,6 +195,12 @@ fn rows_to_result(rows: &[tiberius::Row]) -> QueryResult {
 /// identifiers and comments. `INSERT/UPDATE/DELETE/MERGE ... OUTPUT` returns
 /// rows, so it must keep the row-fetching path.
 fn has_output_clause(stmt: &str) -> bool {
+    has_word(stmt, "OUTPUT")
+}
+
+/// Whether `stmt` contains `word` (any case) outside string literals, quoted
+/// identifiers and comments.
+fn has_word(stmt: &str, word: &str) -> bool {
     let is_word_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$');
     let mut rest = stmt;
     while let Some(c) = rest.chars().next() {
@@ -211,7 +218,7 @@ fn has_output_clause(stmt: &str) -> bool {
             rest = after.split_once("*/").map_or("", |(_, tail)| tail);
         } else if is_word_char(c) {
             let end = rest.find(|ch| !is_word_char(ch)).unwrap_or(rest.len());
-            if rest[..end].eq_ignore_ascii_case("OUTPUT") {
+            if rest[..end].eq_ignore_ascii_case(word) {
                 return true;
             }
             rest = &rest[end..];
@@ -257,45 +264,34 @@ fn counts_only<S: AsRef<str>>(statements: &[S]) -> bool {
 /// Run `batch` with `Client::execute` and sum the affected-row counts. It goes
 /// through `sp_executesql`: the whole text is still one batch, so variables
 /// declared in it stay visible across its statements.
+///
+/// Under `SET NOCOUNT ON` the server reports no counts (tiberius then sees
+/// zeros): a zero total is checked against the session's `NOCOUNT` and the
+/// count is then flagged unknown rather than shown as "0 rows".
 async fn execute_counting(client: &mut TdsClient, batch: &str) -> Result<QueryResult> {
     let affected = client.execute(batch, &[]).await?.total();
+    let count_unknown = affected == 0 && {
+        let rows = run_batch(client, "SELECT CAST(@@OPTIONS & 512 AS int)").await?;
+        let nocount: Option<i32> = rows
+            .first()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get(0));
+        nocount.is_some_and(|bit| bit != 0)
+    };
     Ok(QueryResult {
         rows_affected: affected,
+        count_unknown,
         ..QueryResult::default()
     })
 }
 
-/// Collect the rows of the first result set of `stream`, keeping at most
-/// `max_rows` of them. Returns the rows and whether more were available.
-///
-/// The stream is always read to the end, extra rows being discarded right
-/// away (only the kept rows use memory). Dropping a partially read
-/// `QueryStream` would leave the rest of the response on the wire: tiberius
-/// then flushes it packet by packet at the start of the next query on this
-/// shared client, logging a warning for every packet, and a later error in the
-/// batch would surface on that unrelated query. Draining here keeps the client
-/// clean and reports errors where they belong.
-async fn first_result_capped(
-    mut stream: QueryStream<'_>,
-    max_rows: Option<usize>,
-) -> Result<(Vec<tiberius::Row>, bool)> {
-    let mut rows = Vec::new();
-    let mut truncated = false;
-    let mut result_sets = 0usize;
-    while let Some(item) = stream.try_next().await? {
-        match item {
-            QueryItem::Metadata(_) => result_sets += 1,
-            QueryItem::Row(row) if result_sets <= 1 => {
-                if max_rows.is_some_and(|max| rows.len() >= max) {
-                    truncated = true;
-                } else {
-                    rows.push(row);
-                }
-            }
-            QueryItem::Row(_) => {}
-        }
+/// The result of a batch that returned no result set and whose affected-row
+/// counts tiberius' `QueryStream` does not report.
+fn executed() -> QueryResult {
+    QueryResult {
+        count_unknown: true,
+        ..QueryResult::default()
     }
-    Ok((rows, truncated))
 }
 
 /// Execute a query on SQL Server, keeping at most `max_rows` rows of the first
@@ -316,11 +312,11 @@ pub async fn execute_query_limited(
             return execute_counting(&mut client, query).await;
         }
         let stream = client.simple_query(query).await?;
-        let (rows, truncated) = first_result_capped(stream, max_rows).await?;
-        Ok(QueryResult {
-            truncated,
-            ..rows_to_result(&rows)
-        })
+        let first = result_sets(stream, max_rows, true)
+            .await?
+            .into_iter()
+            .next();
+        Ok(first.unwrap_or_else(executed))
     }
     .await;
     client.settle(&outcome);
@@ -362,12 +358,8 @@ pub async fn execute_transaction(
         let results = stream.into_results().await?;
         // Return the last result set that produced rows (typically the final
         // SELECT); otherwise an empty result.
-        let rows = results
-            .into_iter()
-            .rev()
-            .find(|r| !r.is_empty())
-            .unwrap_or_default();
-        Ok(rows_to_result(&rows))
+        let rows = results.into_iter().rev().find(|r| !r.is_empty());
+        Ok(rows.map_or_else(executed, |rows| rows_to_result(&rows)))
     }
     .await;
 
@@ -390,6 +382,191 @@ pub async fn execute_transaction(
         client.settle(&outcome);
     }
     outcome
+}
+
+/// Whether `stmt` opens a transaction (`BEGIN TRAN[SACTION]`,
+/// `BEGIN DISTRIBUTED …`), as opposed to a `BEGIN … END` block or
+/// `BEGIN TRY`.
+pub(crate) fn is_tsql_transaction_start(stmt: &str) -> bool {
+    leading_keyword(stmt) == "BEGIN" && is_rowless_control(stmt)
+}
+
+/// The text sent for a script batch run in auto-commit mode. A batch that
+/// opens a transaction runs with `XACT_ABORT ON` (as `build_tsql_batch`):
+/// otherwise most errors only end their statement and the batch's `COMMIT`
+/// would commit the statements that succeeded. The setting goes on the
+/// batch's first line, so the line numbers the server reports are unchanged.
+/// A batch starting with `CREATE`/`ALTER` (a procedure, a view… must come
+/// first in its batch) is sent as is.
+fn guarded_batch(batch: &str, statements: &[String]) -> Option<String> {
+    let first = statements.first().map(|s| leading_keyword(s));
+    let opens = statements.iter().any(|s| is_tsql_transaction_start(s));
+    (opens && !matches!(first.as_deref(), Some("CREATE" | "ALTER")))
+        .then(|| format!("SET XACT_ABORT ON; {batch}\n;SET XACT_ABORT OFF;"))
+}
+
+/// Whether `statements` end as many transactions as they open.
+/// `execute_counting` goes through `sp_executesql`, which refuses to
+/// return with another transaction count than it started with (error 266):
+/// a batch opening a transaction that a later batch commits (or that is
+/// left open) must not use it.
+fn opens_and_ends_alike(statements: &[String]) -> bool {
+    let balance: i32 = statements
+        .iter()
+        .map(|s| match leading_keyword(s).as_str() {
+            "BEGIN" if is_tsql_transaction_start(s) => 1,
+            "COMMIT" | "ROLLBACK" => -1,
+            _ => 0,
+        })
+        .sum();
+    balance == 0
+}
+
+/// Read the result sets of `stream` (only the first one when `first_only`),
+/// keeping at most `max_rows` rows of each (`truncated` set when more were
+/// available). An empty result set keeps its columns.
+///
+/// The stream is always read to the end, extra rows being discarded right
+/// away (only the kept rows use memory). Dropping a partially read
+/// `QueryStream` would leave the rest of the response on the wire: tiberius
+/// then flushes it packet by packet at the start of the next query on this
+/// shared client, logging a warning for every packet, and a later error in the
+/// batch would surface on that unrelated query. Draining here keeps the client
+/// clean and reports errors where they belong.
+async fn result_sets(
+    mut stream: QueryStream<'_>,
+    max_rows: Option<usize>,
+    first_only: bool,
+) -> Result<Vec<QueryResult>> {
+    let mut sets: Vec<QueryResult> = Vec::new();
+    let mut skipping = false;
+    while let Some(item) = stream.try_next().await? {
+        match item {
+            QueryItem::Metadata(_) if first_only && !sets.is_empty() => skipping = true,
+            QueryItem::Metadata(meta) => sets.push(QueryResult {
+                columns: meta.columns().iter().map(column_of).collect(),
+                ..QueryResult::default()
+            }),
+            QueryItem::Row(_) if skipping => {}
+            QueryItem::Row(row) => {
+                let Some(set) = sets.last_mut() else {
+                    continue;
+                };
+                if max_rows.is_some_and(|max| set.rows.len() >= max) {
+                    set.truncated = true;
+                } else {
+                    let values = (0..set.columns.len()).map(|i| get_value(&row, i));
+                    set.rows.push(values.collect());
+                }
+            }
+        }
+    }
+    for set in &mut sets {
+        set.rows_affected = set.rows.len() as u64;
+    }
+    Ok(sets)
+}
+
+/// Run one batch of a script in a single round trip, as SSMS does: its
+/// variables are visible to all its statements. Returns one result per
+/// result set (each capped at `max_rows`), or, when it returns none, one
+/// result with the affected-row count (counted only for DML-only batches,
+/// see `counts_only`; flagged unknown otherwise).
+///
+/// `auto`: auto-commit mode, on the connection's shared client. The batch
+/// is then guarded (`guarded_batch`) and, when it fails, a transaction it
+/// left open is rolled back so later queries aren't poisoned. In manual
+/// transaction mode (`auto` false) the open transaction is the user's: it
+/// is left as the server left it.
+pub async fn execute_batch(
+    client: &SqlServerClient,
+    batch: &str,
+    max_rows: Option<usize>,
+    auto: bool,
+) -> Result<Vec<QueryResult>> {
+    let statements: Vec<String> = split_statements(batch)
+        .into_iter()
+        .map(|(_, _, stmt)| stmt)
+        .collect();
+    let guarded = auto.then(|| guarded_batch(batch, &statements)).flatten();
+    let text = guarded.as_deref().unwrap_or(batch);
+    let mut client = client.lock().await?;
+    let outcome = async {
+        if counts_only(&statements) && opens_and_ends_alike(&statements) {
+            return Ok(vec![execute_counting(&mut client, text).await?]);
+        }
+        let stream = client.simple_query(text).await?;
+        let mut sets = result_sets(stream, max_rows, false).await?;
+        if sets.is_empty() {
+            sets.push(executed());
+        }
+        Ok(sets)
+    }
+    .await;
+    match &outcome {
+        Err(e) if auto && is_server_error(e) => {
+            // As in `execute_transaction`: if the rollback fails too, the
+            // client stays dirty and is replaced on next use.
+            let cleanup = run_batch(
+                &mut client,
+                "IF @@TRANCOUNT > 0 ROLLBACK; SET XACT_ABORT OFF",
+            )
+            .await
+            .map(drop);
+            client.settle(&cleanup);
+        }
+        _ => client.settle(&outcome),
+    }
+    outcome
+}
+
+/// Roll back the transaction a script left open on the shared client.
+/// Returns whether there was one.
+pub async fn rollback_open_transaction(client: &SqlServerClient) -> Result<bool> {
+    let mut client = client.lock().await?;
+    let outcome = run_batch(
+        &mut client,
+        "IF @@TRANCOUNT > 0 BEGIN ROLLBACK; SELECT 1 END ELSE SELECT 0",
+    )
+    .await;
+    client.settle(&outcome);
+    let open: Option<i32> = outcome?
+        .first()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get(0));
+    Ok(open == Some(1))
+}
+
+/// The message and line of the server error `e` raised by the batch text
+/// itself (not by a procedure it called): the line counts from the batch's
+/// first line.
+pub fn batch_error_line(e: &anyhow::Error) -> Option<(String, u32)> {
+    match e.downcast_ref::<tiberius::error::Error>() {
+        Some(tiberius::error::Error::Server(t)) if t.procedure().is_empty() && t.line() > 0 => {
+            Some((t.message().to_string(), t.line()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a batch statement always returns one result set: a `SELECT`
+/// that neither assigns variables (`SELECT @x = …`) nor fills a table
+/// (`SELECT … INTO`).
+pub(crate) fn is_result_select(stmt: &str) -> bool {
+    if leading_keyword(stmt) != "SELECT" {
+        return false;
+    }
+    let after = skip_leading_comments(stmt)["SELECT".len()..].trim_start();
+    let assigns = after.starts_with('@') && {
+        let name_end = after
+            .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$')))
+            .unwrap_or(after.len());
+        let op = after[name_end..].trim_start();
+        ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="]
+            .iter()
+            .any(|assign| op.starts_with(assign))
+    };
+    !assigns && !has_word(stmt, "INTO")
 }
 
 /// Run `sql` as one batch and read its whole response.
@@ -800,7 +977,93 @@ fn get_value(row: &tiberius::Row, index: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_tsql_batch, counts_only, has_output_clause, is_rowless_control};
+    use super::{
+        build_tsql_batch, counts_only, guarded_batch, has_output_clause, is_result_select,
+        is_rowless_control, is_tsql_transaction_start, opens_and_ends_alike,
+    };
+
+    fn stmts(sql: &str) -> Vec<String> {
+        crate::engine::sql::statements::split_statements(sql)
+            .into_iter()
+            .map(|s| s.2)
+            .collect()
+    }
+
+    #[test]
+    fn transaction_start_is_begin_tran_only() {
+        assert!(is_tsql_transaction_start("BEGIN TRANSACTION"));
+        assert!(is_tsql_transaction_start(
+            "-- x
+begin tran t1"
+        ));
+        assert!(is_tsql_transaction_start("BEGIN DISTRIBUTED TRANSACTION"));
+        assert!(!is_tsql_transaction_start("BEGIN TRY"));
+        assert!(!is_tsql_transaction_start(
+            "BEGIN
+SELECT 1"
+        ));
+        assert!(!is_tsql_transaction_start("COMMIT"));
+    }
+
+    #[test]
+    fn script_batches_opening_a_transaction_abort_on_error() {
+        let batch = "-- note
+BEGIN TRAN;
+INSERT INTO t VALUES (1);
+COMMIT;";
+        let guarded = guarded_batch(batch, &stmts(batch)).unwrap();
+        // Same line numbers: the setting is on the first line.
+        assert!(guarded.starts_with(
+            "SET XACT_ABORT ON; -- note
+BEGIN TRAN;"
+        ));
+        assert!(guarded.ends_with(
+            "COMMIT;
+;SET XACT_ABORT OFF;"
+        ));
+        assert_eq!(guarded.lines().count(), batch.lines().count() + 1);
+        assert_eq!(guarded_batch("SELECT 1", &stmts("SELECT 1")), None);
+        assert_eq!(
+            guarded_batch("BEGIN TRY SELECT 1", &stmts("BEGIN TRY SELECT 1")),
+            None
+        );
+        let proc = "CREATE PROCEDURE p AS BEGIN TRAN; COMMIT;";
+        assert_eq!(guarded_batch(proc, &stmts(proc)), None);
+    }
+
+    #[test]
+    fn counted_batches_open_and_end_alike() {
+        assert!(opens_and_ends_alike(&stmts("INSERT INTO t VALUES (1)")));
+        assert!(opens_and_ends_alike(&stmts(
+            "BEGIN TRAN; INSERT INTO t VALUES (1); COMMIT"
+        )));
+        assert!(!opens_and_ends_alike(&stmts(
+            "BEGIN TRAN; INSERT INTO t VALUES (1)"
+        )));
+        assert!(!opens_and_ends_alike(&stmts(
+            "INSERT INTO t VALUES (1); COMMIT"
+        )));
+    }
+
+    #[test]
+    fn result_selects() {
+        assert!(is_result_select("SELECT * FROM t"));
+        assert!(is_result_select(
+            "-- c
+select @x AS x"
+        ));
+        assert!(is_result_select("SELECT @a, @b"));
+        assert!(is_result_select("SELECT 'INTO' AS w"));
+        assert!(is_result_select("SELECT [into] FROM t"));
+        assert!(!is_result_select("SELECT @x = 1"));
+        assert!(!is_result_select("SELECT @x += n FROM t"));
+        assert!(!is_result_select("SELECT * INTO #t FROM t"));
+        assert!(!is_result_select("INSERT INTO t SELECT 1"));
+        assert!(!is_result_select("IF 1 = 1 SELECT 1"));
+        assert!(!is_result_select(
+            "WITH c AS (SELECT 1 AS a) SELECT a FROM c"
+        ));
+    }
 
     #[test]
     fn detects_output_clause() {

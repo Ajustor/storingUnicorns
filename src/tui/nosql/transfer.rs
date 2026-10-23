@@ -466,8 +466,8 @@ fn edit_text(text: &mut String, cursor: &mut usize, key: KeyCode) {
     }
 }
 
-/// The shown result as a file: the documents of a collection (relaxed
-/// extended JSON), else the rows as objects; CSV as `export_to_csv` (a
+/// The shown result as a file: the documents of a collection (canonical
+/// extended JSON, types kept), else the rows as objects; CSV as `export_to_csv` (a
 /// missing field empty, like null).
 pub fn results_file(
     result: &QueryResult,
@@ -488,7 +488,7 @@ pub fn results_file(
     let values: Vec<serde_json::Value> = match docs {
         Some(docs) if docs.len() == result.rows.len() => docs
             .iter()
-            .map(|d| bson::Bson::Document(d.clone()).into_relaxed_extjson())
+            .map(|d| bson::Bson::Document(d.clone()).into_canonical_extjson())
             .collect(),
         _ => result
             .rows

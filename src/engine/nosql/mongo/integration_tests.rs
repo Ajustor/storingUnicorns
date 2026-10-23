@@ -413,6 +413,32 @@ db.users.find({_id: 1}, {})"#,
 
     // --- export → import ----------------------------------------------------------
     let dir = tempfile::tempdir().unwrap();
+    // JSON keeps every type (canonical extended JSON).
+    run(
+        &conn,
+        r#"db.types.insertOne({_id: 1, l: NumberLong(5), i: 5, d: 1.0, m: NumberDecimal("1.50"), t: ISODate("2024-01-02T03:04:05.678Z")})"#,
+    )
+    .await;
+    let typed = all_docs(c, "types").await;
+    assert_eq!(typed[0].get("l"), Some(&Bson::Int64(5)));
+    for format in [TransferFormat::Json, TransferFormat::JsonLines] {
+        let path = dir.path().join(format!("types.{}", format.extension()));
+        export_collection(c, &coll("types"), "", &path, format, |_, _, _| {})
+            .await
+            .unwrap();
+        let target = format!("types_{}", format.extension());
+        import_collection(
+            c,
+            &coll(&target),
+            &path,
+            format,
+            &ImportOptions::default(),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(all_docs(c, &target).await, typed, "{format:?}");
+    }
     let source = all_docs(c, "users").await;
     for format in TransferFormat::ALL {
         let path = dir

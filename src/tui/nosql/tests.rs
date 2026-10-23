@@ -1290,7 +1290,7 @@ fn results_export_as_json_lines_or_csv() {
     // Documents keep their types.
     let docs = vec![
         bson::doc! { "_id": 1, "name": "Ann" },
-        bson::doc! { "_id": 2 },
+        bson::doc! { "_id": 2_i64 },
     ];
     let json: serde_json::Value = serde_json::from_str(&transfer::results_file(
         &r,
@@ -1300,7 +1300,10 @@ fn results_export_as_json_lines_or_csv() {
     .unwrap();
     assert_eq!(
         json,
-        serde_json::json!([{"_id": 1, "name": "Ann"}, {"_id": 2}])
+        serde_json::json!([
+            {"_id": {"$numberInt": "1"}, "name": "Ann"},
+            {"_id": {"$numberLong": "2"}}
+        ])
     );
 }
 

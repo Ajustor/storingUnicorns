@@ -1,6 +1,8 @@
 //! MongoDB export / import: JSON (array), JSON Lines and CSV (plan 13,
-//! user decision 2). JSON files hold relaxed extended JSON, as mongoexport
-//! writes it; CSV goes through `export_to_csv` / `parse_csv`.
+//! user decision 2). JSON files hold canonical extended JSON (types kept:
+//! a small `NumberLong` stays a long, `1.0` a double; relaxed JSON, as
+//! mongoexport writes by default, is read too); CSV goes through
+//! `export_to_csv` / `parse_csv`.
 
 use std::path::Path;
 
@@ -23,6 +25,11 @@ const BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn relaxed_json(v: &Bson) -> String {
     v.clone().into_relaxed_extjson().to_string()
+}
+
+/// A document as canonical extended JSON (every BSON type kept).
+pub(crate) fn canonical_json(d: &Document) -> serde_json::Value {
+    Bson::Document(d.clone()).into_canonical_extjson()
 }
 
 /// One CSV cell: plain text for strings, numbers, booleans and dates,
@@ -305,7 +312,7 @@ pub(crate) fn read_documents(
 
 /// The file content of `docs`.
 pub(crate) fn write_documents(docs: &[Document], format: TransferFormat) -> String {
-    let json = |d: &Document| relaxed_json(&Bson::Document(d.clone()));
+    let json = |d: &Document| canonical_json(d).to_string();
     match format {
         TransferFormat::Json => {
             if docs.is_empty() {
@@ -482,6 +489,32 @@ mod tests {
 
     fn row(cells: &[&str]) -> Vec<String> {
         cells.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn json_exports_keep_every_number_type() {
+        let d = doc! {
+            "_id": 1,
+            "long": 5_i64,
+            "int": 5_i32,
+            "double": 1.0,
+            "dec": Bson::Decimal128("1.50".parse().unwrap()),
+            "date": bson::DateTime::from_millis(1_700_000_000_123),
+            "nested": { "l": [2_i64, 3_i32] },
+        };
+        for format in [TransferFormat::Json, TransferFormat::JsonLines] {
+            let text = write_documents(std::slice::from_ref(&d), format);
+            assert!(text.contains("$numberLong"), "{text}");
+            let (docs, errors) = read_documents(&text, format, &opts()).unwrap();
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(docs, [d.clone()], "{format:?}");
+        }
+        // Relaxed files (mongoexport's default) still read.
+        let relaxed = "{\"a\": 1, \"b\": 1.5, \"c\": {\"$date\": \"2024-01-02T03:04:05Z\"}}
+";
+        let (docs, _) = read_documents(relaxed, TransferFormat::JsonLines, &opts()).unwrap();
+        assert_eq!(docs[0].get("a"), Some(&Bson::Int32(1)));
+        assert!(matches!(docs[0].get("c"), Some(Bson::DateTime(_))));
     }
 
     #[test]

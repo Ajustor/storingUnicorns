@@ -5,6 +5,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use egui::Id;
 
+use crate::engine::config::folders::{self, is_within, FolderNode, SEP};
+use crate::engine::config::AppConfig;
 use crate::engine::models::{ConnectionConfig, SchemaInfo, TableDetails};
 use crate::engine::ops::transfer::qualified;
 
@@ -49,6 +51,13 @@ pub struct TableAt {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RowKind {
+    /// `folder` indexes `Flat::folders`; `count` is the number of
+    /// connections it holds, subfolders included.
+    Folder {
+        folder: usize,
+        count: usize,
+        open: bool,
+    },
     /// `conn` indexes the configured connections.
     Connection {
         conn: usize,
@@ -65,6 +74,9 @@ pub enum RowKind {
         schema: usize,
         count: usize,
         open: bool,
+        /// Hidden by the user, shown because « Afficher les schémas
+        /// masqués » is on.
+        hidden: bool,
     },
     Table {
         at: TableAt,
@@ -111,6 +123,8 @@ pub struct SessionView<'a> {
 /// What the tree needs from a configured connection.
 pub struct ConnView<'a> {
     pub name: &'a str,
+    /// Schemas the user hid.
+    pub hidden: &'a [String],
     pub session: Option<SessionView<'a>>,
     pub connecting: bool,
     pub failed: bool,
@@ -124,6 +138,7 @@ pub(super) fn conn_views<'a>(
         .iter()
         .map(|c| ConnView {
             name: &c.name,
+            hidden: &c.hidden_schemas,
             session: sessions.get(&c.name).map(|s| SessionView {
                 schemas: &s.schemas,
                 details: &s.details,
@@ -134,6 +149,15 @@ pub(super) fn conn_views<'a>(
             failed: sessions.errors.contains_key(&c.name),
         })
         .collect()
+}
+
+pub fn folder_id(path: &str) -> Id {
+    Id::new(("explorer_folder", path))
+}
+
+/// Open state of « Afficher les schémas masqués » of `conn`.
+pub fn show_hidden_id(conn: &str) -> Id {
+    Id::new(("explorer_show_hidden", conn))
 }
 
 pub fn connection_id(conn: &str) -> Id {
@@ -158,60 +182,41 @@ pub fn group_id(conn: &str, schema: &str, table: &str, group: Group) -> Id {
 pub struct Flat {
     pub rows: Vec<Row>,
     pub needs_details: Vec<(usize, String)>,
+    /// Paths of the folders the rows show (`RowKind::Folder::folder`).
+    pub folders: Vec<String>,
+    /// Every folder, depth first: the targets of « Déplacer vers… ».
+    pub all_folders: Vec<String>,
 }
 
-/// Flatten the tree. `open(id)` is the state the user gave a node, if any.
-/// Connections are closed by default and can only stay open while
-/// connected or connecting; schemas are open by default when their
-/// connection has only one. While filtering, the connections and schemas
-/// with matching tables are forced open (their state is kept) and the others
-/// hidden.
-pub fn flatten(conns: &[ConnView], filter: &str, open: impl Fn(Id) -> Option<bool>) -> Flat {
-    let mut flat = Flat::default();
-    for (ci, c) in conns.iter().enumerate() {
-        let groups = match (&c.session, filter.is_empty()) {
-            (_, true) => None,
-            (None, false) => continue,
-            (Some(s), false) => {
-                let groups = filter_tables(s.schemas, filter);
-                if groups.is_empty() {
-                    continue;
-                }
-                Some(groups)
-            }
-        };
-        let is_open = groups.is_some()
-            || (open(connection_id(c.name)).unwrap_or(false)
-                && (c.session.is_some() || c.connecting));
-        flat.push(
-            0,
-            RowKind::Connection {
-                conn: ci,
-                open: is_open,
-            },
-        );
-        if is_open {
-            match &c.session {
-                None => flat.push(1, RowKind::Note("Connexion…")),
-                Some(s) => match groups {
-                    Some(groups) => {
-                        for (si, tables) in groups {
-                            flat.schema(c, ci, s, si, Some(&tables), &open);
-                        }
-                    }
-                    None if s.schemas.is_empty() => flat.push(1, RowKind::Note("Aucune table")),
-                    None => {
-                        for si in 0..s.schemas.len() {
-                            flat.schema(c, ci, s, si, None, &open);
-                        }
-                    }
-                },
-            }
-        }
-        if c.session.is_none() && c.failed {
-            flat.push(1, RowKind::ConnError { conn: ci });
-        }
+/// Number of connections in `node`, subfolders included.
+fn connection_count(node: &FolderNode) -> usize {
+    node.connections.len() + node.folders.iter().map(connection_count).sum::<usize>()
+}
+
+fn all_folders(node: &FolderNode, out: &mut Vec<String>) {
+    for f in &node.folders {
+        out.push(f.path.clone());
+        all_folders(f, out);
     }
+}
+
+/// Flatten the tree of `root` (its connection indexes index `conns`).
+/// `open(id)` is the state the user gave a node, if any. Folders are open
+/// by default. Connections are closed by default and can only stay open
+/// while connected or connecting; schemas are open by default when their
+/// connection shows only one. Hidden schemas are left out, unless the
+/// connection's « Afficher les schémas masqués » is on. While filtering,
+/// the folders, connections and schemas with matching tables are forced
+/// open (their state is kept) and the others hidden.
+pub fn flatten(
+    root: &FolderNode,
+    conns: &[ConnView],
+    filter: &str,
+    open: impl Fn(Id) -> Option<bool>,
+) -> Flat {
+    let mut flat = Flat::default();
+    all_folders(root, &mut flat.all_folders);
+    flat.node(root, 0, conns, filter, &open);
     flat
 }
 
@@ -220,27 +225,139 @@ impl Flat {
         self.rows.push(Row { depth, kind });
     }
 
-    /// Schema `si` of `s`, with only `tables` (forced open) when filtering.
+    /// The content of folder `node` at `depth`: its subfolders, then its
+    /// connections. Whether it showed anything.
+    fn node(
+        &mut self,
+        node: &FolderNode,
+        depth: u8,
+        conns: &[ConnView],
+        filter: &str,
+        open: &impl Fn(Id) -> Option<bool>,
+    ) -> bool {
+        let mut any = false;
+        for f in &node.folders {
+            let (rows, folders) = (self.rows.len(), self.folders.len());
+            let is_open = !filter.is_empty() || open(folder_id(&f.path)).unwrap_or(true);
+            self.folders.push(f.path.clone());
+            self.push(
+                depth,
+                RowKind::Folder {
+                    folder: folders,
+                    count: connection_count(f),
+                    open: is_open,
+                },
+            );
+            let shown = is_open && self.node(f, depth.saturating_add(1), conns, filter, open);
+            if !filter.is_empty() && !shown {
+                // No match inside: the folder goes too.
+                self.rows.truncate(rows);
+                self.folders.truncate(folders);
+                continue;
+            }
+            any = true;
+        }
+        for &ci in &node.connections {
+            if let Some(c) = conns.get(ci) {
+                any |= self.connection(ci, c, depth, filter, open);
+            }
+        }
+        any
+    }
+
+    /// Connection `ci` and, when open, its schemas. Whether it showed.
+    fn connection(
+        &mut self,
+        ci: usize,
+        c: &ConnView,
+        depth: u8,
+        filter: &str,
+        open: &impl Fn(Id) -> Option<bool>,
+    ) -> bool {
+        let show_hidden = open(show_hidden_id(c.name)).unwrap_or(false);
+        let shown = |s: &SchemaInfo| show_hidden || !c.hidden.contains(&s.name);
+        let groups = match (&c.session, filter.is_empty()) {
+            (_, true) => None,
+            (None, false) => return false,
+            (Some(s), false) => {
+                let groups: Vec<_> = filter_tables(s.schemas, filter)
+                    .into_iter()
+                    .filter(|(si, _)| shown(&s.schemas[*si]))
+                    .collect();
+                if groups.is_empty() {
+                    return false;
+                }
+                Some(groups)
+            }
+        };
+        let is_open = groups.is_some()
+            || (open(connection_id(c.name)).unwrap_or(false)
+                && (c.session.is_some() || c.connecting));
+        self.push(
+            depth,
+            RowKind::Connection {
+                conn: ci,
+                open: is_open,
+            },
+        );
+        let inner = depth.saturating_add(1);
+        if is_open {
+            match &c.session {
+                None => self.push(inner, RowKind::Note("Connexion…")),
+                Some(s) => match groups {
+                    Some(groups) => {
+                        let lone = groups.len() == 1;
+                        for (si, tables) in groups {
+                            self.schema(c, ci, s, si, inner, lone, Some(&tables), open);
+                        }
+                    }
+                    None if s.schemas.is_empty() => self.push(inner, RowKind::Note("Aucune table")),
+                    None => {
+                        let visible: Vec<usize> = (0..s.schemas.len())
+                            .filter(|&si| shown(&s.schemas[si]))
+                            .collect();
+                        if visible.is_empty() {
+                            self.push(inner, RowKind::Note("Tous les schémas sont masqués"));
+                        }
+                        let lone = visible.len() == 1;
+                        for si in visible {
+                            self.schema(c, ci, s, si, inner, lone, None, open);
+                        }
+                    }
+                },
+            }
+        }
+        if c.session.is_none() && c.failed {
+            self.push(inner, RowKind::ConnError { conn: ci });
+        }
+        true
+    }
+
+    /// Schema `si` of `s` at `depth`, with only `tables` (forced open) when
+    /// filtering; `lone`: the only schema shown (open by default).
+    #[allow(clippy::too_many_arguments)]
     fn schema(
         &mut self,
         c: &ConnView,
         ci: usize,
         s: &SessionView,
         si: usize,
+        depth: u8,
+        lone: bool,
         tables: Option<&[usize]>,
         open: &impl Fn(Id) -> Option<bool>,
     ) {
         let schema = &s.schemas[si];
         let count = tables.map_or(schema.tables.len(), <[usize]>::len);
-        let is_open = tables.is_some()
-            || open(schema_id(c.name, &schema.name)).unwrap_or(s.schemas.len() == 1);
+        let is_open = tables.is_some() || open(schema_id(c.name, &schema.name)).unwrap_or(lone);
         self.push(
-            1,
+            depth,
             RowKind::Schema {
                 conn: ci,
                 schema: si,
                 count,
                 open: is_open,
+                hidden: c.hidden.contains(&schema.name),
             },
         );
         if !is_open {
@@ -254,9 +371,9 @@ impl Flat {
                 table: ti,
             };
             let is_open = open(table_id(c.name, &schema.name, name)).unwrap_or(false);
-            self.push(2, RowKind::Table { at, open: is_open });
+            self.push(depth + 1, RowKind::Table { at, open: is_open });
             if is_open {
-                self.details(c, s, at, &schema.name, name, open);
+                self.details(c, s, at, depth + 2, &schema.name, name, open);
             }
         };
         match tables {
@@ -265,11 +382,13 @@ impl Flat {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn details(
         &mut self,
         c: &ConnView,
         s: &SessionView,
         at: TableAt,
+        depth: u8,
         schema: &str,
         table: &str,
         open: &impl Fn(Id) -> Option<bool>,
@@ -277,14 +396,14 @@ impl Flat {
         let key = qualified(schema, table, s.quotes);
         let d = match s.details.get(&key) {
             None => {
-                self.push(3, RowKind::DetailsLoading);
+                self.push(depth, RowKind::DetailsLoading);
                 if !s.loading.contains_key(&key) {
                     self.needs_details.push((at.conn, key));
                 }
                 return;
             }
             Some(Err(_)) => {
-                self.push(3, RowKind::DetailsError { at });
+                self.push(depth, RowKind::DetailsError { at });
                 return;
             }
             Some(Ok(d)) => d,
@@ -293,7 +412,7 @@ impl Flat {
             let count = group_len(d, group);
             let is_open = open(group_id(c.name, schema, table, group)).unwrap_or(false);
             self.push(
-                3,
+                depth,
                 RowKind::Group {
                     at,
                     group,
@@ -303,12 +422,12 @@ impl Flat {
             );
             if is_open {
                 for index in 0..count {
-                    self.push(4, RowKind::Item { at, group, index });
+                    self.push(depth + 1, RowKind::Item { at, group, index });
                 }
                 // After the lines it has: keys still list the primary key
                 // when the foreign keys couldn't be read.
                 if group_error(d, group).is_some() {
-                    self.push(4, RowKind::GroupError { at, group });
+                    self.push(depth + 1, RowKind::GroupError { at, group });
                 }
             }
         }
@@ -353,6 +472,26 @@ impl Tree {
         self.generation += 1;
     }
 
+    /// The state the user gave `id`, if any.
+    pub(super) fn is_open(&self, id: Id) -> Option<bool> {
+        self.open.get(&id).copied()
+    }
+
+    /// Folder `from` (and the folders under it, among `folders`) became
+    /// `to`: they keep the states the user gave them.
+    pub(super) fn folder_moved(&mut self, folders: &[String], from: &str, to: &str) {
+        let moved: Vec<(Id, Id)> = folders
+            .iter()
+            .filter_map(|p| Some((folder_id(p), folder_id(&moved_under(p, from, to)?))))
+            .collect();
+        let states: Vec<(Id, bool)> = moved
+            .iter()
+            .filter_map(|(old, new)| Some((*new, self.open.remove(old)?)))
+            .collect();
+        self.open.extend(states);
+        self.generation += 1;
+    }
+
     /// The rows for inputs hashing to `key`, built by `build` when they
     /// changed.
     pub(super) fn rows(
@@ -369,27 +508,299 @@ impl Tree {
 }
 
 /// Hash of everything the rows depend on besides the open states.
-pub(super) fn inputs_key(
-    filter: &str,
-    connections: &[ConnectionConfig],
-    sessions: &Sessions,
-    tree: u64,
-) -> u64 {
+pub(super) fn inputs_key(filter: &str, config: &AppConfig, sessions: &Sessions, tree: u64) -> u64 {
     egui::util::hash((
         filter,
         tree,
         sessions.generation(),
-        connections.iter().map(|c| &c.name).collect::<Vec<_>>(),
+        &config.folders,
+        config
+            .connections
+            .iter()
+            .map(|c| (&c.name, &c.folder, &c.hidden_schemas))
+            .collect::<Vec<_>>(),
         sessions.open.keys().collect::<Vec<_>>(),
         &sessions.connecting,
         sessions.errors.keys().collect::<BTreeSet<_>>(),
     ))
 }
 
+/// `path` once folder `from` became `to`, if it is `from` or under it.
+pub fn moved_under(path: &str, from: &str, to: &str) -> Option<String> {
+    (!from.is_empty() && is_within(path, from)).then(|| format!("{to}{}", &path[from.len()..]))
+}
+
+/// `name` in folder `parent` (`""`: the root).
+pub fn join_folder(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}{SEP}{name}")
+    }
+}
+
+/// What the explorer drags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DragItem {
+    /// A connection, by name.
+    Connection(String),
+    /// A folder, by path.
+    Folder(String),
+}
+
+impl DragItem {
+    /// Its folder once dropped into `target` (`""`: the root).
+    pub fn destination(&self, target: &str) -> String {
+        match self {
+            DragItem::Connection(_) => target.to_string(),
+            DragItem::Folder(path) => join_folder(target, folders::name(path)),
+        }
+    }
+}
+
+/// Whether dropping `item` into folder `target` (`""`: the root) moves it:
+/// not where it already is, and never a folder into itself or one of its
+/// subfolders. `folder_of` gives a connection's folder (`""`: the root).
+pub fn can_drop(item: &DragItem, target: &str, folder_of: impl Fn(&str) -> String) -> bool {
+    match item {
+        DragItem::Connection(name) => folder_of(name) != target,
+        DragItem::Folder(path) => !is_within(target, path) && folders::parent(path) != target,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::config::folders::tree;
     use crate::engine::models::{Column, ForeignKeyInfo};
+
+    /// A config with connections `(name, folder)` and explicit `folders`.
+    fn config(conns: &[(&str, Option<&str>)], folders: &[&str]) -> AppConfig {
+        AppConfig {
+            connections: conns
+                .iter()
+                .map(|(name, folder)| ConnectionConfig {
+                    name: name.to_string(),
+                    folder: folder.map(Into::into),
+                    ..Default::default()
+                })
+                .collect(),
+            folders: folders.iter().map(|f| f.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn views(config: &AppConfig) -> Vec<ConnView<'_>> {
+        config
+            .connections
+            .iter()
+            .map(|c| ConnView {
+                name: &c.name,
+                hidden: &c.hidden_schemas,
+                session: None,
+                connecting: false,
+                failed: false,
+            })
+            .collect()
+    }
+
+    /// Each row as `depth name`, folders as `[path]`.
+    fn outline(flat: &Flat, config: &AppConfig) -> Vec<String> {
+        flat.rows
+            .iter()
+            .map(|r| {
+                let label = match r.kind {
+                    RowKind::Folder { folder, count, .. } => {
+                        format!("[{}] {count}", flat.folders[folder])
+                    }
+                    RowKind::Connection { conn, .. } => config.connections[conn].name.clone(),
+                    RowKind::Schema { schema, hidden, .. } => {
+                        format!("schema {schema}{}", if hidden { " (masqué)" } else { "" })
+                    }
+                    RowKind::Note(n) => n.to_string(),
+                    other => format!("{other:?}"),
+                };
+                format!("{} {label}", r.depth)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn folders_come_first_nested_and_open_by_default() {
+        let c = config(
+            &[
+                ("prod", Some("Clients/ACME")),
+                ("local", None),
+                ("beta", Some("Clients")),
+            ],
+            &["Vide"],
+        );
+        let flat = flatten(&tree(&c), &views(&c), "", |_| None);
+        assert_eq!(
+            outline(&flat, &c),
+            [
+                "0 [Clients] 2",
+                "1 [Clients/ACME] 1",
+                "2 prod",
+                "1 beta",
+                "0 [Vide] 0",
+                "0 local",
+            ]
+        );
+        assert_eq!(flat.all_folders, ["Clients", "Clients/ACME", "Vide"]);
+        // A folder the user closed hides its content.
+        let closed = |id| (id == folder_id("Clients/ACME")).then_some(false);
+        let flat = flatten(&tree(&c), &views(&c), "", closed);
+        assert_eq!(
+            outline(&flat, &c),
+            [
+                "0 [Clients] 2",
+                "1 [Clients/ACME] 1",
+                "1 beta",
+                "0 [Vide] 0",
+                "0 local",
+            ]
+        );
+        assert!(matches!(
+            flat.rows[1].kind,
+            RowKind::Folder { open: false, .. }
+        ));
+    }
+
+    #[test]
+    fn filtering_keeps_only_the_folders_holding_a_match() {
+        let c = config(
+            &[("a", Some("X/Y")), ("b", Some("Z")), ("c", None)],
+            &["Vide"],
+        );
+        let with_users = Fixture::new(vec![schema("main", &["users"])]);
+        let without = Fixture::new(vec![schema("main", &["items"])]);
+        let conns = [
+            with_users.view("a"),
+            without.view("b"),
+            offline("c", false, false),
+        ];
+        // Closed folders are forced open while filtering.
+        let flat = flatten(&tree(&c), &conns, "user", |_| Some(false));
+        assert_eq!(
+            outline(&flat, &c)[..4],
+            ["0 [X] 1", "1 [X/Y] 1", "2 a", "3 schema 0"]
+        );
+        assert_eq!(flat.rows.len(), 5, "the table too");
+        assert_eq!(flat.folders, ["X", "X/Y"]);
+        assert!(flatten(&tree(&c), &conns, "zzz", |_| None).rows.is_empty());
+    }
+
+    #[test]
+    fn hidden_schemas_are_left_out_unless_shown_greyed() {
+        let f = Fixture::new(vec![
+            schema("public", &["users"]),
+            schema("audit", &["logs"]),
+        ]);
+        let hidden = ["audit".to_string()];
+        let view = || ConnView {
+            hidden: &hidden,
+            ..f.view("a")
+        };
+        let ids = [connection_id("a")];
+        let flat_of = |open: &dyn Fn(Id) -> Option<bool>| at_root(&[view()], "", open);
+        let rows = kinds(&flat_of(&opened(&ids)));
+        // The lone schema left is open by default.
+        assert_eq!(
+            rows[1],
+            RowKind::Schema {
+                conn: 0,
+                schema: 0,
+                count: 1,
+                open: true,
+                hidden: false
+            }
+        );
+        assert_eq!(rows.len(), 3, "connection, public, users");
+        let show = [connection_id("a"), show_hidden_id("a")];
+        let rows = kinds(&flat_of(&opened(&show)));
+        assert_eq!(
+            rows[2],
+            RowKind::Schema {
+                conn: 0,
+                schema: 1,
+                count: 1,
+                open: false,
+                hidden: true
+            }
+        );
+        // Filtering skips them too, unless shown.
+        assert!(at_root(&[view()], "logs", |_| None).rows.is_empty());
+        assert_eq!(at_root(&[view()], "logs", opened(&show)).rows.len(), 3);
+        // Everything hidden: a note says so.
+        let all = ["public".to_string(), "audit".to_string()];
+        let v = ConnView {
+            hidden: &all,
+            ..f.view("a")
+        };
+        assert_eq!(
+            kinds(&at_root(&[v], "", opened(&ids)))[1],
+            RowKind::Note("Tous les schémas sont masqués")
+        );
+    }
+
+    #[test]
+    fn drops_never_put_a_folder_inside_itself() {
+        let folder_of = |name: &str| {
+            if name == "prod" {
+                "A".into()
+            } else {
+                String::new()
+            }
+        };
+        let conn = DragItem::Connection("prod".into());
+        assert!(can_drop(&conn, "", folder_of));
+        assert!(can_drop(&conn, "A/B", folder_of));
+        assert!(!can_drop(&conn, "A", folder_of), "already there");
+        let local = DragItem::Connection("local".into());
+        assert!(!can_drop(&local, "", folder_of));
+        let folder = DragItem::Folder("A/B".into());
+        assert!(!can_drop(&folder, "A/B", folder_of), "itself");
+        assert!(!can_drop(&folder, "A/B/C", folder_of), "a descendant");
+        assert!(!can_drop(&folder, "A", folder_of), "already there");
+        assert!(can_drop(&folder, "", folder_of));
+        assert!(can_drop(&folder, "A/BC", folder_of), "a sibling's prefix");
+        assert_eq!(folder.destination(""), "B");
+        assert_eq!(folder.destination("X/Y"), "X/Y/B");
+        assert_eq!(conn.destination("X"), "X");
+    }
+
+    #[test]
+    fn moved_folders_keep_their_open_states() {
+        assert_eq!(moved_under("A/B/C", "A/B", "Z"), Some("Z/C".into()));
+        assert_eq!(moved_under("A/B", "A/B", "Z"), Some("Z".into()));
+        assert_eq!(moved_under("A/BC", "A/B", "Z"), None);
+        let mut t = Tree::default();
+        t.set_open(folder_id("A/B"), false);
+        t.set_open(folder_id("A/B/C"), false);
+        t.set_open(folder_id("A"), false);
+        let all = ["A".to_string(), "A/B".into(), "A/B/C".into()];
+        t.folder_moved(&all, "A/B", "Z");
+        assert_eq!(t.is_open(folder_id("Z")), Some(false));
+        assert_eq!(t.is_open(folder_id("Z/C")), Some(false));
+        assert_eq!(t.is_open(folder_id("A/B")), None);
+        assert_eq!(t.is_open(folder_id("A")), Some(false));
+    }
+
+    #[test]
+    fn the_cache_key_follows_folders_and_hidden_schemas() {
+        let sessions = Sessions::default();
+        let mut c = config(&[("a", None)], &[]);
+        let key = |c: &AppConfig| inputs_key("", c, &sessions, 0);
+        let k0 = key(&c);
+        c.folders.push("F".into());
+        let k1 = key(&c);
+        c.connections[0].folder = Some("F".into());
+        let k2 = key(&c);
+        c.connections[0].hidden_schemas.push("s".into());
+        let k3 = key(&c);
+        assert!(k0 != k1 && k1 != k2 && k2 != k3);
+    }
 
     fn schema(name: &str, tables: &[&str]) -> SchemaInfo {
         SchemaInfo {
@@ -429,6 +840,7 @@ mod tests {
         fn view<'a>(&'a self, name: &'a str) -> ConnView<'a> {
             ConnView {
                 name,
+                hidden: &[],
                 session: Some(SessionView {
                     schemas: &self.schemas,
                     details: &self.details,
@@ -444,10 +856,20 @@ mod tests {
     fn offline(name: &str, connecting: bool, failed: bool) -> ConnView<'_> {
         ConnView {
             name,
+            hidden: &[],
             session: None,
             connecting,
             failed,
         }
+    }
+
+    /// `conns` all at the root.
+    fn at_root(conns: &[ConnView], filter: &str, open: impl Fn(Id) -> Option<bool>) -> Flat {
+        let root = FolderNode {
+            connections: (0..conns.len()).collect(),
+            ..Default::default()
+        };
+        flatten(&root, conns, filter, open)
     }
 
     fn kinds(flat: &Flat) -> Vec<RowKind> {
@@ -461,7 +883,7 @@ mod tests {
     #[test]
     fn connections_are_closed_by_default() {
         let f = Fixture::new(vec![schema("main", &["t"])]);
-        let flat = flatten(&[f.view("a")], "", |_| None);
+        let flat = at_root(&[f.view("a")], "", |_| None);
         assert_eq!(
             kinds(&flat),
             vec![RowKind::Connection {
@@ -476,7 +898,7 @@ mod tests {
         let one = Fixture::new(vec![schema("main", &["t1", "t2"])]);
         let two = Fixture::new(vec![schema("a", &["t"]), schema("b", &["u"])]);
         let ids = [connection_id("one"), connection_id("two")];
-        let flat = flatten(&[one.view("one"), two.view("two")], "", opened(&ids));
+        let flat = at_root(&[one.view("one"), two.view("two")], "", opened(&ids));
         let at = |table| TableAt {
             conn: 0,
             schema: 0,
@@ -493,7 +915,8 @@ mod tests {
                     conn: 0,
                     schema: 0,
                     count: 2,
-                    open: true
+                    open: true,
+                    hidden: false
                 },
                 RowKind::Table {
                     at: at(0),
@@ -511,13 +934,15 @@ mod tests {
                     conn: 1,
                     schema: 0,
                     count: 1,
-                    open: false
+                    open: false,
+                    hidden: false
                 },
                 RowKind::Schema {
                     conn: 1,
                     schema: 1,
                     count: 1,
-                    open: false
+                    open: false,
+                    hidden: false
                 },
             ]
         );
@@ -525,14 +950,14 @@ mod tests {
         assert_eq!(depths, vec![0, 1, 2, 2, 0, 1, 1]);
         // The user's choice wins over the default.
         let closed = |id| (id == schema_id("one", "main")).then_some(false);
-        let flat = flatten(&[one.view("one")], "", |id| closed(id).or(opened(&ids)(id)));
+        let flat = at_root(&[one.view("one")], "", |id| closed(id).or(opened(&ids)(id)));
         assert_eq!(flat.rows.len(), 2);
     }
 
     #[test]
     fn offline_connections_only_stay_open_while_connecting() {
         let ids = [connection_id("a"), connection_id("b")];
-        let flat = flatten(
+        let flat = at_root(
             &[offline("a", false, true), offline("b", true, false)],
             "",
             opened(&ids),
@@ -554,7 +979,7 @@ mod tests {
         );
         let empty = Fixture::new(Vec::new());
         let ids = [connection_id("e")];
-        let flat = flatten(&[empty.view("e")], "", opened(&ids));
+        let flat = at_root(&[empty.view("e")], "", opened(&ids));
         assert_eq!(flat.rows[1].kind, RowKind::Note("Aucune table"));
     }
 
@@ -567,7 +992,7 @@ mod tests {
         let b = Fixture::new(vec![schema("main", &["items"])]);
         let conns = [a.view("a"), b.view("b"), offline("c", false, false)];
         // Stored states say closed: ignored while filtering.
-        let flat = flatten(&conns, "USER", |_| Some(false));
+        let flat = at_root(&conns, "USER", |_| Some(false));
         let at = |table| TableAt {
             conn: 0,
             schema: 0,
@@ -584,7 +1009,8 @@ mod tests {
                     conn: 0,
                     schema: 0,
                     count: 2,
-                    open: true
+                    open: true,
+                    hidden: false
                 },
                 RowKind::Table {
                     at: at(0),
@@ -596,7 +1022,7 @@ mod tests {
                 },
             ]
         );
-        assert!(flatten(&conns, "zzz", |_| None).rows.is_empty());
+        assert!(at_root(&conns, "zzz", |_| None).rows.is_empty());
     }
 
     #[test]
@@ -608,7 +1034,7 @@ mod tests {
             table_id("a", "main", "u"),
             group_id("a", "main", "t", Group::Keys),
         ];
-        let flat = flatten(&[f.view("a")], "", opened(&ids));
+        let flat = at_root(&[f.view("a")], "", opened(&ids));
         assert_eq!(flat.rows[3].kind, RowKind::DetailsLoading);
         assert_eq!(
             flat.needs_details,
@@ -639,7 +1065,7 @@ mod tests {
             }),
         );
         f.loading.insert("\"main\".\"u\"".into(), 1);
-        let flat = flatten(&[f.view("a")], "", opened(&ids));
+        let flat = at_root(&[f.view("a")], "", opened(&ids));
         let at = TableAt {
             conn: 0,
             schema: 0,
@@ -688,7 +1114,7 @@ mod tests {
 
         f.details
             .insert("\"main\".\"u\"".into(), Err("boom".into()));
-        let flat = flatten(&[f.view("a")], "", opened(&ids));
+        let flat = at_root(&[f.view("a")], "", opened(&ids));
         assert_eq!(
             flat.rows.last().map(|r| r.kind),
             Some(RowKind::DetailsError {
@@ -714,7 +1140,7 @@ mod tests {
                 ..TableDetails::default()
             }),
         );
-        let flat = flatten(&[f.view("a")], "", opened(&ids));
+        let flat = at_root(&[f.view("a")], "", opened(&ids));
         let at = TableAt {
             conn: 0,
             schema: 0,
@@ -747,7 +1173,7 @@ mod tests {
         );
         assert_eq!(flat.rows[5].depth, 4);
         // A closed group shows no note.
-        let flat = flatten(&[f.view("a")], "", opened(&ids[..2]));
+        let flat = at_root(&[f.view("a")], "", opened(&ids[..2]));
         assert!(!kinds(&flat)
             .iter()
             .any(|k| matches!(k, RowKind::GroupError { .. })));
@@ -774,7 +1200,7 @@ mod tests {
                 ..TableDetails::default()
             }),
         );
-        let flat = flatten(&[f.view("a")], "", opened(&ids));
+        let flat = at_root(&[f.view("a")], "", opened(&ids));
         let at = TableAt {
             conn: 0,
             schema: 0,

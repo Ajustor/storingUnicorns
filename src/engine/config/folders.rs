@@ -6,7 +6,6 @@
 //! is listed in `AppConfig.folders` (created explicitly, kept even when
 //! empty), when a connection lives in it, or when it is an ancestor of one of
 //! those (implicit: it vanishes once nothing is left under it).
-#![allow(dead_code)] // TODO(folders): used by the GUI/TUI tasks
 
 use std::collections::BTreeSet;
 

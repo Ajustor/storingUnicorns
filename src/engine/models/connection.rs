@@ -198,7 +198,6 @@ pub struct ConnectionConfig {
 
 impl ConnectionConfig {
     /// Whether `schema` is hidden on this connection (exact name match).
-    #[allow(dead_code)] // TODO(folders): used by the GUI/TUI tasks
     pub fn is_schema_hidden(&self, schema: &str) -> bool {
         self.hidden_schemas.iter().any(|s| s == schema)
     }

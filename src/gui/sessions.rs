@@ -171,8 +171,14 @@ pub fn completion_columns(
 }
 
 /// Tables offered by completion: bare names with a single schema, else
-/// `schema.table` (a part holding a dot is quoted).
-pub fn completion_tables(schemas: &[SchemaInfo], quotes: (char, char)) -> Vec<String> {
+/// `schema.table` (a part holding a dot is quoted). The `hidden` schemas
+/// are left out (their tables still complete their columns when typed).
+pub fn completion_tables(
+    schemas: &[SchemaInfo],
+    quotes: (char, char),
+    hidden: &[String],
+) -> Vec<String> {
+    let schemas: Vec<&SchemaInfo> = visible(schemas, hidden).collect();
     if schemas.len() <= 1 {
         return tables_of(schemas);
     }
@@ -184,7 +190,7 @@ pub fn completion_tables(schemas: &[SchemaInfo], quotes: (char, char)) -> Vec<St
         }
     };
     schemas
-        .iter()
+        .into_iter()
         .flat_map(|s| {
             s.tables
                 .iter()
@@ -203,7 +209,7 @@ impl CompletionSource for SessionSource<'_> {
 
     fn tables(&self) -> Vec<String> {
         self.0
-            .map(|s| completion_tables(&s.schemas, s.quotes))
+            .map(|s| completion_tables(&s.schemas, s.quotes, &s.config.hidden_schemas))
             .unwrap_or_default()
     }
 
@@ -307,24 +313,36 @@ impl Sessions {
             .collect()
     }
 
-    /// All `(connection, schema, table)` triples, for Ctrl+N and completion.
+    /// All `(connection, schema, table)` triples of the schemas not hidden,
+    /// for Ctrl+N.
     pub fn all_tables(&self) -> Vec<(String, String, String)> {
-        all_tables(
-            self.open
-                .iter()
-                .map(|(name, s)| (name.as_str(), s.schemas.as_slice())),
-        )
+        all_tables(self.open.iter().map(|(name, s)| {
+            (
+                name.as_str(),
+                s.schemas.as_slice(),
+                s.config.hidden_schemas.as_slice(),
+            )
+        }))
     }
 }
 
-/// Flatten `(connection, schemas)` pairs into `(connection, schema, table)`.
+/// The schemas of `schemas` not named in `hidden`.
+pub fn visible<'a>(
+    schemas: &'a [SchemaInfo],
+    hidden: &'a [String],
+) -> impl Iterator<Item = &'a SchemaInfo> + 'a {
+    schemas.iter().filter(|s| !hidden.contains(&s.name))
+}
+
+/// Flatten `(connection, schemas, hidden schemas)` into `(connection,
+/// schema, table)`, without the hidden schemas.
 pub fn all_tables<'a>(
-    sessions: impl IntoIterator<Item = (&'a str, &'a [SchemaInfo])>,
+    sessions: impl IntoIterator<Item = (&'a str, &'a [SchemaInfo], &'a [String])>,
 ) -> Vec<(String, String, String)> {
     sessions
         .into_iter()
-        .flat_map(|(conn, schemas)| {
-            schemas.iter().flat_map(move |s| {
+        .flat_map(|(conn, schemas, hidden)| {
+            visible(schemas, hidden).flat_map(move |s| {
                 s.tables
                     .iter()
                     .map(move |t| (conn.to_string(), s.name.clone(), t.clone()))
@@ -334,8 +352,8 @@ pub fn all_tables<'a>(
 }
 
 /// Distinct table names across `schemas`, sorted.
-pub fn tables_of(schemas: &[SchemaInfo]) -> Vec<String> {
-    let names: BTreeSet<&String> = schemas.iter().flat_map(|s| &s.tables).collect();
+pub fn tables_of<'a>(schemas: impl IntoIterator<Item = &'a SchemaInfo>) -> Vec<String> {
+    let names: BTreeSet<&String> = schemas.into_iter().flat_map(|s| &s.tables).collect();
     names.into_iter().cloned().collect()
 }
 
@@ -355,7 +373,10 @@ mod tests {
     fn all_tables_flattens_every_connection() {
         let prod = vec![schema("public", &["users", "orders"])];
         let dev = vec![schema("main", &["t"]), schema("aux", &[])];
-        let all = all_tables([("prod", prod.as_slice()), ("dev", dev.as_slice())]);
+        let all = all_tables([
+            ("prod", prod.as_slice(), &[][..]),
+            ("dev", dev.as_slice(), &[][..]),
+        ]);
         let s = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
         assert_eq!(
             all,
@@ -461,12 +482,42 @@ mod tests {
     fn completion_tables_are_qualified_with_several_schemas() {
         let q = ('"', '"');
         let one = vec![schema("main", &["b", "a"])];
-        assert_eq!(completion_tables(&one, q), vec!["a", "b"]);
+        assert_eq!(completion_tables(&one, q, &[]), vec!["a", "b"]);
         let two = vec![schema("public", &["users"]), schema("a.b", &["t"])];
         assert_eq!(
-            completion_tables(&two, q),
+            completion_tables(&two, q, &[]),
             vec!["public.users", "\"a.b\".t"]
         );
+    }
+
+    #[test]
+    fn hidden_schemas_are_left_out_of_completion_and_search() {
+        let q = ('"', '"');
+        let schemas = vec![
+            schema("public", &["users"]),
+            schema("audit", &["logs"]),
+            schema("pg_toast", &["t1"]),
+        ];
+        let hidden = vec!["audit".to_string()];
+        assert_eq!(
+            completion_tables(&schemas, q, &hidden),
+            vec!["public.users", "pg_toast.t1"]
+        );
+        // One schema left visible: bare names, as with a single schema.
+        let hidden = vec!["audit".to_string(), "pg_toast".to_string()];
+        assert_eq!(completion_tables(&schemas, q, &hidden), vec!["users"]);
+        let all = all_tables([("prod", schemas.as_slice(), hidden.as_slice())]);
+        assert_eq!(
+            all,
+            vec![("prod".into(), "public".into(), "users".into())]
+        );
+        // A table of a hidden schema still gets its columns when typed.
+        let t = TableRef {
+            schema: Some("audit".into()),
+            name: "logs".into(),
+            alias: None,
+        };
+        assert!(details_key(&schemas, &t, q).is_some());
     }
 
     #[test]

@@ -10,13 +10,16 @@
 pub mod tree;
 
 use egui::collapsing_header::paint_default_icon;
-use egui::{Id, Label, Response, RichText, Sense};
+use egui::{DragAndDrop, Id, Label, Response, RichText, Sense, Stroke, StrokeKind};
 use egui_phosphor::regular as icon;
 
+use crate::engine::config::folders::{self, SEP};
+use crate::engine::config::AppConfig;
 use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType, TableDetails};
 use crate::engine::ops::transfer::qualified;
 
 use super::app::App;
+use super::dialogs::folder::{FolderGoal, FolderPrompt};
 use super::dialogs::transfer::{self, BatchKind};
 use super::dialogs::{self, connection::ConnectionForm, Dialog};
 use super::fk;
@@ -25,14 +28,37 @@ use super::sessions::{Session, Sessions};
 use super::status::one_line;
 use super::theme::{self, ERROR};
 use tree::{
-    conn_views, connection_id, flatten, group_error, group_id, has_pk, inputs_key, schema_id,
-    table_id, Group, Row, RowKind, TableAt, Tree,
+    can_drop, conn_views, connection_id, flatten, folder_id, group_error, group_id, has_pk,
+    inputs_key, schema_id, show_hidden_id, table_id, DragItem, Group, Row, RowKind, TableAt, Tree,
 };
 
 /// What the user asked for while the tree was drawn (applied afterwards, so
 /// drawing only needs shared borrows).
 enum Action {
-    NewConnection,
+    /// A new connection in this folder (`""`: the root).
+    NewConnection(String),
+    /// Name a new folder in this one (`""`: the root).
+    NewFolder(String),
+    RenameFolder(String),
+    /// Delete this folder; its content moves up one level.
+    DeleteFolder(String),
+    /// Move connection `name` into `folder` (`""`: the root).
+    MoveConnection {
+        name: String,
+        folder: String,
+    },
+    /// Move connection `name` into a folder to name.
+    MoveToNewFolder(String),
+    /// `item` was dropped into folder `target` (`""`: the root).
+    Drop {
+        item: DragItem,
+        target: String,
+    },
+    SetSchemaHidden {
+        connection: String,
+        schema: String,
+        hidden: bool,
+    },
     RefreshAll,
     /// Open or close a node.
     SetOpen(Id, bool),
@@ -85,6 +111,7 @@ enum Action {
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let mut actions = Vec::new();
+    let top = ui.cursor().top();
     ui.horizontal(|ui| {
         ui.strong("Explorateur");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -93,7 +120,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 .on_hover_text("Nouvelle connexion")
                 .clicked()
             {
-                actions.push(Action::NewConnection);
+                actions.push(Action::NewConnection(String::new()));
+            }
+            if ui
+                .small_button(icon::FOLDER_PLUS)
+                .on_hover_text("Nouveau dossier")
+                .clicked()
+            {
+                actions.push(Action::NewFolder(String::new()));
             }
             if ui
                 .add_enabled(
@@ -112,6 +146,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             .hint_text(format!("{} Filtrer les tables", icon::MAGNIFYING_GLASS))
             .desired_width(f32::INFINITY),
     );
+    let header = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+    if let Some(item) = DragAndDrop::payload::<DragItem>(ui.ctx()) {
+        dragging_ui(ui, header, &app.config.connections, &item, &mut actions);
+    }
     ui.separator();
     if app.config.connections.is_empty() {
         ui.label(RichText::new("Aucune connexion. Cliquez sur + pour en ajouter une.").weak());
@@ -120,7 +158,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         ui,
         &mut app.explorer_tree,
         app.explorer_filter.trim(),
-        &app.config.connections,
+        &app.config,
         &app.sessions,
         &mut actions,
     );
@@ -134,15 +172,23 @@ fn tree_ui(
     ui: &mut egui::Ui,
     tree: &mut Tree,
     filter: &str,
-    connections: &[ConnectionConfig],
+    config: &AppConfig,
     sessions: &Sessions,
     actions: &mut Vec<Action>,
 ) {
-    let key = inputs_key(filter, connections, sessions, tree.generation);
+    let connections = &config.connections;
+    let show_hidden: Vec<bool> = connections
+        .iter()
+        .map(|c| tree.is_open(show_hidden_id(&c.name)).unwrap_or(false))
+        .collect();
+    let key = inputs_key(filter, config, sessions, tree.generation);
     let flat = tree.rows(key, |open| {
-        flatten(&conn_views(connections, sessions), filter, |id| {
-            open.get(&id).copied()
-        })
+        flatten(
+            &folders::tree(config),
+            &conn_views(connections, sessions),
+            filter,
+            |id| open.get(&id).copied(),
+        )
     });
     for (conn, table) in &flat.needs_details {
         let Some(name) = connections.get(*conn).map(|c| &c.name) else {
@@ -162,6 +208,9 @@ fn tree_ui(
         connections,
         sessions,
         row_height: ui.spacing().interact_size.y,
+        folders: &flat.folders,
+        all_folders: &flat.all_folders,
+        show_hidden: &show_hidden,
     };
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -172,11 +221,209 @@ fn tree_ui(
         });
 }
 
+/// While an item is dragged: what it is, by the pointer, and the root as a
+/// drop target over the explorer's `header` (title and filter: covering
+/// them leaves the rows where they are).
+fn dragging_ui(
+    ui: &mut egui::Ui,
+    header: egui::Rect,
+    connections: &[ConnectionConfig],
+    item: &DragItem,
+    actions: &mut Vec<Action>,
+) {
+    let text = match item {
+        DragItem::Connection(name) => format!("{} {name}", icon::DATABASE),
+        DragItem::Folder(path) => format!("{} {}", icon::FOLDER, folders::name(path)),
+    };
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), Id::new("explorer_drag"), |ui| {
+        ui.add(Label::new(text).extend())
+    });
+    if !can_drop(item, "", |name| folder_of(connections, name)) {
+        return;
+    }
+    let visuals = ui.visuals();
+    let painter = ui.painter();
+    painter.rect(
+        header,
+        4.0,
+        visuals.panel_fill,
+        visuals.widgets.noninteractive.bg_stroke,
+        StrokeKind::Inside,
+    );
+    painter.text(
+        header.center(),
+        egui::Align2::CENTER_CENTER,
+        format!(
+            "{} Déposer ici pour ranger à la racine",
+            icon::ARROW_LINE_UP
+        ),
+        egui::TextStyle::Body.resolve(ui.style()),
+        visuals.weak_text_color(),
+    );
+    drop_target(ui, header, connections, "", actions);
+}
+
+/// The folder of connection `name` (`""`: the root).
+fn folder_of(connections: &[ConnectionConfig], name: &str) -> String {
+    connections
+        .iter()
+        .find(|c| c.name == name)
+        .and_then(|c| c.folder.as_deref())
+        .and_then(|f| folders::normalize(f).ok())
+        .unwrap_or_default()
+}
+
+/// Highlight `rect` while the dragged item can be dropped into folder
+/// `target` (`""`: the root) and the pointer is over it; drop it there
+/// when released.
+fn drop_target(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    connections: &[ConnectionConfig],
+    target: &str,
+    actions: &mut Vec<Action>,
+) {
+    let ctx = ui.ctx().clone();
+    let Some(item) = DragAndDrop::payload::<DragItem>(&ctx) else {
+        return;
+    };
+    if !ui.rect_contains_pointer(rect) {
+        return;
+    }
+    if !can_drop(&item, target, |name| folder_of(connections, name)) {
+        ctx.set_cursor_icon(egui::CursorIcon::NotAllowed);
+        return;
+    }
+    let selection = ui.visuals().selection;
+    ui.painter().rect(
+        rect,
+        3.0,
+        selection.bg_fill.gamma_multiply(0.3),
+        Stroke::new(1.5, selection.stroke.color),
+        StrokeKind::Inside,
+    );
+    if ctx.input(|i| i.pointer.any_released()) {
+        if let Some(item) = DragAndDrop::take_payload::<DragItem>(&ctx) {
+            actions.push(Action::Drop {
+                item: (*item).clone(),
+                target: target.to_string(),
+            });
+        }
+    }
+}
+
+/// Paths of every folder, depth first (the « Dossier » choices).
+pub fn folder_paths(config: &AppConfig) -> Vec<String> {
+    fn walk(node: &folders::FolderNode, out: &mut Vec<String>) {
+        for f in &node.folders {
+            out.push(f.path.clone());
+            walk(f, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&folders::tree(config), &mut out);
+    out
+}
+
+/// The connection form for `config` (`None`: a new one), with the folders
+/// to choose from and, when connected, its schemas.
+fn connection_form(app: &App, config: Option<ConnectionConfig>) -> ConnectionForm {
+    let schemas = config.as_ref().and_then(|c| {
+        let s = app.sessions.get(&c.name)?;
+        Some(s.schemas.iter().map(|s| s.name.clone()).collect())
+    });
+    ConnectionForm::new(config).with_context(folder_paths(&app.config), schemas)
+}
+
+/// Apply the folder prompt's name; whether the prompt stays open (refused:
+/// it shows why).
+pub fn apply_folder_prompt(app: &mut App, prompt: &mut FolderPrompt) -> bool {
+    let before = folder_paths(&app.config);
+    match prompt.apply(&mut app.config) {
+        Ok(path) => {
+            if let FolderGoal::Rename { from } = &prompt.goal {
+                app.explorer_tree.folder_moved(&before, from, &path);
+            }
+            app.save_config();
+            false
+        }
+        Err(e) => {
+            prompt.error = Some(e);
+            true
+        }
+    }
+}
+
+/// Hide or show `schema` of `connection`, in the config and its session.
+fn set_schema_hidden(app: &mut App, connection: &str, schema: &str, hidden: bool) {
+    app.config.set_schema_hidden(connection, schema, hidden);
+    let list = app
+        .config
+        .connections
+        .iter()
+        .find(|c| c.name == connection)
+        .map(|c| c.hidden_schemas.clone());
+    if let (Some(list), Some(s)) = (list, app.sessions.get_mut(connection)) {
+        s.config.hidden_schemas = list;
+    }
+    app.save_config();
+}
+
+/// Apply a config change of the explorer: saved, or its error reported.
+fn change_config(app: &mut App, change: impl FnOnce(&mut AppConfig) -> Result<(), String>) {
+    match change(&mut app.config) {
+        Ok(()) => app.save_config(),
+        Err(e) => app.error(e),
+    }
+}
+
 fn apply(app: &mut App, ctx: &egui::Context, action: Action) {
     match action {
-        Action::NewConnection => {
-            app.dialog = Some(Dialog::Connection(Box::new(ConnectionForm::new(None))));
+        Action::NewConnection(folder) => {
+            let mut form = connection_form(app, None);
+            form.folder = folder;
+            app.dialog = Some(Dialog::Connection(Box::new(form)));
         }
+        Action::NewFolder(parent) => {
+            let goal = FolderGoal::Create { parent };
+            app.dialog = Some(Dialog::Folder(FolderPrompt::new(goal)));
+        }
+        Action::RenameFolder(from) => {
+            let goal = FolderGoal::Rename { from };
+            app.dialog = Some(Dialog::Folder(FolderPrompt::new(goal)));
+        }
+        Action::DeleteFolder(path) => change_config(app, |c| c.delete_folder(&path)),
+        Action::MoveConnection { name, folder } => {
+            change_config(app, |c| c.move_connection(&name, Some(&folder)))
+        }
+        Action::MoveToNewFolder(connection) => {
+            let goal = FolderGoal::MoveConnection { connection };
+            app.dialog = Some(Dialog::Folder(FolderPrompt::new(goal)));
+        }
+        Action::Drop { item, target } => {
+            let destination = item.destination(&target);
+            match item {
+                DragItem::Connection(name) => {
+                    change_config(app, |c| c.move_connection(&name, Some(&destination)))
+                }
+                DragItem::Folder(path) => {
+                    let before = folder_paths(&app.config);
+                    match app.config.rename_folder(&path, &destination) {
+                        Ok(()) => {
+                            app.explorer_tree.folder_moved(&before, &path, &destination);
+                            app.save_config();
+                        }
+                        Err(e) => app.error(e),
+                    }
+                }
+            }
+        }
+        Action::SetSchemaHidden {
+            connection,
+            schema,
+            hidden,
+        } => set_schema_hidden(app, &connection, &schema, hidden),
         Action::RefreshAll => {
             let names: Vec<String> = app.sessions.open.keys().cloned().collect();
             for name in names {
@@ -189,9 +436,8 @@ fn apply(app: &mut App, ctx: &egui::Context, action: Action) {
         Action::Refresh(name) => app.refresh(&name),
         Action::Edit(name) => {
             if let Some(c) = app.config.connections.iter().find(|c| c.name == name) {
-                app.dialog = Some(Dialog::Connection(Box::new(ConnectionForm::new(Some(
-                    c.clone(),
-                )))));
+                let form = connection_form(app, Some(c.clone()));
+                app.dialog = Some(Dialog::Connection(Box::new(form)));
             }
         }
         Action::Delete(name) => app.dialog = Some(Dialog::ConfirmDeleteConnection(name)),
@@ -240,6 +486,12 @@ struct Cx<'a> {
     connections: &'a [ConnectionConfig],
     sessions: &'a Sessions,
     row_height: f32,
+    /// `Flat::folders`.
+    folders: &'a [String],
+    /// `Flat::all_folders`.
+    all_folders: &'a [String],
+    /// Per connection: whether « Afficher les schémas masqués » is on.
+    show_hidden: &'a [bool],
 }
 
 /// A table row's names, resolved against the current sessions (`None` if
@@ -302,9 +554,20 @@ fn row_contents(
     }
     ui.add_space(f32::from(row.depth) * indent);
     match row.kind {
+        RowKind::Folder {
+            folder,
+            count,
+            open,
+        } => {
+            if let Some(path) = cx.folders.get(folder) {
+                folder_row(ui, path, count, open, actions);
+                drop_target(ui, rect, cx.connections, path, actions);
+            }
+        }
         RowKind::Connection { conn, open } => {
             if let Some(config) = cx.connections.get(conn) {
-                connection_row(ui, cx, config, open, actions);
+                let show_hidden = cx.show_hidden.get(conn).copied().unwrap_or(false);
+                connection_row(ui, cx, config, open, show_hidden, actions);
             }
         }
         RowKind::Note(text) => {
@@ -324,19 +587,21 @@ fn row_contents(
             schema,
             count,
             open,
+            hidden,
         } => {
             let names = cx.connections.get(conn).and_then(|c| {
                 let s = cx.sessions.get(&c.name)?.schemas.get(schema)?;
                 Some((&c.name, &s.name))
             });
             if let Some((connection, schema)) = names {
-                let id = schema_id(connection, schema);
-                let toggled = toggle(ui, open).clicked();
-                let label = clickable(ui, format!("{} {schema}", icon::DATABASE));
-                ui.label(RichText::new(count.to_string()).weak().small());
-                if toggled || label.clicked() {
-                    actions.push(Action::SetOpen(id, !open));
-                }
+                let row = SchemaRow {
+                    connection,
+                    schema,
+                    count,
+                    open,
+                    hidden,
+                };
+                schema_row(ui, &row, actions);
             }
         }
         RowKind::Table { at, open } => {
@@ -417,11 +682,165 @@ fn clickable(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> Response {
     ui.add(Label::new(text).sense(Sense::click()).selectable(false))
 }
 
+/// A label that can be clicked and dragged.
+fn draggable(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> Response {
+    ui.add(
+        Label::new(text)
+            .sense(Sense::click_and_drag())
+            .selectable(false),
+    )
+}
+
+fn folder_row(ui: &mut egui::Ui, path: &str, count: usize, open: bool, actions: &mut Vec<Action>) {
+    let toggled = toggle(ui, open).clicked();
+    let glyph = if open {
+        icon::FOLDER_OPEN
+    } else {
+        icon::FOLDER
+    };
+    let label = draggable(ui, format!("{glyph} {}", folders::name(path)));
+    ui.label(RichText::new(count.to_string()).weak().small());
+    if toggled || label.clicked() {
+        actions.push(Action::SetOpen(folder_id(path), !open));
+    }
+    label.dnd_set_drag_payload(DragItem::Folder(path.to_string()));
+    let label = label.on_hover_text(path.replace(SEP, " › "));
+    label.context_menu(|ui| {
+        let items = [
+            (
+                icon::PLUS,
+                "Nouvelle connexion ici",
+                Action::NewConnection(path.into()),
+            ),
+            (
+                icon::FOLDER_PLUS,
+                "Nouveau sous-dossier…",
+                Action::NewFolder(path.into()),
+            ),
+            (
+                icon::PENCIL_SIMPLE,
+                "Renommer…",
+                Action::RenameFolder(path.into()),
+            ),
+        ];
+        for (glyph, text, action) in items {
+            if ui.button(format!("{glyph} {text}")).clicked() {
+                actions.push(action);
+                ui.close_menu();
+            }
+        }
+        ui.separator();
+        if ui
+            .button(format!("{} Supprimer", icon::TRASH))
+            .on_hover_text("Son contenu remonte d'un niveau")
+            .clicked()
+        {
+            actions.push(Action::DeleteFolder(path.into()));
+            ui.close_menu();
+        }
+    });
+}
+
+/// What a schema row shows.
+struct SchemaRow<'a> {
+    connection: &'a str,
+    schema: &'a str,
+    count: usize,
+    open: bool,
+    /// Hidden, shown greyed (« Afficher les schémas masqués »).
+    hidden: bool,
+}
+
+fn schema_row(ui: &mut egui::Ui, row: &SchemaRow, actions: &mut Vec<Action>) {
+    let set_hidden = |hidden| Action::SetSchemaHidden {
+        connection: row.connection.to_string(),
+        schema: row.schema.to_string(),
+        hidden,
+    };
+    let toggled = toggle(ui, row.open).clicked();
+    let mut text = RichText::new(format!("{} {}", icon::DATABASE, row.schema));
+    if row.hidden {
+        text = text.weak().italics();
+    }
+    let label = clickable(ui, text);
+    ui.label(RichText::new(row.count.to_string()).weak().small());
+    if toggled || label.clicked() {
+        let id = schema_id(row.connection, row.schema);
+        actions.push(Action::SetOpen(id, !row.open));
+    }
+    if row.hidden
+        && ui
+            .small_button("Réafficher")
+            .on_hover_text("Ce schéma est masqué")
+            .clicked()
+    {
+        actions.push(set_hidden(false));
+    }
+    label.context_menu(|ui| {
+        let (glyph, text) = if row.hidden {
+            (icon::EYE, "Réafficher le schéma")
+        } else {
+            (icon::EYE_SLASH, "Masquer le schéma")
+        };
+        if ui.button(format!("{glyph} {text}")).clicked() {
+            actions.push(set_hidden(!row.hidden));
+            ui.close_menu();
+        }
+    });
+}
+
+/// « Déplacer vers… »: the root, every folder, or a new one.
+fn move_menu(ui: &mut egui::Ui, cx: &Cx, name: &str, actions: &mut Vec<Action>) {
+    let current = folder_of(cx.connections, name);
+    let mut target = None;
+    if ui
+        .add_enabled(
+            !current.is_empty(),
+            egui::Button::new(format!("{} Racine", icon::ARROW_LINE_UP)),
+        )
+        .clicked()
+    {
+        target = Some(String::new());
+    }
+    for path in cx.all_folders {
+        let depth = path.matches(SEP).count();
+        let text = format!(
+            "{}{} {}",
+            "    ".repeat(depth),
+            icon::FOLDER,
+            folders::name(path)
+        );
+        if ui
+            .add_enabled(*path != current, egui::Button::new(text))
+            .on_hover_text(path.replace(SEP, " › "))
+            .clicked()
+        {
+            target = Some(path.clone());
+        }
+    }
+    ui.separator();
+    if ui
+        .button(format!("{} Nouveau dossier…", icon::FOLDER_PLUS))
+        .clicked()
+    {
+        actions.push(Action::MoveToNewFolder(name.to_string()));
+        ui.close_menu();
+    }
+    if let Some(folder) = target {
+        actions.push(Action::MoveConnection {
+            name: name.to_string(),
+            folder,
+        });
+        ui.close_menu();
+    }
+}
+
 fn connection_row(
     ui: &mut egui::Ui,
     cx: &Cx,
     config: &ConnectionConfig,
     open: bool,
+    show_hidden: bool,
     actions: &mut Vec<Action>,
 ) {
     let name = &config.name;
@@ -429,7 +848,8 @@ fn connection_row(
     let connecting = cx.sessions.connecting.contains(name);
     let toggled = toggle(ui, open).clicked();
     theme::dot(ui, theme::connection_color(config.color));
-    let label = clickable(ui, RichText::new(name).strong());
+    let label = draggable(ui, RichText::new(name).strong());
+    label.dnd_set_drag_payload(DragItem::Connection(name.clone()));
     ui.label(RichText::new(config.display_type()).weak().small());
     if connecting {
         ui.spinner();
@@ -474,6 +894,15 @@ fn connection_row(
             actions.push(Action::Connect(name.clone()));
             ui.close_menu();
         }
+        let hidden = config.hidden_schemas.len();
+        if hidden > 0 {
+            let mut show = show_hidden;
+            let text = format!("Afficher les schémas masqués ({hidden})");
+            if ui.checkbox(&mut show, text).clicked() {
+                actions.push(Action::SetOpen(show_hidden_id(name), show));
+                ui.close_menu();
+            }
+        }
         ui.separator();
         if ui
             .button(format!("{} Modifier", icon::PENCIL_SIMPLE))
@@ -482,6 +911,9 @@ fn connection_row(
             actions.push(Action::Edit(name.clone()));
             ui.close_menu();
         }
+        ui.menu_button(format!("{} Déplacer vers…", icon::FOLDER_SIMPLE), |ui| {
+            move_menu(ui, cx, name, actions)
+        });
         if keeps_sign_in(config)
             && ui
                 .button(format!("{} Oublier la connexion Azure AD", icon::SIGN_OUT))
@@ -750,6 +1182,10 @@ mod tests {
                 Session::new(c.clone(), conn.clone(), schemas),
             );
         }
+        let config = AppConfig {
+            connections: configs.clone(),
+            ..Default::default()
+        };
         let tree = std::cell::RefCell::new(Tree::default());
         for c in &configs {
             tree.borrow_mut().set_open(connection_id(&c.name), true);
@@ -769,7 +1205,7 @@ mod tests {
                         ui,
                         &mut tree.borrow_mut(),
                         filter,
-                        &configs,
+                        &config,
                         &sessions,
                         &mut actions,
                     );

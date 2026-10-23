@@ -558,6 +558,27 @@ pub fn lifted_out(path: &str, deleted: &str) -> Option<String> {
     (!deleted.is_empty()).then(|| join_folder(folders::parent(deleted), rest))
 }
 
+/// A connection goes into `folder` (`None`: the root), typed in the form:
+/// when it doesn't exist yet it is created explicitly, as « Nouveau
+/// dossier… » would, so that it stays once empty.
+pub fn keep_new_folder(config: &mut AppConfig, folder: Option<&str>) {
+    let Some(folder) = folder.filter(|f| !f.trim().is_empty()) else {
+        return;
+    };
+    if !config.folder_exists(folder) {
+        // Refused only for an invalid path, which the move then reports.
+        let _ = config.create_folder(folder);
+    }
+}
+
+/// Folder `path`, just moved by a drag, stays once empty (it may have
+/// existed only through its connections).
+pub fn keep_moved_folder(config: &mut AppConfig, path: &str) {
+    if !config.folders.iter().any(|f| f == path) {
+        config.folders.push(path.to_string());
+    }
+}
+
 /// `name` in folder `parent` (`""`: the root).
 pub fn join_folder(parent: &str, name: &str) -> String {
     if parent.is_empty() {
@@ -840,6 +861,29 @@ mod tests {
         t.connection_renamed("old", "new");
         assert_eq!(t.is_open(show_hidden_id("new")), Some(true));
         assert_eq!(t.is_open(show_hidden_id("old")), None);
+    }
+
+    #[test]
+    fn folders_typed_or_dragged_to_stay_once_empty() {
+        let mut c = config(&[("a", None), ("b", Some("Implicit"))], &[]);
+        keep_new_folder(&mut c, Some("New/Sub"));
+        c.move_connection("a", Some("New/Sub")).unwrap();
+        c.move_connection("a", None).unwrap();
+        assert!(c.folder_exists("New/Sub"), "kept once empty");
+        // Existing folders are left as they are, the root needs none.
+        keep_new_folder(&mut c, Some("Implicit"));
+        keep_new_folder(&mut c, Some("New/Sub"));
+        keep_new_folder(&mut c, None);
+        keep_new_folder(&mut c, Some("  "));
+        assert_eq!(c.folders, ["New", "New/Sub"]);
+        // A folder that existed only through its connection, dragged
+        // elsewhere, stays there once emptied.
+        c.rename_folder("Implicit", "New/Moved").unwrap();
+        keep_moved_folder(&mut c, "New/Moved");
+        keep_moved_folder(&mut c, "New/Moved");
+        c.move_connection("b", None).unwrap();
+        assert!(c.folder_exists("New/Moved"));
+        assert_eq!(c.folders, ["New", "New/Sub", "New/Moved"]);
     }
 
     #[test]

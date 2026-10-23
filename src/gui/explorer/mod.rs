@@ -420,6 +420,7 @@ fn apply(app: &mut App, ctx: &egui::Context, action: Action) {
                     let before = folder_paths(&app.config);
                     match app.config.rename_folder(&path, &destination) {
                         Ok(()) => {
+                            tree::keep_moved_folder(&mut app.config, &destination);
                             app.explorer_tree.folder_moved(&before, &path, &destination);
                             app.save_config();
                         }

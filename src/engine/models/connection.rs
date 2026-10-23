@@ -255,6 +255,17 @@ impl ConnectionConfig {
         }
     }
 
+    /// The username the connection signs in with: none for a MongoDB
+    /// connection string, which carries its own user (a username left in
+    /// the config, e.g. `Default`'s "postgres", is stale).
+    pub fn effective_username(&self) -> Option<&str> {
+        let uri = self.uri.as_deref().is_some_and(|u| !u.trim().is_empty());
+        if self.db_type == DatabaseType::MongoDB && uri {
+            return None;
+        }
+        self.username.as_deref()
+    }
+
     /// MongoDB / Redis TLS: `None` = plain connection, `Some(verify)` = TLS,
     /// verifying the server certificate when `verify`. From `ssl_mode`
     /// (`Disable`/`Prefer` = none, `Require` = not verified, `VerifyCa` /
@@ -564,6 +575,31 @@ pub struct SchemaInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mongodb_uri_carries_the_username() {
+        let mongo = ConnectionConfig {
+            db_type: DatabaseType::MongoDB,
+            username: Some("postgres".into()),
+            ..Default::default()
+        };
+        assert_eq!(mongo.effective_username(), Some("postgres"), "parameters");
+        let uri = ConnectionConfig {
+            uri: Some("mongodb://h/".into()),
+            ..mongo.clone()
+        };
+        assert_eq!(uri.effective_username(), None);
+        let blank = ConnectionConfig {
+            uri: Some(" ".into()),
+            ..mongo
+        };
+        assert_eq!(blank.effective_username(), Some("postgres"));
+        assert_eq!(
+            ConnectionConfig::default().effective_username(),
+            Some("postgres"),
+            "SQL engines unchanged"
+        );
+    }
 
     #[test]
     fn old_connection_toml_still_parses_without_color() {

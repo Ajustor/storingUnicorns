@@ -10,8 +10,8 @@ use crate::engine::db::azure::AzureCloud;
 use crate::engine::db::gcp_iam;
 use crate::engine::models::{AzureAuthMethod, DatabaseType, SslMode};
 use crate::engine::presets;
-use crate::tui::{shows_ssl, uses_tls, AppState, ConnectionField, DialogMode};
 use crate::tui::ui::widgets::draw_cursor;
+use crate::tui::{shows_ssl, uses_tls, AppState, ConnectionField, DialogMode};
 
 /// Rows per field: the value line and its bottom rule.
 const FIELD_HEIGHT: u16 = 2;
@@ -420,6 +420,9 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
                 "Username",
                 "utilisateur ACL (facultatif)",
             );
+        } else if nc.mongo_uri() {
+            // `to_config` leaves it out: the URI's user is used.
+            render_on_rule(frame, chunks[idx], " ignoré : utilisateur de l'URI ");
         }
         idx += 1;
     }
@@ -757,6 +760,19 @@ mod tests {
         }
         assert!(!all.contains("Modèle"), "no products: {all}");
         assert!(!all.contains("Auth:"), "no IAM: {all}");
+        assert!(!all.contains("ignoré"), "no URI yet: {all}");
+        state.new_connection.url = "mongodb://h/".into();
+        state.new_connection.username = "stale".into();
+        let with_uri = screen(&state).join(
+            "
+",
+        );
+        assert!(
+            with_uri.contains("ignoré : utilisateur de l'URI"),
+            "{with_uri}"
+        );
+        state.new_connection.url.clear();
+        state.new_connection.username.clear();
         assert!(rows[23].contains('└'), "{all}");
 
         state.new_connection.set_db_type(DatabaseType::Redis);

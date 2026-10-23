@@ -205,9 +205,9 @@ async fn client_options(config: &ConnectionConfig) -> Result<ClientOptions> {
     let mut opts = ClientOptions::parse(connection_uri(config))
         .await
         .map_err(mongo_error)?;
+    // With a connection string, the user is the URI's.
     let username = config
-        .username
-        .as_deref()
+        .effective_username()
         .map(str::trim)
         .filter(|u| !u.is_empty());
     let auth_source = config
@@ -1264,6 +1264,7 @@ mod tests {
         };
         let o = client_options(&uri).await.unwrap();
         let cred = o.credential.unwrap();
+        assert_eq!(cred.username.as_deref(), Some("u"), "the URI's user");
         assert_eq!(cred.source.as_deref(), Some("x"));
         assert_eq!(cred.password.as_deref(), Some("pw"));
         match o.tls {
@@ -1273,6 +1274,19 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_uri_without_user_ignores_a_stale_username() {
+        let config = ConnectionConfig {
+            db_type: crate::engine::models::DatabaseType::MongoDB,
+            uri: Some("mongodb://127.0.0.1:47017/".into()),
+            // ConnectionConfig::default()'s, or left by the parameters' form.
+            username: Some("postgres".into()),
+            ..Default::default()
+        };
+        let o = client_options(&config).await.unwrap();
+        assert!(o.credential.is_none(), "{:?}", o.credential);
     }
 
     #[tokio::test]

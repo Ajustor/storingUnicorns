@@ -207,7 +207,7 @@ pub fn same_target(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
     a.db_type == b.db_type
         && a.host == b.host
         && a.port == b.port
-        && a.username == b.username
+        && a.effective_username() == b.effective_username()
         && a.password == b.password
         && a.database == b.database
         && a.azure_auth_method == b.azure_auth_method
@@ -612,7 +612,12 @@ impl ConnectionForm {
             db_type: self.db_type.clone(),
             host: if server { opt(&self.host) } else { None },
             port,
-            username: if server { opt(&self.username) } else { None },
+            // A MongoDB URI carries its user (the field is hidden then).
+            username: if server && uri.is_none() {
+                opt(&self.username)
+            } else {
+                None
+            },
             // The IAM sign-in's password is a token, fetched when connecting.
             password: match uri_password.filter(|_| uri.is_some()) {
                 Some(p) => Some(p),
@@ -959,11 +964,19 @@ impl ConnectionForm {
             ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(80.0));
             ui.end_row();
         }
-        ui.label("Utilisateur");
-        ui.text_edit_singleline(&mut self.username);
-        ui.end_row();
+        // With a URI, the user is the URI's (`mongodb://user@host`).
+        if !self.mongo_uri_mode {
+            ui.label("Utilisateur");
+            ui.text_edit_singleline(&mut self.username);
+            ui.end_row();
+        }
         ui.label("Mot de passe");
-        ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+        ui.add(egui::TextEdit::singleline(&mut self.password).password(true))
+            .on_hover_text(if self.mongo_uri_mode {
+                "Mot de passe de l'utilisateur de l'URI"
+            } else {
+                "Mot de passe de l'utilisateur"
+            });
         ui.end_row();
         ui.label("Base d'authentification");
         ui.add(egui::TextEdit::singleline(&mut self.auth_source).hint_text(
@@ -1848,6 +1861,40 @@ mod tests {
             ..saved.clone()
         };
         assert!(!same_target(&saved, &other));
+    }
+
+    #[test]
+    fn a_mongo_uri_never_sends_the_username_field() {
+        // A user typed in « Paramètres », then the URI mode chosen.
+        let mut f = mongo_form();
+        f.username = "stale".into();
+        f.mongo_uri_mode = true;
+        f.uri = "mongodb://h:27017/".into();
+        assert_eq!(f.validate(&[]).unwrap().username, None);
+        // Back to the parameters: the field is used again.
+        f.mongo_uri_mode = false;
+        f.host = "h".into();
+        assert_eq!(f.validate(&[]).unwrap().username.as_deref(), Some("stale"));
+        // A saved connection with a stale username round-trips without it,
+        // then unchanged.
+        let saved = ConnectionConfig {
+            name: "m".into(),
+            db_type: DatabaseType::MongoDB,
+            uri: Some("mongodb://app@h:27017/".into()),
+            username: Some("postgres".into()),
+            password: Some("pw".into()),
+            database: String::new(),
+            ..Default::default()
+        };
+        let c = ConnectionForm::new(Some(saved.clone()))
+            .validate(std::slice::from_ref(&saved))
+            .unwrap();
+        assert_eq!(c.username, None);
+        assert_eq!((&c.uri, &c.password), (&saved.uri, &saved.password));
+        let again = ConnectionForm::new(Some(c.clone()))
+            .validate(std::slice::from_ref(&c))
+            .unwrap();
+        assert_eq!(again, c);
     }
 
     #[test]

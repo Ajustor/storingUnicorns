@@ -391,7 +391,8 @@ impl NewConnectionState {
                 Some(self.host.clone())
             },
             port: self.port.parse().ok(),
-            username: if self.username.is_empty() {
+            // A MongoDB URI carries its user: the field is ignored then.
+            username: if self.username.is_empty() || self.mongo_uri() {
                 None
             } else {
                 Some(self.username.clone())
@@ -448,6 +449,11 @@ impl NewConnectionState {
                 && !self.auth_source.trim().is_empty())
             .then(|| self.auth_source.trim().to_string()),
         }
+    }
+
+    /// MongoDB with a connection string (its user is the URI's).
+    pub fn mongo_uri(&self) -> bool {
+        self.db_type == DatabaseType::MongoDB && !self.url.trim().is_empty()
     }
 
     /// `to_config`, once the password of a MongoDB URI typed in the form
@@ -2250,6 +2256,34 @@ mod tests {
         assert_eq!(back.url, nc.url);
         assert_eq!(back.auth_source, "admin");
         assert_eq!(back.to_config(), c);
+    }
+
+    #[test]
+    fn a_mongodb_uri_never_sends_the_username_field() {
+        let mut nc = NewConnectionState::default();
+        nc.set_db_type(DatabaseType::MongoDB);
+        nc.username = "stale".into();
+        nc.url = "mongodb://db1:27017/".into();
+        assert!(nc.mongo_uri());
+        assert_eq!(nc.to_config().username, None);
+        // Without a URI, the field is the user.
+        nc.url.clear();
+        nc.host = "db1".into();
+        assert_eq!(nc.to_config().username.as_deref(), Some("stale"));
+        // A saved connection with a stale username: dropped, then stable.
+        let saved = ConnectionConfig {
+            name: "m".into(),
+            db_type: DatabaseType::MongoDB,
+            uri: Some("mongodb://app@db1:27017/".into()),
+            username: Some("postgres".into()),
+            password: Some("pw".into()),
+            database: String::new(),
+            ..Default::default()
+        };
+        let c = NewConnectionState::from_config(&saved).to_config();
+        assert_eq!(c.username, None);
+        assert_eq!((&c.uri, &c.password), (&saved.uri, &saved.password));
+        assert_eq!(NewConnectionState::from_config(&c).to_config(), c);
     }
 
     #[test]

@@ -5,9 +5,11 @@ use egui_phosphor::regular as icon;
 
 use crate::gui::sessions::SessionSource;
 use crate::gui::shortcuts;
-use crate::gui::tabs::console::ConsoleContext;
+use crate::gui::tabs::console::{ConsoleContext, ConsoleNoSql};
 use crate::gui::tabs::data::DataContext;
 use crate::gui::tabs::ddl::DdlAction;
+use crate::gui::tabs::documents::DocumentsContext;
+use crate::gui::tabs::keys::KeysContext;
 use crate::gui::tabs::TabKind;
 use crate::gui::theme::{self, ERROR};
 
@@ -123,10 +125,18 @@ impl App {
         };
         let mut data_action = None;
         let mut ddl_action = None;
+        let mut doc_action = None;
+        let mut key_action = None;
         let action = match &mut tab.kind {
             TabKind::Console(c) => {
                 let name = tab.connection.as_str();
-                let source = SessionSource(sessions.get(name));
+                let session = sessions.get(name);
+                let source = SessionSource(session);
+                let nosql = session.filter(|s| s.is_nosql()).map(|s| ConsoleNoSql {
+                    db: &s.config.db_type,
+                    schemas: &s.schemas,
+                    keys: &s.key_names,
+                });
                 c.show(
                     ui,
                     ConsoleContext {
@@ -139,8 +149,38 @@ impl App {
                         shortcuts,
                         source: &source,
                         tx: sessions.tx_view(name),
+                        nosql,
                     },
                 )
+            }
+            TabKind::Documents(d) => {
+                let session = sessions.get(&tab.connection);
+                doc_action = d.show(
+                    ui,
+                    DocumentsContext {
+                        tab: tab.id,
+                        connected: session.is_some(),
+                        submitting: tab.runs.submit.is_some(),
+                        loading: tab.runs.page.is_some(),
+                        aggregating: tab.runs.agg.is_some(),
+                        source: &SessionSource(session),
+                        schemas: session.map_or(&[][..], |s| &s.schemas[..]),
+                    },
+                );
+                None
+            }
+            TabKind::Keys(k) => {
+                key_action = k.show(
+                    ui,
+                    KeysContext {
+                        tab: tab.id,
+                        connected: sessions.open.contains_key(&tab.connection),
+                        scanning: tab.runs.page.is_some(),
+                        reading: tab.runs.value.is_some(),
+                        submitting: tab.runs.submit.is_some(),
+                    },
+                );
+                None
             }
             TabKind::Data(d) => {
                 data_action = d.show(
@@ -174,7 +214,8 @@ impl App {
         let requests = match &mut tab.kind {
             TabKind::Console(c) => c.completion.take_requests(),
             TabKind::Data(d) => d.take_completion_requests(),
-            TabKind::Ddl(_) => Vec::new(),
+            TabKind::Documents(d) => d.take_completion_requests(),
+            TabKind::Ddl(_) | TabKind::Keys(_) => Vec::new(),
         };
         if !requests.is_empty() {
             let name = tab.connection.clone();
@@ -196,6 +237,12 @@ impl App {
         }
         if let Some(DdlAction::Refresh) = ddl_action {
             self.reload_ddl(id);
+        }
+        if let Some(action) = doc_action {
+            self.documents_action(id, action);
+        }
+        if let Some(action) = key_action {
+            self.keys_action(id, action);
         }
     }
 }

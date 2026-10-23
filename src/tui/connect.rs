@@ -127,7 +127,10 @@ pub async fn poll(state: &mut AppState) {
                 super::columns::close(old).await;
             }
             state.connection = Some(std::sync::Arc::new(conn));
+            super::nosql::forget_other_scopes(state, &config.name);
             state.current_connection_config = Some(config.clone());
+            // The keys and editable result of the previous connection go.
+            state.nosql = Default::default();
             state.set_status(format!("Connected to {}", config.name));
             super::handle_refresh_tables(state).await;
             if let Some(warning) = state.sign_in_warning.take() {

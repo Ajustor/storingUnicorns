@@ -46,7 +46,12 @@ pub fn build_select(q: &DataQuery, db: &DatabaseType) -> String {
                 q.page_size
             ));
         }
-        DatabaseType::Postgres | DatabaseType::MySQL | DatabaseType::SQLite => {
+        // MongoDB / Redis have no data tabs (`mongo::find_page` pages documents).
+        DatabaseType::Postgres
+        | DatabaseType::MySQL
+        | DatabaseType::SQLite
+        | DatabaseType::MongoDB
+        | DatabaseType::Redis => {
             if !order_by.is_empty() {
                 sql.push_str(&format!(" ORDER BY {order_by}"));
             }

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 
-use crate::engine::db::DatabaseConnection;
+use crate::engine::db::{not_sql, DatabaseConnection};
 use crate::engine::ops::rows::BatchReport;
 use crate::engine::services::export_import::{
     batch_file_name, build_upsert_import_actions, export_to_file, find_batch_csv, parse_csv,
@@ -56,6 +56,9 @@ pub async fn import_csv(
     quotes: (char, char),
     mut progress: impl FnMut(usize, usize),
 ) -> Result<ImportStats> {
+    if !conn.db_type().is_sql() {
+        return Err(not_sql(&conn.db_type()));
+    }
     let (columns, rows) = parse_csv(content).map_err(|e| anyhow!("CSV parse error: {e}"))?;
     let actions = build_upsert_import_actions(table, &columns, &rows, quotes.0, quotes.1);
     let mut stats = ImportStats {
@@ -99,6 +102,10 @@ pub async fn export_tables(
         total: tables.len(),
         ..Default::default()
     };
+    if !conn.db_type().is_sql() {
+        report.errors.push(not_sql(&conn.db_type()).to_string());
+        return report;
+    }
     for (i, (schema, table)) in tables.iter().enumerate() {
         progress(i, tables.len(), table);
         let full = qualified(schema, table, quotes);
@@ -145,6 +152,10 @@ pub async fn import_tables(
         total: tables.len(),
         ..Default::default()
     };
+    if !conn.db_type().is_sql() {
+        report.errors.push(not_sql(&conn.db_type()).to_string());
+        return report;
+    }
     'tables: for (i, (schema, table)) in tables.iter().enumerate() {
         progress(i, tables.len(), table);
         let Some(path) = find_batch_csv(dir, schema, table, Path::exists) else {

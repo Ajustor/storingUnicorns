@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 
 use crate::engine::db::utils::split_qualified;
-use crate::engine::db::DatabaseConnection;
+use crate::engine::db::{not_sql, DatabaseConnection};
 use crate::engine::models::{
     Column, DatabaseType, ForeignKeyInfo, IncomingForeignKey, IndexInfo, TableDetails,
 };
@@ -156,6 +156,7 @@ pub async fn table_ddl(
             let quotes = quote_chars(db);
             Ok(generate_ddl(&quote_table(table, quotes), &details, quotes))
         }
+        DatabaseType::MongoDB | DatabaseType::Redis => Err(not_sql(db)),
     }
 }
 
@@ -261,6 +262,9 @@ pub async fn apply_modification(
     m: &SchemaModification,
     db_type: &DatabaseType,
 ) -> Result<String> {
+    if !db_type.is_sql() {
+        return Err(not_sql(db_type));
+    }
     let sql = SchemaService::generate_sql(m, db_type);
     conn.execute_query(&sql).await?;
     if let Some(table) = table_of(m) {

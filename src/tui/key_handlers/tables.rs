@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::engine::models::DatabaseType;
-use crate::tui::{ActivePanel, AppState};
+use crate::tui::{nosql, ActivePanel, AppState};
 
 use super::KeyAction;
 
@@ -17,6 +17,14 @@ pub async fn handle_tables_keys(
             if !state.schemas.is_empty() && !state.table_selection_visible() =>
         {
             KeyAction::Consumed
+        }
+
+        // MongoDB / Redis: their own keys (no SQL in the editor).
+        _ if nosql::engine(state).is_some() => {
+            match handle_nosql_tables_keys(state, key_code, modifiers).await {
+                KeyAction::NotHandled => handle_common_keys(state, key_code),
+                handled => handled,
+            }
         }
 
         // Select table or toggle schema — generate SELECT query
@@ -85,6 +93,14 @@ pub async fn handle_tables_keys(
             KeyAction::Consumed
         }
 
+        _ => handle_common_keys(state, key_code),
+    }
+}
+
+/// Keys of the Tables panel shared by every engine: hidden schemas and the
+/// name filter.
+fn handle_common_keys(state: &mut AppState, key_code: KeyCode) -> KeyAction {
+    match key_code {
         // Hide the schema under the cursor (or show it again)
         KeyCode::Char('h') => {
             state.toggle_selected_schema_hidden();
@@ -114,4 +130,41 @@ pub async fn handle_tables_keys(
 
         _ => KeyAction::NotHandled,
     }
+}
+
+/// Keys of the Tables panel of a MongoDB / Redis connection: Enter opens a
+/// collection / a key (folds a database / a key group), `s` the indexes,
+/// `t` empties (confirmed), `n` a new Redis key, `/` the Redis SCAN
+/// pattern; `T` and the SQL schema dialog are not offered.
+async fn handle_nosql_tables_keys(
+    state: &mut AppState,
+    key_code: KeyCode,
+    modifiers: KeyModifiers,
+) -> KeyAction {
+    let redis = nosql::is_redis(state);
+    match key_code {
+        KeyCode::Enter => nosql::tables_enter(state).await,
+        // A database unfolds; on Redis, a key group too.
+        KeyCode::Char(' ')
+            if state.selected_table == 0
+                || matches!(
+                    nosql::selected_key_row(state),
+                    Some((_, nosql::KeyRow::Group { .. }))
+                ) =>
+        {
+            nosql::tables_enter(state).await
+        }
+        KeyCode::Char(' ') => {}
+        KeyCode::Char('s') => nosql::tables_schema_key(state).await,
+        KeyCode::Char('t') if !modifiers.contains(KeyModifiers::CONTROL) => {
+            if state.is_connected() {
+                nosql::tables_truncate_key(state);
+            }
+        }
+        KeyCode::Char('T') => nosql::sql_only(state, "Vidage par lot"),
+        KeyCode::Char('n') if redis => nosql::tables_new_key(state),
+        KeyCode::Char('/') if redis => nosql::tables_pattern(state),
+        _ => return KeyAction::NotHandled,
+    }
+    KeyAction::Consumed
 }

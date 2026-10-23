@@ -7,10 +7,11 @@ use egui::Id;
 
 use crate::engine::config::folders::{self, is_within, FolderNode, SEP};
 use crate::engine::config::AppConfig;
-use crate::engine::models::{ConnectionConfig, SchemaInfo, TableDetails};
+use crate::engine::models::{ConnectionConfig, Family, SchemaInfo, TableDetails};
+use crate::engine::nosql::redis::{self, KeyInfo, KeyNode};
 use crate::engine::ops::transfer::qualified;
 
-use crate::gui::sessions::Sessions;
+use crate::gui::sessions::{redis_db, KeySet, Sessions};
 use crate::gui::worker::RunId;
 
 /// `(schema index, table indexes)` of the tables whose names contain
@@ -103,6 +104,42 @@ pub enum RowKind {
         at: TableAt,
         group: Group,
     },
+    /// A group of Redis keys sharing a prefix (`node` indexes
+    /// `Flat::key_rows`) in database `schema` of `conn`.
+    KeyGroup {
+        conn: usize,
+        schema: usize,
+        node: usize,
+        open: bool,
+    },
+    /// A Redis key (`node` indexes `Flat::key_rows`).
+    Key {
+        conn: usize,
+        schema: usize,
+        node: usize,
+    },
+    /// The keys of a Redis database couldn't be listed.
+    KeysError {
+        conn: usize,
+        schema: usize,
+    },
+    /// The explorer lists a database's first keys only.
+    KeysMore {
+        conn: usize,
+        schema: usize,
+    },
+}
+
+/// A Redis key tree node shown by a row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyRow {
+    pub label: String,
+    /// A group's prefix (`user:42:`), a key's full name.
+    pub prefix: String,
+    /// Keys under a group.
+    pub count: usize,
+    /// A key: its index in the database's `KeySet::keys`.
+    pub key: Option<usize>,
 }
 
 /// One line of the tree.
@@ -118,6 +155,11 @@ pub struct SessionView<'a> {
     pub details: &'a HashMap<String, Result<TableDetails, String>>,
     pub loading: &'a HashMap<String, RunId>,
     pub quotes: (char, char),
+    /// MongoDB: no « Clés » group, fields sampled; Redis: databases hold
+    /// keys, not tables.
+    pub family: Family,
+    pub redis_keys: &'a HashMap<u8, Result<KeySet, String>>,
+    pub keys_loading: &'a HashMap<u8, RunId>,
 }
 
 /// What the tree needs from a configured connection.
@@ -144,6 +186,9 @@ pub(super) fn conn_views<'a>(
                 details: &s.details,
                 loading: &s.loading,
                 quotes: s.quotes,
+                family: s.config.db_type.family(),
+                redis_keys: &s.redis_keys,
+                keys_loading: &s.keys_loading,
             }),
             connecting: sessions.connecting.contains(&c.name),
             failed: sessions.errors.contains_key(&c.name),
@@ -176,6 +221,11 @@ pub fn group_id(conn: &str, schema: &str, table: &str, group: Group) -> Id {
     Id::new(("explorer_group", conn, schema, table, group))
 }
 
+/// Open state of the Redis key group `prefix` of database `schema`.
+pub fn key_group_id(conn: &str, schema: &str, prefix: &str) -> Id {
+    Id::new(("explorer_key_group", conn, schema, prefix))
+}
+
 /// Rows of the tree, and the tables shown open whose details are neither
 /// loaded nor loading (`(connection index, qualified table)`).
 #[derive(Default)]
@@ -186,6 +236,12 @@ pub struct Flat {
     pub folders: Vec<String>,
     /// Every folder, depth first: the targets of « Déplacer vers… ».
     pub all_folders: Vec<String>,
+    /// Redis databases shown open whose keys are neither listed nor being
+    /// listed (`(connection index, database)`).
+    pub needs_keys: Vec<(usize, u8)>,
+    /// The Redis key tree nodes the rows show (`RowKind::KeyGroup` /
+    /// `RowKind::Key`).
+    pub key_rows: Vec<KeyRow>,
 }
 
 /// Number of connections in `node`, subfolders included.
@@ -279,6 +335,19 @@ impl Flat {
         let groups = match (&c.session, filter.is_empty()) {
             (_, true) => None,
             (None, false) => return false,
+            // Redis: the databases with a listed key matching.
+            (Some(s), false) if s.family == Family::KeyValue => {
+                let needle = filter.to_lowercase();
+                let groups: Vec<(usize, Vec<usize>)> = (0..s.schemas.len())
+                    .filter(|&si| shown(&s.schemas[si]))
+                    .filter(|&si| !matching_keys(s, si, &needle).is_empty())
+                    .map(|si| (si, Vec::new()))
+                    .collect();
+                if groups.is_empty() {
+                    return false;
+                }
+                Some(groups)
+            }
             (Some(s), false) => {
                 let groups: Vec<_> = filter_tables(s.schemas, filter)
                     .into_iter()
@@ -308,7 +377,11 @@ impl Flat {
                     Some(groups) => {
                         let lone = groups.len() == 1;
                         for (si, tables) in groups {
-                            self.schema(c, ci, s, si, inner, lone, Some(&tables), open);
+                            if s.family == Family::KeyValue {
+                                self.redis_db(c, ci, s, si, inner, true, filter, open);
+                            } else {
+                                self.schema(c, ci, s, si, inner, lone, Some(&tables), open);
+                            }
                         }
                     }
                     None if s.schemas.is_empty() => self.push(inner, RowKind::Note("Aucune table")),
@@ -321,7 +394,11 @@ impl Flat {
                         }
                         let lone = visible.len() == 1;
                         for si in visible {
-                            self.schema(c, ci, s, si, inner, lone, None, open);
+                            if s.family == Family::KeyValue {
+                                self.redis_db(c, ci, s, si, inner, lone, filter, open);
+                            } else {
+                                self.schema(c, ci, s, si, inner, lone, None, open);
+                            }
                         }
                     }
                 },
@@ -382,6 +459,150 @@ impl Flat {
         }
     }
 
+    /// Redis database `si` of `s` at `depth` and, when open, its keys
+    /// grouped by prefix (only those containing `filter`, forced open).
+    #[allow(clippy::too_many_arguments)]
+    fn redis_db(
+        &mut self,
+        c: &ConnView,
+        ci: usize,
+        s: &SessionView,
+        si: usize,
+        depth: u8,
+        lone: bool,
+        filter: &str,
+        open: &impl Fn(Id) -> Option<bool>,
+    ) {
+        let schema = &s.schemas[si];
+        let filtering = !filter.is_empty();
+        let is_open = filtering || open(schema_id(c.name, &schema.name)).unwrap_or(lone);
+        let count = match redis_db(&schema.name).and_then(|db| s.redis_keys.get(&db)) {
+            Some(Ok(set)) => set.keys.len(),
+            _ => 0,
+        };
+        self.push(
+            depth,
+            RowKind::Schema {
+                conn: ci,
+                schema: si,
+                count,
+                open: is_open,
+                hidden: c.hidden.contains(&schema.name),
+            },
+        );
+        let Some(db) = redis_db(&schema.name).filter(|_| is_open) else {
+            return;
+        };
+        let inner = depth.saturating_add(1);
+        let set = match s.redis_keys.get(&db) {
+            None => {
+                self.push(inner, RowKind::DetailsLoading);
+                if !s.keys_loading.contains_key(&db) {
+                    self.needs_keys.push((ci, db));
+                }
+                return;
+            }
+            Some(Err(_)) => {
+                self.push(
+                    inner,
+                    RowKind::KeysError {
+                        conn: ci,
+                        schema: si,
+                    },
+                );
+                return;
+            }
+            Some(Ok(set)) => set,
+        };
+        if set.keys.is_empty() {
+            self.push(inner, RowKind::Note("Aucune clé"));
+        }
+        let shown = matching_keys(s, si, &filter.to_lowercase());
+        let keys: Vec<KeyInfo> = shown.iter().map(|&i| set.keys[i].clone()).collect();
+        let mut nodes = redis::key_tree(&keys, ':');
+        if nodes.is_empty() && !keys.is_empty() {
+            // No grouping available: the keys one by one.
+            nodes = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let name = redis::display_bytes(&k.key);
+                    KeyNode {
+                        label: name.clone(),
+                        prefix: name,
+                        children: Vec::new(),
+                        key: Some(i),
+                        count: 1,
+                    }
+                })
+                .collect();
+        }
+        let ids = KeyTreeIds {
+            conn: c.name,
+            schema: &schema.name,
+            ci,
+            si,
+            filtering,
+        };
+        self.key_nodes(&nodes, &shown, &ids, inner, open);
+        if set.more {
+            self.push(
+                inner,
+                RowKind::KeysMore {
+                    conn: ci,
+                    schema: si,
+                },
+            );
+        }
+    }
+
+    /// Rows of the key tree `nodes`; `shown[k]` is the index in the
+    /// database's keys of key `k` of the tree.
+    fn key_nodes(
+        &mut self,
+        nodes: &[KeyNode],
+        shown: &[usize],
+        ids: &KeyTreeIds,
+        depth: u8,
+        open: &impl Fn(Id) -> Option<bool>,
+    ) {
+        for n in nodes {
+            let node = self.key_rows.len();
+            self.key_rows.push(KeyRow {
+                label: n.label.clone(),
+                prefix: n.prefix.clone(),
+                count: n.count,
+                key: n.key.and_then(|k| shown.get(k).copied()),
+            });
+            match n.key {
+                Some(_) if n.children.is_empty() => self.push(
+                    depth,
+                    RowKind::Key {
+                        conn: ids.ci,
+                        schema: ids.si,
+                        node,
+                    },
+                ),
+                _ => {
+                    let is_open = ids.filtering
+                        || open(key_group_id(ids.conn, ids.schema, &n.prefix)).unwrap_or(false);
+                    self.push(
+                        depth,
+                        RowKind::KeyGroup {
+                            conn: ids.ci,
+                            schema: ids.si,
+                            node,
+                            open: is_open,
+                        },
+                    );
+                    if is_open {
+                        self.key_nodes(&n.children, shown, ids, depth.saturating_add(1), open);
+                    }
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn details(
         &mut self,
@@ -408,7 +629,13 @@ impl Flat {
             }
             Some(Ok(d)) => d,
         };
-        for group in [Group::Columns, Group::Keys, Group::Indexes] {
+        // MongoDB has no keys to list (`_id` is the key of every collection).
+        let groups: &[Group] = if s.family == Family::Document {
+            &[Group::Columns, Group::Indexes]
+        } else {
+            &[Group::Columns, Group::Keys, Group::Indexes]
+        };
+        for &group in groups {
             let count = group_len(d, group);
             let is_open = open(group_id(c.name, schema, table, group)).unwrap_or(false);
             self.push(
@@ -432,6 +659,31 @@ impl Flat {
             }
         }
     }
+}
+
+/// Names a key tree's rows build their open-state ids from.
+struct KeyTreeIds<'a> {
+    conn: &'a str,
+    schema: &'a str,
+    ci: usize,
+    si: usize,
+    filtering: bool,
+}
+
+/// Indexes of the listed keys of Redis database `si` of `s` whose name
+/// contains `needle` (lowercase; empty: all of them).
+fn matching_keys(s: &SessionView, si: usize, needle: &str) -> Vec<usize> {
+    let Some(Ok(set)) = redis_db(&s.schemas[si].name).and_then(|db| s.redis_keys.get(&db)) else {
+        return Vec::new();
+    };
+    (0..set.keys.len())
+        .filter(|&i| {
+            needle.is_empty()
+                || redis::display_bytes(&set.keys[i].key)
+                    .to_lowercase()
+                    .contains(needle)
+        })
+        .collect()
 }
 
 pub(super) fn has_pk(d: &TableDetails) -> bool {
@@ -925,6 +1177,9 @@ mod tests {
         schemas: Vec<SchemaInfo>,
         details: HashMap<String, Result<TableDetails, String>>,
         loading: HashMap<String, RunId>,
+        family: Family,
+        keys: HashMap<u8, Result<KeySet, String>>,
+        keys_loading: HashMap<u8, RunId>,
     }
 
     impl Fixture {
@@ -933,6 +1188,9 @@ mod tests {
                 schemas,
                 details: HashMap::new(),
                 loading: HashMap::new(),
+                family: Family::Sql,
+                keys: HashMap::new(),
+                keys_loading: HashMap::new(),
             }
         }
 
@@ -945,6 +1203,9 @@ mod tests {
                     details: &self.details,
                     loading: &self.loading,
                     quotes: ('"', '"'),
+                    family: self.family,
+                    redis_keys: &self.keys,
+                    keys_loading: &self.keys_loading,
                 }),
                 connecting: false,
                 failed: false,
@@ -1325,6 +1586,126 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn mongo_collections_show_sampled_fields_and_indexes_but_no_keys() {
+        let mut f = Fixture::new(vec![schema("shop", &["users"])]);
+        f.family = Family::Document;
+        let ids = [connection_id("m"), table_id("m", "shop", "users")];
+        f.details
+            .insert("\"shop\".\"users\"".into(), Ok(TableDetails::default()));
+        let flat = at_root(&[f.view("m")], "", opened(&ids));
+        let groups: Vec<Group> = flat
+            .rows
+            .iter()
+            .filter_map(|r| match r.kind {
+                RowKind::Group { group, .. } => Some(group),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(groups, [Group::Columns, Group::Indexes]);
+    }
+
+    fn redis_key(name: &str) -> KeyInfo {
+        KeyInfo {
+            key: name.as_bytes().to_vec(),
+            kind: crate::engine::nosql::redis::RedisType::String,
+            ttl: None,
+            size: None,
+        }
+    }
+
+    fn redis_fixture() -> Fixture {
+        let mut f = Fixture::new(vec![schema("db0", &[]), schema("db1", &[])]);
+        f.family = Family::KeyValue;
+        f
+    }
+
+    #[test]
+    fn redis_databases_list_their_keys_when_opened() {
+        let mut f = redis_fixture();
+        let ids = [connection_id("r"), schema_id("r", "db0")];
+        // Not listed yet: the explorer asks for them.
+        let flat = at_root(&[f.view("r")], "", opened(&ids));
+        assert_eq!(flat.needs_keys, vec![(0, 0)]);
+        assert!(kinds(&flat).contains(&RowKind::DetailsLoading));
+        // Being listed: not asked twice.
+        f.keys_loading.insert(0, 1);
+        assert!(at_root(&[f.view("r")], "", opened(&ids))
+            .needs_keys
+            .is_empty());
+        f.keys_loading.clear();
+        f.keys.insert(
+            0,
+            Ok(KeySet {
+                keys: vec![redis_key("user:1"), redis_key("user:2")],
+                more: true,
+            }),
+        );
+        let flat = at_root(&[f.view("r")], "", opened(&ids));
+        assert!(flat.needs_keys.is_empty());
+        // The listed keys show (grouped by the engine's key tree, else one
+        // by one), then the note of the explorer's limit.
+        let keys: Vec<Option<usize>> = flat
+            .rows
+            .iter()
+            .filter_map(|r| match r.kind {
+                RowKind::Key { node, .. } => Some(flat.key_rows[node].key),
+                _ => None,
+            })
+            .collect();
+        let groups = flat
+            .rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::KeyGroup { .. }))
+            .count();
+        assert!(groups > 0 || keys == [Some(0), Some(1)], "{keys:?}");
+        let more = kinds(&flat)
+            .iter()
+            .position(|k| *k == RowKind::KeysMore { conn: 0, schema: 0 });
+        let db1 = kinds(&flat)
+            .iter()
+            .position(|k| matches!(k, RowKind::Schema { schema: 1, .. }));
+        assert!(more.is_some() && more < db1, "after db0's keys");
+        // The database shows its key count.
+        assert!(flat.rows.iter().any(|r| matches!(
+            r.kind,
+            RowKind::Schema {
+                schema: 0,
+                count: 2,
+                ..
+            }
+        )));
+        f.keys.insert(0, Err("NOPERM".into()));
+        let flat = at_root(&[f.view("r")], "", opened(&ids));
+        assert!(kinds(&flat).contains(&RowKind::KeysError { conn: 0, schema: 0 }));
+    }
+
+    #[test]
+    fn filtering_a_redis_connection_keeps_databases_with_matching_keys() {
+        let mut f = redis_fixture();
+        f.keys.insert(
+            1,
+            Ok(KeySet {
+                keys: vec![redis_key("session:abc"), redis_key("user:1")],
+                more: false,
+            }),
+        );
+        let flat = at_root(&[f.view("r")], "SESSION", |_| None);
+        let schemas: Vec<usize> = flat
+            .rows
+            .iter()
+            .filter_map(|r| match r.kind {
+                RowKind::Schema { schema, open, .. } => {
+                    assert!(open, "forced open");
+                    Some(schema)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(schemas, [1]);
+        assert!(at_root(&[f.view("r")], "nothing", |_| None).rows.is_empty());
     }
 
     #[test]

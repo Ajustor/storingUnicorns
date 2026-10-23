@@ -12,6 +12,28 @@ use crate::engine::models::{
 
 pub use super::sqlserver::SqlServerClient;
 use super::{azure, gcp_iam, mysql, postgres, sqlite, sqlserver, tls, utils};
+use crate::engine::nosql::mongo::{self, CollectionRef, MongoClient};
+use crate::engine::nosql::redis::{self, RedisClient};
+
+/// Error of a SQL operation asked of a MongoDB / Redis connection.
+pub fn not_sql(db: &DatabaseType) -> anyhow::Error {
+    anyhow::anyhow!("Opération SQL indisponible pour {db}")
+}
+
+/// Documents sampled to list a collection's fields.
+const SAMPLE_SIZE: u32 = 200;
+
+/// The collection a table name of a MongoDB connection designates.
+fn collection(table_name: &str) -> Result<CollectionRef> {
+    CollectionRef::parse(table_name).ok_or_else(|| {
+        anyhow::anyhow!("Collection invalide : « {table_name} » (attendu base.collection)")
+    })
+}
+
+/// Redis has no columns, keys or indexes.
+fn no_tables() -> anyhow::Error {
+    anyhow::anyhow!("Redis : pas de tables ni de colonnes")
+}
 
 /// A known TLS failure gets a French hint; the driver's message stays in
 /// parentheses for diagnosis. Other errors are unchanged.
@@ -64,6 +86,8 @@ pub enum DatabaseConnection {
     SQLite(SqlitePool),
     SQLServer(SqlServerClient),
     Azure(SqlServerClient),
+    MongoDB(MongoClient),
+    Redis(RedisClient),
 }
 
 impl DatabaseConnection {
@@ -126,6 +150,33 @@ impl DatabaseConnection {
                     _ => DatabaseConnection::SQLServer(client),
                 })
             }
+            // No dedicated session: there is no manual transaction mode.
+            DatabaseType::MongoDB | DatabaseType::Redis if opened.is_some() => {
+                Err(anyhow::anyhow!(
+                    "Mode transaction manuel indisponible pour {}",
+                    config.db_type
+                ))
+            }
+            DatabaseType::MongoDB => Ok(DatabaseConnection::MongoDB(mongo::connect(config).await?)),
+            DatabaseType::Redis => Ok(DatabaseConnection::Redis(redis::connect(config).await?)),
+        }
+    }
+
+    /// The MongoDB client of this connection.
+    #[allow(dead_code)] // used by the GUI and the TUI (plan 13, Tasks 4 and 5)
+    pub fn mongo(&self) -> Result<&MongoClient> {
+        match self {
+            DatabaseConnection::MongoDB(c) => Ok(c),
+            _ => anyhow::bail!("{} : connexion non MongoDB", self.db_type()),
+        }
+    }
+
+    /// The Redis client of this connection.
+    #[allow(dead_code)] // used by the GUI and the TUI (plan 13, Tasks 4 and 5)
+    pub fn redis(&self) -> Result<&RedisClient> {
+        match self {
+            DatabaseConnection::Redis(c) => Ok(c),
+            _ => anyhow::bail!("{} : connexion non Redis", self.db_type()),
         }
     }
 
@@ -159,6 +210,9 @@ impl DatabaseConnection {
             DatabaseConnection::Azure(client) => {
                 azure::execute_query_limited(client, query, max_rows).await?
             }
+            DatabaseConnection::MongoDB(_) | DatabaseConnection::Redis(_) => {
+                return Err(not_sql(&self.db_type()))
+            }
         };
 
         Ok(QueryResult {
@@ -186,6 +240,9 @@ impl DatabaseConnection {
             }
             DatabaseConnection::Azure(client) => {
                 sqlserver::execute_transaction(client, statements).await?
+            }
+            DatabaseConnection::MongoDB(_) | DatabaseConnection::Redis(_) => {
+                return Err(not_sql(&self.db_type()))
             }
         };
 
@@ -236,6 +293,8 @@ impl DatabaseConnection {
             DatabaseConnection::SQLite(_) => DatabaseType::SQLite,
             DatabaseConnection::SQLServer(_) => DatabaseType::SQLServer,
             DatabaseConnection::Azure(_) => DatabaseType::Azure,
+            DatabaseConnection::MongoDB(_) => DatabaseType::MongoDB,
+            DatabaseConnection::Redis(_) => DatabaseType::Redis,
         }
     }
 
@@ -249,6 +308,9 @@ impl DatabaseConnection {
         statements: &[String],
         expected: &[Option<u64>],
     ) -> Result<u64> {
+        if !self.db_type().is_sql() {
+            return Err(not_sql(&self.db_type()));
+        }
         let (begin, _) = utils::transaction_bounds(&self.db_type());
         match self {
             DatabaseConnection::Postgres(pool) => {
@@ -263,6 +325,9 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) | DatabaseConnection::Azure(client) => {
                 sqlserver::execute_checked_batch(client, statements, expected).await
             }
+            DatabaseConnection::MongoDB(_) | DatabaseConnection::Redis(_) => {
+                Err(not_sql(&self.db_type()))
+            }
         }
     }
 
@@ -274,6 +339,8 @@ impl DatabaseConnection {
             DatabaseConnection::SQLite(pool) => sqlite::test(pool).await,
             DatabaseConnection::SQLServer(client) => sqlserver::test(client).await,
             DatabaseConnection::Azure(client) => azure::test(client).await,
+            DatabaseConnection::MongoDB(c) => mongo::test(c).await,
+            DatabaseConnection::Redis(c) => redis::test(c).await,
         }
     }
 
@@ -303,6 +370,8 @@ impl DatabaseConnection {
             DatabaseConnection::SQLite(pool) => sqlite::get_tables_by_schema(pool).await,
             DatabaseConnection::SQLServer(client) => sqlserver::get_tables_by_schema(client).await,
             DatabaseConnection::Azure(client) => azure::get_tables_by_schema(client).await,
+            DatabaseConnection::MongoDB(c) => mongo::get_tables_by_schema(c).await,
+            DatabaseConnection::Redis(c) => redis::databases(c).await,
         }
     }
 
@@ -325,6 +394,16 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) => {
                 sqlserver::get_column_nullability(client, table_name).await
             }
+            DatabaseConnection::MongoDB(c) => {
+                Ok(
+                    mongo::sample_fields(c, &collection(table_name)?, SAMPLE_SIZE)
+                        .await?
+                        .into_iter()
+                        .map(|col| (col.name, col.nullable))
+                        .collect(),
+                )
+            }
+            DatabaseConnection::Redis(_) => Err(no_tables()),
             DatabaseConnection::Azure(client) => {
                 sqlserver::get_column_nullability(client, table_name).await
             }
@@ -342,6 +421,11 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) => {
                 sqlserver::get_primary_keys(client, table_name).await
             }
+            DatabaseConnection::MongoDB(_) => {
+                collection(table_name)?;
+                Ok(vec!["_id".to_string()])
+            }
+            DatabaseConnection::Redis(_) => Err(no_tables()),
             DatabaseConnection::Azure(client) => {
                 sqlserver::get_primary_keys(client, table_name).await
             }
@@ -360,6 +444,16 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) => {
                 sqlserver::get_table_columns(client, table_name).await
             }
+            DatabaseConnection::MongoDB(c) => {
+                Ok(
+                    mongo::sample_fields(c, &collection(table_name)?, SAMPLE_SIZE)
+                        .await?
+                        .into_iter()
+                        .map(|col| col.name)
+                        .collect(),
+                )
+            }
+            DatabaseConnection::Redis(_) => Err(no_tables()),
             DatabaseConnection::Azure(client) => {
                 sqlserver::get_table_columns(client, table_name).await
             }
@@ -384,6 +478,10 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) => {
                 sqlserver::get_table_column_details(client, table_name).await
             }
+            DatabaseConnection::MongoDB(c) => {
+                mongo::sample_fields(c, &collection(table_name)?, SAMPLE_SIZE).await
+            }
+            DatabaseConnection::Redis(_) => Err(no_tables()),
             DatabaseConnection::Azure(client) => {
                 sqlserver::get_table_column_details(client, table_name).await
             }
@@ -400,6 +498,12 @@ impl DatabaseConnection {
                 sqlserver::get_indexes(client, table_name).await
             }
             DatabaseConnection::Azure(client) => sqlserver::get_indexes(client, table_name).await,
+            DatabaseConnection::MongoDB(c) => Ok(mongo::list_indexes(c, &collection(table_name)?)
+                .await?
+                .iter()
+                .map(mongo::index_info)
+                .collect()),
+            DatabaseConnection::Redis(_) => Err(no_tables()),
         }
     }
 
@@ -414,6 +518,9 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) => {
                 sqlserver::get_foreign_keys(client, table_name).await
             }
+            // No foreign keys between documents.
+            DatabaseConnection::MongoDB(_) => Ok(Vec::new()),
+            DatabaseConnection::Redis(_) => Err(no_tables()),
             DatabaseConnection::Azure(client) => {
                 sqlserver::get_foreign_keys(client, table_name).await
             }
@@ -439,6 +546,8 @@ impl DatabaseConnection {
             DatabaseConnection::SQLServer(client) | DatabaseConnection::Azure(client) => {
                 sqlserver::get_incoming_foreign_keys(client, table_name).await
             }
+            DatabaseConnection::MongoDB(_) => Ok(Vec::new()),
+            DatabaseConnection::Redis(_) => Err(no_tables()),
         }
     }
 
@@ -449,7 +558,10 @@ impl DatabaseConnection {
             DatabaseConnection::Postgres(pool) => pool.close().await,
             DatabaseConnection::MySQL(pool) => pool.close().await,
             DatabaseConnection::SQLite(pool) => pool.close().await,
-            DatabaseConnection::SQLServer(_) | DatabaseConnection::Azure(_) => {}
+            DatabaseConnection::SQLServer(_)
+            | DatabaseConnection::Azure(_)
+            | DatabaseConnection::MongoDB(_)
+            | DatabaseConnection::Redis(_) => {}
         }
     }
 
@@ -465,6 +577,8 @@ impl DatabaseConnection {
             DatabaseConnection::Azure(_) => {
                 // Azure client is dropped automatically
             }
+            // The MongoDB pool and the Redis managers close when dropped.
+            DatabaseConnection::MongoDB(_) | DatabaseConnection::Redis(_) => {}
         }
     }
 }

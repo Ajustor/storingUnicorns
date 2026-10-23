@@ -15,21 +15,28 @@ use egui_phosphor::regular as icon;
 
 use crate::engine::config::folders::{self, SEP};
 use crate::engine::config::AppConfig;
-use crate::engine::models::{AzureAuthMethod, ConnectionConfig, DatabaseType, TableDetails};
+use crate::engine::models::{
+    AzureAuthMethod, ConnectionConfig, DatabaseType, Family, TableDetails,
+};
+use crate::engine::nosql::mongo::CollectionRef;
+use crate::engine::nosql::redis::{self, KeyInfo};
 use crate::engine::ops::transfer::qualified;
 
-use super::app::App;
+use super::app::{nosql, App};
 use super::dialogs::folder::{FolderGoal, FolderPrompt};
 use super::dialogs::transfer::{self, BatchKind};
 use super::dialogs::{self, connection::ConnectionForm, Dialog};
 use super::fk;
 use super::rows::fixed_row;
-use super::sessions::{Session, Sessions};
+use super::sessions::{redis_db, Session, Sessions};
 use super::status::one_line;
+use super::tabs::documents::DocMode;
+use super::tabs::keys::{ttl_label, type_icon, type_label};
 use super::theme::{self, ERROR};
 use tree::{
     can_drop, conn_views, connection_id, flatten, folder_id, group_error, group_id, has_pk,
-    inputs_key, schema_id, show_hidden_id, table_id, DragItem, Group, Row, RowKind, TableAt, Tree,
+    inputs_key, key_group_id, schema_id, show_hidden_id, table_id, DragItem, Group, KeyRow, Row,
+    RowKind, TableAt, Tree,
 };
 
 /// What the user asked for while the tree was drawn (applied afterwards, so
@@ -107,6 +114,79 @@ enum Action {
         only: Option<(String, String)>,
     },
     Copy(String),
+    /// List the keys of a Redis database.
+    LoadKeys {
+        connection: String,
+        db: u8,
+    },
+    /// MongoDB: a collection in this database.
+    NewCollection {
+        connection: String,
+        db: String,
+    },
+    DropDatabase {
+        connection: String,
+        db: String,
+    },
+    OpenDocuments {
+        connection: String,
+        coll: CollectionRef,
+        mode: DocMode,
+    },
+    Indexes {
+        connection: String,
+        coll: CollectionRef,
+    },
+    /// Export / import of one collection.
+    CollectionTransfer {
+        connection: String,
+        coll: CollectionRef,
+        kind: BatchKind,
+    },
+    EmptyCollection {
+        connection: String,
+        coll: CollectionRef,
+    },
+    DropCollection {
+        connection: String,
+        coll: CollectionRef,
+    },
+    /// Redis: the « Clés » tab of a database, on `key` when given.
+    OpenKeys {
+        connection: String,
+        db: u8,
+        key: Option<Vec<u8>>,
+    },
+    NewKey {
+        connection: String,
+        db: u8,
+    },
+    /// Export / import of a Redis database.
+    RedisTransfer {
+        connection: String,
+        db: u8,
+        kind: BatchKind,
+    },
+    FlushDb {
+        connection: String,
+        db: u8,
+    },
+    RenameKey {
+        connection: String,
+        db: u8,
+        key: Vec<u8>,
+    },
+    ExpireKey {
+        connection: String,
+        db: u8,
+        key: Vec<u8>,
+        ttl: Option<i64>,
+    },
+    DeleteKey {
+        connection: String,
+        db: u8,
+        key: Vec<u8>,
+    },
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -204,9 +284,24 @@ fn tree_ui(
             });
         }
     }
+    for (conn, db) in &flat.needs_keys {
+        let Some(name) = connections.get(*conn).map(|c| &c.name) else {
+            continue;
+        };
+        if sessions
+            .get(name)
+            .is_some_and(|s| !s.redis_keys.contains_key(db) && !s.keys_loading.contains_key(db))
+        {
+            actions.push(Action::LoadKeys {
+                connection: name.clone(),
+                db: *db,
+            });
+        }
+    }
     let cx = Cx {
         connections,
         sessions,
+        key_rows: &flat.key_rows,
         row_height: ui.spacing().interact_size.y,
         folders: &flat.folders,
         all_folders: &flat.all_folders,
@@ -524,6 +619,71 @@ fn apply(app: &mut App, ctx: &egui::Context, action: Action) {
             transfer::open_batch(app, &connection, kind, only)
         }
         Action::Copy(text) => ctx.copy_text(text),
+        Action::LoadKeys { connection, db } => {
+            if let Some(s) = app.sessions.get_mut(&connection) {
+                s.load_keys(&mut app.worker, &connection, db);
+            }
+        }
+        Action::NewCollection { connection, db } => {
+            let kind = dialogs::nosql::PromptKind::NewCollection { db };
+            let prompt = dialogs::nosql::Prompt::new(&connection, kind, String::new());
+            app.dialog = Some(Dialog::Prompt(prompt));
+        }
+        Action::DropDatabase { connection, db } => {
+            app.dialog = Some(nosql::confirm_drop_database(&connection, db))
+        }
+        Action::OpenDocuments {
+            connection,
+            coll,
+            mode,
+        } => app.open_documents(&connection, coll, mode),
+        Action::Indexes { connection, coll } => app.open_indexes(&connection, coll),
+        Action::CollectionTransfer {
+            connection,
+            coll,
+            kind,
+        } => transfer::open_batch(app, &connection, kind, Some((&coll.db, &coll.coll))),
+        Action::EmptyCollection { connection, coll } => {
+            app.dialog = Some(nosql::confirm_empty_collection(&connection, coll))
+        }
+        Action::DropCollection { connection, coll } => {
+            app.dialog = Some(nosql::confirm_drop_collection(&connection, coll))
+        }
+        Action::OpenKeys {
+            connection,
+            db,
+            key,
+        } => app.open_keys(&connection, db, key),
+        Action::NewKey { connection, db } => {
+            app.dialog = Some(Dialog::NewKey(dialogs::nosql::NewKey::new(&connection, db)))
+        }
+        Action::RedisTransfer {
+            connection,
+            db,
+            kind,
+        } => {
+            let b = transfer::NoSqlBatch::redis(&connection, kind, db);
+            app.dialog = Some(Dialog::NoSqlBatch(Box::new(b)));
+        }
+        Action::FlushDb { connection, db } => {
+            app.dialog = Some(nosql::confirm_flush(&connection, db))
+        }
+        Action::RenameKey {
+            connection,
+            db,
+            key,
+        } => app.dialog = Some(nosql::rename_prompt(&connection, db, key)),
+        Action::ExpireKey {
+            connection,
+            db,
+            key,
+            ttl,
+        } => app.dialog = Some(nosql::expire_prompt(&connection, db, key, ttl)),
+        Action::DeleteKey {
+            connection,
+            db,
+            key,
+        } => app.dialog = Some(nosql::confirm_delete_key(&connection, db, key)),
     }
 }
 
@@ -531,6 +691,8 @@ fn apply(app: &mut App, ctx: &egui::Context, action: Action) {
 struct Cx<'a> {
     connections: &'a [ConnectionConfig],
     sessions: &'a Sessions,
+    /// `Flat::key_rows`.
+    key_rows: &'a [KeyRow],
     row_height: f32,
     /// `Flat::folders`.
     folders: &'a [String],
@@ -549,7 +711,32 @@ struct TableRef<'a> {
     table: &'a str,
 }
 
+/// A Redis database of a row, resolved against the current sessions.
+struct RedisDbRef<'a> {
+    connection: &'a str,
+    schema: &'a str,
+    index: u8,
+    /// Its listed keys, when listed.
+    keys: Option<&'a [KeyInfo]>,
+    error: Option<&'a str>,
+}
+
 impl<'a> Cx<'a> {
+    fn redis_db(&self, conn: usize, schema: usize) -> Option<RedisDbRef<'a>> {
+        let connection = &self.connections.get(conn)?.name;
+        let session = self.sessions.get(connection)?;
+        let schema = &session.schemas.get(schema)?.name;
+        let index = redis_db(schema)?;
+        let listed = session.redis_keys.get(&index);
+        Some(RedisDbRef {
+            connection,
+            schema,
+            index,
+            keys: listed.and_then(|k| k.as_ref().ok()).map(|k| &k.keys[..]),
+            error: listed.and_then(|k| k.as_ref().err()).map(String::as_str),
+        })
+    }
+
     fn table(&self, at: TableAt) -> Option<TableRef<'a>> {
         let connection = &self.connections.get(at.conn)?.name;
         let session = self.sessions.get(connection)?;
@@ -645,19 +832,83 @@ fn row_contents(
                 Some((&c.name, &s.name))
             });
             if let Some((connection, schema)) = names {
+                let session = cx.sessions.get(connection);
                 let row = SchemaRow {
                     connection,
                     schema,
                     count,
                     open,
                     hidden,
+                    family: session.map_or(Family::Sql, |s| s.config.db_type.family()),
+                    keys: redis_db(schema).and_then(|db| session?.key_count(db)),
                 };
                 schema_row(ui, &row, actions);
             }
         }
         RowKind::Table { at, open } => {
             if let Some(t) = cx.table(at) {
-                table_row(ui, &t, open, actions);
+                if t.session.config.db_type == DatabaseType::MongoDB {
+                    collection_row(ui, &t, open, actions);
+                } else {
+                    table_row(ui, &t, open, actions);
+                }
+            }
+        }
+        RowKind::KeyGroup {
+            conn,
+            schema,
+            node,
+            open,
+        } => {
+            if let (Some(db), Some(n)) = (cx.redis_db(conn, schema), cx.key_rows.get(node)) {
+                let toggled = toggle(ui, open).clicked();
+                let glyph = if open {
+                    icon::FOLDER_OPEN
+                } else {
+                    icon::FOLDER
+                };
+                let label = clickable(ui, format!("{glyph} {}", n.label));
+                ui.label(RichText::new(n.count.to_string()).weak().small());
+                if toggled || label.clicked() {
+                    actions.push(Action::SetOpen(
+                        key_group_id(db.connection, db.schema, &n.prefix),
+                        !open,
+                    ));
+                }
+                label.on_hover_text(&n.prefix);
+            }
+        }
+        RowKind::Key { conn, schema, node } => {
+            if let (Some(db), Some(n)) = (cx.redis_db(conn, schema), cx.key_rows.get(node)) {
+                let info = n.key.and_then(|k| db.keys?.get(k));
+                if let Some(info) = info {
+                    key_row(ui, &db, n, info, actions);
+                }
+            }
+        }
+        RowKind::KeysError { conn, schema } => {
+            let e = cx.redis_db(conn, schema).and_then(|db| db.error);
+            if let Some(e) = e {
+                error_line(ui, e);
+            }
+        }
+        RowKind::KeysMore { conn, schema } => {
+            if let Some(db) = cx.redis_db(conn, schema) {
+                let text = format!(
+                    "… {} premières clés : utiliser l'onglet Clés",
+                    crate::gui::worker::nosql::EXPLORER_MAX_KEYS
+                );
+                if ui
+                    .link(RichText::new(text).weak().small())
+                    .on_hover_text("Parcourir toutes les clés (SCAN, motif, type)")
+                    .clicked()
+                {
+                    actions.push(Action::OpenKeys {
+                        connection: db.connection.to_string(),
+                        db: db.index,
+                        key: None,
+                    });
+                }
             }
         }
         RowKind::DetailsLoading => {
@@ -677,7 +928,9 @@ fn row_contents(
         } => {
             if let Some(t) = cx.table(at) {
                 let id = group_id(t.connection, t.schema, t.table, group);
+                let mongo = t.session.config.db_type == DatabaseType::MongoDB;
                 let (glyph, title) = match group {
+                    Group::Columns if mongo => (icon::COLUMNS, "Champs (échantillon)"),
                     Group::Columns => (icon::COLUMNS, "Colonnes"),
                     Group::Keys => (icon::KEY, "Clés"),
                     Group::Indexes => (icon::LIST_BULLETS, "Index"),
@@ -689,8 +942,11 @@ fn row_contents(
             }
         }
         RowKind::Item { at, group, index } => {
-            if let Some(Ok(d)) = cx.table(at).and_then(|t| t.details()) {
-                item_row(ui, d, group, index);
+            if let Some(t) = cx.table(at) {
+                let mongo = t.session.config.db_type == DatabaseType::MongoDB;
+                if let Some(Ok(d)) = t.details() {
+                    item_row(ui, d, group, index, mongo);
+                }
             }
         }
         RowKind::GroupError { at, group } => {
@@ -800,6 +1056,29 @@ struct SchemaRow<'a> {
     open: bool,
     /// Hidden, shown greyed (« Afficher les schémas masqués »).
     hidden: bool,
+    family: Family,
+    /// Redis: the key count (`Session::key_count`) and whether it is a
+    /// lower bound; `None` when not known yet.
+    keys: Option<(u64, bool)>,
+}
+
+/// « 1 234 clés », « 5 000+ clés » (keys listed up to the explorer's
+/// limit), nothing while unknown.
+fn key_count_label(keys: Option<(u64, bool)>) -> String {
+    let Some((n, more)) = keys else {
+        return String::new();
+    };
+    let digits = n.to_string();
+    let mut grouped = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push('\u{202f}');
+        }
+        grouped.push(c);
+    }
+    let plus = if more { "+" } else { "" };
+    let s = if n == 1 && !more { "" } else { "s" };
+    format!("{grouped}{plus} clé{s}")
 }
 
 fn schema_row(ui: &mut egui::Ui, row: &SchemaRow, actions: &mut Vec<Action>) {
@@ -814,7 +1093,11 @@ fn schema_row(ui: &mut egui::Ui, row: &SchemaRow, actions: &mut Vec<Action>) {
         text = text.weak().italics();
     }
     let label = clickable(ui, text);
-    ui.label(RichText::new(row.count.to_string()).weak().small());
+    let count = match row.family {
+        Family::KeyValue => key_count_label(row.keys),
+        _ => row.count.to_string(),
+    };
+    ui.label(RichText::new(count).weak().small());
     if toggled || label.clicked() {
         let id = schema_id(row.connection, row.schema);
         actions.push(Action::SetOpen(id, !row.open));
@@ -828,13 +1111,316 @@ fn schema_row(ui: &mut egui::Ui, row: &SchemaRow, actions: &mut Vec<Action>) {
         actions.push(set_hidden(false));
     }
     label.context_menu(|ui| {
-        let (glyph, text) = if row.hidden {
-            (icon::EYE, "Réafficher le schéma")
-        } else {
-            (icon::EYE_SLASH, "Masquer le schéma")
+        match row.family {
+            Family::Document => mongo_db_menu(ui, row, actions),
+            Family::KeyValue => redis_db_menu(ui, row, actions),
+            Family::Sql => {}
+        }
+        let (glyph, text) = match (row.hidden, row.family) {
+            (true, Family::Sql) => (icon::EYE, "Réafficher le schéma"),
+            (false, Family::Sql) => (icon::EYE_SLASH, "Masquer le schéma"),
+            (true, _) => (icon::EYE, "Réafficher la base"),
+            (false, _) => (icon::EYE_SLASH, "Masquer la base"),
         };
         if ui.button(format!("{glyph} {text}")).clicked() {
             actions.push(set_hidden(!row.hidden));
+            ui.close_menu();
+        }
+    });
+}
+
+/// A menu item pushing `action`.
+fn menu_item(ui: &mut egui::Ui, text: String, action: Action, actions: &mut Vec<Action>) {
+    if ui.button(text).clicked() {
+        actions.push(action);
+        ui.close_menu();
+    }
+}
+
+/// The items of a MongoDB database's menu (before « Masquer »).
+fn mongo_db_menu(ui: &mut egui::Ui, row: &SchemaRow, actions: &mut Vec<Action>) {
+    let (connection, db) = (row.connection.to_string(), row.schema.to_string());
+    menu_item(
+        ui,
+        format!("{} Nouvelle collection…", icon::FOLDER_SIMPLE_PLUS),
+        Action::NewCollection {
+            connection: connection.clone(),
+            db: db.clone(),
+        },
+        actions,
+    );
+    menu_item(
+        ui,
+        format!("{} Nouvelle console", icon::TERMINAL_WINDOW),
+        Action::NewConsole {
+            connection: connection.clone(),
+            query: format!("use {db}\n"),
+        },
+        actions,
+    );
+    ui.separator();
+    if ui
+        .button(RichText::new(format!("{} Supprimer la base…", icon::TRASH)).color(ERROR))
+        .clicked()
+    {
+        actions.push(Action::DropDatabase { connection, db });
+        ui.close_menu();
+    }
+    ui.separator();
+}
+
+/// The items of a Redis database's menu (before « Masquer »).
+fn redis_db_menu(ui: &mut egui::Ui, row: &SchemaRow, actions: &mut Vec<Action>) {
+    let Some(db) = redis_db(row.schema) else {
+        return;
+    };
+    let connection = row.connection.to_string();
+    menu_item(
+        ui,
+        format!("{} Parcourir les clés", icon::LIST_MAGNIFYING_GLASS),
+        Action::OpenKeys {
+            connection: connection.clone(),
+            db,
+            key: None,
+        },
+        actions,
+    );
+    menu_item(
+        ui,
+        format!("{} Nouvelle clé…", icon::PLUS),
+        Action::NewKey {
+            connection: connection.clone(),
+            db,
+        },
+        actions,
+    );
+    menu_item(
+        ui,
+        format!("{} Nouvelle console", icon::TERMINAL_WINDOW),
+        Action::NewConsole {
+            connection: connection.clone(),
+            query: format!("SELECT {db}\n"),
+        },
+        actions,
+    );
+    menu_item(
+        ui,
+        format!("{} Rafraîchir les clés", icon::ARROW_CLOCKWISE),
+        Action::LoadKeys {
+            connection: connection.clone(),
+            db,
+        },
+        actions,
+    );
+    ui.separator();
+    menu_item(
+        ui,
+        format!("{} Exporter…", icon::EXPORT),
+        Action::RedisTransfer {
+            connection: connection.clone(),
+            db,
+            kind: BatchKind::Export,
+        },
+        actions,
+    );
+    menu_item(
+        ui,
+        format!("{} Importer…", icon::DOWNLOAD_SIMPLE),
+        Action::RedisTransfer {
+            connection: connection.clone(),
+            db,
+            kind: BatchKind::Import,
+        },
+        actions,
+    );
+    if ui
+        .button(RichText::new(format!("{} Vider la base…", icon::ERASER)).color(ERROR))
+        .clicked()
+    {
+        actions.push(Action::FlushDb { connection, db });
+        ui.close_menu();
+    }
+    ui.separator();
+}
+
+/// A MongoDB collection: the documents on double-click, its menu.
+fn collection_row(ui: &mut egui::Ui, t: &TableRef, open: bool, actions: &mut Vec<Action>) {
+    let TableRef {
+        connection,
+        schema,
+        table,
+        ..
+    } = *t;
+    if toggle(ui, open).clicked() {
+        actions.push(Action::SetOpen(table_id(connection, schema, table), !open));
+    }
+    let label = clickable(ui, format!("{} {table}", icon::FILES));
+    let connection = connection.to_string();
+    let coll = CollectionRef {
+        db: schema.to_string(),
+        coll: table.to_string(),
+    };
+    let documents = |mode| Action::OpenDocuments {
+        connection: connection.clone(),
+        coll: coll.clone(),
+        mode,
+    };
+    if label.double_clicked() {
+        actions.push(documents(DocMode::Find));
+    }
+    label.context_menu(|ui| {
+        menu_item(
+            ui,
+            format!("{} Ouvrir les documents", icon::FILES),
+            documents(DocMode::Find),
+            actions,
+        );
+        menu_item(
+            ui,
+            format!("{} Nouvelle console", icon::TERMINAL_WINDOW),
+            Action::NewConsole {
+                connection: connection.clone(),
+                query: format!(
+                    "use {}\n{}",
+                    coll.db,
+                    crate::gui::tabs::documents::find_command(&coll, "", "", "")
+                ),
+            },
+            actions,
+        );
+        menu_item(
+            ui,
+            format!("{} Agrégation…", icon::FUNNEL),
+            documents(DocMode::Aggregate),
+            actions,
+        );
+        menu_item(
+            ui,
+            format!("{} Index…", icon::LIST_BULLETS),
+            Action::Indexes {
+                connection: connection.clone(),
+                coll: coll.clone(),
+            },
+            actions,
+        );
+        ui.separator();
+        menu_item(
+            ui,
+            format!("{} Exporter…", icon::EXPORT),
+            Action::CollectionTransfer {
+                connection: connection.clone(),
+                coll: coll.clone(),
+                kind: BatchKind::Export,
+            },
+            actions,
+        );
+        menu_item(
+            ui,
+            format!("{} Importer…", icon::DOWNLOAD_SIMPLE),
+            Action::CollectionTransfer {
+                connection: connection.clone(),
+                coll: coll.clone(),
+                kind: BatchKind::Import,
+            },
+            actions,
+        );
+        if ui
+            .button(RichText::new(format!("{} Vider la collection…", icon::ERASER)).color(ERROR))
+            .clicked()
+        {
+            actions.push(Action::EmptyCollection {
+                connection: connection.clone(),
+                coll: coll.clone(),
+            });
+            ui.close_menu();
+        }
+        if ui
+            .button(RichText::new(format!("{} Supprimer la collection…", icon::TRASH)).color(ERROR))
+            .clicked()
+        {
+            actions.push(Action::DropCollection {
+                connection: connection.clone(),
+                coll: coll.clone(),
+            });
+            ui.close_menu();
+        }
+        ui.separator();
+        menu_item(
+            ui,
+            format!("{} Copier le nom", icon::COPY),
+            Action::Copy(coll.to_string()),
+            actions,
+        );
+    });
+}
+
+/// A Redis key: type icon, name, TTL badge; opened on double-click.
+fn key_row(
+    ui: &mut egui::Ui,
+    db: &RedisDbRef,
+    n: &KeyRow,
+    info: &KeyInfo,
+    actions: &mut Vec<Action>,
+) {
+    let label = clickable(ui, format!("{} {}", type_icon(&info.kind), n.label));
+    if info.ttl.is_some() {
+        ui.label(
+            RichText::new(format!("{} {}", icon::TIMER, ttl_label(info.ttl)))
+                .weak()
+                .small(),
+        );
+    }
+    let connection = db.connection.to_string();
+    let key = info.key.clone();
+    let open = || Action::OpenKeys {
+        connection: connection.clone(),
+        db: db.index,
+        key: Some(key.clone()),
+    };
+    if label.double_clicked() {
+        actions.push(open());
+    }
+    let name = redis::display_bytes(&key);
+    let label = label.on_hover_text(format!("{name} · {}", type_label(&info.kind)));
+    label.context_menu(|ui| {
+        menu_item(ui, format!("{} Ouvrir", icon::KEY), open(), actions);
+        menu_item(
+            ui,
+            format!("{} Renommer…", icon::PENCIL_SIMPLE),
+            Action::RenameKey {
+                connection: connection.clone(),
+                db: db.index,
+                key: key.clone(),
+            },
+            actions,
+        );
+        menu_item(
+            ui,
+            format!("{} Expiration…", icon::TIMER),
+            Action::ExpireKey {
+                connection: connection.clone(),
+                db: db.index,
+                key: key.clone(),
+                ttl: info.ttl,
+            },
+            actions,
+        );
+        menu_item(
+            ui,
+            format!("{} Copier le nom", icon::COPY),
+            Action::Copy(name.clone()),
+            actions,
+        );
+        ui.separator();
+        if ui
+            .button(RichText::new(format!("{} Supprimer", icon::TRASH)).color(ERROR))
+            .clicked()
+        {
+            actions.push(Action::DeleteKey {
+                connection: connection.clone(),
+                db: db.index,
+                key: key.clone(),
+            });
             ui.close_menu();
         }
     });
@@ -987,12 +1573,21 @@ fn connection_row(
         }
         if session.is_some() {
             ui.separator();
-            let batches = [
-                (BatchKind::Export, icon::EXPORT, "Export par lot…"),
-                (BatchKind::Import, icon::DOWNLOAD_SIMPLE, "Import par lot…"),
-                (BatchKind::Truncate, icon::ERASER, "Vidage par lot…"),
-            ];
-            for (kind, glyph, label) in batches {
+            let batches: &[(BatchKind, &str, &str)] = match config.db_type.family() {
+                Family::Sql => &[
+                    (BatchKind::Export, icon::EXPORT, "Export par lot…"),
+                    (BatchKind::Import, icon::DOWNLOAD_SIMPLE, "Import par lot…"),
+                    (BatchKind::Truncate, icon::ERASER, "Vidage par lot…"),
+                ],
+                // JSON / JSON Lines / CSV; no truncate of every collection.
+                Family::Document => &[
+                    (BatchKind::Export, icon::EXPORT, "Export par lot…"),
+                    (BatchKind::Import, icon::DOWNLOAD_SIMPLE, "Import par lot…"),
+                ],
+                // Per database (its menu).
+                Family::KeyValue => &[],
+            };
+            for &(kind, glyph, label) in batches {
                 if ui.button(format!("{glyph} {label}")).clicked() {
                     actions.push(Action::Batch {
                         connection: name.clone(),
@@ -1111,8 +1706,9 @@ fn error_line(ui: &mut egui::Ui, e: &str) {
         .on_hover_text(e);
 }
 
-/// Line `index` of `group` of a table's details.
-fn item_row(ui: &mut egui::Ui, d: &TableDetails, group: Group, index: usize) {
+/// Line `index` of `group` of a table's details (`mongo`: a collection's
+/// sampled fields).
+fn item_row(ui: &mut egui::Ui, d: &TableDetails, group: Group, index: usize, mongo: bool) {
     match group {
         Group::Columns => {
             let Some(c) = d.columns.get(index) else {
@@ -1138,7 +1734,10 @@ fn item_row(ui: &mut egui::Ui, d: &TableDetails, group: Group, index: usize) {
                 name.on_hover_text(l.tooltip());
             }
             ui.label(RichText::new(&c.type_name).weak());
-            if !c.nullable {
+            if mongo && c.nullable && !c.is_primary_key {
+                ui.label(RichText::new("partiel").weak().small())
+                    .on_hover_text("Absent ou null dans une partie de l'échantillon");
+            } else if !mongo && !c.nullable {
                 ui.label(RichText::new("NOT NULL").weak().small());
             }
         }
@@ -1180,6 +1779,19 @@ fn item_row(ui: &mut egui::Ui, d: &TableDetails, group: Group, index: usize) {
 mod tests {
     use super::*;
     use crate::engine::models::SchemaInfo;
+
+    #[test]
+    fn redis_key_counts_are_grouped_and_bounded() {
+        assert_eq!(key_count_label(None), "");
+        assert_eq!(key_count_label(Some((0, false))), "0 clés");
+        assert_eq!(key_count_label(Some((1, false))), "1 clé");
+        assert_eq!(key_count_label(Some((1234, false))), "1\u{202f}234 clés");
+        assert_eq!(key_count_label(Some((5000, true))), "5\u{202f}000+ clés");
+        assert_eq!(
+            key_count_label(Some((1_234_567, false))),
+            "1\u{202f}234\u{202f}567 clés"
+        );
+    }
 
     #[test]
     fn dragging_by_an_edge_scrolls_towards_it() {

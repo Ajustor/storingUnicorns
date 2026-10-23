@@ -5,6 +5,7 @@ use chrono::{DateTime, Local};
 
 use crate::engine::db::utils::display_table_name;
 use crate::engine::models::QueryResult;
+use crate::engine::nosql::{NoSqlOutcome, Source};
 use crate::engine::ops::query::{editable_table, StatementOutcome};
 use crate::engine::ops::rows::NO_PRIMARY_KEY;
 use crate::engine::sql::statements::{extract_table_from_query, single_table_source};
@@ -29,6 +30,11 @@ pub struct ResultTab {
     pub editable: bool,
     /// Last failed Submit (the transaction was rolled back).
     pub error: Option<String>,
+    /// MongoDB / Redis: where the rows come from (documents of a
+    /// collection or the value of a key: editable).
+    pub source: Option<Source>,
+    /// MongoDB / Redis: why these rows are read-only (a projection…).
+    pub read_only: Option<String>,
 }
 
 impl ResultTab {
@@ -50,9 +56,82 @@ impl ResultTab {
             grid: GridState::default(),
             editable,
             error: None,
+            source: None,
+            read_only: None,
         }
     }
+
+    /// The document writes of `changes` (edits of this result's grid) when
+    /// its rows are documents of a collection: the collection and the
+    /// writes (`mongo::doc_changes`).
+    pub fn doc_writes(
+        &self,
+        changes: &crate::engine::ops::rows::RowChanges,
+    ) -> Option<(
+        crate::engine::nosql::mongo::CollectionRef,
+        Result<Vec<crate::engine::nosql::mongo::DocChange>, String>,
+    )> {
+        let Some(Source::Collection { coll, docs }) = &self.source else {
+            return None;
+        };
+        let page = crate::engine::nosql::mongo::DocPage {
+            result: self.result.clone(),
+            docs: docs.clone(),
+        };
+        Some((
+            coll.clone(),
+            crate::engine::nosql::mongo::doc_changes(&page, changes),
+        ))
+    }
+
+    /// The key writes of `changes` (edits of this result's grid) when its
+    /// rows are the value of a Redis key: the database, the key and the
+    /// edits (`redis::console_edits`, on the grid shown).
+    pub fn key_writes(&self, changes: &crate::engine::ops::rows::RowChanges) -> Option<KeyWrites> {
+        let Some(Source::Key { db, key, kind }) = &self.source else {
+            return None;
+        };
+        Some((
+            *db,
+            key.clone(),
+            crate::engine::nosql::redis::console_edits(key, kind, &self.result, changes),
+        ))
+    }
+
+    /// The rows are NoSQL rows from `source`: editable when they are the
+    /// documents of a collection or the value of a Redis key of a known
+    /// type (never through the SQL path).
+    pub fn set_source(&mut self, source: Option<Source>) {
+        self.editable = match &source {
+            Some(Source::Collection { .. }) => true,
+            Some(Source::Key { kind, .. }) => {
+                !matches!(kind, crate::engine::nosql::redis::RedisType::Other(_))
+            }
+            None => false,
+        };
+        let name = match &source {
+            Some(Source::Collection { coll, .. }) => Some(coll.coll.clone()),
+            Some(Source::Key { key, .. }) => Some(crate::engine::nosql::redis::display_bytes(key)),
+            None => None,
+        };
+        if let Some(name) = name {
+            self.title = if self.result.truncated {
+                format!("{name} ({MAX_ROWS}+)")
+            } else {
+                name
+            };
+        }
+        self.source = source;
+    }
 }
+
+/// The database, the key and the edits (or why they can't be made) of a
+/// Redis value grid's Submit (`ResultTab::key_writes`).
+pub type KeyWrites = (
+    u8,
+    Vec<u8>,
+    Result<Vec<crate::engine::nosql::redis::KeyEdit>, String>,
+);
 
 /// Connection result tab `r` must be submitted to / refreshed from, when it
 /// is open (`open`); else the error to report.
@@ -211,6 +290,64 @@ pub fn apply_outcomes(
     }
 }
 
+/// [`apply_outcomes`] for a MongoDB / Redis run: the result tabs also get
+/// the `Source` of their rows (`set_source`).
+pub fn apply_nosql_outcomes(
+    console: &mut ConsoleTab,
+    connection: &str,
+    outcomes: Vec<NoSqlOutcome>,
+    now: DateTime<Local>,
+) -> String {
+    let (plain, sources) = split_nosql(outcomes);
+    let summary = apply_outcomes(console, connection, plain, now);
+    let start = console.results.len() - sources.len();
+    for (r, (source, read_only)) in console.results[start..].iter_mut().zip(sources) {
+        r.set_source(source);
+        r.read_only = read_only;
+    }
+    console.refresh_known_columns();
+    summary
+}
+
+/// [`apply_refresh`] for a MongoDB / Redis re-run: the refreshed tab also
+/// gets its new `Source`.
+pub fn apply_nosql_refresh(
+    console: &mut ConsoleTab,
+    id: u64,
+    outcomes: Vec<NoSqlOutcome>,
+    now: DateTime<Local>,
+) -> String {
+    let (plain, sources) = split_nosql(outcomes);
+    let summary = apply_refresh(console, id, plain, now);
+    if let (Some((source, read_only)), Some(tab)) = (
+        sources.into_iter().last(),
+        console.results.iter_mut().find(|r| r.id == id),
+    ) {
+        tab.set_source(source);
+        tab.read_only = read_only;
+    }
+    summary
+}
+
+/// The sources (and read-only reasons) of the outcomes that make a result
+/// tab (rows returned), in order.
+type Sources = Vec<(Option<Source>, Option<String>)>;
+
+/// The outcomes, and the sources of those that make a result tab.
+fn split_nosql(outcomes: Vec<NoSqlOutcome>) -> (Vec<StatementOutcome>, Sources) {
+    let mut sources = Vec::new();
+    let plain = outcomes
+        .into_iter()
+        .map(|o| {
+            if matches!(&o.outcome.result, Ok(r) if !r.columns.is_empty()) {
+                sources.push((o.source, o.read_only));
+            }
+            o.outcome
+        })
+        .collect();
+    (plain, sources)
+}
+
 /// What to do once a console Submit finished.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SubmitReport {
@@ -331,6 +468,157 @@ mod tests {
             result: Ok(r),
             elapsed_ms: 5,
         }
+    }
+
+    fn nosql(sql: &str, r: Result<QueryResult, String>, source: Option<Source>) -> NoSqlOutcome {
+        NoSqlOutcome {
+            outcome: StatementOutcome {
+                sql: sql.into(),
+                result: r,
+                elapsed_ms: 2,
+            },
+            source,
+            read_only: None,
+        }
+    }
+
+    fn documents() -> Source {
+        Source::Collection {
+            coll: crate::engine::nosql::mongo::CollectionRef {
+                db: "shop".into(),
+                coll: "users".into(),
+            },
+            docs: vec![],
+        }
+    }
+
+    #[test]
+    fn nosql_results_are_editable_through_their_source_only() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        let mut affected = QueryResult {
+            rows_affected: 1,
+            ..Default::default()
+        };
+        affected.columns.clear();
+        let key = Source::Key {
+            db: 0,
+            key: b"user:1".to_vec(),
+            kind: crate::engine::nosql::redis::RedisType::Hash,
+        };
+        apply_nosql_outcomes(
+            &mut c,
+            "mongo",
+            vec![
+                nosql("db.users.insertOne({})", Ok(affected), None),
+                nosql(
+                    "db.users.find()",
+                    Ok(result(&["_id", "a"], 2)),
+                    Some(documents()),
+                ),
+                nosql("db.users.distinct(\"a\")", Ok(result(&["valeur"], 1)), None),
+                nosql(
+                    "HGETALL user:1",
+                    Ok(result(&["champ", "valeur"], 1)),
+                    Some(key),
+                ),
+            ],
+            Local::now(),
+        );
+        let tabs: Vec<_> = c
+            .results
+            .iter()
+            .map(|r| (r.title.as_str(), r.editable))
+            .collect();
+        assert_eq!(
+            tabs,
+            [("users", true), ("Résultat 2", false), ("user:1", true)]
+        );
+        assert!(matches!(c.results[2].source, Some(Source::Key { .. })));
+    }
+
+    #[test]
+    fn a_redis_value_read_by_the_console_is_edited_in_place() {
+        use crate::engine::nosql::redis::{KeyEdit, RedisType};
+        let mut c = ConsoleTab::new(String::new(), 0);
+        // `LRANGE l 1 2`: #1 and #2, as the engine shows them.
+        let grid = QueryResult {
+            rows: vec![vec!["1".into(), "b".into()], vec!["2".into(), "c".into()]],
+            ..result(&["#", "valeur"], 0)
+        };
+        let key = Source::Key {
+            db: 3,
+            key: b"l".to_vec(),
+            kind: RedisType::List,
+        };
+        apply_nosql_outcomes(
+            &mut c,
+            "redis",
+            vec![nosql("LRANGE l 1 2", Ok(grid), Some(key))],
+            Local::now(),
+        );
+        let r = &c.results[0];
+        assert!(r.editable);
+        let changes = crate::engine::ops::rows::RowChanges {
+            updates: vec![(vec!["2".into(), "c".into()], vec!["2".into(), "C".into()])],
+            ..Default::default()
+        };
+        let (db, k, edits) = r.key_writes(&changes).unwrap();
+        assert_eq!((db, k.as_slice()), (3, b"l".as_slice()));
+        assert_eq!(
+            edits.unwrap(),
+            [KeyEdit::ListSet {
+                index: 2,
+                old: b"c".to_vec(),
+                value: b"C".to_vec()
+            }]
+        );
+        assert!(r.doc_writes(&changes).is_none());
+        // A module type stays read-only.
+        let mut other = ConsoleTab::new(String::new(), 0);
+        apply_nosql_outcomes(
+            &mut other,
+            "redis",
+            vec![nosql(
+                "JSON.GET j",
+                Ok(result(&["valeur"], 1)),
+                Some(Source::Key {
+                    db: 0,
+                    key: b"j".to_vec(),
+                    kind: RedisType::Other("ReJSON-RL".into()),
+                }),
+            )],
+            Local::now(),
+        );
+        assert!(!other.results[0].editable);
+    }
+
+    #[test]
+    fn a_nosql_refresh_keeps_the_source() {
+        let mut c = ConsoleTab::new(String::new(), 0);
+        apply_nosql_outcomes(
+            &mut c,
+            "mongo",
+            vec![nosql(
+                "db.users.find()",
+                Ok(result(&["_id"], 1)),
+                Some(documents()),
+            )],
+            Local::now(),
+        );
+        let id = c.results[0].id;
+        apply_nosql_refresh(
+            &mut c,
+            id,
+            vec![nosql(
+                "db.users.find()",
+                Ok(result(&["_id"], 3)),
+                Some(documents()),
+            )],
+            Local::now(),
+        );
+        assert_eq!(c.results[0].result.rows.len(), 3);
+        assert!(c.results[0].editable);
+        assert!(c.results[0].source.is_some());
     }
 
     #[test]

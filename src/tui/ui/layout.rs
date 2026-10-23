@@ -10,7 +10,8 @@ use super::help_bar::render_help_bar;
 use super::modals::{
     render_batch_export_dialog, render_batch_import_dialog, render_batch_truncate_dialog,
     render_delete_row_confirm, render_edit_row_dialog, render_export_dialog, render_folder_prompt,
-    render_import_dialog, render_new_connection_dialog, render_schema_dialog,
+    render_import_dialog, render_indexes_dialog, render_json_view, render_new_connection_dialog,
+    render_nosql_confirm, render_nosql_form, render_nosql_transfer_dialog, render_schema_dialog,
     render_truncate_confirm,
 };
 use super::widgets::{
@@ -114,4 +115,10 @@ pub fn render_ui(frame: &mut Frame, state: &AppState, clickable_registry: &Click
     render_truncate_confirm(frame, state);
     render_batch_truncate_dialog(frame, state);
     render_folder_prompt(frame, state);
+    // MongoDB / Redis.
+    render_json_view(frame, state);
+    render_indexes_dialog(frame, state);
+    render_nosql_transfer_dialog(frame, state);
+    render_nosql_form(frame, state);
+    render_nosql_confirm(frame, state);
 }

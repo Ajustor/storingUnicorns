@@ -122,6 +122,12 @@ impl ManualTx {
     /// Open a dedicated session to `config`; `meta` is the connection's
     /// shared pool.
     pub async fn open(config: &ConnectionConfig, meta: Arc<DatabaseConnection>) -> Result<Self> {
+        if !config.db_type.is_sql() {
+            anyhow::bail!(
+                "Mode transaction manuel indisponible pour {}",
+                config.db_type
+            );
+        }
         let opened = Arc::new(AtomicU64::new(0));
         let conn = DatabaseConnection::connect_dedicated(config, opened.clone()).await?;
         Ok(Self {
@@ -218,6 +224,8 @@ impl ManualTx {
                 }),
             DatabaseType::MySQL => format!("{e:#}").contains("Deadlock"),
             DatabaseType::SQLite => false,
+            // No manual transaction for them (`ManualTx::open` refuses).
+            DatabaseType::MongoDB | DatabaseType::Redis => false,
         };
         if ended {
             *st = State::default();

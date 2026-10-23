@@ -8,8 +8,8 @@ use ratatui::{
 
 use super::centered_rect;
 use crate::engine::services::export_import::PathCompletion;
-use crate::tui::{AppState, DialogMode};
 use crate::tui::ui::widgets::draw_cursor;
+use crate::tui::{AppState, DialogMode};
 
 /// Render a path completion dropdown at the given position.
 /// `x` and `y` are the top-left of where the dropdown should appear (below the field).
@@ -976,5 +976,344 @@ pub fn render_batch_truncate_dialog(frame: &mut Frame, state: &AppState) {
                 .position(batch.scroll_offset);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
+}
+
+/// Where the NoSQL `(o/N)` question is drawn.
+pub fn nosql_confirm_rect(area: Rect) -> Rect {
+    centered_rect(60, 30, area)
+}
+
+/// A MongoDB / Redis `(o/N)` question: destructive console commands,
+/// emptying a collection / database, deleting a row or an index.
+pub fn render_nosql_confirm(frame: &mut Frame, state: &AppState) {
+    if state.dialog_mode != DialogMode::NoSqlConfirm {
+        return;
+    }
+    let Some(confirm) = state.nosql.confirm.as_ref() else {
+        return;
+    };
+    let area = nosql_confirm_rect(frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Confirmation ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+    frame.render_widget(block, area);
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        format!("⚠ {}", confirm.title),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    let room = (inner.height as usize).saturating_sub(3);
+    for line in confirm.lines.iter().take(room) {
+        lines.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(Color::White),
+        )));
+    }
+    if confirm.lines.len() > room {
+        lines.push(Line::from(Span::styled(
+            format!("  … et {} autre(s)", confirm.lines.len() - room),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " o ",
+            Style::default()
+                .bg(Color::Red)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Oui  ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            " N/Entrée/Échap ",
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Non", Style::default().fg(Color::Gray)),
+    ]));
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// Where the NoSQL transfer modal is drawn.
+pub fn nosql_transfer_rect(area: Rect) -> Rect {
+    centered_rect(60, 70, area)
+}
+
+/// The MongoDB / Redis export / import modal: format, file or folder,
+/// database, pattern / filter, import options, collections.
+pub fn render_nosql_transfer_dialog(frame: &mut Frame, state: &AppState) {
+    use crate::tui::nosql::transfer::{Field, Kind};
+
+    if state.dialog_mode != DialogMode::NoSqlTransfer {
+        return;
+    }
+    let Some(t) = state.nosql.transfer.as_ref() else {
+        return;
+    };
+    let area = nosql_transfer_rect(frame.area());
+    frame.render_widget(Clear, area);
+    let title = match t.kind {
+        Kind::Results => " Exporter le résultat ",
+        Kind::Export => " Exporter ",
+        Kind::Import => " Importer ",
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(block, area);
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
+    let style = |f: Field| {
+        if t.active == f {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let check = |on: bool| if on { "[x]" } else { "[ ]" };
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cursor: Option<(u16, u16)> = None;
+    let mut list_start = None;
+    for field in t.fields() {
+        let (label, value) = match field {
+            Field::Format => ("Format", format!("◀ {} ▶", t.format.label())),
+            Field::Path if t.path_is_folder() => ("Dossier", t.path.clone()),
+            Field::Path => ("Fichier", t.path.clone()),
+            Field::Database => (
+                "Base",
+                format!(
+                    "◀ {} ▶",
+                    t.databases.get(t.database).map_or("-", String::as_str)
+                ),
+            ),
+            Field::Pattern => ("Motif", t.text.clone()),
+            Field::Filter => ("Filtre (une collection)", t.text.clone()),
+            Field::Upsert => (
+                if t.engine == crate::engine::models::DatabaseType::Redis {
+                    "Écraser les clés existantes"
+                } else {
+                    "Remplacer les documents de même _id"
+                },
+                check(t.options.upsert).to_string(),
+            ),
+            Field::KeepStrings => ("Tout garder en texte", check(t.options.keep_strings).into()),
+            Field::ParseDates => (
+                "Reconnaître les dates ISO",
+                check(t.options.parse_dates).into(),
+            ),
+            Field::List => {
+                let n = t.items.iter().filter(|i| i.2).count();
+                ("Collections", format!("{n}/{} choisie(s)", t.items.len()))
+            }
+        };
+        if t.active == field {
+            let text_cursor = match field {
+                Field::Path => Some(t.path_cursor.min(t.path.len())),
+                Field::Pattern | Field::Filter => Some(t.text_cursor.min(t.text.len())),
+                _ => None,
+            };
+            if let Some(c) = text_cursor {
+                let typed = if field == Field::Path {
+                    &t.path
+                } else {
+                    &t.text
+                };
+                let x = label.chars().count() + 2 + typed[..c].chars().count();
+                cursor = Some((x as u16, lines.len() as u16));
+            }
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label}: "), style(field)),
+            Span::styled(value, style(field)),
+        ]));
+        if field == Field::List {
+            list_start = Some(lines.len());
+        }
+    }
+    // The collections, the cursor's line kept in view.
+    if let Some(start) = list_start {
+        let room = (inner.height as usize).saturating_sub(start + 3);
+        let skip = t.selected.saturating_sub(room.saturating_sub(1));
+        for (i, (db, coll, on)) in t.items.iter().enumerate().skip(skip).take(room) {
+            let selected = i == t.selected && t.active == Field::List;
+            let s = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {} {db}.{coll}", check(*on)),
+                s,
+            )));
+        }
+    }
+    if t.format == crate::engine::nosql::TransferFormat::Csv
+        && t.engine == crate::engine::models::DatabaseType::MongoDB
+    {
+        // Two lines: the modal is narrow.
+        for part in crate::engine::nosql::CSV_NULL_HINT.split_inclusive("; ") {
+            lines.push(Line::from(Span::styled(
+                part.trim_end(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    if let Some((done, total, ref current)) = t.progress {
+        lines.push(Line::from(Span::styled(
+            format!("En cours : {current} ({}/{total})", done + 1),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        let hint = match t.kind {
+            Kind::Results => "←/→ format | Entrée exporter | Échap annuler",
+            _ if t.fields().contains(&Field::List) => {
+                "Tab champ | Espace cocher | a/n tout/rien | Entrée lancer | Échap annuler"
+            }
+            _ => "Tab champ | ←/→ changer | Entrée lancer | Échap annuler",
+        };
+        lines.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+    if let Some((x, y)) = cursor {
+        draw_cursor(
+            frame,
+            (inner.x + x).min(inner.x + inner.width.saturating_sub(1)),
+            inner.y + y,
+        );
+    }
+}
+
+#[cfg(test)]
+mod nosql_tests {
+    use super::*;
+    use crate::engine::config::AppConfig;
+    use crate::engine::models::{DatabaseType, SchemaInfo};
+    use crate::tui::nosql::transfer::{Kind, Transfer};
+    use crate::tui::nosql::{Confirm, ConfirmAction};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn screen(state: &AppState, draw: fn(&mut Frame, &AppState)) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, state)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_question_lists_the_destructive_commands() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.nosql.confirm = Some(Confirm {
+            title: "1 commande(s) destructive(s) : exécuter ?".into(),
+            lines: vec![
+                "Supprime tous les documents de shop.users : db.users.deleteMany({})".into(),
+            ],
+            action: ConfirmAction::DeleteRow,
+        });
+        state.dialog_mode = DialogMode::NoSqlConfirm;
+        let all = screen(&state, render_nosql_confirm);
+        assert!(all.contains("destructive"), "{all}");
+        assert!(
+            all.contains("Supprime tous les documents de shop.users"),
+            "{all}"
+        );
+        assert!(
+            all.contains(" o ") && all.contains("N/Entrée/Échap"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn the_import_of_collections_shows_the_csv_options() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        let schemas = vec![SchemaInfo {
+            name: "shop".into(),
+            tables: vec!["users".into(), "orders".into()],
+            expanded: true,
+        }];
+        let mut t = Transfer::batch(
+            Kind::Import,
+            DatabaseType::MongoDB,
+            &schemas,
+            &|_| false,
+            None,
+        );
+        t.cycle_format(false); // JSON -> CSV
+        state.nosql.transfer = Some(t);
+        state.dialog_mode = DialogMode::NoSqlTransfer;
+        let all = screen(&state, render_nosql_transfer_dialog);
+        for label in [
+            " Importer ",
+            "Format: ◀ CSV ▶",
+            "Dossier: .",
+            "Remplacer les documents de même _id: [ ]",
+            "Tout garder en texte: [ ]",
+            "Reconnaître les dates ISO: [ ]",
+            "[ ] shop.users",
+            "[ ] shop.orders",
+            "null et champ absent s'exportent tous deux vides",
+            "valeur nulle",
+        ] {
+            assert!(all.contains(label), "{label} missing:\n{all}");
+        }
+    }
+
+    #[test]
+    fn the_redis_export_shows_its_database_and_pattern() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        let schemas: Vec<SchemaInfo> = (0..3)
+            .map(|i| SchemaInfo {
+                name: format!("db{i}"),
+                tables: Vec::new(),
+                expanded: false,
+            })
+            .collect();
+        let t = Transfer::batch(
+            Kind::Export,
+            DatabaseType::Redis,
+            &schemas,
+            &|_| false,
+            Some(("db2", None)),
+        );
+        state.nosql.transfer = Some(t);
+        state.dialog_mode = DialogMode::NoSqlTransfer;
+        let all = screen(&state, render_nosql_transfer_dialog);
+        assert!(all.contains("Base: ◀ db2 ▶"), "{all}");
+        assert!(all.contains("Motif: *"), "{all}");
+        assert!(all.contains("Fichier: db2.json"), "{all}");
+        assert!(!all.contains("Collections"), "{all}");
     }
 }

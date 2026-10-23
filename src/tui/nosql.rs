@@ -565,6 +565,21 @@ pub fn tables_pattern(state: &mut AppState) {
 
 /// The database of the current console: the tab's when it suits the
 /// engine, else the connection's default.
+/// Before `name` becomes the connection: the editor tabs' NoSQL databases
+/// (`use` / `SELECT`) belonged to the previous one, so they go unless it is
+/// the same connection again.
+pub fn forget_other_scopes(state: &mut AppState, name: &str) {
+    let same = state
+        .current_connection_config
+        .as_ref()
+        .is_some_and(|c| c.name == name);
+    if !same {
+        for tab in &mut state.query_tabs.tabs {
+            tab.nosql_scope = None;
+        }
+    }
+}
+
 pub fn current_scope(state: &AppState) -> NoSqlScope {
     let initial = state
         .current_connection_config

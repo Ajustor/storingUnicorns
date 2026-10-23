@@ -1452,3 +1452,26 @@ fn transfer_hints_name_every_format_offered() {
     assert!(help_text(&DatabaseType::MongoDB).contains("JSON, JSON Lines, CSV"));
     assert!(help_text(&DatabaseType::Redis).contains("JSON/CSV"));
 }
+
+#[tokio::test]
+async fn the_console_database_does_not_follow_another_connection() {
+    let mut state = mongo_state().await;
+    state.query_tabs.current_tab_mut().nosql_scope = Some("shop".into());
+    assert_eq!(current_scope(&state).database, "shop");
+    // Reconnecting the same connection keeps it.
+    forget_other_scopes(&mut state, "nosql");
+    assert_eq!(current_scope(&state).database, "shop");
+    // Another connection: its own default database.
+    forget_other_scopes(&mut state, "other");
+    state.current_connection_config = Some(ConnectionConfig {
+        name: "other".into(),
+        database: "crm".into(),
+        ..config(DatabaseType::MongoDB)
+    });
+    assert_eq!(current_scope(&state).database, "crm");
+    assert!(state
+        .query_tabs
+        .tabs
+        .iter()
+        .all(|t| t.nosql_scope.is_none()));
+}

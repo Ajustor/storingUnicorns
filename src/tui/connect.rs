@@ -127,6 +127,7 @@ pub async fn poll(state: &mut AppState) {
                 super::columns::close(old).await;
             }
             state.connection = Some(std::sync::Arc::new(conn));
+            super::nosql::forget_other_scopes(state, &config.name);
             state.current_connection_config = Some(config.clone());
             // The keys and editable result of the previous connection go.
             state.nosql = Default::default();

@@ -9,15 +9,28 @@ use ratatui::{
 use crate::tui::{ActivePanel, AppState, DialogMode};
 
 /// Returns the help entries for the Connections panel.
-fn connections_help() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("Enter", "Connect"),
-        ("n", "New"),
-        ("e", "Edit"),
-        ("d", "Delete"),
-        ("Tab", "Next panel"),
-        ("F6/F7", "Exp/Imp"),
-    ]
+fn connections_help(state: &AppState) -> Vec<(&'static str, &'static str)> {
+    if state.selected_folder.is_some() {
+        vec![
+            ("Enter/←/→", "Fold"),
+            ("r", "Rename"),
+            ("d", "Delete"),
+            ("f", "New folder"),
+            ("n", "New conn"),
+            ("Tab", "Next panel"),
+        ]
+    } else {
+        vec![
+            ("Enter", "Connect"),
+            ("n", "New"),
+            ("e", "Edit"),
+            ("d", "Delete"),
+            ("m", "Move"),
+            ("f", "New folder"),
+            ("Tab", "Next panel"),
+            ("F6/F7", "Exp/Imp"),
+        ]
+    }
 }
 
 /// Returns the help entries for the Tables panel.
@@ -28,6 +41,7 @@ fn tables_help() -> Vec<(&'static str, &'static str)> {
         ("Space", "Expand"),
         ("s", "Schema"),
         ("t", "Truncate"),
+        ("h/H", "Hide/Show hidden"),
         ("F6/F7", "Exp/Imp"),
     ]
 }
@@ -105,6 +119,7 @@ fn dialog_help(mode: DialogMode) -> Vec<(&'static str, &'static str)> {
             ("Enter", "Start"),
             ("Esc", "Cancel"),
         ],
+        DialogMode::FolderPrompt => vec![("Enter", "Confirm"), ("Esc", "Cancel")],
         DialogMode::DeleteRowConfirm | DialogMode::TruncateConfirm => {
             vec![("y/Enter", "Confirm"), ("n/Esc", "Cancel")]
         }
@@ -136,7 +151,7 @@ pub fn get_help_entries(state: &AppState) -> Vec<(&'static str, &'static str)> {
         filter_help()
     } else {
         let mut entries = match state.active_panel {
-            ActivePanel::Connections => connections_help(),
+            ActivePanel::Connections => connections_help(state),
             ActivePanel::Tables => tables_help(),
             ActivePanel::QueryEditor => query_editor_help(state),
             ActivePanel::Results => results_help(),

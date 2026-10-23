@@ -3,6 +3,7 @@
 use egui::{Key, Modifiers, Sense, Stroke, StrokeKind};
 use egui_phosphor::regular as icon;
 
+use crate::engine::config::folders;
 use crate::engine::db::azure::{self, AzureCloud};
 use crate::engine::db::{entra_interactive, gcp_iam};
 use crate::engine::models::{
@@ -195,6 +196,14 @@ pub struct ConnectionForm {
     pub test_result: Option<Result<(), String>>,
     /// The configs tested since the form opened, the running test's last.
     tested: Vec<ConnectionConfig>,
+    /// Folder of the connection (`/`-separated path); empty = the root.
+    pub folder: String,
+    /// The existing folders, offered by « Dossier ».
+    pub known_folders: Vec<String>,
+    /// Schemas hidden from the explorer, Ctrl+N and completion.
+    pub hidden_schemas: Vec<String>,
+    /// The connection's schemas, when it is open (« Schémas affichés »).
+    pub schemas: Option<Vec<String>>,
 }
 
 /// What the form asks for (closing it is the modal's `Cancel`).
@@ -244,6 +253,39 @@ impl ConnectionForm {
             testing: false,
             test_result: None,
             tested: Vec::new(),
+            folder: c.folder.unwrap_or_default(),
+            known_folders: Vec::new(),
+            hidden_schemas: c.hidden_schemas,
+            schemas: None,
+        }
+    }
+
+    /// The existing folders to choose from, and the connection's schemas
+    /// when it is open.
+    pub fn with_context(
+        mut self,
+        known_folders: Vec<String>,
+        schemas: Option<Vec<String>>,
+    ) -> Self {
+        self.known_folders = known_folders;
+        self.schemas = schemas;
+        self
+    }
+
+    /// The folder typed in, normalized (`None`: the root).
+    fn folder(&self) -> Result<Option<String>, String> {
+        if self.folder.trim().is_empty() {
+            Ok(None)
+        } else {
+            folders::normalize(&self.folder).map(Some)
+        }
+    }
+
+    /// Show or hide `schema`.
+    fn set_shown(&mut self, schema: &str, shown: bool) {
+        self.hidden_schemas.retain(|s| s != schema);
+        if !shown {
+            self.hidden_schemas.push(schema.to_string());
         }
     }
 
@@ -423,6 +465,7 @@ impl ConnectionForm {
         if iam {
             gcp_iam::validate(&self.db_type, &self.username)?;
         }
+        let folder = self.folder()?;
         Ok(ConnectionConfig {
             name: name.to_string(),
             db_type: self.db_type.clone(),
@@ -454,6 +497,8 @@ impl ConnectionForm {
             flavor: self.flavor.filter(|f| f.driver() == self.db_type),
             // The default method is left out, as in older files.
             db_auth: iam.then_some(DbAuthMethod::GcpIam),
+            folder,
+            hidden_schemas: self.hidden_schemas.clone(),
         })
     }
 
@@ -525,6 +570,10 @@ impl ConnectionForm {
 
                 ui.label("Couleur");
                 self.color_row(ui);
+                ui.end_row();
+
+                ui.label("Dossier");
+                self.folder_row(ui);
                 ui.end_row();
 
                 ui.label("Coller une URL");
@@ -608,6 +657,10 @@ impl ConnectionForm {
                     });
                     ui.end_row();
                 }
+
+                ui.label("Schémas affichés");
+                self.schemas_row(ui);
+                ui.end_row();
             });
         let forced = self.advanced_force();
         if !advanced_fields(&self.db_type, &self.azure_auth).is_empty() {
@@ -858,6 +911,90 @@ impl ConnectionForm {
         ui.end_row();
     }
 
+    /// The folder field, with the existing folders in a menu.
+    fn folder_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.folder)
+                    .hint_text("Racine")
+                    .desired_width(220.0),
+            )
+            .on_hover_text("« / » sépare les sous-dossiers (ex. Clients/ACME)");
+            let mut chosen = None;
+            ui.add_enabled_ui(!self.known_folders.is_empty(), |ui| {
+                ui.menu_button(icon::CARET_DOWN, |ui| {
+                    if ui
+                        .button(format!("{} Racine", icon::ARROW_LINE_UP))
+                        .clicked()
+                    {
+                        chosen = Some(String::new());
+                    }
+                    for path in &self.known_folders {
+                        let depth = path.matches(folders::SEP).count();
+                        let text = format!(
+                            "{}{} {}",
+                            "    ".repeat(depth),
+                            icon::FOLDER,
+                            folders::name(path)
+                        );
+                        if ui.button(text).clicked() {
+                            chosen = Some(path.clone());
+                        }
+                    }
+                    if chosen.is_some() {
+                        ui.close_menu();
+                    }
+                })
+                .response
+                .on_hover_text("Dossiers existants");
+            });
+            if let Some(path) = chosen {
+                self.folder = path;
+            }
+        });
+    }
+
+    /// « Schémas affichés »: a box per schema when they are loaded, else the
+    /// hidden ones, each with « Réafficher ».
+    fn schemas_row(&mut self, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            let mut changes = Vec::new();
+            match &self.schemas {
+                Some(schemas) => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("form_schemas")
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            for schema in schemas {
+                                let mut shown = !self.hidden_schemas.contains(schema);
+                                if ui.checkbox(&mut shown, schema).changed() {
+                                    changes.push((schema.clone(), shown));
+                                }
+                            }
+                        });
+                }
+                None if self.hidden_schemas.is_empty() => {
+                    ui.label(egui::RichText::new("Tous (aucun schéma masqué)").weak());
+                }
+                None => {}
+            }
+            // Hidden schemas the list doesn't hold (or no list: not
+            // connected).
+            let listed = self.schemas.as_deref().unwrap_or_default();
+            for schema in self.hidden_schemas.iter().filter(|s| !listed.contains(s)) {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{} {schema}", icon::EYE_SLASH)).weak());
+                    if ui.small_button("Réafficher").clicked() {
+                        changes.push((schema.clone(), true));
+                    }
+                });
+            }
+            for (schema, shown) in changes {
+                self.set_shown(&schema, shown);
+            }
+        });
+    }
+
     /// The palette swatches plus "aucune"; the selected one is outlined.
     fn color_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -912,6 +1049,58 @@ mod tests {
         f.name = "Local".into();
         f.database = "app".into();
         assert!(f.validate(&existing()).is_ok());
+    }
+
+    #[test]
+    fn the_folder_is_normalized_and_blank_means_the_root() {
+        let mut f = ConnectionForm::new(None);
+        f.name = "x".into();
+        f.database = "d".into();
+        f.folder = "  Clients / ACME// ".into();
+        assert_eq!(
+            f.validate(&[]).unwrap().folder.as_deref(),
+            Some("Clients/ACME")
+        );
+        f.folder = "   ".into();
+        assert_eq!(f.validate(&[]).unwrap().folder, None);
+        f.folder = "a/../b".into();
+        assert!(f.validate(&[]).is_err());
+    }
+
+    #[test]
+    fn editing_keeps_the_folder_and_the_hidden_schemas() {
+        let saved = ConnectionConfig {
+            name: "Prod".into(),
+            folder: Some("Clients/ACME".into()),
+            hidden_schemas: vec!["audit".into()],
+            ..Default::default()
+        };
+        let f = ConnectionForm::new(Some(saved.clone()));
+        assert_eq!(f.folder, "Clients/ACME");
+        let config = f.validate(std::slice::from_ref(&saved)).unwrap();
+        assert_eq!(config.folder, saved.folder);
+        assert_eq!(config.hidden_schemas, saved.hidden_schemas);
+    }
+
+    #[test]
+    fn schemas_are_shown_or_hidden_from_the_form() {
+        let saved = ConnectionConfig {
+            name: "Prod".into(),
+            hidden_schemas: vec!["audit".into()],
+            ..Default::default()
+        };
+        let mut f = ConnectionForm::new(Some(saved.clone())).with_context(
+            vec!["A".into()],
+            Some(vec!["public".into(), "audit".into()]),
+        );
+        assert_eq!(f.known_folders, ["A"]);
+        f.set_shown("public", false);
+        f.set_shown("audit", true);
+        f.set_shown("public", false);
+        assert_eq!(
+            f.validate(&[saved]).unwrap().hidden_schemas,
+            ["public".to_string()]
+        );
     }
 
     #[test]

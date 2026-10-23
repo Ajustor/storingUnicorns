@@ -1,6 +1,7 @@
 //! Modal dialogs (connection form, confirmations, …).
 
 pub mod connection;
+pub mod folder;
 pub mod structure;
 pub mod transfer;
 
@@ -14,6 +15,7 @@ use super::worker::Event;
 use crate::engine::db::entra_interactive;
 use crate::engine::ops::transfer::qualified;
 use connection::{ConnectionForm, FormAction};
+use folder::FolderPrompt;
 use structure::{StructureAction, StructureDialog};
 use transfer::{BatchDialog, BatchStart};
 
@@ -56,6 +58,8 @@ pub enum Dialog {
     },
     /// Batch export / import / truncate on one connection.
     Batch(BatchDialog),
+    /// Name a new or renamed folder of the explorer.
+    Folder(FolderPrompt),
 }
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
@@ -110,6 +114,8 @@ enum Answer {
     Open(usize),
     /// Start the batch.
     StartBatch,
+    /// Create / rename the folder of the prompt.
+    Folder,
 }
 
 /// The answer a standard dialog got this frame: `Some(None)` to cancel it
@@ -257,6 +263,7 @@ fn dialog_ui(app: &mut App, ui: &mut egui::Ui, dialog: &mut Dialog) -> ModalResp
             form.ui(ui, sign_in).map(Answer::Connection)
         }
         Dialog::Structure(d) => structure::ui(app, ui, d).map(Answer::Structure),
+        Dialog::Folder(prompt) => prompt.ui(ui).map(|()| Answer::Folder),
     }
 }
 
@@ -309,6 +316,8 @@ enum Effect {
         table: String,
     },
     Batch(BatchStart),
+    /// The folder prompt's button (the prompt is the dialog).
+    Folder,
 }
 
 /// The effect of `answer` (`None`: cancelled) to `dialog`.
@@ -351,6 +360,7 @@ fn effect(dialog: &Dialog, answer: Option<Answer>) -> Effect {
             None => Effect::Nothing,
         },
         (Dialog::Batch(b), Some(StartBatch)) => b.start().map_or(Effect::Nothing, Effect::Batch),
+        (Dialog::Folder(_), Some(Answer::Folder)) => Effect::Folder,
         _ => Effect::Nothing,
     }
 }
@@ -367,6 +377,11 @@ fn apply(app: &mut App, ctx: &egui::Context, dialog: &mut Dialog, effect: Effect
         Effect::Structure(action) => {
             if let Dialog::Structure(d) = dialog {
                 return structure::act(app, d, action);
+            }
+        }
+        Effect::Folder => {
+            if let Dialog::Folder(prompt) = dialog {
+                return super::explorer::apply_folder_prompt(app, prompt);
             }
         }
         Effect::Nothing => {}

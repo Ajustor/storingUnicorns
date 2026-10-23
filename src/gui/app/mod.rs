@@ -239,6 +239,8 @@ impl App {
     /// its tabs and saved consoles along; a change of target (host, base…)
     /// drops its open session.
     pub fn save_connection(&mut self, original: Option<String>, config: ConnectionConfig) {
+        // A folder typed in the form stays once empty, as a created one.
+        super::explorer::tree::keep_new_folder(&mut self.config, config.folder.as_deref());
         let index = original
             .as_ref()
             .and_then(|old| self.config.connections.iter().position(|c| &c.name == old));
@@ -261,6 +263,7 @@ impl App {
             self.sign_ins.dismiss(&old);
         }
         if old != new {
+            self.explorer_tree.connection_renamed(&old, &new);
             for tab in &mut self.tabs.list {
                 if tab.connection == old {
                     tab.connection = new.clone();

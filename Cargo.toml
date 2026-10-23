@@ -70,6 +70,8 @@ thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 toml = "0.8"
+# NFC for folder names (already in the dependency tree)
+unicode-normalization = "0.1"
 
 # Logging
 tracing = "0.1"

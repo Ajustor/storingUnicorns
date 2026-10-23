@@ -142,6 +142,42 @@ et la complétion ; les colonnes de clé primaire sont marquées d'une clé.
   et entrantes ; chaque lien est cliquable et ouvre la structure de l'autre
   table.
 
+### Dossiers de connexions
+
+Les connexions se rangent dans des **dossiers imbriqués** (`Clients/ACME/Prod`)
+affichés comme une arborescence dans l'explorateur. Un dossier peut être vide.
+
+- **Nouveau dossier** : bouton de l'en-tête de l'explorateur.
+- **Menu contextuel d'un dossier** : **Nouvelle connexion ici**, **Nouveau
+  sous-dossier…**, **Renommer…** et **Supprimer** (le contenu du dossier
+  remonte d'un niveau, rien n'est perdu).
+- **Menu d'une connexion** : **Déplacer vers…**.
+- **Glisser-déposer** : une connexion (ou un dossier) se dépose sur un dossier,
+  ou sur l'en-tête de l'explorateur pour la remettre à la racine.
+- **Formulaire de connexion** : champ **Dossier** (`Clients/ACME`, vide pour la
+  racine).
+
+Dans l'interface terminal : `f` crée un dossier, `m` déplace la connexion
+sélectionnée (ou renomme le dossier), `r` / `e` renomment, `d` supprime,
+`Entrée` / `Espace` plie ou déplie un dossier, `←` / `→` le replient / le
+déplient.
+
+### Masquer des schémas
+
+Pour alléger l'explorateur, on peut **masquer des schémas** d'une connexion
+(`audit`, `pg_toast`, schémas techniques…).
+
+- **Menu d'un schéma** : **Masquer le schéma**.
+- **Menu d'une connexion** : **Afficher les schémas masqués** (ils réapparaissent
+  grisés ; le même menu permet de les démasquer).
+- **Formulaire de connexion** : champ **Schémas affichés** pour choisir ceux qui
+  restent visibles.
+- Les schémas masqués sont **exclus de `Ctrl+N` et de la complétion des
+  tables** ; une table saisie à la main (`audit.logs`) fonctionne toujours.
+
+Dans l'interface terminal : `h` masque / démasque le schéma sélectionné, `H`
+affiche les schémas masqués (en grisé).
+
 ### Raccourcis (GUI)
 
 | Touche                      | Action                                                   |
@@ -174,7 +210,14 @@ et la complétion ; les colonnes de clé primaire sont marquées d'une clé.
 | `Esc`       | Connecting     | Cancel the connection          |
 | `Enter`     | Tables         | Generate SELECT query          |
 | `n`         | Connections    | New connection dialog          |
-| `d`         | Connections    | Delete selected connection     |
+| `f`         | Connections    | New folder                     |
+| `m`         | Connections    | Move the connection / rename the folder |
+| `r` / `e`   | Connections    | Rename the selected folder     |
+| `d`         | Connections    | Delete selected connection or folder |
+| `Enter` / `Space` | Connections (folder) | Fold / unfold         |
+| `←` / `→`   | Connections (folder) | Fold / unfold           |
+| `h`         | Tables         | Hide / show the selected schema |
+| `H`         | Tables         | Show hidden schemas (greyed)   |
 | `F5`        | Any            | Execute query                  |
 | `Ctrl+R`    | Any            | Refresh tables                 |
 | `?`         | Any            | Show help in status bar        |
@@ -225,6 +268,7 @@ portable install…). The tests never touch the real directory.
 
 ```toml
 theme = "dark"          # "system" (default), "dark" or "light"
+folders = ["Archives"]  # optional: folders, even empty ("A/B" for nested ones)
 
 [[connections]]
 name = "Local Postgres"
@@ -235,6 +279,8 @@ username = "postgres"
 password = "secret"
 database = "mydb"
 color = [229, 83, 75]   # optional, GUI tab dot
+folder = "Clients/ACME" # optional: the folder (absent = root)
+hidden_schemas = ["audit"] # optional: schemas hidden in the explorer
 
 [[connections]]
 name = "Supabase"

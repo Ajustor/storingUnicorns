@@ -12,6 +12,13 @@ pub async fn handle_tables_keys(
     modifiers: KeyModifiers,
 ) -> KeyAction {
     match key_code {
+        // The cursor on a line not drawn (a hidden schema's): nothing to act on.
+        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('h')
+            if !state.schemas.is_empty() && !state.table_selection_visible() =>
+        {
+            KeyAction::Consumed
+        }
+
         // Select table or toggle schema — generate SELECT query
         KeyCode::Enter => {
             if state.selected_table == 0 {
@@ -75,6 +82,18 @@ pub async fn handle_tables_keys(
             } else {
                 state.set_status("Not connected or no tables.");
             }
+            KeyAction::Consumed
+        }
+
+        // Hide the schema under the cursor (or show it again)
+        KeyCode::Char('h') => {
+            state.toggle_selected_schema_hidden();
+            KeyAction::Consumed
+        }
+
+        // Show / hide the hidden schemas (greyed)
+        KeyCode::Char('H') => {
+            state.toggle_show_hidden_schemas();
             KeyAction::Consumed
         }
 

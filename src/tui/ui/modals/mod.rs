@@ -1,14 +1,21 @@
 mod edit_row;
 mod export_import;
 mod folder_prompt;
+mod indexes;
+mod json_view;
 mod new_connection;
 mod schema_dialog;
 
-pub use edit_row::render_edit_row_dialog;
+pub use edit_row::{nosql_form_rect, render_edit_row_dialog, render_nosql_form};
 pub use export_import::{
-    render_batch_export_dialog, render_batch_import_dialog, render_batch_truncate_dialog,
-    render_delete_row_confirm, render_export_dialog, render_import_dialog, render_truncate_confirm,
+    nosql_confirm_rect, nosql_transfer_rect, render_batch_export_dialog,
+    render_batch_import_dialog, render_batch_truncate_dialog, render_delete_row_confirm,
+    render_export_dialog, render_import_dialog, render_nosql_confirm, render_nosql_transfer_dialog,
+    render_truncate_confirm,
 };
+pub use indexes::{indexes_rect, render_indexes_dialog};
+pub use json_view::{json_view_rect, render_json_view};
+
 pub use folder_prompt::{folder_prompt_rect, render_folder_prompt};
 pub use new_connection::{connection_dialog_rect, render_new_connection_dialog};
 pub use schema_dialog::{render_schema_dialog, SchemaAction};

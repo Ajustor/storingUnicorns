@@ -1,19 +1,19 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
+use crate::engine::config::AppConfig;
+use crate::engine::db::DatabaseConnection;
+use crate::engine::models::{display_cell, NULL_CELL};
+use crate::engine::models::{
+    AzureAuthMethod, ConnectionConfig, DatabaseType, DbAuthMethod, Flavor, QueryResult, SchemaInfo,
+    SslMode,
+};
+use crate::engine::presets::{self, is_default_user};
 use crate::engine::services::export_import::{
     BatchExportState, BatchImportState, BatchTruncateState, ExportState, ImportState,
 };
 use crate::engine::services::query_tabs::QueryTabsState;
 use crate::engine::services::table_cache::{FetchQueue, TableCache};
-use crate::engine::config::AppConfig;
-use crate::engine::db::DatabaseConnection;
-use crate::engine::models::{
-    AzureAuthMethod, ConnectionConfig, DatabaseType, DbAuthMethod, Flavor, QueryResult, SchemaInfo,
-    SslMode,
-};
-use crate::engine::presets;
-use crate::engine::models::{display_cell, NULL_CELL};
 use crate::engine::sql::completion::{self, Suggestion, TableRef};
 use crate::engine::sql::statements::single_table_source;
 use crate::tui::columns::{self, ColumnStore};
@@ -78,6 +78,16 @@ pub enum DialogMode {
     BatchImport,
     /// Path of a connection folder (`folder_prompt`).
     FolderPrompt,
+    /// MongoDB / Redis `(o/N)` question (`nosql::Confirm`).
+    NoSqlConfirm,
+    /// A document / value, indented, read only (`v`).
+    JsonView,
+    /// The indexes of a MongoDB collection (`s`).
+    Indexes,
+    /// New index, new key, SCAN pattern (`nosql::Form`).
+    NoSqlForm,
+    /// MongoDB / Redis export / import (`nosql::transfer`).
+    NoSqlTransfer,
 }
 
 /// Fields in the new connection dialog
@@ -98,6 +108,8 @@ pub enum ConnectionField {
     DbAuth,
     Username,
     Password,
+    /// MongoDB `authSource` (« Base d'authentification »).
+    AuthSource,
     Database,
     SslMode,
     SslCa,
@@ -118,7 +130,8 @@ impl ConnectionField {
             Self::Port => Self::DbAuth,
             Self::DbAuth => Self::Username,
             Self::Username => Self::Password,
-            Self::Password => Self::Database,
+            Self::Password => Self::AuthSource,
+            Self::AuthSource => Self::Database,
             Self::Database => Self::SslMode,
             Self::SslMode => Self::SslCa,
             Self::SslCa => Self::Name,
@@ -139,7 +152,8 @@ impl ConnectionField {
             Self::DbAuth => Self::Port,
             Self::Username => Self::DbAuth,
             Self::Password => Self::Username,
-            Self::Database => Self::Password,
+            Self::AuthSource => Self::Password,
+            Self::Database => Self::AuthSource,
             Self::SslMode => Self::Database,
             Self::SslCa => Self::SslMode,
         }
@@ -182,6 +196,9 @@ impl ConnectionField {
         db_auth: DbAuthMethod,
     ) -> bool {
         match field {
+            // MongoDB / Redis have no compatible products.
+            Self::Flavor => !db_type.is_sql(),
+            Self::AuthSource => *db_type != DatabaseType::MongoDB,
             Self::DbAuth => !uses_tls(db_type),
             // The IAM sign-in's password is a token fetched when connecting.
             Self::Password if uses_tls(db_type) => db_auth == DbAuthMethod::GcpIam,
@@ -207,7 +224,7 @@ impl ConnectionField {
             Self::Password => {
                 *db_type == DatabaseType::Azure && *auth_method != AzureAuthMethod::Credentials
             }
-            Self::SslMode | Self::SslCa => !uses_tls(db_type),
+            Self::SslMode | Self::SslCa => !shows_ssl(db_type),
             _ => false,
         }
     }
@@ -216,6 +233,17 @@ impl ConnectionField {
 /// Whether the driver honours the SSL settings (PostgreSQL / MySQL).
 pub fn uses_tls(db_type: &DatabaseType) -> bool {
     matches!(db_type, DatabaseType::Postgres | DatabaseType::MySQL)
+}
+
+/// Whether the form shows the SSL / TLS mode and CA: PostgreSQL / MySQL,
+/// and MongoDB / Redis (TLS, `ConnectionConfig::nosql_tls`).
+pub fn shows_ssl(db_type: &DatabaseType) -> bool {
+    uses_tls(db_type) || !db_type.is_sql()
+}
+
+/// A SQL driver's default database, cleared for MongoDB (every database).
+fn is_default_database(db: &str) -> bool {
+    matches!(db.trim(), "postgres" | "master" | "mysql")
 }
 
 /// Empty, or a host `set_db_type` fills in: replaceable by another default.
@@ -243,7 +271,11 @@ pub struct NewConnectionState {
     /// Entra ID application (client) ID of an interactive browser sign-in;
     /// empty (auto): Microsoft's drivers'.
     pub azure_client_id: String,
+    /// Pasted connection URL; for MongoDB, the connection string kept as
+    /// `ConnectionConfig::uri` (its password moves to `password`).
     pub url: String,
+    /// MongoDB `authSource`; empty = the URI's, else `admin`.
+    pub auth_source: String,
     /// Compatible product; `None` = the bare engine.
     pub flavor: Option<Flavor>,
     pub ssl_mode: SslMode,
@@ -275,6 +307,7 @@ impl Default for NewConnectionState {
             tenant_id: String::from("common"),
             azure_client_id: String::new(),
             url: String::new(),
+            auth_source: String::new(),
             flavor: None,
             ssl_mode: SslMode::default(),
             ssl_ca: String::new(),
@@ -307,6 +340,22 @@ impl NewConnectionState {
 
     /// Whether the form can be saved, else a French message.
     pub fn check(&self) -> Result<(), String> {
+        if self.db_type == DatabaseType::MongoDB {
+            let uri = self.url.trim();
+            let scheme = uri.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
+            if !uri.is_empty() && !matches!(scheme.as_deref(), Some("mongodb" | "mongodb+srv")) {
+                return Err("L'URI MongoDB doit commencer par mongodb:// ou mongodb+srv://".into());
+            }
+            if uri.is_empty() && self.host.trim().is_empty() {
+                return Err("Indique un hôte ou une URI MongoDB".into());
+            }
+        }
+        if self.db_type == DatabaseType::Redis {
+            let db = self.database.trim();
+            if !db.is_empty() && db.parse::<u8>().map_or(true, |n| n > 15) {
+                return Err("La base Redis doit être un nombre de 0 à 15".into());
+            }
+        }
         if self.gcp_iam() {
             crate::engine::db::gcp_iam::validate(&self.db_type, &self.username)?;
         }
@@ -337,7 +386,8 @@ impl NewConnectionState {
                 Some(self.host.clone())
             },
             port: self.port.parse().ok(),
-            username: if self.username.is_empty() {
+            // A MongoDB URI carries its user: the field is ignored then.
+            username: if self.username.is_empty() || self.mongo_uri() {
                 None
             } else {
                 Some(self.username.clone())
@@ -376,8 +426,8 @@ impl NewConnectionState {
                 None
             },
             color: self.color,
-            ssl_mode: uses_tls(&self.db_type).then_some(self.ssl_mode),
-            ssl_ca: if uses_tls(&self.db_type) && !self.ssl_ca.trim().is_empty() {
+            ssl_mode: shows_ssl(&self.db_type).then_some(self.ssl_mode),
+            ssl_ca: if shows_ssl(&self.db_type) && !self.ssl_ca.trim().is_empty() {
                 Some(self.ssl_ca.trim().into())
             } else {
                 None
@@ -387,7 +437,33 @@ impl NewConnectionState {
             db_auth: self.gcp_iam().then_some(DbAuthMethod::GcpIam),
             folder: self.folder.clone(),
             hidden_schemas: self.hidden_schemas.clone(),
+            // The connection string never keeps its password.
+            uri: (self.db_type == DatabaseType::MongoDB && !self.url.trim().is_empty())
+                .then(|| presets::split_uri_password(&self.url).0),
+            auth_source: (self.db_type == DatabaseType::MongoDB
+                && !self.auth_source.trim().is_empty())
+            .then(|| self.auth_source.trim().to_string()),
         }
+    }
+
+    /// MongoDB with a connection string (its user is the URI's).
+    pub fn mongo_uri(&self) -> bool {
+        self.db_type == DatabaseType::MongoDB && !self.url.trim().is_empty()
+    }
+
+    /// `to_config`, once the password of a MongoDB URI typed in the form
+    /// moved to the password field (unless one is set there).
+    pub fn config_moving_password(&mut self) -> ConnectionConfig {
+        if self.db_type == DatabaseType::MongoDB {
+            let (uri, pw) = presets::split_uri_password(&self.url);
+            if let Some(pw) = pw {
+                if self.password.is_empty() {
+                    self.password = pw;
+                }
+                self.url = uri;
+            }
+        }
+        self.to_config()
     }
 
     /// Edit form for an existing connection.
@@ -418,7 +494,12 @@ impl NewConnectionState {
             azure_client_id: conn.azure_client_id.clone().unwrap_or_default(),
             active_field: ConnectionField::Name,
             cursor_position: conn.name.len(),
-            url: String::new(),
+            // A MongoDB connection string is edited in the URL field.
+            url: match conn.db_type {
+                DatabaseType::MongoDB => conn.uri.clone().unwrap_or_default(),
+                _ => String::new(),
+            },
+            auth_source: conn.auth_source.clone().unwrap_or_default(),
             flavor: conn.flavor,
             ssl_mode: conn.ssl_mode.unwrap_or_default(),
             ssl_ca: conn
@@ -448,6 +529,7 @@ impl NewConnectionState {
             ConnectionField::Port => &self.port,
             ConnectionField::Username => &self.username,
             ConnectionField::Password => &self.password,
+            ConnectionField::AuthSource => &self.auth_source,
             ConnectionField::Database => &self.database,
         }
     }
@@ -467,6 +549,7 @@ impl NewConnectionState {
             ConnectionField::Port => Some(&mut self.port),
             ConnectionField::Username => Some(&mut self.username),
             ConnectionField::Password => Some(&mut self.password),
+            ConnectionField::AuthSource => Some(&mut self.auth_source),
             ConnectionField::Database => Some(&mut self.database),
         }
     }
@@ -493,7 +576,22 @@ impl NewConnectionState {
             DatabaseType::MySQL => DatabaseType::SQLite,
             DatabaseType::SQLite => DatabaseType::SQLServer,
             DatabaseType::SQLServer => DatabaseType::Azure,
-            DatabaseType::Azure => DatabaseType::Postgres,
+            DatabaseType::Azure => DatabaseType::MongoDB,
+            DatabaseType::MongoDB => DatabaseType::Redis,
+            DatabaseType::Redis => DatabaseType::Postgres,
+        });
+    }
+
+    /// `cycle_db_type` backwards.
+    pub fn cycle_db_type_back(&mut self) {
+        self.set_db_type(match self.db_type {
+            DatabaseType::Postgres => DatabaseType::Redis,
+            DatabaseType::MySQL => DatabaseType::Postgres,
+            DatabaseType::SQLite => DatabaseType::MySQL,
+            DatabaseType::SQLServer => DatabaseType::SQLite,
+            DatabaseType::Azure => DatabaseType::SQLServer,
+            DatabaseType::MongoDB => DatabaseType::Azure,
+            DatabaseType::Redis => DatabaseType::MongoDB,
         });
     }
 
@@ -572,8 +670,11 @@ impl NewConnectionState {
         if let Some(n) = p.port {
             self.port = n.to_string();
         }
-        if let Some(u) = p.username {
-            self.username = u;
+        match p.username {
+            Some(u) => self.username = u,
+            // MongoDB / Redis: a URL without a user signs in without one.
+            None if !self.db_type.is_sql() => self.username.clear(),
+            None => {}
         }
         if let Some(pw) = p.password {
             self.password = pw;
@@ -581,6 +682,9 @@ impl NewConnectionState {
         if let Some(d) = p.database {
             self.database = d;
         }
+        // MongoDB: the connection string (hosts, options) stays in the
+        // field, without its password.
+        let uri = p.uri.unwrap_or_default();
         // The URL describes the whole connection: SSL settings it doesn't
         // mention go back to their defaults. A missing password keeps the
         // typed one (URLs are often shared without it).
@@ -589,7 +693,7 @@ impl NewConnectionState {
             .ssl_ca
             .map(|ca| ca.display().to_string())
             .unwrap_or_default();
-        self.url.clear();
+        self.url = uri;
         Ok(())
     }
 
@@ -621,6 +725,27 @@ impl NewConnectionState {
             DatabaseType::Azure => {
                 self.port = String::from("1433");
                 self.host = String::from("servername.database.windows.net");
+            }
+            DatabaseType::MongoDB => {
+                self.port = String::from("27017");
+                self.host = String::from("localhost");
+                // Every database; no driver default user.
+                if is_default_database(&self.database) {
+                    self.database.clear();
+                }
+                if is_default_user(&self.username) {
+                    self.username.clear();
+                }
+            }
+            DatabaseType::Redis => {
+                self.port = String::from("6379");
+                self.host = String::from("localhost");
+                if self.database.trim().parse::<u8>().map_or(true, |n| n > 15) {
+                    self.database = String::from("0");
+                }
+                if is_default_user(&self.username) {
+                    self.username.clear();
+                }
             }
         };
     }
@@ -749,6 +874,9 @@ pub struct AppState {
     pub interactions:
         Option<std::sync::mpsc::Receiver<crate::engine::db::entra_interactive::Interaction>>,
 
+    /// MongoDB / Redis state: key tree, editable result, dialogs.
+    pub nosql: crate::tui::nosql::NoSqlUi,
+
     // Debug mode
     pub debug_mode: bool,
     // Disable all animations
@@ -833,6 +961,7 @@ impl AppState {
             sign_in: None,
             sign_in_warning: None,
             interactions: None,
+            nosql: Default::default(),
             debug_mode,
             no_animations,
             should_quit: false,
@@ -870,6 +999,7 @@ impl AppState {
         self.batch_export_state = None;
         self.batch_import_state = None;
         self.folder_prompt = None;
+        self.nosql.close_dialogs();
     }
 
     pub fn is_dialog_open(&self) -> bool {
@@ -1028,6 +1158,10 @@ impl AppState {
     /// Suggestions for the cursor, from the tables the statement cites
     /// (their missing columns are loaded in the background).
     fn compute_completions(&mut self) -> Vec<Suggestion> {
+        if crate::tui::nosql::engine(self).is_some() {
+            return crate::tui::nosql::completions(self);
+        }
+
         let query = self.query_input().to_string();
         let cursor = self.cursor_position();
         let tables = self.get_known_tables();
@@ -1102,8 +1236,12 @@ impl AppState {
             .clone();
         let query = self.query_input().to_string();
         let cursor = self.cursor_position().min(query.len());
-        // Same token the engine completed (quotes in strings / comments ignored).
-        let token_start = crate::engine::sql::completion::token_start(&query, cursor);
+        // Same token the engine completed (quotes in strings / comments
+        // ignored; MongoDB / Redis: the NoSQL engine's span).
+        let token_start = match crate::tui::nosql::engine(self) {
+            Some(db) => crate::engine::nosql::completion_start(&db, &query, cursor),
+            None => crate::engine::sql::completion::token_start(&query, cursor),
+        };
 
         let new_query = format!("{}{}{}", &query[..token_start], insert, &query[cursor..]);
         let new_cursor = token_start + insert.len();
@@ -1679,7 +1817,7 @@ mod tests {
         assert_eq!(nc.port, "3306");
         assert!(nc.url.is_empty());
 
-        nc.url = "redis://x".into();
+        nc.url = "ftp://x".into();
         assert!(nc.apply_url().is_err());
         assert_eq!(nc.host, "aws.connect.psdb.cloud"); // untouched
     }
@@ -2031,6 +2169,173 @@ mod tests {
         nc.username.clear();
         assert!(nc.check().is_ok());
         assert_eq!(nc.to_config().db_auth, None);
+    }
+
+    #[test]
+    fn the_type_cycles_through_mongodb_and_redis_both_ways() {
+        let mut nc = NewConnectionState::default();
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            nc.cycle_db_type();
+            seen.push(nc.db_type.clone());
+        }
+        use DatabaseType::*;
+        assert_eq!(
+            seen,
+            [MySQL, SQLite, SQLServer, Azure, MongoDB, Redis, Postgres]
+        );
+        nc.cycle_db_type_back();
+        assert_eq!(nc.db_type, Redis);
+        assert_eq!((nc.port.as_str(), nc.database.as_str()), ("6379", "0"));
+        assert_eq!(nc.username, "", "no driver default user");
+        nc.cycle_db_type_back();
+        assert_eq!(nc.db_type, MongoDB);
+        assert_eq!(nc.port, "27017");
+    }
+
+    #[test]
+    fn nosql_forms_ask_for_their_own_fields() {
+        let a = AzureAuthMethod::Credentials;
+        let pw = DbAuthMethod::Password;
+        let chain = |t: &DatabaseType| {
+            let mut fields = vec![ConnectionField::Name];
+            loop {
+                let next = fields.last().unwrap().next_for(t, &a, pw);
+                if next == ConnectionField::Name {
+                    break fields;
+                }
+                fields.push(next);
+            }
+        };
+        use ConnectionField::*;
+        assert_eq!(
+            chain(&DatabaseType::MongoDB),
+            [
+                Name, Url, DbType, Host, Port, Username, Password, AuthSource, Database, SslMode,
+                SslCa
+            ]
+        );
+        assert_eq!(
+            chain(&DatabaseType::Redis),
+            [Name, Url, DbType, Host, Port, Username, Password, Database, SslMode, SslCa]
+        );
+        // SQL engines never stop on the authentication database.
+        assert!(!chain(&DatabaseType::Postgres).contains(&AuthSource));
+        assert_eq!(
+            ConnectionField::Database.prev_for(&DatabaseType::MongoDB, &a, pw),
+            AuthSource
+        );
+    }
+
+    #[test]
+    fn a_mongodb_uri_fills_the_form_and_keeps_no_password() {
+        let mut nc = NewConnectionState {
+            url: "mongodb+srv://ann:p%40ss@cluster0.example.net/shop?retryWrites=true".into(),
+            ..Default::default()
+        };
+        nc.apply_url().unwrap();
+        assert_eq!(nc.db_type, DatabaseType::MongoDB);
+        assert_eq!(nc.password, "p@ss");
+        assert_eq!(nc.username, "ann");
+        assert!(!nc.url.contains("p%40ss"), "{}", nc.url);
+        assert!(
+            nc.url.starts_with("mongodb+srv://ann@cluster0"),
+            "{}",
+            nc.url
+        );
+        nc.auth_source = " admin ".into();
+        assert!(nc.check().is_ok());
+        let c = nc.to_config();
+        assert_eq!(c.uri.as_deref(), Some(nc.url.as_str()));
+        assert_eq!(c.auth_source.as_deref(), Some("admin"));
+        assert_eq!(c.password.as_deref(), Some("p@ss"));
+        // Editing shows the URI again, unchanged once saved.
+        let back = NewConnectionState::from_config(&c);
+        assert_eq!(back.url, nc.url);
+        assert_eq!(back.auth_source, "admin");
+        assert_eq!(back.to_config(), c);
+    }
+
+    #[test]
+    fn a_nosql_url_without_user_clears_the_typed_one() {
+        let mut nc = NewConnectionState {
+            username: "alice".into(),
+            url: "redis://:secret@cache.local:6380/2".into(),
+            ..Default::default()
+        };
+        nc.apply_url().unwrap();
+        assert_eq!((nc.username.as_str(), nc.password.as_str()), ("", "secret"));
+        assert_eq!(nc.to_config().username, None);
+    }
+
+    #[test]
+    fn a_mongodb_uri_never_sends_the_username_field() {
+        let mut nc = NewConnectionState::default();
+        nc.set_db_type(DatabaseType::MongoDB);
+        nc.username = "stale".into();
+        nc.url = "mongodb://db1:27017/".into();
+        assert!(nc.mongo_uri());
+        assert_eq!(nc.to_config().username, None);
+        // Without a URI, the field is the user.
+        nc.url.clear();
+        nc.host = "db1".into();
+        assert_eq!(nc.to_config().username.as_deref(), Some("stale"));
+        // A saved connection with a stale username: dropped, then stable.
+        let saved = ConnectionConfig {
+            name: "m".into(),
+            db_type: DatabaseType::MongoDB,
+            uri: Some("mongodb://app@db1:27017/".into()),
+            username: Some("postgres".into()),
+            password: Some("pw".into()),
+            database: String::new(),
+            ..Default::default()
+        };
+        let c = NewConnectionState::from_config(&saved).to_config();
+        assert_eq!(c.username, None);
+        assert_eq!((&c.uri, &c.password), (&saved.uri, &saved.password));
+        assert_eq!(NewConnectionState::from_config(&c).to_config(), c);
+    }
+
+    #[test]
+    fn a_typed_uri_password_moves_to_the_password_field() {
+        let mut nc = NewConnectionState::default();
+        nc.set_db_type(DatabaseType::MongoDB);
+        nc.url = "mongodb://ann:secret@db1:27017,db2:27017/?replicaSet=rs0".into();
+        let c = nc.config_moving_password();
+        assert_eq!(c.password.as_deref(), Some("secret"));
+        assert_eq!(
+            c.uri.as_deref(),
+            Some("mongodb://ann@db1:27017,db2:27017/?replicaSet=rs0")
+        );
+        // Not a MongoDB scheme: refused.
+        nc.url = "redis://x".into();
+        assert!(nc.check().unwrap_err().contains("mongodb://"));
+        // Neither URI nor host.
+        nc.url.clear();
+        nc.host.clear();
+        assert!(nc.check().is_err());
+    }
+
+    #[test]
+    fn redis_keeps_its_database_and_tls() {
+        let mut nc = NewConnectionState {
+            url: "rediss://default:pw@cache.example.com:6380/3".into(),
+            ..Default::default()
+        };
+        nc.apply_url().unwrap();
+        assert_eq!(nc.db_type, DatabaseType::Redis);
+        assert_eq!(nc.database, "3");
+        assert_eq!(nc.ssl_mode, SslMode::VerifyFull);
+        assert!(nc.url.is_empty(), "no URI kept for Redis");
+        let c = nc.to_config();
+        assert_eq!(c.ssl_mode, Some(SslMode::VerifyFull));
+        assert_eq!((&c.uri, &c.auth_source), (&None, &None));
+        assert_eq!(
+            NewConnectionState::from_config(&c).to_config().database,
+            "3"
+        );
+        nc.database = "16".into();
+        assert!(nc.check().unwrap_err().contains("0 à 15"));
     }
 
     #[test]

@@ -2,7 +2,9 @@ use std::time::Instant;
 
 use anyhow::{bail, Result};
 
-use crate::engine::db::{batch_error_line, has_control_flow, is_result_select, DatabaseConnection};
+use crate::engine::db::{
+    batch_error_line, has_control_flow, is_result_select, not_sql, DatabaseConnection,
+};
 use crate::engine::models::{QueryResult, SchemaInfo};
 use crate::engine::sql::statements::{
     get_execution_unit_at_cursor, is_transaction_end, is_transaction_start, single_table_source,
@@ -64,6 +66,9 @@ pub async fn run_table_page(
     sql: &str,
     table: &str,
 ) -> Result<QueryResult> {
+    if !conn.db_type().is_sql() {
+        return Err(not_sql(&conn.db_type()));
+    }
     let mut result = conn.execute_query(sql).await?;
     enrich(meta, sql, &mut result).await;
     if result.columns.is_empty() && result.rows.is_empty() {
@@ -80,6 +85,9 @@ async fn run_query_limited(
     sql: &str,
     max_rows: Option<usize>,
 ) -> Result<QueryResult> {
+    if !conn.db_type().is_sql() {
+        return Err(not_sql(&conn.db_type()));
+    }
     let mut result = conn.execute_query_limited(sql, max_rows).await?;
     enrich(conn, sql, &mut result).await;
     Ok(result)
@@ -92,6 +100,9 @@ async fn run_query_limited(
 /// named like a key column of the first table is not that key. Metadata
 /// lookups are best effort.
 pub(crate) async fn enrich(conn: &DatabaseConnection, sql: &str, result: &mut QueryResult) {
+    if !conn.db_type().is_sql() {
+        return;
+    }
     let Some(table) = single_table_source(sql) else {
         return;
     };
@@ -144,6 +155,9 @@ async fn execute_unit(
     unit: ExecutionUnit,
     max_rows: Option<usize>,
 ) -> Result<Executed, RunError> {
+    if !conn.db_type().is_sql() {
+        return Err(RunError::Query(not_sql(&conn.db_type())));
+    }
     match unit {
         ExecutionUnit::UnterminatedTransaction => Err(RunError::Unterminated),
         ExecutionUnit::Transaction(statements) => {
@@ -225,6 +239,13 @@ pub async fn run_script(
     text: &str,
     max_rows: Option<usize>,
 ) -> Vec<StatementOutcome> {
+    if !conn.db_type().is_sql() {
+        return vec![StatementOutcome {
+            sql: text.to_string(),
+            result: Err(not_sql(&conn.db_type()).to_string()),
+            elapsed_ms: 0,
+        }];
+    }
     if conn.runs_tsql_batches() {
         let mut outcomes = run_tsql_batches(conn, text, max_rows).await;
         if outcomes.last().is_some_and(|o| o.result.is_ok()) {
@@ -416,6 +437,9 @@ pub async fn run_at_cursor_outcomes(
 /// SQL Server and Azure run it as T-SQL batches (`run_script`): the result
 /// is the last result set, or the last outcome when none returned rows.
 pub async fn run_all(conn: &DatabaseConnection, text: &str) -> Result<QueryResult> {
+    if !conn.db_type().is_sql() {
+        return Err(not_sql(&conn.db_type()));
+    }
     if text.trim().is_empty() {
         bail!("Query is empty");
     }

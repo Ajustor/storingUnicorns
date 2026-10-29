@@ -625,7 +625,11 @@ pub fn quote_ident(name: &str, (q0, q1): (char, char)) -> String {
 /// Identifier quote characters `(open, close)` for a database type.
 pub fn quote_chars(db_type: &DatabaseType) -> (char, char) {
     match db_type {
-        DatabaseType::Postgres | DatabaseType::SQLite => ('"', '"'),
+        // MongoDB / Redis: the explorer keys collections as `"db"."coll"`.
+        DatabaseType::Postgres
+        | DatabaseType::SQLite
+        | DatabaseType::MongoDB
+        | DatabaseType::Redis => ('"', '"'),
         DatabaseType::MySQL => ('`', '`'),
         DatabaseType::SQLServer | DatabaseType::Azure => ('[', ']'),
     }

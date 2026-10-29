@@ -10,8 +10,8 @@ use crate::engine::db::azure::AzureCloud;
 use crate::engine::db::gcp_iam;
 use crate::engine::models::{AzureAuthMethod, DatabaseType, SslMode};
 use crate::engine::presets;
-use crate::tui::{uses_tls, AppState, ConnectionField, DialogMode};
 use crate::tui::ui::widgets::draw_cursor;
+use crate::tui::{shows_ssl, uses_tls, AppState, ConnectionField, DialogMode};
 
 /// Rows per field: the value line and its bottom rule.
 const FIELD_HEIGHT: u16 = 2;
@@ -78,12 +78,21 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     let gcp_iam = nc.gcp_iam();
     let show_password =
         !gcp_iam && (!is_azure || nc.azure_auth_method == AzureAuthMethod::Credentials);
-    let show_ssl = uses_tls(&nc.db_type);
+    let show_ssl = shows_ssl(&nc.db_type);
+    // PostgreSQL / MySQL's sign-in choice (password / IAM).
+    let show_db_auth = uses_tls(&nc.db_type);
+    let is_mongo = nc.db_type == DatabaseType::MongoDB;
+    let is_redis = nc.db_type == DatabaseType::Redis;
+    // MongoDB / Redis have no compatible products.
+    let show_flavor = nc.db_type.is_sql();
 
-    // Name, URL, Modèle, Type, Host, Port, Database, plus the engine- and
-    // authentication-specific fields. PostgreSQL / MySQL's sign-in choice
-    // shares the port's row: with SSL, they already fill the dialog.
-    let fields = 7
+    // Name, URL, Type, Host, Port, Database, plus the product (SQL), the
+    // engine- and authentication-specific fields. PostgreSQL / MySQL's
+    // sign-in choice shares the port's row: with SSL, they already fill the
+    // dialog.
+    let fields = 6
+        + u16::from(show_flavor)
+        + u16::from(is_mongo)
         + u16::from(is_azure)
         + u16::from(show_tenant)
         + u16::from(browser)
@@ -168,27 +177,41 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     );
     idx += 1;
 
+    // MongoDB keeps its connection string (without the password) there.
+    let url_label = if is_mongo { "URI" } else { "URL" };
     render_field(
         frame,
         chunks[idx],
-        "URL",
+        url_label,
         &nc.url,
         ConnectionField::Url,
         false,
     );
+    if nc.url.is_empty() {
+        let hint = match nc.db_type {
+            DatabaseType::MongoDB => "mongodb://… ou mongodb+srv://… (ou hôte et port)",
+            DatabaseType::Redis => "redis://… ou rediss://… (Entrée remplit les champs)",
+            _ => "",
+        };
+        if !hint.is_empty() {
+            render_placeholder(frame, chunks[idx], url_label, hint);
+        }
+    }
     idx += 1;
 
-    let flavor = nc
-        .flavor
-        .map_or_else(|| "Aucun".to_string(), |f| f.to_string());
-    render_cycle(
-        frame,
-        chunks[idx],
-        "Modèle",
-        &flavor,
-        ConnectionField::Flavor,
-    );
-    idx += 1;
+    if show_flavor {
+        let flavor = nc
+            .flavor
+            .map_or_else(|| "Aucun".to_string(), |f| f.to_string());
+        render_cycle(
+            frame,
+            chunks[idx],
+            "Modèle",
+            &flavor,
+            ConnectionField::Flavor,
+        );
+        idx += 1;
+    }
 
     // DB Type - special handling with cycle indicator
     let db_type_active = nc.active_field == ConnectionField::DbType;
@@ -295,7 +318,7 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     }
     idx += 1;
 
-    if show_ssl {
+    if show_db_auth {
         let row = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(PORT_WIDTH), Constraint::Min(0)])
@@ -390,6 +413,17 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
             ConnectionField::Username,
             false,
         );
+        if is_redis && nc.username.is_empty() {
+            render_placeholder(
+                frame,
+                chunks[idx],
+                "Username",
+                "utilisateur ACL (facultatif)",
+            );
+        } else if nc.mongo_uri() {
+            // `to_config` leaves it out: the URI's user is used.
+            render_on_rule(frame, chunks[idx], " ignoré : utilisateur de l'URI ");
+        }
         idx += 1;
     }
 
@@ -405,19 +439,51 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
         idx += 1;
     }
 
+    if is_mongo {
+        const LABEL: &str = "Base d'authentification";
+        render_field(
+            frame,
+            chunks[idx],
+            LABEL,
+            &nc.auth_source,
+            ConnectionField::AuthSource,
+            false,
+        );
+        if nc.auth_source.is_empty() {
+            render_placeholder(frame, chunks[idx], LABEL, "admin");
+        }
+        idx += 1;
+    }
+
+    let db_label = match nc.db_type {
+        DatabaseType::MongoDB => "Base par défaut",
+        DatabaseType::Redis => "Base (0-15)",
+        _ => "Database",
+    };
     render_field(
         frame,
         chunks[idx],
-        "Database",
+        db_label,
         &nc.database,
         ConnectionField::Database,
         false,
     );
+    if is_mongo && nc.database.is_empty() {
+        render_placeholder(frame, chunks[idx], db_label, "vide = toutes");
+    }
     idx += 1;
 
     if show_ssl {
         let mode = nc.ssl_mode.to_string();
-        render_cycle(frame, chunks[idx], "SSL", &mode, ConnectionField::SslMode);
+        let ssl_label = if show_db_auth { "SSL" } else { "TLS" };
+        render_cycle(
+            frame,
+            chunks[idx],
+            ssl_label,
+            &mode,
+            ConnectionField::SslMode,
+        );
+
         // The IAM sign-in connects with TLS whatever the mode says.
         if gcp_iam && matches!(nc.ssl_mode, SslMode::Disable | SslMode::Prefer) {
             render_on_rule(frame, chunks[idx], " IAM : au moins Obligatoire ");
@@ -672,6 +738,56 @@ mod tests {
         state.new_connection.host = "mine".into();
         let all = screen(&state).join("\n");
         assert!(!all.contains("supabase.co"), "{all}");
+    }
+
+    #[test]
+    fn mongodb_and_redis_show_their_own_fields() {
+        let mut state = AppState::new(AppConfig::default(), false, true);
+        state.open_new_connection_dialog();
+        state.new_connection.set_db_type(DatabaseType::MongoDB);
+        let rows = screen(&state);
+        let all = rows.join("\n");
+        for label in [
+            "URI: mongodb://… ou mongodb+srv://…",
+            "Type: MongoDB",
+            "Port: 27017",
+            "Base d'authentification: admin",
+            "Base par défaut: vide = toutes",
+            "TLS: ",
+            "Certificat CA:",
+        ] {
+            assert!(all.contains(label), "{label} missing:\n{all}");
+        }
+        assert!(!all.contains("Modèle"), "no products: {all}");
+        assert!(!all.contains("Auth:"), "no IAM: {all}");
+        assert!(!all.contains("ignoré"), "no URI yet: {all}");
+        state.new_connection.url = "mongodb://h/".into();
+        state.new_connection.username = "stale".into();
+        let with_uri = screen(&state).join(
+            "
+",
+        );
+        assert!(
+            with_uri.contains("ignoré : utilisateur de l'URI"),
+            "{with_uri}"
+        );
+        state.new_connection.url.clear();
+        state.new_connection.username.clear();
+        assert!(rows[23].contains('└'), "{all}");
+
+        state.new_connection.set_db_type(DatabaseType::Redis);
+        let all = screen(&state).join("\n");
+        for label in [
+            "URL: redis://… ou rediss://…",
+            "Type: Redis",
+            "Port: 6379",
+            "Username: utilisateur ACL (facultatif)",
+            "Base (0-15): 0",
+            "TLS: ",
+        ] {
+            assert!(all.contains(label), "{label} missing:\n{all}");
+        }
+        assert!(!all.contains("Base d'authentification"), "{all}");
     }
 
     #[test]

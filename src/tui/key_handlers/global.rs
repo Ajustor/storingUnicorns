@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
+use crate::tui::nosql::{self, transfer};
 use crate::tui::{ActivePanel, AppState};
 
 use super::KeyAction;
@@ -94,6 +95,20 @@ pub async fn handle_global_keys(
             KeyAction::Consumed
         }
 
+        // MongoDB / Redis: JSON / JSON Lines / CSV transfers.
+        KeyCode::F(6) if nosql::engine(state).is_some() => {
+            if modifiers.contains(KeyModifiers::SHIFT) {
+                transfer::open_batch(state, transfer::Kind::Export);
+            } else {
+                transfer::open_results(state);
+            }
+            KeyAction::Consumed
+        }
+        KeyCode::F(7) if nosql::engine(state).is_some() => {
+            transfer::open_batch(state, transfer::Kind::Import);
+            KeyAction::Consumed
+        }
+
         // Export results: F6
         KeyCode::F(6) if !modifiers.contains(KeyModifiers::SHIFT) => {
             if state.query_result.is_some() {
@@ -172,8 +187,14 @@ pub async fn handle_global_keys(
         }
 
         // Help
+        KeyCode::Char('?') if nosql::engine(state).is_some() => {
+            let db = nosql::engine(state).unwrap_or(crate::engine::models::DatabaseType::Redis);
+            state.set_status(nosql::help_text(&db));
+            KeyAction::Consumed
+        }
         KeyCode::Char('?') => {
             state.set_status(
+
                 "Help: Tab=switch panels, Enter=connect/select/fold, F5/Ctrl+G=execute, Ctrl+Enter/Ctrl+E=run current, n=new, d=delete, m=move, f=folder, h=hide schema, q=quit",
             );
             KeyAction::Consumed

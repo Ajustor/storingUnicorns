@@ -16,13 +16,66 @@ use crate::gui::popup;
 use crate::gui::sign_in;
 use crate::gui::theme::{self, CONNECTION_COLORS, ERROR};
 
-const DB_TYPES: [DatabaseType; 5] = [
+const DB_TYPES: [DatabaseType; 7] = [
     DatabaseType::Postgres,
     DatabaseType::MySQL,
     DatabaseType::SQLite,
     DatabaseType::SQLServer,
     DatabaseType::Azure,
+    DatabaseType::MongoDB,
+    DatabaseType::Redis,
 ];
+
+/// Databases a new MongoDB connection hides (the server's own).
+pub const MONGO_HIDDEN: [&str; 2] = ["config", "local"];
+
+/// Help of the MongoDB form for the compatible services.
+const MONGO_SERVICES_HELP: &str = "Cosmos DB (API MongoDB) et DocumentDB : collez la chaîne de \
+     connexion fournie (DocumentDB : CA global-bundle.pem)";
+
+/// TLS of a MongoDB / Redis connection, as the form offers it (stored in
+/// `ssl_mode`, see `ConnectionConfig::nosql_tls`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoSqlTls {
+    Off,
+    On,
+    /// Encrypted, certificate not verified.
+    Insecure,
+}
+
+impl NoSqlTls {
+    pub const ALL: [NoSqlTls; 3] = [NoSqlTls::Off, NoSqlTls::On, NoSqlTls::Insecure];
+
+    pub fn from_mode(mode: SslMode) -> Self {
+        match mode {
+            SslMode::Disable | SslMode::Prefer => Self::Off,
+            SslMode::Require => Self::Insecure,
+            SslMode::VerifyCa | SslMode::VerifyFull => Self::On,
+        }
+    }
+
+    pub fn mode(self) -> SslMode {
+        match self {
+            Self::Off => SslMode::Disable,
+            Self::On => SslMode::VerifyFull,
+            Self::Insecure => SslMode::Require,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Désactivé",
+            Self::On => "Activé",
+            Self::Insecure => "Activé sans vérifier le certificat",
+        }
+    }
+}
+
+/// Whether `uri` is a MongoDB connection string.
+fn is_mongo_uri(uri: &str) -> bool {
+    let lower = uri.trim().to_ascii_lowercase();
+    lower.starts_with("mongodb://") || lower.starts_with("mongodb+srv://")
+}
 
 const AZURE_METHODS: [AzureAuthMethod; 4] = [
     AzureAuthMethod::Credentials,
@@ -142,6 +195,8 @@ fn default_port(t: &DatabaseType) -> &'static str {
         DatabaseType::MySQL => "3306",
         DatabaseType::SQLite => "",
         DatabaseType::SQLServer | DatabaseType::Azure => "1433",
+        DatabaseType::MongoDB => "27017",
+        DatabaseType::Redis => "6379",
     }
 }
 
@@ -152,7 +207,7 @@ pub fn same_target(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
     a.db_type == b.db_type
         && a.host == b.host
         && a.port == b.port
-        && a.username == b.username
+        && a.effective_username() == b.effective_username()
         && a.password == b.password
         && a.database == b.database
         && a.azure_auth_method == b.azure_auth_method
@@ -161,6 +216,8 @@ pub fn same_target(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
         && a.ssl_mode == b.ssl_mode
         && a.ssl_ca == b.ssl_ca
         && a.effective_db_auth() == b.effective_db_auth()
+        && a.uri == b.uri
+        && a.auth_source == b.auth_source
 }
 
 pub struct ConnectionForm {
@@ -204,6 +261,14 @@ pub struct ConnectionForm {
     pub hidden_schemas: Vec<String>,
     /// The connection's schemas, when it is open (« Schémas affichés »).
     pub schemas: Option<Vec<String>>,
+    /// MongoDB: connect with the connection string (`uri`) rather than
+    /// host / port.
+    pub mongo_uri_mode: bool,
+    /// MongoDB connection string, never with its password (moved to
+    /// `password` as soon as it is typed or pasted).
+    pub uri: String,
+    /// MongoDB authentication database; empty = the URI's, else `admin`.
+    pub auth_source: String,
 }
 
 /// What the form asks for (closing it is the modal's `Cancel`).
@@ -257,6 +322,23 @@ impl ConnectionForm {
             known_folders: Vec::new(),
             hidden_schemas: c.hidden_schemas,
             schemas: None,
+            mongo_uri_mode: c.uri.is_some(),
+            uri: c.uri.unwrap_or_default(),
+            auth_source: c.auth_source.unwrap_or_default(),
+        }
+    }
+
+    /// A MongoDB / Redis connection.
+    fn nosql(&self) -> bool {
+        !self.db_type.is_sql()
+    }
+
+    /// Move the password of the typed / pasted URI to the password field:
+    /// the URI saved never holds it.
+    pub fn take_uri_password(&mut self) {
+        if let (uri, Some(password)) = presets::split_uri_password(&self.uri) {
+            self.uri = uri;
+            self.password = password;
         }
     }
 
@@ -324,6 +406,35 @@ impl ConnectionForm {
         if self.flavor.is_some_and(|f| f.driver() != t) {
             self.flavor = None;
         }
+        // A new MongoDB connection hides the server's own databases.
+        let pre_hidden = self
+            .hidden_schemas
+            .iter()
+            .map(String::as_str)
+            .eq(MONGO_HIDDEN);
+        if self.original_name.is_none() {
+            if t == DatabaseType::MongoDB && self.hidden_schemas.is_empty() {
+                self.hidden_schemas = MONGO_HIDDEN.map(String::from).to_vec();
+            } else if t != DatabaseType::MongoDB && pre_hidden {
+                self.hidden_schemas.clear();
+            }
+        }
+        // A database index for Redis, a default database (or none) for
+        // MongoDB: what was typed for another engine rarely fits.
+        let untouched = self.database.trim().is_empty()
+            || self.database == ConnectionConfig::default().database;
+        if t == DatabaseType::Redis && self.database.trim().parse::<u8>().is_err() {
+            self.database = "0".into();
+        } else if (t == DatabaseType::MongoDB && untouched)
+            || (self.db_type == DatabaseType::Redis && t != DatabaseType::Redis)
+        {
+            self.database.clear();
+        }
+        // No driver default user for MongoDB / Redis (`AUTH postgres …`,
+        // a SCRAM sign-in as "postgres").
+        if !t.is_sql() && presets::is_default_user(&self.username) {
+            self.username.clear();
+        }
         self.db_type = t;
     }
 
@@ -349,9 +460,16 @@ impl ConnectionForm {
         self.db_type != DatabaseType::SQLite
     }
 
-    /// Whether the driver honours the SSL settings (PostgreSQL / MySQL).
+    /// Whether the driver honours the SSL settings (PostgreSQL / MySQL,
+    /// MongoDB / Redis through `nosql_tls`).
     fn uses_tls(&self) -> bool {
-        matches!(self.db_type, DatabaseType::Postgres | DatabaseType::MySQL)
+        matches!(
+            self.db_type,
+            DatabaseType::Postgres
+                | DatabaseType::MySQL
+                | DatabaseType::MongoDB
+                | DatabaseType::Redis
+        )
     }
 
     /// Whether the « Authentification » choice shows (PostgreSQL / MySQL).
@@ -396,6 +514,11 @@ impl ConnectionForm {
         let p = presets::parse_url(&self.url)?;
         self.set_db_type(p.db_type);
         self.flavor = p.flavor;
+        // MongoDB: the whole string (hosts, options), without its password.
+        if let Some(uri) = p.uri {
+            self.uri = uri;
+            self.mongo_uri_mode = true;
+        }
         if let Some(h) = p.host {
             self.host = h;
         }
@@ -403,8 +526,12 @@ impl ConnectionForm {
             .port
             .map(|n| n.to_string())
             .unwrap_or_else(|| default_port(&self.db_type).to_string());
-        if let Some(u) = p.username {
-            self.username = u;
+        match p.username {
+            Some(u) => self.username = u,
+            // MongoDB / Redis: a URL without a user signs in without one
+            // (not as the user typed for another engine).
+            None if !self.db_type.is_sql() => self.username.clear(),
+            None => {}
         }
         if let Some(pw) = p.password {
             self.password = pw;
@@ -434,13 +561,36 @@ impl ConnectionForm {
             return Err("Une connexion porte déjà ce nom".into());
         }
         let server = self.uses_server();
-        if self.database.trim().is_empty() {
+        // MongoDB: no default database = every database.
+        if self.database.trim().is_empty() && !self.nosql() {
             return Err(if server {
                 "La base est obligatoire"
             } else {
                 "Le fichier est obligatoire"
             }
             .into());
+        }
+        let mongo = self.db_type == DatabaseType::MongoDB;
+        let database = match self.db_type {
+            DatabaseType::Redis => {
+                let db = match self.database.trim() {
+                    "" => "0",
+                    d => d,
+                };
+                if !db.parse::<u8>().is_ok_and(|n| n <= 15) {
+                    return Err("La base Redis est un numéro de 0 à 15".into());
+                }
+                db.to_string()
+            }
+            _ => self.database.trim().to_string(),
+        };
+        // The URI saved never holds the password (see `take_uri_password`).
+        let (uri, uri_password) = presets::split_uri_password(&self.uri);
+        let uri = (mongo && self.mongo_uri_mode).then_some(uri);
+        if let Some(uri) = &uri {
+            if !is_mongo_uri(uri) {
+                return Err("URI MongoDB attendue : mongodb://… ou mongodb+srv://…".into());
+            }
         }
         let port = if server && !self.port.trim().is_empty() {
             Some(
@@ -471,14 +621,19 @@ impl ConnectionForm {
             db_type: self.db_type.clone(),
             host: if server { opt(&self.host) } else { None },
             port,
-            username: if server { opt(&self.username) } else { None },
-            // The IAM sign-in's password is a token, fetched when connecting.
-            password: if server && !iam && !self.password.is_empty() {
-                Some(self.password.clone())
+            // A MongoDB URI carries its user (the field is hidden then).
+            username: if server && uri.is_none() {
+                opt(&self.username)
             } else {
                 None
             },
-            database: self.database.trim().to_string(),
+            // The IAM sign-in's password is a token, fetched when connecting.
+            password: match uri_password.filter(|_| uri.is_some()) {
+                Some(p) => Some(p),
+                None if server && !iam && !self.password.is_empty() => Some(self.password.clone()),
+                None => None,
+            },
+            database,
             azure_auth_method: azure.then(|| self.azure_auth.clone()),
             tenant_id: if azure { opt(&self.tenant_id) } else { None },
             // Only that method uses an application of its own.
@@ -488,7 +643,10 @@ impl ConnectionForm {
                 None
             },
             color: self.color,
-            ssl_mode: self.uses_tls().then_some(self.ssl_mode),
+            // MongoDB / Redis without TLS: nothing written.
+            ssl_mode: (self.uses_tls()
+                && !(self.nosql() && NoSqlTls::from_mode(self.ssl_mode) == NoSqlTls::Off))
+                .then_some(self.ssl_mode),
             ssl_ca: if self.uses_tls() {
                 opt(&self.ssl_ca).map(Into::into)
             } else {
@@ -498,6 +656,8 @@ impl ConnectionForm {
             // The default method is left out, as in older files.
             db_auth: iam.then_some(DbAuthMethod::GcpIam),
             folder,
+            uri,
+            auth_source: if mongo { opt(&self.auth_source) } else { None },
             hidden_schemas: self.hidden_schemas.clone(),
         })
     }
@@ -603,23 +763,26 @@ impl ConnectionForm {
                     ui.end_row();
                 }
 
-                ui.label("Modèle");
-                let mut flavor = self.flavor;
-                let labels = std::iter::once("Aucun".to_string())
-                    .chain(Flavor::ALL.iter().map(|f| f.to_string()));
-                egui::ComboBox::from_id_salt("flavor")
-                    .width(popup::combo_width(ui, labels))
-                    .selected_text(flavor.map_or("Aucun".to_string(), |f| f.to_string()))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut flavor, None, "Aucun");
-                        for f in Flavor::ALL {
-                            ui.selectable_value(&mut flavor, Some(f), f.to_string());
-                        }
-                    });
-                if flavor != self.flavor {
-                    self.apply_preset(flavor);
+                // No compatible products for MongoDB / Redis.
+                if !self.nosql() {
+                    ui.label("Modèle");
+                    let mut flavor = self.flavor;
+                    let labels = std::iter::once("Aucun".to_string())
+                        .chain(Flavor::ALL.iter().map(|f| f.to_string()));
+                    egui::ComboBox::from_id_salt("flavor")
+                        .width(popup::combo_width(ui, labels))
+                        .selected_text(flavor.map_or("Aucun".to_string(), |f| f.to_string()))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut flavor, None, "Aucun");
+                            for f in Flavor::ALL {
+                                ui.selectable_value(&mut flavor, Some(f), f.to_string());
+                            }
+                        });
+                    if flavor != self.flavor {
+                        self.apply_preset(flavor);
+                    }
+                    ui.end_row();
                 }
-                ui.end_row();
 
                 ui.label("Type");
                 let mut t = self.db_type.clone();
@@ -640,7 +803,11 @@ impl ConnectionForm {
                 }
                 ui.end_row();
 
-                if self.uses_server() {
+                if self.db_type == DatabaseType::MongoDB {
+                    self.mongo_fields(ui);
+                } else if self.db_type == DatabaseType::Redis {
+                    self.redis_fields(ui);
+                } else if self.uses_server() {
                     self.server_fields(ui);
                 } else {
                     ui.label("Fichier");
@@ -658,7 +825,11 @@ impl ConnectionForm {
                     ui.end_row();
                 }
 
-                ui.label("Schémas affichés");
+                ui.label(if self.nosql() {
+                    "Bases affichées"
+                } else {
+                    "Schémas affichés"
+                });
                 self.schemas_row(ui);
                 ui.end_row();
             });
@@ -772,6 +943,136 @@ impl ConnectionForm {
         if self.uses_tls() {
             self.ssl_fields(ui);
         }
+    }
+
+    /// MongoDB: a connection string or host / port, the sign-in, the
+    /// databases and TLS (grid rows).
+    fn mongo_fields(&mut self, ui: &mut egui::Ui) {
+        ui.label("Connexion");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.mongo_uri_mode, true, "URI");
+            ui.radio_value(&mut self.mongo_uri_mode, false, "Paramètres");
+        });
+        ui.end_row();
+        if self.mongo_uri_mode {
+            ui.label("URI");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.uri)
+                    .hint_text("mongodb://… ou mongodb+srv://…")
+                    .desired_width(f32::INFINITY),
+            )
+            .on_hover_text("Le mot de passe éventuel est déplacé dans « Mot de passe »");
+            // Typed or pasted: the password leaves the URI at once.
+            self.take_uri_password();
+            ui.end_row();
+        } else {
+            ui.label("Hôte");
+            ui.add(egui::TextEdit::singleline(&mut self.host).hint_text("localhost"));
+            ui.end_row();
+            ui.label("Port");
+            ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(80.0));
+            ui.end_row();
+        }
+        // With a URI, the user is the URI's (`mongodb://user@host`).
+        if !self.mongo_uri_mode {
+            ui.label("Utilisateur");
+            ui.text_edit_singleline(&mut self.username);
+            ui.end_row();
+        }
+        ui.label("Mot de passe");
+        ui.add(egui::TextEdit::singleline(&mut self.password).password(true))
+            .on_hover_text(if self.mongo_uri_mode {
+                "Mot de passe de l'utilisateur de l'URI"
+            } else {
+                "Mot de passe de l'utilisateur"
+            });
+        ui.end_row();
+        ui.label("Base d'authentification");
+        ui.add(egui::TextEdit::singleline(&mut self.auth_source).hint_text(
+            if self.mongo_uri_mode {
+                "celle de l'URI, sinon admin"
+            } else {
+                "admin"
+            },
+        ));
+        ui.end_row();
+        ui.label("Base par défaut");
+        ui.add(egui::TextEdit::singleline(&mut self.database).hint_text("vide = toutes"));
+        ui.end_row();
+        self.nosql_tls_fields(ui);
+        ui.label("");
+        ui.label(egui::RichText::new(MONGO_SERVICES_HELP).weak().small());
+        ui.end_row();
+    }
+
+    /// Redis: host / port, the sign-in (ACL user optional), the database
+    /// index and TLS (grid rows).
+    fn redis_fields(&mut self, ui: &mut egui::Ui) {
+        ui.label("Hôte");
+        ui.add(egui::TextEdit::singleline(&mut self.host).hint_text("localhost"));
+        ui.end_row();
+        ui.label("Port");
+        ui.add(egui::TextEdit::singleline(&mut self.port).desired_width(80.0));
+        ui.end_row();
+        ui.label("Utilisateur");
+        ui.add(egui::TextEdit::singleline(&mut self.username).hint_text("ACL, facultatif"));
+        ui.end_row();
+        ui.label("Mot de passe");
+        ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+        ui.end_row();
+        ui.label("Base");
+        let current = self.database.trim().parse::<u8>().unwrap_or(0).min(15);
+        let mut chosen = current;
+        egui::ComboBox::from_id_salt("redis_db")
+            .selected_text(current.to_string())
+            .show_ui(ui, |ui| {
+                for n in 0..=15u8 {
+                    ui.selectable_value(&mut chosen, n, n.to_string());
+                }
+            });
+        if chosen != current || self.database.trim().is_empty() {
+            self.database = chosen.to_string();
+        }
+        ui.end_row();
+        self.nosql_tls_fields(ui);
+    }
+
+    /// TLS of MongoDB / Redis: off, on (verified), on without checking the
+    /// certificate; the extra CA (grid rows).
+    fn nosql_tls_fields(&mut self, ui: &mut egui::Ui) {
+        ui.label("TLS");
+        let current = NoSqlTls::from_mode(self.ssl_mode);
+        let mut chosen = current;
+        egui::ComboBox::from_id_salt("nosql_tls")
+            .width(popup::combo_width(
+                ui,
+                NoSqlTls::ALL.iter().map(|t| t.label()),
+            ))
+            .selected_text(current.label())
+            .show_ui(ui, |ui| {
+                for t in NoSqlTls::ALL {
+                    ui.selectable_value(&mut chosen, t, t.label());
+                }
+            });
+        // Only a change rewrites the mode (a « Vérifier l'autorité » saved
+        // before stays as it is).
+        if chosen != current {
+            self.ssl_mode = chosen.mode();
+        }
+        ui.end_row();
+        ui.label("Certificat CA");
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.ssl_ca).hint_text("racines du système"));
+            if ui.button(egui_phosphor::regular::FOLDER_OPEN).clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("Certificat", &["pem", "crt", "cer"])
+                    .pick_file()
+                {
+                    self.ssl_ca = p.display().to_string();
+                }
+            }
+        });
+        ui.end_row();
     }
 
     /// The label and the input of `field`: two cells of a grid row.
@@ -1473,7 +1774,7 @@ mod tests {
         assert_eq!(f.flavor, Some(Flavor::Supabase));
         assert!(f.url.is_empty());
 
-        f.url = "redis://x".into();
+        f.url = "ftp://x".into();
         assert!(f.apply_url().is_err());
         assert_eq!(f.host, "db.abc.supabase.co"); // untouched
     }
@@ -1492,6 +1793,226 @@ mod tests {
         f.url = "postgres://u:p@localhost/db".into();
         f.apply_url().unwrap();
         assert_eq!(f.password, "p");
+    }
+
+    fn mongo_form() -> ConnectionForm {
+        let mut f = ConnectionForm::new(None);
+        f.name = "Atlas".into();
+        f.set_db_type(DatabaseType::MongoDB);
+        f
+    }
+
+    #[test]
+    fn a_new_mongo_connection_hides_config_and_local() {
+        let mut f = mongo_form();
+        assert_eq!(f.hidden_schemas, ["config", "local"]);
+        assert_eq!(f.port, "27017");
+        // Another engine: they go again.
+        f.set_db_type(DatabaseType::Redis);
+        assert!(f.hidden_schemas.is_empty());
+        assert_eq!(f.port, "6379");
+        assert_eq!(f.database, "0");
+        // An edited connection keeps its own list.
+        let saved = ConnectionConfig {
+            name: "m".into(),
+            db_type: DatabaseType::Postgres,
+            ..Default::default()
+        };
+        let mut e = ConnectionForm::new(Some(saved));
+        e.set_db_type(DatabaseType::MongoDB);
+        assert!(e.hidden_schemas.is_empty());
+    }
+
+    #[test]
+    fn a_typed_mongo_uri_gives_its_password_to_the_password_field() {
+        let mut f = mongo_form();
+        f.mongo_uri_mode = true;
+        f.uri = "mongodb+srv://app:p%40ss@cluster0.x.mongodb.net/shop?retryWrites=true".into();
+        f.take_uri_password();
+        assert_eq!(
+            f.uri,
+            "mongodb+srv://app@cluster0.x.mongodb.net/shop?retryWrites=true"
+        );
+        assert_eq!(f.password, "p@ss");
+        let c = f.validate(&[]).unwrap();
+        assert_eq!(c.uri.as_deref(), Some(f.uri.as_str()));
+        assert_eq!(c.password.as_deref(), Some("p@ss"));
+        assert_eq!(c.database, "", "no default database: all of them");
+        assert_eq!(c.ssl_mode, None, "TLS from the URI scheme");
+        // Even a URI validated as typed loses its password.
+        f.uri = "mongodb://u:secret@h:27017/".into();
+        let c = f.validate(&[]).unwrap();
+        assert_eq!(c.uri.as_deref(), Some("mongodb://u@h:27017/"));
+        assert_eq!(c.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn editing_a_mongo_connection_keeps_its_uri_and_auth_source() {
+        let saved = ConnectionConfig {
+            name: "Atlas".into(),
+            db_type: DatabaseType::MongoDB,
+            uri: Some("mongodb+srv://app@cluster0.x.mongodb.net/?retryWrites=true".into()),
+            auth_source: Some("admin".into()),
+            password: Some("pw".into()),
+            hidden_schemas: vec!["local".into()],
+            ..Default::default()
+        };
+        let f = ConnectionForm::new(Some(saved.clone()));
+        assert!(f.mongo_uri_mode);
+        let c = f.validate(std::slice::from_ref(&saved)).unwrap();
+        assert_eq!(c.uri, saved.uri);
+        assert_eq!(c.auth_source, saved.auth_source);
+        assert_eq!(c.password, saved.password);
+        assert_eq!(c.hidden_schemas, saved.hidden_schemas);
+        assert!(same_target(&saved, &c), "the session stays open");
+        let other = ConnectionConfig {
+            auth_source: Some("shop".into()),
+            ..saved.clone()
+        };
+        assert!(!same_target(&saved, &other));
+    }
+
+    #[test]
+    fn a_mongo_uri_never_sends_the_username_field() {
+        // A user typed in « Paramètres », then the URI mode chosen.
+        let mut f = mongo_form();
+        f.username = "stale".into();
+        f.mongo_uri_mode = true;
+        f.uri = "mongodb://h:27017/".into();
+        assert_eq!(f.validate(&[]).unwrap().username, None);
+        // Back to the parameters: the field is used again.
+        f.mongo_uri_mode = false;
+        f.host = "h".into();
+        assert_eq!(f.validate(&[]).unwrap().username.as_deref(), Some("stale"));
+        // A saved connection with a stale username round-trips without it,
+        // then unchanged.
+        let saved = ConnectionConfig {
+            name: "m".into(),
+            db_type: DatabaseType::MongoDB,
+            uri: Some("mongodb://app@h:27017/".into()),
+            username: Some("postgres".into()),
+            password: Some("pw".into()),
+            database: String::new(),
+            ..Default::default()
+        };
+        let c = ConnectionForm::new(Some(saved.clone()))
+            .validate(std::slice::from_ref(&saved))
+            .unwrap();
+        assert_eq!(c.username, None);
+        assert_eq!((&c.uri, &c.password), (&saved.uri, &saved.password));
+        let again = ConnectionForm::new(Some(c.clone()))
+            .validate(std::slice::from_ref(&c))
+            .unwrap();
+        assert_eq!(again, c);
+    }
+
+    #[test]
+    fn mongo_parameters_need_no_uri_and_a_uri_must_be_mongo() {
+        let mut f = mongo_form();
+        f.host = "db.local".into();
+        f.auth_source = " admin ".into();
+        f.database = "shop".into();
+        let c = f.validate(&[]).unwrap();
+        assert_eq!(c.uri, None);
+        assert_eq!(c.host.as_deref(), Some("db.local"));
+        assert_eq!(c.port, Some(27017));
+        assert_eq!(c.auth_source.as_deref(), Some("admin"));
+        assert_eq!(c.database, "shop");
+        f.mongo_uri_mode = true;
+        f.uri = "postgres://x".into();
+        assert!(f.validate(&[]).unwrap_err().contains("mongodb"));
+    }
+
+    #[test]
+    fn pasting_a_mongo_url_fills_the_uri() {
+        let mut f = ConnectionForm::new(None);
+        f.url = "mongodb://root:p%40ss@h1:27017,h2:27017/shop?replicaSet=rs0".into();
+        f.apply_url().unwrap();
+        assert_eq!(f.db_type, DatabaseType::MongoDB);
+        assert!(f.mongo_uri_mode);
+        assert!(!f.uri.contains("p%40ss") && f.uri.contains("h2:27017"));
+        assert_eq!(f.password, "p@ss");
+        assert_eq!(f.hidden_schemas, ["config", "local"]);
+    }
+
+    #[test]
+    fn nosql_connections_drop_the_sql_default_user() {
+        // A new form starts as PostgreSQL, user "postgres".
+        for t in [DatabaseType::MongoDB, DatabaseType::Redis] {
+            let mut f = ConnectionForm::new(None);
+            f.name = "n".into();
+            assert_eq!(f.username, "postgres");
+            f.set_db_type(t.clone());
+            assert_eq!(f.username, "", "{t:?}");
+            f.host = "h".into();
+            assert_eq!(f.validate(&[]).unwrap().username, None, "{t:?}");
+        }
+        // A user typed by hand stays.
+        let mut f = ConnectionForm::new(None);
+        f.username = "alice".into();
+        f.set_db_type(DatabaseType::Redis);
+        assert_eq!(f.username, "alice");
+        // A URL without a user: none, even after another engine's.
+        let mut f = ConnectionForm::new(None);
+        f.name = "cache".into();
+        f.username = "alice".into();
+        f.url = "redis://:secret@cache.local:6380/2".into();
+        f.apply_url().unwrap();
+        assert_eq!((f.username.as_str(), f.password.as_str()), ("", "secret"));
+        let c = f.validate(&[]).unwrap();
+        assert_eq!(c.username, None);
+        assert_eq!(c.password.as_deref(), Some("secret"));
+        // A SQL URL without a user keeps the typed one, as before.
+        let mut f = ConnectionForm::new(None);
+        f.username = "alice".into();
+        f.url = "postgres://db.local/app".into();
+        f.apply_url().unwrap();
+        assert_eq!(f.username, "alice");
+    }
+
+    #[test]
+    fn redis_databases_go_from_0_to_15() {
+        let mut f = ConnectionForm::new(None);
+        f.name = "cache".into();
+        f.set_db_type(DatabaseType::Redis);
+        f.database = " ".into();
+        assert_eq!(f.validate(&[]).unwrap().database, "0");
+        f.database = "15".into();
+        assert_eq!(f.validate(&[]).unwrap().database, "15");
+        f.database = "16".into();
+        assert!(f.validate(&[]).unwrap_err().contains("0 à 15"));
+        f.database = "3".into();
+        f.username = "app".into();
+        f.password = "pw".into();
+        let c = f.validate(&[]).unwrap();
+        assert_eq!((c.uri, c.auth_source), (None, None));
+        assert_eq!(c.username.as_deref(), Some("app"));
+        assert_eq!(c.port, Some(6379));
+        f.url = "rediss://default:p%20w@cache.example.com:6380/2".into();
+        f.apply_url().unwrap();
+        assert_eq!(
+            (f.host.as_str(), f.port.as_str(), f.database.as_str()),
+            ("cache.example.com", "6380", "2")
+        );
+        assert_eq!(NoSqlTls::from_mode(f.ssl_mode), NoSqlTls::On);
+    }
+
+    #[test]
+    fn nosql_tls_maps_to_the_ssl_mode() {
+        for t in NoSqlTls::ALL {
+            assert_eq!(NoSqlTls::from_mode(t.mode()), t);
+        }
+        assert_eq!(NoSqlTls::from_mode(SslMode::Prefer), NoSqlTls::Off);
+        assert_eq!(NoSqlTls::from_mode(SslMode::VerifyCa), NoSqlTls::On);
+        let mut f = mongo_form();
+        f.ssl_mode = NoSqlTls::Insecure.mode();
+        f.ssl_ca = "C:/global-bundle.pem".into();
+        let c = f.validate(&[]).unwrap();
+        assert_eq!(c.ssl_mode, Some(SslMode::Require));
+        assert_eq!(c.ssl_ca, Some("C:/global-bundle.pem".into()));
+        assert_eq!(c.nosql_tls(), Some(false));
+        f.ssl_mode = SslMode::Disable;
+        assert_eq!(f.validate(&[]).unwrap().ssl_mode, None);
     }
 
     #[test]

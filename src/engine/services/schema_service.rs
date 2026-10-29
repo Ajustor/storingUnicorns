@@ -76,6 +76,8 @@ impl SchemaService {
         use crate::engine::models::DatabaseType;
         let quotes = crate::engine::sql::statements::quote_chars(db_type);
         let q = |name: &str| crate::engine::sql::statements::quote_ident(name, quotes);
+        // MongoDB / Redis share the PostgreSQL arms below only to keep the
+        // matches exhaustive: `apply_modification` refuses them.
         // Text inside a '…' string literal (sp_rename arguments).
         let lit = |text: &str| text.replace('\'', "''");
 
@@ -107,7 +109,11 @@ impl SchemaService {
             } => match db_type {
                 // MySQL: RENAME COLUMN needs MySQL 8.0+ (CHANGE would need
                 // the full column definition).
-                DatabaseType::Postgres | DatabaseType::MySQL | DatabaseType::SQLite => format!(
+                DatabaseType::Postgres
+                | DatabaseType::MySQL
+                | DatabaseType::SQLite
+                | DatabaseType::MongoDB
+                | DatabaseType::Redis => format!(
                     "ALTER TABLE {} RENAME COLUMN {} TO {}",
                     table_name,
                     q(old_name),
@@ -127,7 +133,7 @@ impl SchemaService {
                     " NOT NULL"
                 };
                 match db_type {
-                    DatabaseType::Postgres => format!(
+                    DatabaseType::Postgres | DatabaseType::MongoDB | DatabaseType::Redis => format!(
                         "ALTER TABLE {} ALTER COLUMN {} TYPE {}",
                         table_name,
                         q(&column.name),
@@ -185,7 +191,11 @@ impl SchemaService {
                 format!("DROP TABLE {}", table_name)
             }
             SchemaModification::RenameTable { old_name, new_name } => match db_type {
-                DatabaseType::Postgres | DatabaseType::MySQL | DatabaseType::SQLite => {
+                DatabaseType::Postgres
+                | DatabaseType::MySQL
+                | DatabaseType::SQLite
+                | DatabaseType::MongoDB
+                | DatabaseType::Redis => {
                     format!("ALTER TABLE {} RENAME TO {}", old_name, new_name)
                 }
                 DatabaseType::SQLServer | DatabaseType::Azure => {
@@ -212,7 +222,10 @@ impl SchemaService {
                 table_name,
                 index_name,
             } => match db_type {
-                DatabaseType::Postgres | DatabaseType::SQLite => {
+                DatabaseType::Postgres
+                | DatabaseType::SQLite
+                | DatabaseType::MongoDB
+                | DatabaseType::Redis => {
                     format!("DROP INDEX {}", q(index_name))
                 }
                 DatabaseType::MySQL | DatabaseType::SQLServer | DatabaseType::Azure => {

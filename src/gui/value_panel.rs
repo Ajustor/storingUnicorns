@@ -229,6 +229,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     ui.strong("Valeur");
     ui.separator();
+    if let Some(doc) = target.and_then(|key| focused_document(&app.tabs, key)) {
+        document_preview(ui, &doc);
+    }
     let link = target.and_then(|key| focused_link(app, key));
     let mut follow = None;
     let panel = &mut app.value_panel;
@@ -326,6 +329,22 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if let Some(e) = &panel.error {
         ui.colored_label(ERROR, e);
     }
+    // A document's object / array cell: indented, in shell syntax.
+    let nested = (!panel.json)
+        .then(|| shell_preview(&panel.buffer))
+        .flatten();
+    if let Some(p) = nested {
+        egui::CollapsingHeader::new("Aperçu indenté")
+            .id_salt("value_shell_preview")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut p.as_str())
+                        .code_editor()
+                        .desired_width(f32::INFINITY),
+                );
+            });
+    }
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -357,6 +376,68 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     if let Some((tab, row, col, new_tab)) = follow {
         app.data_action(tab, DataAction::Follow { row, col, new_tab });
     }
+}
+
+/// Result ids of the grids of the NoSQL tabs in a [`CellKey`] (a console
+/// result's id is its own).
+const DOCS_GRID: u64 = 0;
+const AGGREGATE_GRID: u64 = 1;
+const VALUE_GRID: u64 = 2;
+const KEYS_GRID: u64 = 3;
+
+/// The document of the focused row, in shell syntax: a « Documents » tab's,
+/// or a console result's read from a collection.
+fn focused_document(tabs: &Tabs, key: CellKey) -> Option<String> {
+    use crate::engine::nosql::Source;
+    let (tab_id, result_id, row, _) = key;
+    let tab = tabs.list.iter().find(|t| t.id == tab_id)?;
+    let RowRef::Base(i) = row else {
+        return None;
+    };
+    let doc = match &tab.kind {
+        TabKind::Documents(d) => d.doc(row)?,
+        TabKind::Console(c) => {
+            let r = c.results.iter().find(|r| r.id == result_id)?;
+            match &r.source {
+                Some(Source::Collection { docs, .. }) => docs.get(i)?,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(super::tabs::documents::doc_text(doc))
+}
+
+/// The whole document of the focused row, folded under the cell.
+fn document_preview(ui: &mut egui::Ui, doc: &str) {
+    egui::CollapsingHeader::new(format!("{} Document", icon::BRACKETS_CURLY))
+        .id_salt("value_document")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("value_document_scroll")
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut doc.to_string().as_str())
+                            .code_editor()
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+        });
+    ui.separator();
+}
+
+/// An object or array written in shell syntax (a document's cell),
+/// indented; `None` for anything else.
+pub fn shell_preview(cell: &str) -> Option<String> {
+    use crate::engine::nosql::mongo::shell;
+    let t = cell.trim_start();
+    if !(t.starts_with('{') || t.starts_with('[')) {
+        return None;
+    }
+    let value = shell::parse_value(cell).ok()?;
+    Some(shell::to_shell(&value, true)).filter(|s| !s.trim().is_empty())
 }
 
 /// The foreign key of the focused cell of a data tab, when its value links
@@ -668,6 +749,20 @@ fn focused_key(tabs: &Tabs) -> Option<CellKey> {
             let (row, col) = r.grid.selected?;
             Some((tab.id, r.id, row, col))
         }
+        TabKind::Documents(d) => {
+            use super::tabs::documents::DocMode;
+            let (grid, id) = match d.mode {
+                DocMode::Find => (&d.grid, DOCS_GRID),
+                DocMode::Aggregate => (&d.agg_grid, AGGREGATE_GRID),
+            };
+            let (row, col) = grid.selected?;
+            Some((tab.id, id, row, col))
+        }
+        TabKind::Keys(k) => match (k.value_grid.selected, k.keys_grid.selected) {
+            (Some((row, col)), _) => Some((tab.id, VALUE_GRID, row, col)),
+            (None, Some((row, col))) => Some((tab.id, KEYS_GRID, row, col)),
+            _ => None,
+        },
         TabKind::Ddl(_) => None,
     }
 }
@@ -690,6 +785,21 @@ fn cell(tabs: &mut Tabs, key: CellKey) -> Option<Focus<'_>> {
             let lock = c.result_lock(index, runs.script.is_some());
             let r = &mut c.results[index];
             (&r.result, &mut r.grid, r.editable && lock.is_none())
+        }
+        TabKind::Documents(d) => {
+            let busy = busy_hint(runs.submit.is_some(), runs.page.is_some());
+            let editable = d.editable() && busy.is_none();
+            match result_id {
+                DOCS_GRID => (&d.page.as_ref()?.result, &mut d.grid, editable),
+                _ => (&d.aggregated.as_ref()?.result, &mut d.agg_grid, false),
+            }
+        }
+        TabKind::Keys(k) => {
+            let editable = k.value_editable() && runs.submit.is_none() && runs.value.is_none();
+            match result_id {
+                VALUE_GRID => (&k.value_result, &mut k.value_grid, editable),
+                _ => (&k.keys_result, &mut k.keys_grid, false),
+            }
         }
         TabKind::Ddl(_) => return None,
     };

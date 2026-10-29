@@ -7,6 +7,49 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Nouveautés
+
+- **MongoDB** : nouveau type de connexion, dans l'interface graphique et
+  l'interface terminal. URI (`mongodb://`, `mongodb+srv://` pour Atlas) ou
+  paramètres, base d'authentification, TLS avec CA facultatif ; Azure Cosmos DB
+  et Amazon DocumentDB par leur API MongoDB. Explorateur des bases,
+  collections, champs (échantillon) et index ; onglet **Documents** avec
+  filtre, tri et projection en syntaxe shell, pages de 500, édition dans la
+  grille ou dans un éditeur JSON, **Submit** / **Revert** ; mode
+  **Agrégation** ; console en syntaxe `mongosh` (sans JavaScript) avec
+  complétion des collections, champs et opérateurs, **Formater** et
+  confirmation des commandes destructives ; gestion des index ; export /
+  import JSON, JSON Lines et CSV.
+- **Redis** (et Valkey) : nouveau type de connexion, dans les deux
+  interfaces. Bases 0–15 avec leur nombre de clés, clés groupées par préfixe
+  `:` avec type et expiration ; onglet **Clés** (motif, type, valeur
+  modifiable de chaque type : string, list, set, zset, hash, stream ; TTL,
+  renommage) ; console de commandes brutes (`SELECT`, `MULTI` / `EXEC`, `KEYS`
+  exécuté par `SCAN`, confirmation de `FLUSHDB`, `FLUSHALL`…), dont les
+  lectures de clé se modifient directement dans la grille ; export / import
+  JSON et CSV. Noms et valeurs binaires affichés comme dans `redis-cli`
+  (`"\xff"`).
+
+### Limites connues
+
+- Non pris en charge : Redis Cluster et Sentinel ; authentification MongoDB
+  X.509, AWS et Kerberos ; BSON binaire (`mongodump` / `mongorestore`).
+- Un **Submit MongoDB n'est pas atomique** : les écritures partent une à une
+  (sans transaction) et l'erreur indique combien ont été appliquées.
+- Le parcours des clés Redis (explorateur, interface terminal) s'arrête à
+  **5 000 clés** par base ; l'onglet **Clés** et un motif plus précis
+  permettent d'aller au-delà.
+- CSV MongoDB : `null` et champ absent s'exportent tous deux vides ; à
+  l'import, une cellule vide donne un champ absent (une chaîne vide, écrite
+  `""`, est conservée).
+- MongoDB : des documents lus avec une projection sont en lecture seule ; un
+  champ nommé avec `.` ou commençant par `$` se modifie dans l'éditeur JSON ;
+  `$out` / `$merge` ne s'exécutent que dans la console, après confirmation.
+- Redis : modifier ou supprimer un élément de liste demande `EVAL` (script qui
+  vérifie l'élément avant d'écrire).
+
 ## [0.18.4] - 2026-10-23
 
 ### Améliorations

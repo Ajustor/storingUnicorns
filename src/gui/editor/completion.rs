@@ -7,6 +7,8 @@
 
 use egui::{Key, KeyboardShortcut, Modifiers};
 
+use crate::engine::models::{DatabaseType, SchemaInfo};
+use crate::engine::nosql;
 use crate::engine::sql::completion::{
     complete, complete_for_table, token_start, BarMode, ColumnInfo, Completions, Context,
     Suggestion, TableRef,
@@ -68,6 +70,56 @@ pub enum Scope<'a> {
     Script { fallback_columns: &'a [String] },
     /// A WHERE / ORDER BY fragment of one table (table view).
     Table { table: &'a TableRef, mode: BarMode },
+    /// A MongoDB / Redis console, or a bar of a « Documents » tab.
+    NoSql(NoSqlScope<'a>),
+}
+
+/// What the NoSQL completion (`nosql::complete`) reads, besides the
+/// sampled fields of the source.
+#[derive(Clone, Copy)]
+pub struct NoSqlScope<'a> {
+    pub db: &'a DatabaseType,
+    /// The console's current database.
+    pub scope: &'a nosql::NoSqlScope,
+    /// Databases → collections.
+    pub schemas: &'a [SchemaInfo],
+    /// Redis: the keys known.
+    pub keys: &'a [String],
+    /// Text completed before the field's own (a bar of the « Documents »
+    /// tab completes as an argument of `db.getCollection("c").find(`).
+    pub prefix: &'a str,
+}
+
+/// How far back a suggestion replaces the typed text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TokenRule {
+    /// SQL identifiers (`token_start`).
+    #[default]
+    Sql,
+    /// MongoDB shell: a name, or an operator with its `$` (`$gt`), cut at dots.
+    Mongo,
+    /// Redis: the whole argument (keys hold `:`, `-`…).
+    Redis,
+}
+
+impl TokenRule {
+    fn of(scope: &Scope) -> Self {
+        match scope {
+            Scope::NoSql(n) if *n.db == DatabaseType::Redis => Self::Redis,
+            Scope::NoSql(_) => Self::Mongo,
+            _ => Self::Sql,
+        }
+    }
+
+    /// Byte offset where the token ending at `cursor` starts (NoSQL: the
+    /// engine's own `nosql::completion_start`).
+    pub fn start(self, text: &str, cursor: usize) -> usize {
+        match self {
+            Self::Sql => token_start(text, cursor),
+            Self::Mongo => nosql::completion_start(&DatabaseType::MongoDB, text, cursor),
+            Self::Redis => nosql::completion_start(&DatabaseType::Redis, text, cursor),
+        }
+    }
 }
 
 /// Suggestions for `cursor` (bytes) in `text`.
@@ -77,11 +129,21 @@ pub fn compute(
     source: &dyn CompletionSource,
     scope: Scope,
 ) -> Completions {
-    let tables = source.tables();
     let columns = |t: &TableRef| source.columns(t);
+    if let Scope::NoSql(n) = scope {
+        let full = format!("{}{text}", n.prefix);
+        let cx = nosql::CompletionContext {
+            scope: n.scope,
+            schemas: n.schemas,
+            columns: &columns,
+            keys: n.keys,
+        };
+        return nosql::complete(n.db, &full, cursor + n.prefix.len(), &cx);
+    }
+    let tables = source.tables();
     let fallback: &[String] = match scope {
         Scope::Script { fallback_columns } => fallback_columns,
-        Scope::Table { .. } => &[],
+        Scope::Table { .. } | Scope::NoSql(_) => &[],
     };
     let cx = Context {
         quotes: source.quotes(),
@@ -92,6 +154,7 @@ pub fn compute(
     match scope {
         Scope::Script { .. } => complete(text, cursor, &cx),
         Scope::Table { table, mode } => complete_for_table(text, cursor, mode, table, &cx),
+        Scope::NoSql(_) => Completions::default(),
     }
 }
 
@@ -107,13 +170,26 @@ pub struct Completion {
     waiting: Vec<TableRef>,
     /// Tables to load, taken by the app.
     requests: Vec<TableRef>,
+    /// How the items replace the typed text.
+    rule: TokenRule,
 }
 
 /// Replace the token ending at `cursor` with `suggestion`; returns the new
 /// text and cursor (bytes).
+#[cfg(test)]
 pub fn apply_suggestion(text: &str, cursor: usize, suggestion: &str) -> (String, usize) {
+    apply_suggestion_with(TokenRule::Sql, text, cursor, suggestion)
+}
+
+/// [`apply_suggestion`] with the token of `rule`.
+pub fn apply_suggestion_with(
+    rule: TokenRule,
+    text: &str,
+    cursor: usize,
+    suggestion: &str,
+) -> (String, usize) {
     // Same token as the one completed (quotes in literals ignored).
-    let start = token_start(text, cursor);
+    let start = rule.start(text, cursor);
     let mut cursor = cursor.min(text.len());
     while !text.is_char_boundary(cursor) {
         cursor -= 1;
@@ -135,6 +211,7 @@ impl Completion {
         scope: Scope,
     ) {
         let Completions { mut items, missing } = compute(text, cursor, source, scope);
+        self.rule = TokenRule::of(&scope);
         items.truncate(MAX_ITEMS);
         self.items = items;
         self.selected = 0;
@@ -215,7 +292,7 @@ impl Completion {
         let Some(item) = self.items.get(self.selected) else {
             return;
         };
-        let (new_text, cursor) = apply_suggestion(text, self.cursor, &item.insert);
+        let (new_text, cursor) = apply_suggestion_with(self.rule, text, self.cursor, &item.insert);
         *text = new_text;
         set_cursor(ctx, id, text, cursor);
     }
@@ -241,7 +318,7 @@ impl Completion {
         let typed_word_char = ui.input(|i| {
             i.events.iter().any(|e| {
                 matches!(e, egui::Event::Text(t)
-                    if t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.'))
+                    if t.chars().all(|c| c.is_alphanumeric() || "_.$:".contains(c)))
             })
         });
         if triggered || (out.response.changed() && typed_word_char) {
@@ -596,6 +673,112 @@ mod tests {
         assert_eq!(c.items[0].label, "Created At");
         let (out, _) = apply_suggestion(text, 11, &c.items[0].insert);
         assert_eq!(out, "SELECT u.\"Created At\" FROM users u");
+    }
+
+    #[test]
+    fn nosql_suggestions_replace_their_own_token() {
+        let mongo = "db.users.find({ $g";
+        let (out, cursor) = apply_suggestion_with(TokenRule::Mongo, mongo, mongo.len(), "$gt");
+        assert_eq!(out, "db.users.find({ $gt");
+        assert_eq!(cursor, out.len());
+        let (out, _) = apply_suggestion_with(TokenRule::Mongo, "db.us", 5, "users");
+        assert_eq!(out, "db.users", "cut at the dot");
+        let redis = "GET user:4";
+        let (out, _) = apply_suggestion_with(TokenRule::Redis, redis, redis.len(), "user:42");
+        assert_eq!(out, "GET user:42", "a key is one token");
+        assert_eq!(TokenRule::Redis.start("HGET  ", 6), 6);
+    }
+
+    /// The engine's suggestions, accepted as the popup does, on the text
+    /// the engine completed.
+    fn accept_first(db: &DatabaseType, text: &str, keys: &[String]) -> String {
+        let scope = nosql::NoSqlScope {
+            database: "shop".into(),
+        };
+        let schemas = [SchemaInfo {
+            name: "shop".into(),
+            tables: vec!["users".into()],
+            expanded: false,
+        }];
+        let n = NoSqlScope {
+            db,
+            scope: &scope,
+            schemas: &schemas,
+            keys,
+            prefix: "",
+        };
+        let mut c = Completion::default();
+        c.refresh(text, text.len(), &FieldsSource, Scope::NoSql(n));
+        assert!(c.open, "no suggestion for {text:?}");
+        apply_suggestion_with(c.rule, text, text.len(), &c.items[0].insert).0
+    }
+
+    /// Fields `age` and `address.city` for every collection.
+    struct FieldsSource;
+    impl CompletionSource for FieldsSource {
+        fn tables(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn quotes(&self) -> (char, char) {
+            ('"', '"')
+        }
+        fn columns(&self, _: &TableRef) -> Option<Vec<ColumnInfo>> {
+            let col = |name: &str| ColumnInfo {
+                name: name.into(),
+                type_name: "int".into(),
+                primary_key: false,
+                foreign_key: None,
+            };
+            Some(vec![col("age"), col("address.city")])
+        }
+    }
+
+    #[test]
+    fn engine_suggestions_apply_on_the_engine_span() {
+        let mongo = DatabaseType::MongoDB;
+        assert_eq!(
+            accept_first(&mongo, "db.users.find({age: {$g", &[]),
+            "db.users.find({age: {$gt"
+        );
+        assert_eq!(accept_first(&mongo, "db.us", &[]), "db.users");
+        assert_eq!(
+            accept_first(&mongo, "db.users.find({addr", &[]),
+            "db.users.find({\"address.city\""
+        );
+        assert_eq!(
+            accept_first(&mongo, "db.users.updateOne({}, {$se", &[]),
+            "db.users.updateOne({}, {$set"
+        );
+        let redis = DatabaseType::Redis;
+        let keys = vec!["user:42".to_string(), "a b".to_string()];
+        assert_eq!(accept_first(&redis, "GET user:4", &keys), "GET user:42");
+        assert_eq!(accept_first(&redis, "DEL a", &keys), "DEL \"a b\"");
+        assert_eq!(accept_first(&redis, "DEL \"a", &keys), "DEL \"a b\"");
+        assert_eq!(accept_first(&redis, "hgetal", &keys), "HGETALL");
+    }
+
+    #[test]
+    fn nosql_scope_uses_the_engine_completion() {
+        let scope = nosql::NoSqlScope {
+            database: "shop".into(),
+        };
+        let mut c = Completion::default();
+        // Not the SQL completion: no SQL keyword in a MongoDB console (the
+        // engine's completion decides).
+        c.refresh(
+            "SEL",
+            3,
+            &NoSource,
+            Scope::NoSql(NoSqlScope {
+                db: &DatabaseType::MongoDB,
+                scope: &scope,
+                schemas: &[],
+                keys: &[],
+                prefix: "",
+            }),
+        );
+        assert!(!c.items.iter().any(|s| s.label == "SELECT"));
+        assert_eq!(c.rule, TokenRule::Mongo);
     }
 
     #[test]

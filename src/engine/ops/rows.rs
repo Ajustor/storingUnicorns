@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::engine::db::utils::{
     build_delete_query, build_insert_query, build_update_query, display_qualified,
 };
-use crate::engine::db::DatabaseConnection;
+use crate::engine::db::{not_sql, DatabaseConnection};
 use crate::engine::models::{Column, DatabaseType};
 
 #[cfg(test)] // integration tests
@@ -19,6 +19,9 @@ pub async fn update_row(
     original: &[String],
     new: &[String],
 ) -> Result<u64> {
+    if !conn.db_type().is_sql() {
+        return Err(not_sql(&conn.db_type()));
+    }
     let Some(sql) = build_update_query(table, columns, original, new, &conn.db_type()) else {
         return Ok(0);
     };
@@ -33,6 +36,9 @@ pub async fn insert_row(
     columns: &[Column],
     values: &[Option<String>],
 ) -> Result<u64> {
+    if !conn.db_type().is_sql() {
+        return Err(not_sql(&conn.db_type()));
+    }
     let sql = build_insert_query(table, columns, values, &conn.db_type());
     Ok(conn.execute_query(&sql).await?.rows_affected)
 }
@@ -45,6 +51,9 @@ pub async fn delete_row(
     columns: &[Column],
     values: &[String],
 ) -> Result<u64> {
+    if !conn.db_type().is_sql() {
+        return Err(not_sql(&conn.db_type()));
+    }
     let sql = build_delete_query(table, columns, values, &conn.db_type());
     conn.execute_checked_batch(&[sql], &[Some(1)]).await
 }
@@ -90,6 +99,9 @@ pub async fn submit_changes(
     columns: &[Column],
     changes: &RowChanges,
 ) -> Result<usize> {
+    if !conn.db_type().is_sql() {
+        return Err(not_sql(&conn.db_type()));
+    }
     let (statements, expected) = submit_statements(db, table, columns, changes)?;
     if statements.is_empty() {
         return Ok(0);
@@ -147,6 +159,10 @@ pub async fn truncate_tables(
         total: tables.len(),
         ..Default::default()
     };
+    if !conn.db_type().is_sql() {
+        report.errors.push(not_sql(&conn.db_type()).to_string());
+        return report;
+    }
     for (i, table) in tables.iter().enumerate() {
         let shown = display_qualified(table);
         progress(i, tables.len(), &shown);

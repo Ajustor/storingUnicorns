@@ -13,10 +13,15 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
+pub mod nosql;
+
 use crate::engine::db::DatabaseConnection;
 use crate::engine::models::{
     Column, ConnectionConfig, DatabaseType, QueryResult, SchemaInfo, TableDetails,
 };
+use crate::engine::nosql::mongo::{CollectionRef, DocPage, MongoIndex};
+use crate::engine::nosql::redis::{KeyInfo, ScanPage, ValuePage};
+use crate::engine::nosql::{NoSqlOutcome, NoSqlScope};
 use crate::engine::ops::{
     self,
     query::StatementOutcome,
@@ -153,6 +158,67 @@ pub enum Event {
         commit: bool,
         outcome: Result<usize, String>,
     },
+    /// NoSQL console execution: one outcome per executed unit, and the
+    /// scope (current database) the script left.
+    NoSqlScript {
+        tab: TabId,
+        run: RunId,
+        outcomes: Vec<NoSqlOutcome>,
+        scope: NoSqlScope,
+    },
+    /// One page of a « Documents » tab.
+    DocPage {
+        tab: TabId,
+        run: RunId,
+        outcome: Result<DocPage, String>,
+    },
+    /// The result of an aggregation pipeline (« Documents » tab).
+    Aggregated {
+        tab: TabId,
+        run: RunId,
+        outcome: Result<DocPage, String>,
+    },
+    /// One SCAN step of a « Clés » tab.
+    KeyPage {
+        tab: TabId,
+        run: RunId,
+        outcome: Result<ScanPage, String>,
+    },
+    /// A key's info and a page of its value (`None`: the key is gone).
+    KeyValue {
+        tab: TabId,
+        run: RunId,
+        key: Vec<u8>,
+        outcome: Result<Option<(KeyInfo, ValuePage)>, String>,
+    },
+    /// The keys of Redis database `db` shown by the explorer (`cursor` not
+    /// 0: there are more).
+    Keys {
+        name: String,
+        db: u8,
+        run: RunId,
+        outcome: Result<ScanPage, String>,
+    },
+    /// Keys per database of Redis connection `name` (`INFO keyspace`);
+    /// `None` when the server refuses INFO.
+    KeyCounts {
+        name: String,
+        counts: Option<std::collections::BTreeMap<u8, u64>>,
+    },
+    /// The indexes of `coll` (index dialog).
+    Indexes {
+        name: String,
+        coll: CollectionRef,
+        run: RunId,
+        outcome: Result<Vec<MongoIndex>, String>,
+    },
+    /// An administration task of a NoSQL connection finished: the success
+    /// message, or the error.
+    NoSqlDone {
+        name: String,
+        refresh: nosql::Refresh,
+        outcome: Result<String, String>,
+    },
     /// Progress of transfer `op` (throttled, see `progress_due`).
     Progress {
         op: OpId,
@@ -178,10 +244,16 @@ pub fn progress_due(last: Option<Instant>, now: Instant, done: usize, total: usi
 }
 
 impl Event {
-    /// Tab an outcome belongs to (`Script`, `Page`, `Count`, `Submitted`, `Ddl`).
+    /// Tab an outcome belongs to (`Script`, `Page`, `Count`, `Submitted`,
+    /// `Ddl` and the NoSQL tab outcomes).
     pub fn tab(&self) -> Option<TabId> {
         match self {
             Event::Script { tab, .. }
+            | Event::NoSqlScript { tab, .. }
+            | Event::DocPage { tab, .. }
+            | Event::Aggregated { tab, .. }
+            | Event::KeyPage { tab, .. }
+            | Event::KeyValue { tab, .. }
             | Event::Page { tab, .. }
             | Event::Count { tab, .. }
             | Event::Submitted { tab, .. }
@@ -791,7 +863,7 @@ mod tests {
         }
     }
 
-    fn next_event(w: &mut Worker) -> Event {
+    pub(super) fn next_event(w: &mut Worker) -> Event {
         let start = Instant::now();
         loop {
             if let Some(ev) = w.poll().into_iter().next() {

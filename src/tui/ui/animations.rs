@@ -232,6 +232,11 @@ pub fn compute_modal_area(frame_area: Rect, dialog_mode: DialogMode) -> Rect {
         }
         DialogMode::FolderPrompt => crate::tui::ui::modals::folder_prompt_rect(frame_area),
         DialogMode::BatchTruncate => centered_rect(60, 70, frame_area),
+        DialogMode::NoSqlConfirm => crate::tui::ui::modals::nosql_confirm_rect(frame_area),
+        DialogMode::JsonView => crate::tui::ui::modals::json_view_rect(frame_area),
+        DialogMode::Indexes => crate::tui::ui::modals::indexes_rect(frame_area),
+        DialogMode::NoSqlForm => crate::tui::ui::modals::nosql_form_rect(frame_area),
+        DialogMode::NoSqlTransfer => crate::tui::ui::modals::nosql_transfer_rect(frame_area),
         DialogMode::None => Rect::default(),
     }
 }

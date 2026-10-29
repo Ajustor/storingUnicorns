@@ -2,7 +2,9 @@
 //! between display positions and rows.
 
 use super::changes::{PendingEdits, RowRef};
-use crate::engine::models::{display_cell, is_null};
+use super::display_cell;
+use crate::engine::models::is_null;
+use crate::engine::nosql::is_absent;
 use std::cmp::Ordering;
 
 use super::GridState;
@@ -34,7 +36,7 @@ impl SortKey {
     fn of(cell: Option<&String>) -> Self {
         match cell.map(String::as_str) {
             None => Self::Null,
-            Some(v) if is_null(v) => Self::Null,
+            Some(v) if is_null(v) || is_absent(v) => Self::Null,
             Some(v) => match v.trim().parse::<f64>() {
                 Ok(n) if !n.is_nan() => Self::Number(n),
                 _ => Self::Text(v.to_lowercase()),

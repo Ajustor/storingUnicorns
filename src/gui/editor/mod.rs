@@ -160,6 +160,9 @@ pub struct EditorContext<'a> {
     pub known_columns: &'a [String],
     /// Tables and columns of the console's connection.
     pub source: &'a dyn CompletionSource,
+    /// A MongoDB / Redis console: completed by the engine's NoSQL
+    /// completion instead of the SQL one.
+    pub nosql: Option<completion::NoSqlScope<'a>>,
 }
 
 pub struct EditorOutput {
@@ -169,6 +172,16 @@ pub struct EditorOutput {
     pub selection: Option<(usize, usize)>,
     /// The text was changed this frame (typing or completion).
     pub changed: bool,
+}
+
+/// The empty editor's hint, by engine (`None`: SQL).
+pub fn hint_text(db: Option<&crate::engine::models::DatabaseType>) -> &'static str {
+    use crate::engine::models::DatabaseType;
+    match db {
+        Some(DatabaseType::MongoDB) => "db.collection.find({})",
+        Some(DatabaseType::Redis) => "GET clé",
+        _ => "SELECT * FROM …",
+    }
 }
 
 /// Draw the editor filling `min_height` (more when the text is longer).
@@ -194,13 +207,16 @@ pub fn show(
         .code_editor()
         .desired_width(f32::INFINITY)
         .min_size(egui::vec2(0.0, min_height))
-        .hint_text("SELECT * FROM …")
+        .hint_text(hint_text(cx.nosql.as_ref().map(|n| n.db)))
         .layouter(&mut layouter)
         .show(ui);
     ui.data_mut(|d| d.insert_temp(cache_id, cache));
     let changed = output.response.changed();
-    let scope = Scope::Script {
-        fallback_columns: cx.known_columns,
+    let scope = match cx.nosql {
+        Some(n) => Scope::NoSql(n),
+        None => Scope::Script {
+            fallback_columns: cx.known_columns,
+        },
     };
     completion.after_edit(ui, &output, text, id, cx.source, scope, triggered);
 
@@ -343,6 +359,7 @@ mod tests {
                             EditorContext {
                                 known_columns: &cols,
                                 source: &completion::NoSource,
+                                nosql: None,
                             },
                         )
                     });

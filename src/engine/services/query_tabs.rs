@@ -14,6 +14,9 @@ pub struct QueryTab {
     /// Name of the connection this console is bound to (GUI).
     #[serde(default)]
     pub connection: Option<String>,
+    /// Current database of a MongoDB / Redis console (`use shop`, `SELECT 3`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nosql_scope: Option<String>,
 }
 
 impl Default for QueryTab {
@@ -24,6 +27,7 @@ impl Default for QueryTab {
             cursor_position: 0,
             is_modified: false,
             connection: None,
+            nosql_scope: None,
         }
     }
 }
@@ -36,6 +40,7 @@ impl QueryTab {
             cursor_position: 0,
             is_modified: false,
             connection: None,
+            nosql_scope: None,
         }
     }
 
@@ -47,6 +52,7 @@ impl QueryTab {
             query,
             is_modified: false,
             connection: None,
+            nosql_scope: None,
         }
     }
 }

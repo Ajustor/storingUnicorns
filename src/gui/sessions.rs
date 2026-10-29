@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::engine::models::{ConnectionConfig, SchemaInfo, TableDetails};
+use crate::engine::nosql::redis::KeyInfo;
 use crate::engine::ops::transfer::qualified;
 use crate::engine::ops::tx::ManualTx;
 use crate::engine::sql::completion::{ColumnInfo, TableRef};
@@ -42,6 +43,29 @@ pub struct Session {
     /// the request awaited: an answer to another one is stale.
     pub loading: HashMap<String, RunId>,
     pub tx: TxMode,
+    /// Redis: the keys the explorer lists, per database, filled when the
+    /// database is opened.
+    pub redis_keys: HashMap<u8, Result<KeySet, String>>,
+    /// Redis databases whose keys are being listed, with the request awaited.
+    pub keys_loading: HashMap<u8, RunId>,
+    /// The names of the keys listed (Redis completion), kept with them.
+    pub key_names: Vec<String>,
+    /// Redis: keys per database from `INFO keyspace` (empty databases
+    /// absent); `None` until known, or when INFO is refused.
+    pub key_counts: Option<std::collections::BTreeMap<u8, u64>>,
+}
+
+/// The keys of a Redis database listed by the explorer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeySet {
+    pub keys: Vec<KeyInfo>,
+    /// The listing stopped at the explorer's limit: there are more.
+    pub more: bool,
+}
+
+/// The index of a Redis database from its schema name (`db3` → 3).
+pub fn redis_db(schema: &str) -> Option<u8> {
+    schema.strip_prefix("db")?.parse().ok()
 }
 
 impl Session {
@@ -54,7 +78,52 @@ impl Session {
             details: HashMap::new(),
             loading: HashMap::new(),
             tx: TxMode::Auto,
+            redis_keys: HashMap::new(),
+            keys_loading: HashMap::new(),
+            key_names: Vec::new(),
+            key_counts: None,
         }
+    }
+
+    /// A MongoDB or Redis session (no SQL path may be used for it).
+    pub fn is_nosql(&self) -> bool {
+        !self.config.db_type.is_sql()
+    }
+
+    /// Request the keys of Redis database `db` for the explorer,
+    /// superseding a listing still running for it.
+    pub fn load_keys(&mut self, worker: &mut Worker, name: &str, db: u8) {
+        let run = worker.explorer_keys(name.to_string(), self.conn.clone(), db);
+        self.keys_loading.insert(db, run);
+        // The keys changed maybe: their counts too.
+        worker.key_counts(name.to_string(), self.conn.clone());
+    }
+
+    /// The key count the explorer shows for Redis database `db`, and
+    /// whether it is a lower bound: `INFO keyspace` when the server gives
+    /// it, else the keys listed (capped); `None` when neither is known.
+    pub fn key_count(&self, db: u8) -> Option<(u64, bool)> {
+        if let Some(counts) = &self.key_counts {
+            return Some((counts.get(&db).copied().unwrap_or(0), false));
+        }
+        match self.redis_keys.get(&db) {
+            Some(Ok(set)) => Some((set.keys.len() as u64, set.more)),
+            _ => None,
+        }
+    }
+
+    /// Compute `key_names` again (the listed keys changed).
+    pub fn refresh_key_names(&mut self) {
+        let mut names: Vec<String> = self
+            .redis_keys
+            .values()
+            .filter_map(|k| k.as_ref().ok())
+            .flat_map(|k| &k.keys)
+            .map(|k| crate::engine::nosql::redis::display_bytes(&k.key))
+            .collect();
+        names.sort();
+        names.dedup();
+        self.key_names = names;
     }
 
     /// Where the consoles and grids of this session run their SQL.
@@ -124,6 +193,23 @@ impl Session {
             self.load_details(worker, name, &key);
         }
     }
+}
+
+/// Store the keys of Redis database `db` answered by request `run`, unless
+/// it is no longer awaited (see [`accept_details`]).
+pub fn accept_keys(
+    keys: &mut HashMap<u8, Result<KeySet, String>>,
+    loading: &mut HashMap<u8, RunId>,
+    db: u8,
+    run: RunId,
+    outcome: Result<KeySet, String>,
+) -> bool {
+    if loading.get(&db) != Some(&run) {
+        return false;
+    }
+    loading.remove(&db);
+    keys.insert(db, outcome);
+    true
 }
 
 /// See [`Session::details_key`].
@@ -297,6 +383,11 @@ impl Sessions {
         }
     }
 
+    /// Whether connection `name` is an open MongoDB / Redis session.
+    pub fn is_nosql(&self, name: &str) -> bool {
+        self.open.get(name).is_some_and(Session::is_nosql)
+    }
+
     /// Whether connection `name` is in manual transaction mode.
     pub fn is_manual(&self, name: &str) -> bool {
         self.open.get(name).is_some_and(|s| s.manual_tx().is_some())
@@ -389,6 +480,35 @@ mod tests {
                 s("dev", "main", "t"),
             ]
         );
+    }
+
+    #[test]
+    fn redis_key_counts_prefer_info_keyspace() {
+        let config = ConnectionConfig {
+            db_type: crate::engine::models::DatabaseType::Redis,
+            ..Default::default()
+        };
+        let conn = Arc::new(crate::engine::ops::test_support::redis_offline());
+        let mut s = Session::new(config, conn, Vec::new());
+        assert_eq!(s.key_count(0), None, "nothing known yet");
+        let set = KeySet {
+            keys: vec![
+                crate::engine::nosql::redis::KeyInfo {
+                    key: b"a".to_vec(),
+                    kind: crate::engine::nosql::redis::RedisType::String,
+                    ttl: None,
+                    size: None,
+                };
+                3
+            ],
+            more: true,
+        };
+        s.redis_keys.insert(0, Ok(set));
+        // INFO refused: the keys listed, a lower bound.
+        assert_eq!(s.key_count(0), Some((3, true)));
+        s.key_counts = Some([(0, 12_345)].into_iter().collect());
+        assert_eq!(s.key_count(0), Some((12_345, false)));
+        assert_eq!(s.key_count(4), Some((0, false)), "absent = empty");
     }
 
     #[test]
@@ -567,6 +687,36 @@ mod tests {
             Some(vec![]),
             "unknown: nothing to load"
         );
+    }
+
+    #[test]
+    fn redis_databases_by_schema_name() {
+        assert_eq!(redis_db("db0"), Some(0));
+        assert_eq!(redis_db("db15"), Some(15));
+        assert_eq!(redis_db("main"), None);
+        assert_eq!(redis_db("dbx"), None);
+    }
+
+    #[test]
+    fn stale_key_listings_are_dropped() {
+        let (mut keys, mut loading) = (HashMap::new(), HashMap::new());
+        loading.insert(3u8, 7);
+        assert!(!accept_keys(
+            &mut keys,
+            &mut loading,
+            3,
+            6,
+            Ok(KeySet::default())
+        ));
+        assert!(keys.is_empty());
+        assert!(accept_keys(
+            &mut keys,
+            &mut loading,
+            3,
+            7,
+            Ok(KeySet::default())
+        ));
+        assert!(keys.contains_key(&3) && loading.is_empty());
     }
 
     #[test]

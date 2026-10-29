@@ -538,8 +538,23 @@ fn map_bit_value(value: &str) -> String {
     }
 }
 
+/// A field read as `""` (quoted, nothing inside) by
+/// [`parse_csv_marking_quoted_empty`]: an empty string, as opposed to an
+/// unquoted empty field (NULL / missing). Can't be typed.
+pub const QUOTED_EMPTY: &str = "\u{E000}QUOTED_EMPTY";
+
 /// Export query results to CSV format
 pub fn export_to_csv(result: &QueryResult) -> String {
+    export_csv(result, false)
+}
+
+/// [`export_to_csv`], an empty string written `""` (NULL stays an empty
+/// field): MongoDB keeps `{note: ""}` apart from a null or missing field.
+pub fn export_to_csv_quoting_empty(result: &QueryResult) -> String {
+    export_csv(result, true)
+}
+
+fn export_csv(result: &QueryResult, quote_empty: bool) -> String {
     let mut output = String::new();
 
     // Header row
@@ -560,6 +575,8 @@ pub fn export_to_csv(result: &QueryResult) -> String {
                 if is_null(v) {
                     // NULL: an empty field (as the CSV import reads it).
                     String::new()
+                } else if quote_empty && v.is_empty() {
+                    "\"\"".to_string()
                 } else if idx < result.columns.len() && is_bit_type(&result.columns[idx].type_name)
                 {
                     escape_csv_field(&map_bit_value(v))
@@ -661,6 +678,21 @@ pub fn export_to_file(
 
 /// Parse a CSV file and return column names and rows
 pub fn parse_csv(content: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    parse_csv_with(content, false)
+}
+
+/// [`parse_csv`], a `""` field read as [`QUOTED_EMPTY`] (an empty string)
+/// and an unquoted empty field as "" (NULL / missing).
+pub fn parse_csv_marking_quoted_empty(
+    content: &str,
+) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    parse_csv_with(content, true)
+}
+
+fn parse_csv_with(
+    content: &str,
+    mark_quoted_empty: bool,
+) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
     let mut lines = content.lines();
 
     // Parse header
@@ -677,7 +709,7 @@ pub fn parse_csv(content: &str) -> Result<(Vec<String>, Vec<Vec<String>>), Strin
         if line.trim().is_empty() {
             continue;
         }
-        let fields = parse_csv_line(line);
+        let fields = parse_csv_line_with(line, mark_quoted_empty);
         if fields.len() != columns.len() {
             return Err(format!(
                 "Row {} has {} fields, expected {} (columns)",
@@ -694,10 +726,26 @@ pub fn parse_csv(content: &str) -> Result<(Vec<String>, Vec<Vec<String>>), Strin
 
 /// Parse a single CSV line respecting quoted fields
 fn parse_csv_line(line: &str) -> Vec<String> {
+    parse_csv_line_with(line, false)
+}
+
+fn parse_csv_line_with(line: &str, mark_quoted_empty: bool) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
+    // The current field had quotes (`""` = an empty string).
+    let mut quoted = false;
     let mut chars = line.chars().peekable();
+    let finish = |current: &mut String, quoted: &mut bool| {
+        let field = if mark_quoted_empty && *quoted && current.is_empty() {
+            QUOTED_EMPTY.to_string()
+        } else {
+            std::mem::take(current)
+        };
+        current.clear();
+        *quoted = false;
+        field
+    };
 
     while let Some(c) = chars.next() {
         if in_quotes {
@@ -717,10 +765,10 @@ fn parse_csv_line(line: &str) -> Vec<String> {
             match c {
                 '"' => {
                     in_quotes = true;
+                    quoted = true;
                 }
                 ',' => {
-                    fields.push(current.clone());
-                    current.clear();
+                    fields.push(finish(&mut current, &mut quoted));
                 }
                 _ => {
                     current.push(c);
@@ -729,7 +777,7 @@ fn parse_csv_line(line: &str) -> Vec<String> {
         }
     }
 
-    fields.push(current);
+    fields.push(finish(&mut current, &mut quoted));
     fields
 }
 

@@ -138,10 +138,28 @@ impl App {
                 tab.summary = Some("Annulé".into());
             }
             ConsoleAction::Rebind(name) => {
+                // Another engine maybe: the console's scope follows.
+                let scope = self.nosql_scope_of(&name, None);
+                let Some(tab) = self.tabs.list.get_mut(index) else {
+                    return;
+                };
+                let TabKind::Console(c) = &mut tab.kind else {
+                    return;
+                };
                 tab.connection = name;
                 *c.completion = Default::default();
+                c.scope = scope;
                 self.consoles_changed();
             }
+            ConsoleAction::NoSqlSubmit {
+                result_index,
+                changes,
+            } => self.submit_nosql_result(index, result_index, changes),
+            ConsoleAction::OpenKey {
+                connection,
+                db,
+                key,
+            } => self.open_keys(&connection, db, Some(key)),
             ConsoleAction::History(search) => {
                 self.dialog = Some(Dialog::History(HistoryPopup::new(search)));
             }
@@ -199,6 +217,11 @@ impl App {
         let TabKind::Console(c) = &mut tab.kind else {
             return;
         };
+        // MongoDB / Redis: never the SQL runner.
+        if self.sessions.is_nosql(&tab.connection) {
+            self.run_nosql_console(id, kind, false);
+            return;
+        }
         let Some(runner) = self.sessions.runner(&tab.connection) else {
             let connection = tab.connection.clone();
             self.not_connected(&connection);

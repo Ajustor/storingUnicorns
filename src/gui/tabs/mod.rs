@@ -4,6 +4,8 @@
 pub mod console;
 pub mod data;
 pub mod ddl;
+pub mod documents;
+pub mod keys;
 
 use crate::engine::services::query_tabs::{QueryTab, QueryTabsState};
 
@@ -15,6 +17,10 @@ pub enum TabKind {
     Console(console::ConsoleTab),
     Data(Box<data::DataTab>),
     Ddl(ddl::DdlTab),
+    /// The documents of a MongoDB collection.
+    Documents(Box<documents::DocumentsTab>),
+    /// The keys of a Redis database.
+    Keys(Box<keys::KeysTab>),
 }
 
 impl TabKind {
@@ -24,8 +30,18 @@ impl TabKind {
             Self::Console(_) => icon::TERMINAL_WINDOW,
             Self::Data(_) => icon::TABLE,
             Self::Ddl(_) => icon::CODE,
+            Self::Documents(_) => icon::FILES,
+            Self::Keys(_) => icon::KEY,
         }
     }
+}
+
+/// What a tab asks the app to do after one of its outcomes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TabAction {
+    Data(data::DataAction),
+    Documents(documents::DocAction),
+    Keys(keys::KeyAction),
 }
 
 /// Run ids a tab is waiting for, one slot per kind of operation. Events of
@@ -37,6 +53,10 @@ pub struct Runs {
     pub count: Option<RunId>,
     pub submit: Option<RunId>,
     pub ddl: Option<RunId>,
+    /// A Redis value read (« Clés » tab).
+    pub value: Option<RunId>,
+    /// An aggregation (« Documents » tab).
+    pub agg: Option<RunId>,
 }
 
 impl Runs {
@@ -44,8 +64,12 @@ impl Runs {
     /// Events that are not tab outcomes are never accepted.
     pub fn accept(&mut self, ev: &Event) -> bool {
         let (slot, run) = match ev {
-            Event::Script { run, .. } => (&mut self.script, *run),
-            Event::Page { run, .. } => (&mut self.page, *run),
+            Event::Script { run, .. } | Event::NoSqlScript { run, .. } => (&mut self.script, *run),
+            Event::Page { run, .. } | Event::DocPage { run, .. } | Event::KeyPage { run, .. } => {
+                (&mut self.page, *run)
+            }
+            Event::KeyValue { run, .. } => (&mut self.value, *run),
+            Event::Aggregated { run, .. } => (&mut self.agg, *run),
             Event::Count { run, .. } => (&mut self.count, *run),
             Event::Submitted { run, .. } => (&mut self.submit, *run),
             Event::Ddl { run, .. } => (&mut self.ddl, *run),
@@ -65,7 +89,8 @@ impl Runs {
 pub enum CloseRisk {
     /// Nothing: close right away.
     None,
-    /// A data tab with pending edits (they can be submitted first).
+    /// A data, documents or keys tab with pending edits (they can be
+    /// submitted first).
     DataEdits,
     /// A console: its text (not kept once closed) and/or pending edits in
     /// its result tabs.
@@ -90,6 +115,8 @@ impl Tab {
         match &mut self.kind {
             TabKind::Console(c) => c.commit_editors(),
             TabKind::Data(d) => d.commit_editor(),
+            TabKind::Documents(d) => d.commit_editor(),
+            TabKind::Keys(k) => k.commit_editor(),
             TabKind::Ddl(_) => {}
         }
     }
@@ -99,6 +126,8 @@ impl Tab {
         match &self.kind {
             TabKind::Console(c) => c.results.iter().any(|r| !r.grid.edits.is_empty()),
             TabKind::Data(d) => !d.grid.edits.is_empty(),
+            TabKind::Documents(d) => !d.grid.edits.is_empty(),
+            TabKind::Keys(k) => k.has_pending_edits(),
             TabKind::Ddl(_) => false,
         }
     }
@@ -112,14 +141,16 @@ impl Tab {
                 text: !c.query.trim().is_empty(),
                 edits,
             },
-            TabKind::Data(_) if edits => CloseRisk::DataEdits,
+            TabKind::Data(_) | TabKind::Documents(_) | TabKind::Keys(_) if edits => {
+                CloseRisk::DataEdits
+            }
             _ => CloseRisk::None,
         }
     }
 
     /// Hand an outcome of this tab to its body. Stale runs are dropped.
-    /// Returns what a data tab asks the app to do next.
-    pub fn on_event(&mut self, ev: Event) -> Option<data::DataAction> {
+    /// Returns what the tab asks the app to do next.
+    pub fn on_event(&mut self, ev: Event) -> Option<TabAction> {
         if !self.runs.accept(&ev) {
             return None;
         }
@@ -131,8 +162,16 @@ impl Tab {
                 if let Some(summary) = d.summary() {
                     self.summary = Some(summary);
                 }
-                action
+                action.map(TabAction::Data)
             }
+            TabKind::Documents(d) => {
+                let action = d.on_event(ev);
+                if let Some(summary) = d.summary() {
+                    self.summary = Some(summary);
+                }
+                action.map(TabAction::Documents)
+            }
+            TabKind::Keys(k) => k.on_event(ev).map(TabAction::Keys),
             TabKind::Ddl(d) => {
                 d.on_event(ev);
                 None
@@ -207,6 +246,26 @@ impl Tabs {
         })
     }
 
+    /// « Documents » tab already open for (connection, collection)? → its
+    /// index.
+    pub fn find_documents(
+        &self,
+        connection: &str,
+        coll: &crate::engine::nosql::mongo::CollectionRef,
+    ) -> Option<usize> {
+        self.list.iter().position(|t| {
+            t.connection == connection
+                && matches!(&t.kind, TabKind::Documents(d) if &d.coll == coll)
+        })
+    }
+
+    /// « Clés » tab already open for (connection, database)? → its index.
+    pub fn find_keys(&self, connection: &str, db: u8) -> Option<usize> {
+        self.list.iter().position(|t| {
+            t.connection == connection && matches!(&t.kind, TabKind::Keys(k) if k.db == db)
+        })
+    }
+
     /// Number of tabs (of `connection` only, when given) with pending edits
     /// (open cell editors committed first).
     pub fn with_pending_edits(&mut self, connection: Option<&str>) -> usize {
@@ -268,6 +327,7 @@ pub fn persisted_consoles(tabs: &Tabs, pending: &[QueryTab]) -> QueryTabsState {
             cursor_position: c.cursor,
             is_modified: false,
             connection: Some(t.connection.clone()),
+            nosql_scope: c.scope.as_ref().map(|s| s.database.clone()),
         }),
         _ => None,
     });
@@ -472,6 +532,97 @@ mod tests {
         );
         assert_eq!(names(take_consoles(&mut pending, "prod", false)), ["a"]);
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn nosql_outcomes_fill_their_own_slots() {
+        let mut runs = Runs {
+            script: Some(1),
+            page: Some(2),
+            value: Some(3),
+            agg: Some(4),
+            ..Default::default()
+        };
+        let script = Event::NoSqlScript {
+            tab: 1,
+            run: 1,
+            outcomes: vec![],
+            scope: crate::engine::nosql::NoSqlScope {
+                database: "shop".into(),
+            },
+        };
+        assert!(runs.accept(&script));
+        let value = |run| Event::KeyValue {
+            tab: 1,
+            run,
+            key: vec![],
+            outcome: Ok(None),
+        };
+        assert!(!runs.accept(&value(2)), "a page id is not a value id");
+        assert!(runs.accept(&value(3)));
+        assert!(runs.accept(&Event::Aggregated {
+            tab: 1,
+            run: 4,
+            outcome: Err("x".into())
+        }));
+        assert!(runs.accept(&Event::KeyPage {
+            tab: 1,
+            run: 2,
+            outcome: Err("x".into())
+        }));
+        assert_eq!(runs, Runs::default());
+    }
+
+    #[test]
+    fn nosql_tabs_are_found_by_collection_and_database() {
+        use crate::engine::nosql::mongo::CollectionRef;
+        let users = CollectionRef {
+            db: "shop".into(),
+            coll: "users".into(),
+        };
+        let mut tabs = Tabs::default();
+        tabs.add(
+            "mongo".into(),
+            "users".into(),
+            TabKind::Documents(Box::new(documents::DocumentsTab::new(
+                users.clone(),
+                documents::DocMode::Find,
+            ))),
+        );
+        tabs.add(
+            "redis".into(),
+            "db3".into(),
+            TabKind::Keys(Box::new(keys::KeysTab::new(3, None))),
+        );
+        assert_eq!(tabs.find_documents("mongo", &users), Some(0));
+        assert_eq!(tabs.find_documents("other", &users), None);
+        assert_eq!(tabs.find_keys("redis", 3), Some(1));
+        assert_eq!(tabs.find_keys("redis", 0), None);
+        // Pending value edits count like a data tab's.
+        let TabKind::Keys(k) = &mut tabs.list[1].kind else {
+            unreachable!()
+        };
+        k.string_buf = "changed".into();
+        assert_eq!(tabs.list[1].close_risk(), CloseRisk::DataEdits);
+        assert_eq!(tabs.with_pending_edits(Some("redis")), 1);
+    }
+
+    #[test]
+    fn nosql_consoles_persist_their_database() {
+        let mut tabs = Tabs::default();
+        let mut c = console::ConsoleTab::new("db.users.find()".into(), 0);
+        c.scope = Some(crate::engine::nosql::NoSqlScope {
+            database: "shop".into(),
+        });
+        tabs.add("mongo".into(), "Console 1".into(), TabKind::Console(c));
+        tabs.add(
+            "pg".into(),
+            "Console 2".into(),
+            TabKind::Console(console::ConsoleTab::new("SELECT 1".into(), 0)),
+        );
+        let state = persisted_consoles(&tabs, &[]);
+        assert_eq!(state.tabs[0].nosql_scope.as_deref(), Some("shop"));
+        assert_eq!(state.tabs[1].nosql_scope, None);
     }
 
     #[test]

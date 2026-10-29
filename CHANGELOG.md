@@ -7,6 +7,17 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [Non publié]
+
+### Corrections
+
+- **« Redémarrer maintenant » depuis l'exécutable** : PowerShell, qui installe
+  la mise à jour puis relance l'application, est lancé par son chemin complet.
+  Un `PATH` Windows abîmé (guillemets en trop) le rendait introuvable quand
+  l'application était ouverte depuis l'Explorateur : rien n'était installé.
+  S'il ne peut toujours pas démarrer, la mise à jour s'installe quand même,
+  sans relance automatique.
+
 ## [0.19.0] - 2026-10-29
 
 ### Nouveautés

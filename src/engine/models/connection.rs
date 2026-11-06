@@ -69,6 +69,27 @@ impl DatabaseType {
     pub fn runs_tsql_batches(&self) -> bool {
         matches!(self, DatabaseType::SQLServer | DatabaseType::Azure)
     }
+
+    /// Name in the connection type pickers: MySQL also covers MariaDB.
+    pub fn picker_label(&self) -> String {
+        match self {
+            DatabaseType::MySQL => "MySQL / MariaDB".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Whether a connection may leave the database empty: PostgreSQL then
+    /// uses the user's database, MySQL / MariaDB none (names qualified by
+    /// schema), MongoDB / Redis their defaults.
+    pub fn database_optional(&self) -> bool {
+        matches!(
+            self,
+            DatabaseType::Postgres
+                | DatabaseType::MySQL
+                | DatabaseType::MongoDB
+                | DatabaseType::Redis
+        )
+    }
 }
 
 impl std::fmt::Display for DatabaseType {

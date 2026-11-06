@@ -225,7 +225,7 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     } else {
         ""
     };
-    let db_content = format!("Type: {}{}", nc.db_type, db_hint);
+    let db_content = format!("Type: {}{}", nc.db_type.picker_label(), db_hint);
     let db_paragraph = Paragraph::new(db_content).style(db_style).block(
         Block::default()
             .borders(Borders::BOTTOM)
@@ -470,6 +470,8 @@ pub fn render_new_connection_dialog(frame: &mut Frame, state: &AppState) {
     );
     if is_mongo && nc.database.is_empty() {
         render_placeholder(frame, chunks[idx], db_label, "vide = toutes");
+    } else if !is_redis && nc.db_type.database_optional() && nc.database.is_empty() {
+        render_placeholder(frame, chunks[idx], db_label, "facultative");
     }
     idx += 1;
 

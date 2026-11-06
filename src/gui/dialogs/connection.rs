@@ -562,7 +562,7 @@ impl ConnectionForm {
         }
         let server = self.uses_server();
         // MongoDB: no default database = every database.
-        if self.database.trim().is_empty() && !self.nosql() {
+        if self.database.trim().is_empty() && !self.db_type.database_optional() {
             return Err(if server {
                 "La base est obligatoire"
             } else {
@@ -789,12 +789,12 @@ impl ConnectionForm {
                 egui::ComboBox::from_id_salt("db_type")
                     .width(popup::combo_width(
                         ui,
-                        DB_TYPES.iter().map(|d| d.to_string()),
+                        DB_TYPES.iter().map(|d| d.picker_label()),
                     ))
-                    .selected_text(t.to_string())
+                    .selected_text(t.picker_label())
                     .show_ui(ui, |ui| {
                         for d in DB_TYPES {
-                            let label = d.to_string();
+                            let label = d.picker_label();
                             ui.selectable_value(&mut t, d, label);
                         }
                     });
@@ -938,7 +938,12 @@ impl ConnectionForm {
             ui.end_row();
         }
         ui.label("Base");
-        ui.text_edit_singleline(&mut self.database);
+        let base = egui::TextEdit::singleline(&mut self.database);
+        ui.add(if self.db_type.database_optional() {
+            base.hint_text("facultative")
+        } else {
+            base
+        });
         ui.end_row();
         if self.uses_tls() {
             self.ssl_fields(ui);
@@ -1420,6 +1425,28 @@ mod tests {
         assert_eq!(f.port, "3306");
         f.port = "abc".into();
         assert!(f.validate(&[]).is_err());
+    }
+
+    #[test]
+    fn database_is_optional_for_postgres_and_mysql_only() {
+        let mut f = ConnectionForm::new(None);
+        f.name = "x".into();
+        for t in [DatabaseType::Postgres, DatabaseType::MySQL] {
+            f.set_db_type(t.clone());
+            f.database.clear();
+            assert_eq!(f.validate(&[]).unwrap().database, "", "{t}");
+        }
+        for t in [DatabaseType::SQLServer, DatabaseType::SQLite] {
+            f.set_db_type(t.clone());
+            f.database.clear();
+            assert!(f.validate(&[]).is_err(), "{t}");
+        }
+    }
+
+    #[test]
+    fn mysql_is_listed_with_mariadb() {
+        assert_eq!(DatabaseType::MySQL.picker_label(), "MySQL / MariaDB");
+        assert_eq!(DatabaseType::Postgres.picker_label(), "PostgreSQL");
     }
 
     #[test]

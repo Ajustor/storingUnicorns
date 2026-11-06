@@ -7,6 +7,15 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.20.1] - 2026-11-06
+
+### Corrections
+
+- **Grille de données : la vue suit la case sélectionnée** : en naviguant au
+  clavier (flèches, Tab, Page préc./suiv.), la grille défile pour garder la
+  case sélectionnée à l'écran, aussi vers la droite et la gauche. La vue ne
+  défilait pas horizontalement et avait un déplacement de retard verticalement.
+
 ## [0.20.0] - 2026-11-06
 
 ### Nouveautés

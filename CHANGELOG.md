@@ -7,6 +7,17 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.20.0] - 2026-11-06
+
+### Nouveautés
+
+- **MariaDB mis en avant** : le type de connexion s'appelle désormais
+  « MySQL / MariaDB », dans l'interface graphique et l'interface terminal.
+- **Base facultative pour PostgreSQL et MySQL / MariaDB** : le champ Base peut
+  rester vide. MySQL / MariaDB ne sélectionne alors aucune base (les tables de
+  toutes les bases restent visibles dans l'explorateur), PostgreSQL se connecte
+  à la base du même nom que l'utilisateur.
+
 ## [0.19.1] - 2026-10-29
 
 ### Corrections

@@ -361,6 +361,9 @@ pub fn show(
             select_all,
             ..
         } = &mut *state;
+        // Screen x range of the focused column, read from its header cell
+        // (always drawn, unlike rows outside the viewport).
+        let mut focused_x = None;
         egui::ScrollArea::horizontal()
             .id_salt(id.with("h"))
             .auto_shrink([false, false])
@@ -388,6 +391,9 @@ pub fn show(
                         });
                         for (c, column) in result.columns.iter().enumerate() {
                             header.col(|ui| {
+                                if scroll_pos.is_some() && selected.is_some_and(|(_, sc)| sc == c) {
+                                    focused_x = Some(ui.max_rect().x_range());
+                                }
                                 let sort = sort_shown.filter(|(sc, _)| *sc == c).map(|(_, a)| a);
                                 let link = opts.links.get(c).and_then(Option::as_ref);
                                 let (job, hover) = header_job(ui, column, link, sort);
@@ -486,9 +492,6 @@ pub fn show(
                                             Stroke::new(1.5, ACCENT),
                                             StrokeKind::Inside,
                                         );
-                                        if scroll_pos.is_some() {
-                                            ui.scroll_to_rect(rect, None);
-                                        }
                                     }
                                 });
                                 let command = ctx.input(|i| i.modifiers.command);
@@ -513,8 +516,24 @@ pub fn show(
                             }
                         });
                     });
+                // The table's own scroll area takes every scroll target
+                // (and asks for x = 0 when scrolling to a row): bring the
+                // focused column into view here, for the horizontal area.
+                if let Some(x) = focused_x {
+                    let y = ui.clip_rect().y_range();
+                    // Not animated, like the rows (`animate_scrolling(false)`).
+                    ui.scroll_to_rect_animation(
+                        egui::Rect::from_x_y_ranges(x, y),
+                        None,
+                        egui::style::ScrollAnimation::none(),
+                    );
+                }
             });
     });
+    if scroll_pos.is_some() {
+        // The new offsets only show on the next frame.
+        ctx.request_repaint();
+    }
 
     match footer(ui, state, result, opts.editable, &mut cell_action) {
         GridAction::Submit => {
@@ -859,6 +878,90 @@ fn footer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Arrow keys move the focus out of the viewport, right and down: the
+    /// grid scrolls both ways so the focused cell stays on screen.
+    #[test]
+    fn keyboard_focus_stays_in_view() {
+        use crate::engine::models::Column;
+        use crate::gui::ui_test::{key, Driver};
+        use egui::Key;
+        let columns = (0..30)
+            .map(|c| Column {
+                name: format!("col{c}"),
+                type_name: "TEXT".into(),
+                nullable: true,
+                is_primary_key: false,
+            })
+            .collect();
+        let rows = (0..200)
+            .map(|r| (0..30).map(|c| format!("r{r}c{c}")).collect())
+            .collect();
+        let result = QueryResult {
+            columns,
+            rows,
+            ..QueryResult::default()
+        };
+        let id = egui::Id::new("grid");
+        let mut state = GridState::default();
+        let mut d = Driver::new();
+        // The focused cell after the frame.
+        let mut frame = |d: &mut Driver, events| {
+            d.central(events, |ui| {
+                show(
+                    ui,
+                    id,
+                    &mut state,
+                    GridOptions {
+                        result: &result,
+                        editable: false,
+                        server_sort: false,
+                        sort_indicator: None,
+                        links: &[],
+                        incoming: &[],
+                    },
+                );
+                state.selected
+            })
+        };
+        frame(&mut d, vec![]);
+        d.ctx.memory_mut(|m| m.request_focus(id.with("focus")));
+        frame(&mut d, vec![]);
+        let on_screen = |d: &Driver, label: &str| {
+            let p = d.text(label).unwrap_or_else(|| panic!("{label} not drawn"));
+            assert!(
+                (0.0..1280.0).contains(&p.x) && (0.0..800.0).contains(&p.y),
+                "{label} off screen at {p:?}"
+            );
+        };
+        // Press `k` `n` times, each followed by the repaint the grid asked
+        // for; the focused cell then.
+        let mut press = |d: &mut Driver, k, n| {
+            for _ in 0..n {
+                frame(d, vec![key(k)]);
+            }
+            frame(d, vec![])
+        };
+        // The first arrow focuses the first cell.
+        assert_eq!(press(&mut d, Key::ArrowDown, 1), Some((RowRef::Base(0), 0)));
+        assert_eq!(
+            press(&mut d, Key::ArrowRight, 25),
+            Some((RowRef::Base(0), 25))
+        );
+        on_screen(&d, "r0c25");
+        assert_eq!(
+            press(&mut d, Key::ArrowDown, 150),
+            Some((RowRef::Base(150), 25))
+        );
+        on_screen(&d, "r150c25");
+        assert_eq!(
+            press(&mut d, Key::ArrowLeft, 25),
+            Some((RowRef::Base(150), 0))
+        );
+        on_screen(&d, "r150c0");
+        assert_eq!(press(&mut d, Key::ArrowUp, 150), Some((RowRef::Base(0), 0)));
+        on_screen(&d, "r0c0");
+    }
 
     #[test]
     fn row_as_tsv() {

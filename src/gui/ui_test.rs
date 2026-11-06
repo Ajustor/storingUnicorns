@@ -67,6 +67,26 @@ impl Driver {
         result.expect("one pass")
     }
 
+    /// Run one frame with `events`, `f` drawing in the central panel like
+    /// a tab; what `f` returned.
+    pub fn central<R>(&mut self, events: Vec<Event>, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        let mut f = Some(f);
+        let mut result = None;
+        let out = self.ctx.run(input, |ctx| {
+            if let Some(f) = f.take() {
+                egui::CentralPanel::default().show(ctx, |ui| result = Some(f(ui)));
+            }
+        });
+        self.out = Some(out);
+        result.expect("one pass")
+    }
+
     /// Centre of the widget (of any role: link, label…) of the last frame
     /// whose label contains `label`.
     pub fn widget(&self, label: &str) -> Option<Pos2> {
@@ -98,6 +118,22 @@ impl Driver {
                 center: Pos2::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32),
                 enabled: !node.is_disabled(),
             })
+        })
+    }
+
+    /// Centre of the label of the last frame showing exactly `text`
+    /// (AccessKit puts a label's text in its value).
+    pub fn text(&self, text: &str) -> Option<Pos2> {
+        let update = self
+            .out
+            .as_ref()?
+            .platform_output
+            .accesskit_update
+            .as_ref()?;
+        update.nodes.iter().find_map(|(_, node)| {
+            let found = node.role() == Role::Label && node.value()? == text;
+            let b = node.bounds()?;
+            found.then(|| Pos2::new(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
         })
     }
 

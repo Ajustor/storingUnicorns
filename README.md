@@ -300,6 +300,8 @@ macOS, `Ctrl+Alt+L` ailleurs).
 | `Ctrl+Alt+E`                    | `⌥⌘E`                    | Historique des requêtes (recherche, aperçu, Insérer / Copier) |
 | `Ctrl+N`                        | `⌘N`                     | Rechercher une table                                     |
 | `Ctrl+T` / `Ctrl+W`             | `⌘T` / `⌘W`              | Nouvelle console (connexion courante) / fermer l'onglet  |
+| `Ctrl+Tab` / `Ctrl+Maj+Tab`     | `⌃⇥` / `⌃⇧⇥`             | Onglet suivant / précédent                               |
+| `Pg↑` / `Pg↓` (+ `Maj`)         | `⇞` / `⇟` (+ `⇧`)        | Console : page précédente / suivante (étendre la sélection) |
 | `Ctrl+S`                        | `⌘S`                     | Enregistrer les consoles                                 |
 | `Ctrl+Espace`                   | `⌃Espace`                | Autocomplétion contextuelle (console, barres WHERE / ORDER BY) |
 | `F2` / `Entrée` / double-clic   | `↩` / `F2` / double-clic | Éditer la cellule                                        |

@@ -386,6 +386,11 @@ impl App {
         if pressed(&CLOSE_TAB) {
             self.request_close(self.tabs.active);
         }
+        // Ctrl+Tab / Ctrl+Shift+Tab, gathered by `raw_input_hook`.
+        let step = std::mem::take(&mut self.tab_step);
+        if let (1.., n @ 1..) = (step.abs(), self.tabs.list.len()) {
+            self.tabs.active = (self.tabs.active as isize + step).rem_euclid(n as isize) as usize;
+        }
         if pressed(&SAVE_CONSOLES) {
             match self.save_consoles() {
                 Ok(()) => self.info("Consoles enregistrées"),

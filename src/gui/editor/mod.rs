@@ -184,6 +184,71 @@ pub fn hint_text(db: Option<&crate::engine::models::DatabaseType>) -> &'static s
     }
 }
 
+/// Page Up / Page Down move the cursor by the visible height (egui's
+/// `TextEdit` ignores them); with Shift they extend the selection.
+fn page_keys(ui: &egui::Ui, output: &egui::text_edit::TextEditOutput, id: egui::Id) {
+    use egui::{Key, Modifiers};
+    if !output.response.has_focus() {
+        return;
+    }
+    // Shift first: a key without modifiers also matches with Shift held.
+    let pressed = ui.input_mut(|i| {
+        [
+            (Key::PageUp, true, false),
+            (Key::PageUp, false, false),
+            (Key::PageDown, true, true),
+            (Key::PageDown, false, true),
+        ]
+        .into_iter()
+        .find(|&(k, shift, _)| {
+            let m = if shift {
+                Modifiers::SHIFT
+            } else {
+                Modifiers::NONE
+            };
+            i.consume_key(m, k)
+        })
+    });
+    let Some((_, shift, down)) = pressed else {
+        return;
+    };
+    let galley = &output.galley;
+    let mut state = output.state.clone();
+    let Some(range) = state.cursor.range(galley) else {
+        return;
+    };
+    let row_height = galley
+        .rows
+        .first()
+        .map_or(16.0, |r| r.rect.height())
+        .max(1.0);
+    let rows = ((ui.clip_rect().height() / row_height) as usize)
+        .saturating_sub(1)
+        .max(1);
+    let mut cursor = range.primary;
+    for _ in 0..rows {
+        cursor = if down {
+            galley.cursor_down_one_row(&cursor)
+        } else {
+            galley.cursor_up_one_row(&cursor)
+        };
+    }
+    let secondary = if shift { range.secondary } else { cursor };
+    state
+        .cursor
+        .set_range(Some(egui::text_selection::CursorRange {
+            primary: cursor,
+            secondary,
+        }));
+    state.store(ui.ctx(), id);
+    let rect = galley
+        .pos_from_cursor(&cursor)
+        .translate(output.galley_pos.to_vec2())
+        .expand(row_height);
+    ui.scroll_to_rect(rect, None);
+    ui.ctx().request_repaint();
+}
+
 /// Draw the editor filling `min_height` (more when the text is longer).
 pub fn show(
     ui: &mut egui::Ui,
@@ -211,6 +276,7 @@ pub fn show(
         .layouter(&mut layouter)
         .show(ui);
     ui.data_mut(|d| d.insert_temp(cache_id, cache));
+    page_keys(ui, &output, id);
     let changed = output.response.changed();
     let scope = match cx.nosql {
         Some(n) => Scope::NoSql(n),
@@ -263,6 +329,74 @@ mod tests {
         // Identifiers and whitespace share a colour: one section.
         let job = highlight_job("a b c", &[], true, 13.0);
         assert_eq!(job.sections.len(), 1);
+    }
+
+    /// Page Down moves the cursor about one viewport down; Shift+Page Up
+    /// then selects back up from there.
+    #[test]
+    fn page_keys_move_and_select() {
+        use crate::gui::ui_test::{key, Driver};
+        use egui::{Event, Key, Modifiers};
+        let mut text: String = (0..200)
+            .map(|i| {
+                format!(
+                    "SELECT {i};
+"
+                )
+            })
+            .collect();
+        let id = egui::Id::new("editor");
+        let mut completion = Completion::default();
+        let mut d = Driver::new();
+        let mut frame = |d: &mut Driver, events: Vec<Event>| {
+            d.central(events, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        show(
+                            ui,
+                            &mut text,
+                            id,
+                            300.0,
+                            &mut completion,
+                            EditorContext {
+                                known_columns: &[],
+                                source: &completion::NoSource,
+                                nosql: None,
+                            },
+                        )
+                    })
+                    .inner
+            })
+        };
+        frame(&mut d, vec![]);
+        d.ctx.memory_mut(|m| m.request_focus(id));
+        frame(&mut d, vec![]);
+        set_cursor(&d.ctx, id, "", 0);
+        let line = |byte: usize| {
+            byte / "SELECT 100;
+"
+            .len()
+        };
+        let out = frame(&mut d, vec![key(Key::PageDown)]);
+        let down = out.cursor;
+        assert!(
+            (5..100).contains(&line(down)),
+            "cursor on line {}",
+            line(down)
+        );
+        assert_eq!(out.selection, None);
+        let shift_up = Event::Key {
+            key: Key::PageUp,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        };
+        let out = frame(&mut d, vec![shift_up]);
+        assert_eq!(out.cursor, 0);
+        assert_eq!(out.selection, Some((0, down)));
     }
 
     #[test]

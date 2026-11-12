@@ -103,6 +103,9 @@ pub struct App {
     /// Last change of the consoles not saved yet (saved `CONSOLES_DELAY`
     /// after it).
     consoles_edited: Option<Instant>,
+    /// Ctrl+Tab (+1) / Ctrl+Shift+Tab (-1) presses of this frame, taken
+    /// out of the raw input so egui does not also move the focus.
+    tab_step: isize,
 }
 
 impl App {
@@ -160,6 +163,7 @@ impl App {
             status,
             progress: status::Progress::default(),
             dialog: None,
+            tab_step: 0,
             pending_consoles,
             unbound_restored: false,
             closed: false,
@@ -671,6 +675,26 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.dialog.is_some() {
+            return;
+        }
+        raw_input.events.retain(|e| match e {
+            egui::Event::Key {
+                key: Key::Tab,
+                pressed,
+                modifiers,
+                ..
+            } if modifiers.ctrl => {
+                if *pressed {
+                    self.tab_step += if modifiers.shift { -1 } else { 1 };
+                }
+                false
+            }
+            _ => true,
+        });
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Before the worker's events: a sign-in warning precedes the
         // connection's outcome.

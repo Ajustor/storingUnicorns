@@ -7,6 +7,19 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.21.0] - 2026-11-12
+
+### Nouveautés
+
+- **Changer d'onglet au clavier** : `Ctrl+Tab` passe à l'onglet suivant,
+  `Ctrl+Maj+Tab` au précédent (aussi `⌃⇥` / `⌃⇧⇥` sur macOS).
+
+### Corrections
+
+- **Console : Page préc. / Page suiv.** : ces touches déplacent le curseur
+  d'une hauteur d'écran dans l'éditeur SQL, et étendent la sélection avec
+  `Maj`. Elles étaient ignorées.
+
 ## [0.20.1] - 2026-11-06
 
 ### Corrections

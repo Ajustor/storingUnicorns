@@ -59,6 +59,7 @@ impl GridState {
     pub fn new_result(&mut self) {
         self.selected = None;
         self.selection = None;
+        self.drag = None;
         self.editing = None;
         self.edits.clear();
         self.view_dirty = true;

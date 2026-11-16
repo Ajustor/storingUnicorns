@@ -19,7 +19,7 @@ use crate::gui::shortcuts::{hint_here, is_mac, label_here};
 use crate::gui::theme::{ACCENT, ERROR, SUCCESS};
 
 use changes::{PendingEdits, RowRef};
-use selection::Selection;
+use selection::{DragMode, Selection};
 pub use state::FOLLOW_LINK;
 use state::{delete_row, edit_cell, ADD_ROW, REVERT, SUBMIT};
 use view::{display_pos, next_sort, row_ref};
@@ -40,6 +40,8 @@ pub struct GridState {
     /// Cells selected with it (Shift+click / arrows, row numbers, headers,
     /// Ctrl+A), copied as CSV.
     pub selection: Option<Selection>,
+    /// A mouse drag selecting cells or rows, until the button is released.
+    drag: Option<DragMode>,
     /// Cell being edited and its text.
     pub editing: Option<(RowRef, usize, String)>,
     /// The edited cell was NULL, or a new row's untouched cell: its editor
@@ -73,6 +75,7 @@ impl Default for GridState {
         Self {
             selected: None,
             selection: None,
+            drag: None,
             editing: None,
             editing_blank: false,
             edits: PendingEdits::default(),
@@ -144,6 +147,23 @@ const SELECT_ALL: egui::KeyboardShortcut =
 const COPY: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C);
 
+/// How far `v` is past `range` (negative before it, 0 inside).
+fn overshoot(v: f32, range: egui::Rangef) -> f32 {
+    if v > range.max {
+        v - range.max
+    } else if v < range.min {
+        v - range.min
+    } else {
+        0.0
+    }
+}
+
+/// Scroll of one frame (`dt` s) while a drag is `over` points past an
+/// edge: faster the further out.
+fn edge_scroll(over: f32, dt: f32) -> f32 {
+    over.signum() * over.abs().min(150.0) * 12.0 * dt
+}
+
 fn edited_bg() -> Color32 {
     AMBER.gamma_multiply(0.25)
 }
@@ -204,6 +224,10 @@ fn cell_text(value: &str, deleted: bool) -> RichText {
 /// What a click or the context menu asked for, applied after the table.
 enum CellAction {
     Select(RowRef, usize),
+    /// A drag started on a cell (with Shift: from the current anchor).
+    DragCells(RowRef, usize, bool),
+    /// A drag started on a row number (with Shift: extend).
+    DragRows(RowRef, bool),
     /// Shift+click: select up to this cell.
     Extend(RowRef, usize),
     /// Row number clicked (with Shift: extend).
@@ -376,6 +400,13 @@ pub fn show(
     let shift = ctx.input(|i| i.modifiers.shift);
     let mut column_clicked = None;
     let mut select_all_clicked = false;
+    // Mouse drag: the cell / row under the pointer (held inside the
+    // visible body, so that the selection follows an edge scroll).
+    let drag = state.drag;
+    let pointer = ctx.input(|i| i.pointer.latest_pos());
+    let dt = ctx.input(|i| i.stable_dt).min(0.1);
+    let mut drag_to = None;
+    let mut drag_rows_to = None;
     let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
     let num_w = 8.0 * (total.max(1).ilog10() as f32 + 1.0) + 18.0;
     ui.allocate_ui(egui::vec2(ui.available_width(), table_h), |ui| {
@@ -398,7 +429,7 @@ pub fn show(
                     .id_salt(id.with("table"))
                     .striped(true)
                     .resizable(true)
-                    .sense(Sense::click())
+                    .sense(Sense::click_and_drag())
                     .auto_shrink([false, false])
                     .max_scroll_height(f32::INFINITY)
                     // Default 200 px would push the footer out of a short area.
@@ -451,7 +482,22 @@ pub fn show(
                             });
                         }
                     })
-                    .body(|body| {
+                    .body(|mut body| {
+                        let clip = body.ui_mut().clip_rect();
+                        if let (Some(_), Some(p)) = (drag, pointer) {
+                            let dy = overshoot(p.y, clip.y_range());
+                            if dy != 0.0 {
+                                body.ui_mut().scroll_with_delta_animation(
+                                    egui::vec2(0.0, -edge_scroll(dy, dt)),
+                                    egui::style::ScrollAnimation::none(),
+                                );
+                                ctx.request_repaint();
+                            }
+                        }
+                        let inset = egui::vec2(1.0, 1.0);
+                        let target = pointer
+                            .filter(|_| drag.is_some())
+                            .map(|p| p.clamp(clip.min + inset, clip.max - inset));
                         body.rows(row_h, total, |mut row| {
                             let d = row.index();
                             let r = row_ref(view, d);
@@ -463,16 +509,24 @@ pub fn show(
                                 .as_ref()
                                 .is_some_and(|s| s.rows.contains(&d) && s.cols.len() == ncols);
                             let (_, num) = row.col(|ui| {
+                                let rect = ui.max_rect();
+                                if let (Some(DragMode::Rows), Some(t)) = (drag, target) {
+                                    if rect.y_range().contains(t.y) {
+                                        drag_rows_to = Some(r);
+                                    }
+                                }
                                 if whole_row {
                                     ui.painter().rect_filled(ui.max_rect(), 0.0, selected_bg());
                                 }
                                 if is_new {
-                                    ui.label(RichText::new(icon::PLUS).color(SUCCESS));
+                                    ui.add(egui::Label::new(RichText::new(icon::PLUS).color(SUCCESS)).selectable(false));
                                 } else {
-                                    ui.label(RichText::new((d + 1).to_string()).weak());
+                                    ui.add(egui::Label::new(RichText::new((d + 1).to_string()).weak()).selectable(false));
                                 }
                             });
-                            if num.clicked() {
+                            if num.drag_started_by(egui::PointerButton::Primary) {
+                                cell_action = Some(CellAction::DragRows(r, shift));
+                            } else if num.clicked() {
                                 cell_action = Some(CellAction::SelectRows(r, shift));
                             }
                             for c in 0..ncols {
@@ -490,6 +544,11 @@ pub fn show(
                                 let in_sel = sel_rect.as_ref().is_some_and(|s| s.contains(d, c));
                                 let (_, resp) = row.col(|ui| {
                                     let rect = ui.max_rect();
+                                    if let (Some(DragMode::Cells), Some(t)) = (drag, target) {
+                                        if rect.contains(t) {
+                                            drag_to = Some((r, c));
+                                        }
+                                    }
                                     if in_sel {
                                         ui.painter().rect_filled(rect, 0.0, selected_bg());
                                     } else if is_new {
@@ -551,6 +610,10 @@ pub fn show(
                                     cell_action = Some(CellAction::Follow(r, c, command));
                                 } else if active && command && resp.clicked() {
                                     cell_action = Some(CellAction::Follow(r, c, true));
+                                } else if resp.drag_started_by(egui::PointerButton::Primary)
+                                    && !edited_here
+                                {
+                                    cell_action = Some(CellAction::DragCells(r, c, shift));
                                 } else if resp.double_clicked() {
                                     cell_action = Some(CellAction::Edit(r, c));
                                 } else if resp.clicked() && shift {
@@ -576,6 +639,18 @@ pub fn show(
                 // The table's own scroll area takes every scroll target
                 // (and asks for x = 0 when scrolling to a row): bring the
                 // focused column into view here, for the horizontal area.
+                // Past the left / right edge while dragging: scroll this
+                // horizontal area (the table's own one is vertical only).
+                if let (Some(DragMode::Cells), Some(p)) = (drag, pointer) {
+                    let dx = overshoot(p.x, ui.clip_rect().x_range());
+                    if dx != 0.0 {
+                        ui.scroll_with_delta_animation(
+                            egui::vec2(-edge_scroll(dx, dt), 0.0),
+                            egui::style::ScrollAnimation::none(),
+                        );
+                        ctx.request_repaint();
+                    }
+                }
                 if let Some(x) = focused_x {
                     let y = ui.clip_rect().y_range();
                     // Not animated, like the rows (`animate_scrolling(false)`).
@@ -629,6 +704,23 @@ pub fn show(
             }
             state.selected = Some((r, c));
             state.selection = None;
+        }
+        Some(CellAction::DragCells(r, c, extend)) => {
+            state.commit_edit(rows);
+            if extend {
+                state.extend_to(r, c);
+            } else {
+                state.selected = Some((r, c));
+                state.selection = None;
+            }
+            state.drag = Some(DragMode::Cells);
+            focus_grid();
+        }
+        Some(CellAction::DragRows(r, extend)) => {
+            state.commit_edit(rows);
+            state.select_rows(r, extend);
+            state.drag = Some(DragMode::Rows);
+            focus_grid();
         }
         Some(CellAction::Extend(r, c)) => {
             state.commit_edit(rows);
@@ -702,6 +794,17 @@ pub fn show(
             action = GridAction::Referencing { row: r, fk };
         }
         None => {}
+    }
+    if state.drag.is_some() {
+        if let Some((r, c)) = drag_to.filter(|&to| state.selected != Some(to)) {
+            state.extend_to(r, c);
+        }
+        if let Some(r) = drag_rows_to.filter(|&to| state.selected.map(|s| s.0) != Some(to)) {
+            state.select_rows(r, true);
+        }
+        if !ctx.input(|i| i.pointer.primary_down()) {
+            state.drag = None;
+        }
     }
     state.clamp(rows, ncols);
     if action == GridAction::None && state.selected != before {
@@ -1141,6 +1244,91 @@ mod tests {
                 .to_string()
         };
         assert_eq!((value(1), value(2)), ("x".into(), "y".into()));
+    }
+
+    /// Pressing on a cell and dragging selects the block up to the cell
+    /// under the pointer; dragging over row numbers selects whole rows.
+    #[test]
+    fn mouse_drag_selects_cells_and_rows() {
+        use crate::engine::models::Column;
+        use crate::gui::ui_test::Driver;
+        use egui::{Event, Modifiers, PointerButton, Pos2};
+        let columns = (0..3)
+            .map(|c| Column {
+                name: format!("col{c}"),
+                type_name: "TEXT".into(),
+                nullable: true,
+                is_primary_key: false,
+            })
+            .collect();
+        let rows = (0..4)
+            .map(|r| (0..3).map(|c| format!("r{r}c{c}")).collect())
+            .collect();
+        let result = QueryResult {
+            columns,
+            rows,
+            ..QueryResult::default()
+        };
+        let id = egui::Id::new("grid");
+        let mut state = GridState::default();
+        let mut d = Driver::new();
+        let mut frame = |d: &mut Driver, events| {
+            d.central(events, |ui| {
+                show(
+                    ui,
+                    id,
+                    &mut state,
+                    GridOptions {
+                        result: &result,
+                        editable: false,
+                        server_sort: false,
+                        sort_indicator: None,
+                        links: &[],
+                        incoming: &[],
+                    },
+                );
+                (state.selected, state.selection_rect(3))
+            })
+        };
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        // Frames of a press at `from`, moves to `to`, release, then none.
+        let drag = |from: Pos2, to: Pos2| {
+            let mut frames = vec![vec![Event::PointerMoved(from), button(from, true)]];
+            for k in 1..=4 {
+                let p = from + (to - from) * (k as f32 / 4.0);
+                frames.push(vec![Event::PointerMoved(p)]);
+            }
+            frames.push(vec![button(to, false)]);
+            frames.push(vec![]);
+            frames
+        };
+        frame(&mut d, vec![]);
+        let at = |d: &Driver, t: &str| d.text(t).unwrap_or_else(|| panic!("{t}"));
+        let (from, to) = (at(&d, "r0c0"), at(&d, "r2c1"));
+        let (focus, rect) = drag(from, to)
+            .into_iter()
+            .fold(None, |_, e| Some(frame(&mut d, e)))
+            .unwrap();
+        assert_eq!(focus, Some((RowRef::Base(2), 1)));
+        let rect = rect.expect("a block");
+        assert_eq!((rect.rows, rect.cols), (0..3, 0..2));
+        // Row numbers: whole rows.
+        let (from, to) = (at(&d, "2"), at(&d, "4"));
+        let (_, rect) = drag(from, to)
+            .into_iter()
+            .fold(None, |_, e| Some(frame(&mut d, e)))
+            .unwrap();
+        let rect = rect.expect("rows");
+        assert_eq!((rect.rows, rect.cols), (1..4, 0..3));
+        // A plain click still selects one cell.
+        let p = at(&d, "r3c2");
+        frame(&mut d, crate::gui::ui_test::click(p));
+        assert_eq!(frame(&mut d, vec![]), (Some((RowRef::Base(3), 2)), None));
     }
 
     #[test]

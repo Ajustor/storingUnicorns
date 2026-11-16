@@ -12,6 +12,15 @@ use crate::engine::services::export_import::export_to_csv_quoting_empty;
 
 /// A selection wider than the focused cell: from `anchor` to the focused
 /// cell, widened to every column (`all_cols`) or every row (`all_rows`).
+/// What a mouse drag started on a grid selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragMode {
+    /// From a cell: the block of cells up to the pointer.
+    Cells,
+    /// From a row number: the whole rows up to the pointer.
+    Rows,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub anchor: (RowRef, usize),
@@ -49,7 +58,8 @@ fn span(a: usize, b: usize) -> Range<usize> {
 }
 
 impl GridState {
-    /// The selected rectangle, when wider than the focused cell alone.
+    /// The selected rectangle, when wider than the focused cell alone
+    /// (dragged back to its first cell: the focused cell alone).
     pub fn selection_rect(&self, ncols: usize) -> Option<SelRect> {
         let sel = self.selection?;
         let (fr, fc) = self.selected?;
@@ -67,7 +77,7 @@ impl GridState {
         } else {
             span(sel.anchor.1, fc)
         };
-        (!rows.is_empty() && !cols.is_empty()).then_some(SelRect { rows, cols })
+        (rows.len() * cols.len() > 1).then_some(SelRect { rows, cols })
     }
 
     /// Shift+click on a cell: from the anchor (the focused cell when

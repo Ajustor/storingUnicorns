@@ -7,6 +7,16 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.22.1] - 2026-11-16
+
+### Nouveautés
+
+- **Grille : sélection à la souris** : appuyer sur une cellule puis glisser
+  sélectionne le bloc parcouru, glisser sur les numéros de ligne des lignes
+  entières. La grille défile d'elle-même quand la souris passe un bord.
+  Glisser sur les cellules ne fait plus défiler la grille (la molette et les
+  barres de défilement, si).
+
 ## [0.22.0] - 2026-11-16
 
 ### Nouveautés

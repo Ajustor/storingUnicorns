@@ -58,6 +58,7 @@ impl GridState {
     /// and the focus, keep the filter and the sort.
     pub fn new_result(&mut self) {
         self.selected = None;
+        self.selection = None;
         self.editing = None;
         self.edits.clear();
         self.view_dirty = true;
@@ -78,6 +79,10 @@ impl GridState {
                 self.selected = None;
             }
         }
+        let anchor_gone = |(r, c): (RowRef, usize)| c >= ncols || !self.row_exists(rows, r);
+        if self.selected.is_none() || self.selection.is_some_and(|s| anchor_gone(s.anchor)) {
+            self.selection = None;
+        }
         if let Some((r, c, _)) = &self.editing {
             if *c >= ncols || !self.row_exists(rows, *r) {
                 self.editing = None;
@@ -96,7 +101,7 @@ impl GridState {
 
     /// Move the focus by `dr` rows / `dc` columns; `wrap` continues on the
     /// next/previous row past the last/first column (Tab).
-    fn move_focus(&mut self, ncols: usize, dr: isize, dc: isize, wrap: bool) {
+    pub(super) fn move_focus(&mut self, ncols: usize, dr: isize, dc: isize, wrap: bool) {
         let total = self.total_rows();
         if total == 0 || ncols == 0 {
             return;
@@ -139,6 +144,7 @@ impl GridState {
         self.editing_blank = blank || self.edits.is_default(r, c);
         let text = if blank { "" } else { value };
         self.editing = Some((r, c, text.to_string()));
+        self.selection = None;
         self.select(r, c);
         self.select_all = true;
         ctx.request_repaint();
@@ -176,6 +182,7 @@ impl GridState {
             return;
         };
         self.generation += 1;
+        self.selection = None;
         let follow = |row: RowRef| match row {
             RowRef::New(j) if j == removed => None,
             RowRef::New(j) if j > removed => Some(RowRef::New(j - 1)),
@@ -197,6 +204,15 @@ impl GridState {
         self.editing = None;
         self.edits.clear();
         self.generation += 1;
+    }
+
+    /// Copy the selection as CSV, or the focused cell's value alone.
+    pub(super) fn copy(&self, ctx: &egui::Context, result: &QueryResult) {
+        if let Some(csv) = self.selection_csv(result) {
+            ctx.copy_text(csv);
+        } else if let Some((r, c)) = self.selected {
+            ctx.copy_text(display_cell(self.edits.value(&result.rows, r, c)).to_string());
+        }
     }
 
     /// Keys while a cell is being edited. The cell editor loses its focus on
@@ -272,23 +288,45 @@ impl GridState {
             (Key::PageUp, -20, 0),
             (Key::PageDown, 20, 0),
         ];
+        // Shift first: a plain key pattern also matches it.
         for (k, dr, dc) in moves {
+            if key(Modifiers::SHIFT, k) {
+                self.extend_by(ncols, dr, dc);
+            }
             if key(Modifiers::NONE, k) {
+                self.selection = None;
                 self.move_focus(ncols, dr, dc, false);
             }
         }
         if key(Modifiers::SHIFT, Key::Tab) {
+            self.selection = None;
             self.move_focus(ncols, 0, -1, true);
         }
         if key(Modifiers::NONE, Key::Tab) {
+            self.selection = None;
             self.move_focus(ncols, 0, 1, true);
         }
+        if key(Modifiers::COMMAND, Key::A) {
+            self.select_all();
+        }
+        if self.selection.is_some() && key(Modifiers::NONE, Key::Escape) {
+            self.selection = None;
+        }
         let copy = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
-        if let (true, Some((r, c))) = (copy, self.selected) {
-            ctx.copy_text(display_cell(self.edits.value(&result.rows, r, c)).to_string());
+        if copy {
+            self.copy(ctx, result);
         }
         if !editable {
             return GridAction::None;
+        }
+        let pasted = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(text) => Some(text.clone()),
+                _ => None,
+            })
+        });
+        if let Some(text) = pasted {
+            self.paste(result, &text);
         }
         if any(&ADD_ROW) {
             self.add_row(ctx, result);

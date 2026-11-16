@@ -1,6 +1,8 @@
 //! Data grid widget: drawing and cell actions. Its rows (filter, sort) are in
 //! `view`, focus / editing / keys in `state`, pending edits in `changes`.
 pub mod changes;
+mod paste;
+mod selection;
 mod state;
 mod view;
 
@@ -17,6 +19,7 @@ use crate::gui::shortcuts::{hint_here, is_mac, label_here};
 use crate::gui::theme::{ACCENT, ERROR, SUCCESS};
 
 use changes::{PendingEdits, RowRef};
+use selection::Selection;
 pub use state::FOLLOW_LINK;
 use state::{delete_row, edit_cell, ADD_ROW, REVERT, SUBMIT};
 use view::{display_pos, next_sort, row_ref};
@@ -34,6 +37,9 @@ pub fn to_tsv(row: &[String]) -> String {
 pub struct GridState {
     /// Focused cell.
     pub selected: Option<(RowRef, usize)>,
+    /// Cells selected with it (Shift+click / arrows, row numbers, headers,
+    /// Ctrl+A), copied as CSV.
+    pub selection: Option<Selection>,
     /// Cell being edited and its text.
     pub editing: Option<(RowRef, usize, String)>,
     /// The edited cell was NULL, or a new row's untouched cell: its editor
@@ -66,6 +72,7 @@ impl Default for GridState {
     fn default() -> Self {
         Self {
             selected: None,
+            selection: None,
             editing: None,
             editing_blank: false,
             edits: PendingEdits::default(),
@@ -127,6 +134,16 @@ const AMBER: Color32 = Color32::from_rgb(0xF2, 0xA6, 0x4C);
 /// Longest text laid out in a cell (the value panel shows it all).
 const MAX_CELL_CHARS: usize = 256;
 
+fn selected_bg() -> Color32 {
+    ACCENT.gamma_multiply(0.22)
+}
+
+/// Shortcuts named in hints (handled by `state::grid_keys` / egui's Copy).
+const SELECT_ALL: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A);
+const COPY: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::C);
+
 fn edited_bg() -> Color32 {
     AMBER.gamma_multiply(0.25)
 }
@@ -187,7 +204,12 @@ fn cell_text(value: &str, deleted: bool) -> RichText {
 /// What a click or the context menu asked for, applied after the table.
 enum CellAction {
     Select(RowRef, usize),
+    /// Shift+click: select up to this cell.
+    Extend(RowRef, usize),
+    /// Row number clicked (with Shift: extend).
+    SelectRows(RowRef, bool),
     Edit(RowRef, usize),
+    CopySelection,
     CopyValue(RowRef, usize),
     CopyRow(RowRef),
     SetNull(RowRef, usize),
@@ -350,6 +372,10 @@ pub fn show(
         None
     };
     let total = state.total_rows();
+    let sel_rect = state.selection_rect(ncols);
+    let shift = ctx.input(|i| i.modifiers.shift);
+    let mut column_clicked = None;
+    let mut select_all_clicked = false;
     let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
     let num_w = 8.0 * (total.max(1).ilog10() as f32 + 1.0) + 18.0;
     ui.allocate_ui(egui::vec2(ui.available_width(), table_h), |ui| {
@@ -387,7 +413,17 @@ pub fn show(
                 table
                     .header(row_h + 2.0, |mut header| {
                         header.col(|ui| {
-                            ui.label(RichText::new("#").weak());
+                            let r = ui
+                                .add(
+                                    egui::Label::new(RichText::new("#").weak())
+                                        .selectable(false)
+                                        .sense(Sense::click()),
+                                )
+                                .on_hover_text(format!(
+                                    "Tout sélectionner ({})",
+                                    label_here(&SELECT_ALL)
+                                ));
+                            select_all_clicked = r.clicked();
                         });
                         for (c, column) in result.columns.iter().enumerate() {
                             header.col(|ui| {
@@ -404,8 +440,12 @@ pub fn show(
                                             .sense(Sense::click())
                                             .truncate(),
                                     )
-                                    .on_hover_text(format!("{hover} · cliquer pour trier"));
-                                if r.clicked() {
+                                    .on_hover_text(format!(
+                                        "{hover} · cliquer pour trier · Maj+clic : sélectionner la colonne"
+                                    ));
+                                if r.clicked() && shift {
+                                    column_clicked = Some(c);
+                                } else if r.clicked() {
                                     header_clicked = Some(c);
                                 }
                             });
@@ -419,13 +459,22 @@ pub fn show(
                             let deleted = edits.is_deleted(r);
                             let row_selected = selected.is_some_and(|(sr, _)| sr == r);
                             row.set_selected(row_selected);
-                            row.col(|ui| {
+                            let whole_row = sel_rect
+                                .as_ref()
+                                .is_some_and(|s| s.rows.contains(&d) && s.cols.len() == ncols);
+                            let (_, num) = row.col(|ui| {
+                                if whole_row {
+                                    ui.painter().rect_filled(ui.max_rect(), 0.0, selected_bg());
+                                }
                                 if is_new {
                                     ui.label(RichText::new(icon::PLUS).color(SUCCESS));
                                 } else {
                                     ui.label(RichText::new((d + 1).to_string()).weak());
                                 }
                             });
+                            if num.clicked() {
+                                cell_action = Some(CellAction::SelectRows(r, shift));
+                            }
                             for c in 0..ncols {
                                 let link = opts.links.get(c).and_then(Option::as_ref);
                                 let edited_here = editing
@@ -438,9 +487,12 @@ pub fn show(
                                     && fk::cell_link(link, blank, saved, edits.is_edited(r, c))
                                         == CellLink::Active;
                                 let mut icon_clicked = false;
+                                let in_sel = sel_rect.as_ref().is_some_and(|s| s.contains(d, c));
                                 let (_, resp) = row.col(|ui| {
                                     let rect = ui.max_rect();
-                                    if is_new {
+                                    if in_sel {
+                                        ui.painter().rect_filled(rect, 0.0, selected_bg());
+                                    } else if is_new {
                                         ui.painter().rect_filled(rect, 0.0, new_bg());
                                     } else if edits.is_edited(r, c) {
                                         ui.painter().rect_filled(rect, 0.0, edited_bg());
@@ -501,6 +553,10 @@ pub fn show(
                                     cell_action = Some(CellAction::Follow(r, c, true));
                                 } else if resp.double_clicked() {
                                     cell_action = Some(CellAction::Edit(r, c));
+                                } else if resp.clicked() && shift {
+                                    cell_action = Some(CellAction::Extend(r, c));
+                                } else if resp.secondary_clicked() && in_sel {
+                                    // Keep the selection for its menu.
                                 } else if resp.clicked() || resp.secondary_clicked() {
                                     cell_action = Some(CellAction::Select(r, c));
                                 }
@@ -508,6 +564,7 @@ pub fn show(
                                     row: r,
                                     col: c,
                                     deleted,
+                                    in_selection: in_sel,
                                     editable: opts.editable,
                                     link: link.filter(|_| active),
                                     incoming: if saved { opts.incoming } else { &[] },
@@ -544,6 +601,14 @@ pub fn show(
         a => action = a,
     }
 
+    if select_all_clicked || column_clicked.is_some() {
+        state.commit_edit(rows);
+        match column_clicked {
+            Some(c) => state.select_column(c),
+            None => state.select_all(),
+        }
+        ctx.memory_mut(|m| m.request_focus(focus_id));
+    }
     if let Some(c) = header_clicked {
         if opts.server_sort {
             action = GridAction::SortBy(c);
@@ -563,7 +628,19 @@ pub fn show(
                 focus_grid();
             }
             state.selected = Some((r, c));
+            state.selection = None;
         }
+        Some(CellAction::Extend(r, c)) => {
+            state.commit_edit(rows);
+            state.extend_to(r, c);
+            focus_grid();
+        }
+        Some(CellAction::SelectRows(r, extend)) => {
+            state.commit_edit(rows);
+            state.select_rows(r, extend);
+            focus_grid();
+        }
+        Some(CellAction::CopySelection) => state.copy(&ctx, result),
         Some(CellAction::Edit(r, c)) => {
             if opts.editable {
                 state.commit_edit(rows);
@@ -586,18 +663,21 @@ pub fn show(
             state.commit_edit(rows);
             state.edits.set(rows, r, c, String::new());
             state.selected = Some((r, c));
+            state.selection = None;
             focus_grid();
         }
         Some(CellAction::SetDefault(r, c)) => {
             state.commit_edit(rows);
             state.edits.reset_default(r, c);
             state.selected = Some((r, c));
+            state.selection = None;
             focus_grid();
         }
         Some(CellAction::SetNull(r, c)) => {
             state.commit_edit(rows);
             state.edits.set(rows, r, c, NULL_CELL.into());
             state.selected = Some((r, c));
+            state.selection = None;
             focus_grid();
         }
         Some(CellAction::AddRow) => state.add_row(&ctx, result),
@@ -609,6 +689,7 @@ pub fn show(
         Some(CellAction::Follow(r, c, new_tab)) => {
             state.commit_edit(rows);
             state.selected = Some((r, c));
+            state.selection = None;
             focus_grid();
             action = GridAction::Follow {
                 row: r,
@@ -670,6 +751,8 @@ struct MenuCell<'a> {
     row: RowRef,
     col: usize,
     deleted: bool,
+    /// Inside a selection wider than one cell.
+    in_selection: bool,
     editable: bool,
     /// Its foreign key, when it links somewhere.
     link: Option<&'a ColumnLink>,
@@ -728,6 +811,17 @@ fn context_menu(ui: &mut egui::Ui, m: &MenuCell, action: &mut Option<CellAction>
             ui.close_menu();
         }
     };
+    if m.in_selection {
+        item(
+            ui,
+            format!(
+                "{} Copier la sélection en CSV ({})",
+                icon::TABLE,
+                label_here(&COPY)
+            ),
+            CellAction::CopySelection,
+        );
+    }
     item(
         ui,
         format!("{} Copier la valeur", icon::COPY),
@@ -832,6 +926,13 @@ fn footer(
         };
         if result.truncated {
             text.push_str(&format!(" · {n}+ (limité)"));
+        }
+        if let Some(s) = state.selection_rect(result.columns.len()) {
+            text.push_str(&format!(
+                " · sélection : {} × {} col.",
+                plural_rows(s.rows.len()),
+                s.cols.len()
+            ));
         }
         ui.label(RichText::new(text).weak());
         if ui
@@ -961,6 +1062,85 @@ mod tests {
         on_screen(&d, "r150c0");
         assert_eq!(press(&mut d, Key::ArrowUp, 150), Some((RowRef::Base(0), 0)));
         on_screen(&d, "r0c0");
+    }
+
+    /// Shift+arrows select a block, Ctrl+A everything: the copy is CSV;
+    /// a single focused cell still copies its bare value.
+    #[test]
+    fn keyboard_selection_is_copied_as_csv() {
+        use crate::engine::models::Column;
+        use crate::gui::ui_test::{key, Driver};
+        use egui::{Event, Key, Modifiers};
+        let columns = (0..3)
+            .map(|c| Column {
+                name: format!("col{c}"),
+                type_name: "TEXT".into(),
+                nullable: true,
+                is_primary_key: false,
+            })
+            .collect();
+        let rows = (0..3)
+            .map(|r| (0..3).map(|c| format!("r{r}c{c}")).collect())
+            .collect();
+        let result = QueryResult {
+            columns,
+            rows,
+            ..QueryResult::default()
+        };
+        let id = egui::Id::new("grid");
+        let mut state = GridState::default();
+        let mut d = Driver::new();
+        let mut frame = |d: &mut Driver, events| {
+            d.central(events, |ui| {
+                show(
+                    ui,
+                    id,
+                    &mut state,
+                    GridOptions {
+                        result: &result,
+                        editable: true,
+                        server_sort: false,
+                        sort_indicator: None,
+                        links: &[],
+                        incoming: &[],
+                    },
+                );
+            });
+            d.copied()
+        };
+        let with = |m: Modifiers, k: Key| Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: m,
+        };
+        frame(&mut d, vec![]);
+        d.ctx.memory_mut(|m| m.request_focus(id.with("focus")));
+        frame(&mut d, vec![]);
+        frame(&mut d, vec![key(Key::ArrowDown)]);
+        assert_eq!(frame(&mut d, vec![Event::Copy]), vec!["r0c0".to_string()]);
+        frame(&mut d, vec![with(Modifiers::SHIFT, Key::ArrowRight)]);
+        frame(&mut d, vec![with(Modifiers::SHIFT, Key::ArrowDown)]);
+        assert_eq!(
+            frame(&mut d, vec![Event::Copy]),
+            vec!["col0,col1\nr0c0,r0c1\nr1c0,r1c1".to_string()]
+        );
+        frame(&mut d, vec![with(Modifiers::COMMAND, Key::A)]);
+        let all = frame(&mut d, vec![Event::Copy]);
+        assert_eq!(all[0].lines().count(), 4, "{all:?}");
+        // A plain arrow drops the selection.
+        frame(&mut d, vec![key(Key::ArrowRight)]);
+        assert_eq!(frame(&mut d, vec![Event::Copy]), vec!["r1c2".to_string()]);
+        // Ctrl+V reaches the grid: pasted from the focused cell.
+        frame(&mut d, vec![Event::Paste("x\ny\n".into())]);
+        let value = |r| {
+            state
+                .edits
+                .value(&result.rows, RowRef::Base(r), 2)
+                .to_string()
+        };
+        assert_eq!((value(1), value(2)), ("x".into(), "y".into()));
     }
 
     #[test]

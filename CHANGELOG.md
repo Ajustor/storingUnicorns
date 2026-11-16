@@ -7,6 +7,24 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.22.0] - 2026-11-16
+
+### Nouveautés
+
+- **Grille : sélection de plusieurs cellules** : `Maj+clic` ou `Maj+flèches`
+  sélectionnent un bloc de cellules, un clic sur un numéro de ligne la ligne
+  entière, `Maj+clic` sur un en-tête la colonne entière, et `Ctrl+A` (ou un
+  clic sur `#`) toute la grille.
+- **Grille : copier en CSV** : `Ctrl+C` sur une sélection copie ses cellules en
+  CSV, avec une ligne d'en-têtes (aussi « Copier la sélection en CSV » au clic
+  droit). Une cellule seule copie toujours sa valeur brute.
+- **Grille : coller** : `Ctrl+V` dans une grille modifiable colle du CSV ou des
+  valeurs séparées par des tabulations (Excel, LibreOffice) à partir de la
+  cellule active, en modifications en attente. Comme dans un tableur, une
+  seule valeur remplit toute la sélection, et un bloc est répété sur une
+  sélection dont la taille en est un multiple. La ligne d'en-têtes d'une copie
+  est ignorée, et ce qui dépasse de la grille est coupé.
+
 ## [0.21.0] - 2026-11-12
 
 ### Nouveautés

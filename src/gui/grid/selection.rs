@@ -162,6 +162,24 @@ impl GridState {
         });
     }
 
+    /// Suppr: the selected cells (or the focused one) set to NULL, as
+    /// pending edits; deleted rows are left alone.
+    pub(super) fn null_selected(&mut self, result: &QueryResult) {
+        let cells: Vec<(RowRef, usize)> = match self.selection_rect(result.columns.len()) {
+            Some(s) => s
+                .rows
+                .flat_map(|d| s.cols.clone().map(move |c| (d, c)))
+                .map(|(d, c)| (row_ref(&self.view, d), c))
+                .collect(),
+            None => self.selected.into_iter().collect(),
+        };
+        for (r, c) in cells {
+            if !self.edits.is_deleted(r) {
+                self.edits.set(&result.rows, r, c, NULL_CELL.into());
+            }
+        }
+    }
+
     /// The selection as CSV (header line, then the rows in display order;
     /// NULL and missing fields as empty fields, the empty string as `""`),
     /// pending edits applied.
@@ -311,6 +329,34 @@ mod tests {
         let csv = g.selection_csv(&r).unwrap();
         assert!(csv.starts_with("id,name,note\n1,Zoe,"), "{csv}");
         assert_eq!(csv.lines().count(), 5, "header, 3 rows, the new row");
+    }
+
+    #[test]
+    fn suppr_sets_the_selection_or_the_focused_cell_to_null() {
+        let r = result();
+        let mut g = grid(&r);
+        g.edits.toggle_delete(RowRef::Base(1));
+        g.selected = Some((RowRef::Base(0), 0));
+        g.extend_to(RowRef::Base(2), 1);
+        g.null_selected(&r);
+        let v = |g: &GridState, row, c| g.edits.value(&r.rows, RowRef::Base(row), c).to_string();
+        for row in [0, 2] {
+            assert_eq!(
+                (v(&g, row, 0), v(&g, row, 1)),
+                (NULL_CELL.into(), NULL_CELL.into())
+            );
+            assert_ne!(v(&g, row, 2), NULL_CELL, "outside the selection");
+        }
+        assert_eq!(v(&g, 1, 0), "2", "deleted row left alone");
+        // No selection: the focused cell.
+        let mut g = grid(&r);
+        g.selected = Some((RowRef::Base(1), 2));
+        g.null_selected(&r);
+        assert_eq!(g.edits.count(), 0, "already NULL");
+        g.selected = Some((RowRef::Base(0), 2));
+        g.null_selected(&r);
+        assert_eq!(v(&g, 0, 2), NULL_CELL);
+        assert_eq!(g.edits.count(), 1);
     }
 
     #[test]

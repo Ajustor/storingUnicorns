@@ -40,6 +40,21 @@ pub fn delete_row(mac: bool) -> &'static [KeyboardShortcut] {
     }
 }
 
+/// Set the selected cells (or the focused one) to NULL: Suppr, and ⌫ on
+/// macOS, where Delete needs fn.
+pub fn clear_cells(mac: bool) -> &'static [KeyboardShortcut] {
+    const MAC: [KeyboardShortcut; 2] = [
+        ks(Modifiers::NONE, Key::Backspace),
+        ks(Modifiers::NONE, Key::Delete),
+    ];
+    const OTHERS: [KeyboardShortcut; 1] = [ks(Modifiers::NONE, Key::Delete)];
+    if mac {
+        &MAC
+    } else {
+        &OTHERS
+    }
+}
+
 /// Edit the focused cell: Enter shown on macOS (F2 needs fn there).
 pub fn edit_cell(mac: bool) -> [KeyboardShortcut; 2] {
     let (f2, enter) = (
@@ -336,6 +351,8 @@ impl GridState {
         if let Some((r, c)) = self.selected {
             if any(delete_row(mac)) {
                 self.toggle_delete(r);
+            } else if any(clear_cells(mac)) {
+                self.null_selected(result);
             } else if any(&edit_cell(mac)) {
                 self.start_edit(ctx, &result.rows, r, c);
             }
@@ -506,10 +523,18 @@ mod tests {
                 );
                 assert!(g.editing.is_none());
             }
-            // Plain Backspace does nothing; Enter and F2 edit the cell.
-            let mut g = on(0);
-            grid_frame(&mut g, &result, &ks(Modifiers::NONE, Key::Backspace), mac);
-            assert!(g.edits.is_empty() && g.editing.is_none());
+            // Suppr (and ⌫ on macOS only) sets the cell to NULL.
+            for (key, clears) in [(Key::Backspace, mac), (Key::Delete, true)] {
+                let mut g = on(0);
+                grid_frame(&mut g, &result, &ks(Modifiers::NONE, key), mac);
+                assert_eq!(
+                    g.edits.value(&result.rows, RowRef::Base(0), 0) == NULL_CELL,
+                    clears,
+                    "{key:?} mac: {mac}"
+                );
+                assert!(!g.edits.is_deleted(RowRef::Base(0)) && g.editing.is_none());
+            }
+            // Enter and F2 edit the cell.
             for edit in edit_cell(mac) {
                 let mut g = on(0);
                 grid_frame(&mut g, &result, &edit, mac);

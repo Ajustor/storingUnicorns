@@ -21,7 +21,7 @@ use crate::gui::theme::{ACCENT, ERROR, SUCCESS};
 use changes::{PendingEdits, RowRef};
 use selection::{DragMode, Selection};
 pub use state::FOLLOW_LINK;
-use state::{delete_row, edit_cell, ADD_ROW, REVERT, SUBMIT};
+use state::{clear_cells, delete_row, edit_cell, ADD_ROW, REVERT, SUBMIT};
 use view::{display_pos, next_sort, row_ref};
 
 /// A row as tab-separated values (tabs and newlines inside cells become spaces).
@@ -234,6 +234,8 @@ enum CellAction {
     SelectRows(RowRef, bool),
     Edit(RowRef, usize),
     CopySelection,
+    /// Suppr on a selection: its cells set to NULL.
+    NullSelection,
     CopyValue(RowRef, usize),
     CopyRow(RowRef),
     SetNull(RowRef, usize),
@@ -733,6 +735,11 @@ pub fn show(
             focus_grid();
         }
         Some(CellAction::CopySelection) => state.copy(&ctx, result),
+        Some(CellAction::NullSelection) => {
+            state.commit_edit(rows);
+            state.null_selected(result);
+            focus_grid();
+        }
         Some(CellAction::Edit(r, c)) => {
             if opts.editable {
                 state.commit_edit(rows);
@@ -949,11 +956,27 @@ fn context_menu(ui: &mut egui::Ui, m: &MenuCell, action: &mut Option<CellAction>
             ),
             CellAction::Edit(r, c),
         );
-        item(
-            ui,
-            format!("{} Mettre à NULL", icon::PROHIBIT),
-            CellAction::SetNull(r, c),
-        );
+        if m.in_selection {
+            item(
+                ui,
+                format!(
+                    "{} Mettre la sélection à NULL ({})",
+                    icon::PROHIBIT,
+                    hint_here(clear_cells(is_mac()))
+                ),
+                CellAction::NullSelection,
+            );
+        } else {
+            item(
+                ui,
+                format!(
+                    "{} Mettre à NULL ({})",
+                    icon::PROHIBIT,
+                    hint_here(clear_cells(is_mac()))
+                ),
+                CellAction::SetNull(r, c),
+            );
+        }
         item(
             ui,
             format!("{} Chaîne vide", icon::TEXT_AA),

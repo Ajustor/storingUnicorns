@@ -7,6 +7,16 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.23.0] - 2026-11-16
+
+### Nouveautés
+
+- **Grille : Suppr met à NULL** : dans une grille modifiable, `Suppr` (aussi
+  `⌫` sur macOS) met à NULL toutes les cellules sélectionnées, ou la cellule
+  active, en modifications en attente. Les lignes marquées supprimées ne sont
+  pas touchées ; `Ctrl+Suppr` supprime toujours la ligne. Aussi « Mettre la
+  sélection à NULL » au clic droit dans une sélection.
+
 ## [0.22.1] - 2026-11-16
 
 ### Nouveautés

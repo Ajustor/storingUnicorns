@@ -227,7 +227,9 @@ impl App {
             self.not_connected(&connection);
             return;
         };
-        let max = Some(console::MAX_ROWS);
+        // Raw console queries are never capped: only a LIMIT/TOP written in
+        // the query limits its rows.
+        let max = None;
         let run = match kind {
             RunKind::Script(text) => self.worker.run_script(tab.id, runner, text, max),
             RunKind::AtCursor { text, cursor } => {

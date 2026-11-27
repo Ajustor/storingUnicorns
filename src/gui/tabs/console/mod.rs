@@ -29,7 +29,7 @@ pub use outcomes::{
     read_only_hint, result_connection, LogLine, ResultTab, MAX_LOG_LINES,
 };
 
-/// Row cap of console results.
+/// Row cap of NoSQL console results (SQL console results are never capped).
 pub const MAX_ROWS: usize = 1000;
 
 pub const RUN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);

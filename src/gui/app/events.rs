@@ -276,9 +276,7 @@ impl App {
                     } else if let (None, Some(runner)) =
                         (tab.runs.script, self.sessions.runner(&connection))
                     {
-                        let run =
-                            self.worker
-                                .run_script(tab.id, runner, sql, Some(console::MAX_ROWS));
+                        let run = self.worker.run_script(tab.id, runner, sql, None);
                         tab.runs.script = Some(run);
                         c.refreshing = Some(id);
                         c.running_since = Some(std::time::Instant::now());

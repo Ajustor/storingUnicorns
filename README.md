@@ -30,8 +30,8 @@ desktop GUI (egui) and a terminal UI (ratatui) sharing the same engine.
     export / import / truncate, single table or batch)
   - SQL consoles: highlighting, context-aware completion of tables and columns
     (see [Complétion contextuelle](#complétion-contextuelle)), formatting,
-    one result tab per statement (pinnable) plus an "Sortie" log, results capped
-    at 1 000 rows, persistent query history (searchable, with a SQL preview)
+    one result tab per statement (pinnable) plus an "Sortie" log, all rows
+    returned (no cap beyond the query's own `LIMIT`/`TOP`), persistent query history (searchable, with a SQL preview)
   - table data editor: 500-row pages, total counted in the background, `WHERE` /
     `ORDER BY` bar, click a header to sort, inline editing (changed cells
     highlighted, new rows green, deleted rows struck through in red), changes

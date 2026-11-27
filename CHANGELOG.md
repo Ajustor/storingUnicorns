@@ -7,6 +7,16 @@ est aussi affichée dans l'application lors d'une mise à jour et sur la
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) et les
 numéros de version suivent le [versionnage sémantique](https://semver.org/lang/fr/).
 
+## [0.23.1] - 2026-11-27
+
+### Corrections
+
+- **Console SQL : plus de limite à 1 000 lignes** : une requête lancée dans
+  la console renvoie toutes ses lignes ; seul un `LIMIT` ou un `TOP` écrit
+  dans la requête les limite. Un script qui produisait plus de 1 000 lignes
+  (par exemple un script d'annulation généré) n'en affichait que 1 000. Les
+  consoles MongoDB et Redis gardent leur limite de 1 000.
+
 ## [0.23.0] - 2026-11-16
 
 ### Nouveautés
